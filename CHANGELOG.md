@@ -16,6 +16,8 @@ and this project will use [Semantic Versioning](https://semver.org/spec/v2.0.0.h
 - Architecture and MCP protocol compatibility plans.
 - Artifact-first output policy for large emulator and analysis data.
 - Phased tool roadmap and mandatory byte-order/address-space metadata policy.
+- Initial `/mcp` HTTP transport shell with modern discovery, tool dispatch,
+  header validation, Origin checks, and bounded legacy initialization support.
 
 ### Changed
 

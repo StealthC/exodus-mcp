@@ -1,22 +1,20 @@
-// Command exodus-mcp is the future local HTTP endpoint for the Exodus MCP bridge.
-//
-// The current scaffold deliberately exposes only a health endpoint. It does not
-// claim MCP conformance until the 2026-07-28 transport validation suite exists.
+// Command exodus-mcp provides the local HTTP endpoint for Exodus MCP.
 package main
 
 import (
-	"encoding/json"
 	"flag"
 	"fmt"
 	"log"
 	"net/http"
 	"os"
+
+	"github.com/StealthC/exodus-mcp/internal/mcp"
 )
 
 var version = "dev"
 
 func main() {
-	listen := flag.String("listen", "127.0.0.1:8767", "local address for the development health endpoint")
+	listen := flag.String("listen", "127.0.0.1:8767", "local address for the MCP HTTP endpoint")
 	showVersion := flag.Bool("version", false, "print version and exit")
 	flag.Parse()
 
@@ -25,22 +23,11 @@ func main() {
 		return
 	}
 
-	mux := http.NewServeMux()
-	mux.HandleFunc("GET /healthz", health)
-
 	server := &http.Server{
 		Addr:    *listen,
-		Handler: mux,
+		Handler: mcp.NewHandler(version),
 	}
 
-	log.Printf("exodus-mcp scaffold listening on http://%s/healthz", *listen)
+	log.Printf("exodus-mcp listening on http://%s/mcp", *listen)
 	log.Fatal(server.ListenAndServe())
-}
-
-func health(w http.ResponseWriter, _ *http.Request) {
-	w.Header().Set("Content-Type", "application/json; charset=utf-8")
-	_ = json.NewEncoder(w).Encode(map[string]string{
-		"status":  "scaffold",
-		"version": version,
-	})
 }

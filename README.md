@@ -4,9 +4,9 @@ Exodus MCP is a local, native bridge that will expose the [Exodus Emulation
 Platform](https://github.com/StealthC/Exodus) to MCP clients for Sega
 Mega Drive / Genesis ROM analysis.
 
-The project is in its foundation phase. The checked-in Go command currently
-offers only a development health endpoint; it does **not** expose `/mcp` or
-claim MCP conformance yet.
+The project is in its foundation phase. The Go command implements the initial
+`/mcp` transport shell and reports the native bridge state honestly. It does
+not yet read from a running Exodus process.
 
 ## Goals
 
@@ -83,10 +83,11 @@ See [Development](docs/DEVELOPMENT.md) for the local workflow and
 
 - [x] Exodus fork pinned as a submodule.
 - [x] Reproducible Exodus build documentation and CI baseline.
-- [x] Go module, formatting rules, basic test, and development health endpoint.
+- [x] Go module, formatting rules, modern MCP transport shell, legacy
+  initialization compatibility, and transport tests.
 - [ ] Native extension discovery and lifecycle spike.
 - [ ] Local IPC contract and serialized command scheduler.
-- [ ] MCP `2026-07-28` conformance suite and `/mcp` endpoint.
+- [ ] Native extension discovery, authenticated IPC, and read-only live data.
 - [ ] Legacy-client compatibility tests with OpenCode.
 
 See the phased [tool roadmap](docs/ROADMAP.md).

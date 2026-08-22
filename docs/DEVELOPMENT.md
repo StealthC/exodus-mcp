@@ -14,8 +14,9 @@ go test ./...
 go run ./cmd/exodus-mcp
 ```
 
-The current binary exposes only `GET /healthz`; it intentionally does not
-implement an MCP endpoint yet.
+The current binary exposes `GET /healthz` and `POST /mcp`. The MCP endpoint
+implements discovery and the initial status tools, but reports the native bridge
+as unavailable until the C++ extension and IPC transport are complete.
 
 ## Quality gates
 
