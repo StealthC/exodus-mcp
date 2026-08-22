@@ -82,5 +82,18 @@ The first native plugin must prove only these capabilities:
 3. A read-only request is scheduled safely on the correct emulator thread.
 4. Shutdown disconnects cleanly without blocking Exodus.
 
+## Native spike status
+
+`native-plugin/ExodusMcpPlugin` now implements the extension side of this
+spike. It is a persistent global extension and deliberately starts no network
+listener. When the launcher provides `EXODUS_MCP_PIPE_NAME` and
+`EXODUS_MCP_CAPABILITY`, it listens on that named pipe and authorizes only a
+small `status` request. The reply contains lifecycle information and the count
+of modules observed while the extension initialized.
+
+The remaining half of the spike is the Go named-pipe client and launcher. Do
+not expose emulator data until that client schedules every read safely on the
+Exodus emulation thread.
+
 No memory mutation, frame advance, ROM loading, or scripting is in scope for
 that spike.

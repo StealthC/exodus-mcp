@@ -1,0 +1,13 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "mcp": {
+    "servers": {
+      "exodus": {
+        "type": "remote",
+        "url": "http://127.0.0.1:8767/mcp",
+        "oauth": false,
+        "codemode": false
+      }
+    }
+  }
+}

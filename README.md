@@ -78,6 +78,9 @@ curl http://127.0.0.1:8767/healthz
 
 See [Development](docs/DEVELOPMENT.md) for the local workflow and
 [Building Exodus](docs/BUILD.md) for the emulator build procedure.
+Client setup for OpenCode, Codex CLI, and Claude Code is in
+[MCP clients](docs/CLIENTS.md). The native extension source and its named-pipe
+contract are in [native-plugin](native-plugin/README.md).
 
 ## Status
 
@@ -85,8 +88,10 @@ See [Development](docs/DEVELOPMENT.md) for the local workflow and
 - [x] Reproducible Exodus build documentation and CI baseline.
 - [x] Go module, formatting rules, modern MCP transport shell, legacy
   initialization compatibility, and transport tests.
-- [ ] Native extension discovery and lifecycle spike.
-- [ ] Local IPC contract and serialized command scheduler.
+- [x] Native extension source, lifecycle status, and authenticated named-pipe
+  contract.
+- [ ] Go named-pipe client, extension deployment verification, and serialized
+  command scheduler.
 - [ ] Native extension discovery, authenticated IPC, and read-only live data.
 - [ ] Legacy-client compatibility tests with OpenCode.
 

@@ -18,6 +18,9 @@ and this project will use [Semantic Versioning](https://semver.org/spec/v2.0.0.h
 - Phased tool roadmap and mandatory byte-order/address-space metadata policy.
 - Initial `/mcp` HTTP transport shell with modern discovery, tool dispatch,
   header validation, Origin checks, and bounded legacy initialization support.
+- Initial native `ExodusMcpPlugin` bridge: a persistent Exodus extension with
+  an authenticated local named-pipe status endpoint and a read-only module
+  snapshot.
 
 ### Changed
 
