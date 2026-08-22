@@ -1,0 +1,7 @@
+# Legacy local Exodus checkout. The tracked dependency is vendor/exodus.
+/src/
+
+# Local Go build and coverage output.
+/bin/
+*.test
+/.coverage/

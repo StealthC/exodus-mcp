@@ -1,0 +1,50 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  go:
+    name: Go tests
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+      - run: test -z "$(gofmt -l cmd)"
+      - run: go test ./...
+
+  exodus:
+    name: Exodus Release x64 build
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - name: Locate MSBuild
+        id: msbuild
+        shell: pwsh
+        run: |
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $msbuild = & $vswhere -latest -products * -requires Microsoft.Component.MSBuild -find 'MSBuild\**\Bin\MSBuild.exe' | Select-Object -First 1
+          if (-not $msbuild) { throw 'MSBuild was not found on the runner.' }
+          "path=$msbuild" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+      - name: Build third-party libraries
+        shell: pwsh
+        run: |
+          & '${{ steps.msbuild.outputs.path }}' "$env:GITHUB_WORKSPACE\vendor\exodus\ThirdPartyLibraries.sln" /m /t:Build /p:Configuration=Release /p:Platform=x64 /nologo /verbosity:minimal
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+      - name: Build Exodus
+        shell: pwsh
+        run: |
+          & '${{ steps.msbuild.outputs.path }}' "$env:GITHUB_WORKSPACE\vendor\exodus\Exodus.sln" /m /t:Build /p:Configuration=Release /p:Platform=x64 /nologo /verbosity:minimal
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }

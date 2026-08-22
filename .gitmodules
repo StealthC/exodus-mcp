@@ -1,0 +1,3 @@
+[submodule "exodus"]
+	path = vendor/exodus
+	url = https://github.com/StealthC/Exodus.git
