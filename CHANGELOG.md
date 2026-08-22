@@ -28,6 +28,8 @@ and this project will use [Semantic Versioning](https://semver.org/spec/v2.0.0.h
 
 - Removed the non-reproducible Exodus build job from the MCP CI. Its clean
   checkout did not contain the upstream-ignored third-party source trees.
+- Pinned an Exodus fork revision that explicitly includes `<algorithm>` for
+  `std::set_difference` under current MSVC toolchains.
 
 ### Security
 

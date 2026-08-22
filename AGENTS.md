@@ -31,7 +31,8 @@ Guidance for contributors and coding agents working in this workspace.
 
 ## Verified build baseline
 
-- Pinned Exodus commit: `08f388f77040af28d16d44fdfbddb73252953161` (`master`).
+- Upstream Exodus base: `08f388f77040af28d16d44fdfbddb73252953161` (`master`).
+- Pinned fork revision: `3cd0e6895196437250bbd00dc271f101ba8faaca`.
 - Validated host: Visual Studio 18 Community, MSVC 14.37 (`v143`), Windows SDK
   10.0.26100.
 - Build `ThirdPartyLibraries.sln` before `Exodus.sln`, with the same
