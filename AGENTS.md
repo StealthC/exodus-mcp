@@ -16,7 +16,9 @@ Guidance for contributors and coding agents working in this workspace.
 
 - [Build guide](docs/BUILD.md): prerequisites, third-party libraries, local
   builds, outputs, and troubleshooting.
-- [CI plan](docs/CI.md): GitHub Actions baseline for this repository.
+- [CI](docs/CI.md): ownership split and GitHub Actions policy.
+- [Exodus fork CI](docs/EXODUS-FORK-CI.md): third-party package contract and
+  ready-to-copy fork build workflow.
 - [Architecture](docs/ARCHITECTURE.md): the process boundary, concurrency, and
   native-extension spike.
 - [MCP compatibility](docs/MCP-COMPATIBILITY.md): normative modern transport
@@ -62,6 +64,8 @@ Guidance for contributors and coding agents working in this workspace.
 - Keep the upstream dependency clean. Product code, MCP code, CI, and docs
   belong in this repository. Make unavoidable Exodus changes as small,
   separately reviewable commits in the fork.
+- The MCP CI must not compile a clean Exodus submodule. Build and publish
+  Exodus in its fork after its vendored third-party source check has completed.
 - Never use `git reset --hard` without explicit authorization. Build output is
   ignored; `git -C vendor/exodus status --short --branch` should be clean after
   a build.

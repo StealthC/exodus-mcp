@@ -21,11 +21,13 @@ and this project will use [Semantic Versioning](https://semver.org/spec/v2.0.0.h
 
 ### Changed
 
-- Nothing yet.
+- Split CI ownership: `exodus-mcp` now tests the Go server only, while the
+  Exodus fork owns its Windows build and binary artifacts.
 
 ### Fixed
 
-- Nothing yet.
+- Removed the non-reproducible Exodus build job from the MCP CI. Its clean
+  checkout did not contain the upstream-ignored third-party source trees.
 
 ### Security
 
