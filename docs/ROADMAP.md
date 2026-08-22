@@ -13,7 +13,9 @@ for a small amount of read-only state.
 - `server/discover` and a conformant `tools/list` / `tools/call` shell.
 - [x] Native persistent extension with a capability-gated named-pipe `status`
   response and an initialization-time module snapshot.
-- `bridge_status`: plugin version, bridge connectivity, queue state.
+- [x] `bridge_status`: plugin version, bridge connectivity, and initialization
+  module count over the authenticated named pipe. Queue state follows with the
+  scheduler.
 - `emulator_status`: loaded modules, running/paused state, and target identity.
 - Named-pipe authentication, serialized command queue, cancellation, and clean
   shutdown.

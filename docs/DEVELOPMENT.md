@@ -15,8 +15,34 @@ go run ./cmd/exodus-mcp
 ```
 
 The current binary exposes `GET /healthz` and `POST /mcp`. The MCP endpoint
-implements discovery and the initial status tools, but reports the native bridge
-as unavailable until the C++ extension and IPC transport are complete.
+implements discovery and the initial status tools. `bridge_status` contacts the
+native extension when its named-pipe configuration is supplied.
+
+On Windows, point the server at a running `ExodusMcpPlugin` with the same pipe
+configuration the Exodus process received:
+
+```powershell
+go run ./cmd/exodus-mcp --pipe-name '\\.\pipe\exodus-mcp-dev' --pipe-capability 'replace-with-the-generated-capability'
+```
+
+`bridge_status` makes a bounded status request through that pipe. To let the
+server own the credentials and start Exodus as its child, use:
+
+```powershell
+go run ./cmd/exodus-mcp --exodus 'C:\path\to\Exodus.exe'
+```
+
+Repeat `--exodus-arg` for any Exodus command-line arguments. This mode creates
+a new pipe name and capability for that one child process and never logs the
+capability.
+
+## Windows server used from WSL
+
+Keep the MCP server bound to `127.0.0.1`. In the default WSL2 NAT mode, WSL
+cannot reach a Windows loopback server. On Windows 11, enable WSL mirrored
+networking in `%USERPROFILE%\.wslconfig`, then restart the WSL VM; WSL and
+Windows can subsequently reach each other's loopback services through
+`127.0.0.1`.
 
 ## Quality gates
 

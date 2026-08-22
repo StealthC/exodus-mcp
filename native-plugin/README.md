@@ -44,7 +44,8 @@ Exodus-derived binary.
 
 ## Next bridge increment
 
-The Go process must add the named-pipe client and startup launcher. Only then
-should `bridge_status` report a live connection. Read-only commands must be
+The Go process now owns the named-pipe client and can launch Exodus with a
+generated capability using `exodus-mcp --exodus <path-to-Exodus.exe>`. The next
+increment is a serialized command scheduler. Read-only commands must be
 scheduled onto the Exodus emulation thread before accessing mutable emulator
 state.

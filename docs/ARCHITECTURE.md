@@ -91,9 +91,10 @@ listener. When the launcher provides `EXODUS_MCP_PIPE_NAME` and
 small `status` request. The reply contains lifecycle information and the count
 of modules observed while the extension initialized.
 
-The remaining half of the spike is the Go named-pipe client and launcher. Do
-not expose emulator data until that client schedules every read safely on the
-Exodus emulation thread.
+The Go server now has the named-pipe client used by `bridge_status`. The
+remaining work is a launcher that generates and injects the capability, plus
+the serialized command scheduler. Do not expose emulator data until that
+scheduler dispatches every read safely on the Exodus emulation thread.
 
 No memory mutation, frame advance, ROM loading, or scripting is in scope for
 that spike.

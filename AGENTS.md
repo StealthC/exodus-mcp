@@ -58,6 +58,12 @@ Guidance for contributors and coding agents working in this workspace.
   metadata. The Mega Drive baseline is M68K `big-endian`, Z80 `little-endian`,
   and device-specific VDP semantics; raw bytes preserve address order.
 
+## WSL environment
+
+- When running under WSL, do not start the MCP server manually from the agent
+  shell. The server runs on the Windows side and is managed outside WSL; check
+  connectivity through the bridge status instead of launching processes.
+
 ## Git and upstream discipline
 
 - Run Exodus Git commands inside `vendor/exodus/`. Check `git status` before

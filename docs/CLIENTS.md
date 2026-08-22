@@ -14,27 +14,31 @@ endpoint to the network.
 
 ## OpenCode
 
-Add this to the repository `opencode.json` (or your OpenCode user
-configuration). Current OpenCode v2 places named servers under `mcp.servers`.
+Both OpenCode v1 (`opencode`) and v2 (`opencode2`) accept this configuration.
+It uses the V1 MCP shape (`mcp.<name>`), which V2 still normalizes for
+backward compatibility, so one `opencode.json` works for either client:
 
 ```json
 {
   "$schema": "https://opencode.ai/config.json",
   "mcp": {
-    "servers": {
-      "exodus": {
-        "type": "remote",
-        "url": "http://127.0.0.1:8767/mcp",
-        "oauth": false,
-        "codemode": false
-      }
+    "exodus": {
+      "type": "remote",
+      "url": "http://127.0.0.1:8767/mcp",
+      "oauth": false,
+      "enabled": true
     }
   }
 }
 ```
 
-Verify it with `opencode mcp list`. With this server name, its tools appear as
-`exodus_bridge_status` and `exodus_target_info`.
+V2 also has a native shape (`mcp.servers.<name>` with `disabled` and
+`codemode` fields), but V1 cannot read it, so keep the shared project
+configuration in the V1 shape. V2-only options such as `codemode: false` are
+not available in that shape.
+
+Verify with `opencode mcp list` (or `opencode2 mcp list`). With this server
+name, its tools appear as `exodus_bridge_status` and `exodus_target_info`.
 
 ## Codex CLI
 

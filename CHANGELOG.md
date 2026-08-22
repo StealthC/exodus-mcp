@@ -21,6 +21,12 @@ and this project will use [Semantic Versioning](https://semver.org/spec/v2.0.0.h
 - Initial native `ExodusMcpPlugin` bridge: a persistent Exodus extension with
   an authenticated local named-pipe status endpoint and a read-only module
   snapshot.
+- Windows named-pipe client for the Go server. `bridge_status` now returns the
+  live native plugin status when matching pipe configuration is supplied.
+- Optional Exodus launcher that generates one pipe name and capability per
+  child process without logging the capability.
+- Windows launcher now starts Exodus in its executable directory, preserving
+  its relative settings and workspace paths.
 
 ### Changed
 

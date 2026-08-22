@@ -2,12 +2,16 @@
 package mcp
 
 import (
+	"context"
 	"encoding/base64"
 	"encoding/json"
 	"io"
 	"net/http"
 	"net/url"
 	"strings"
+	"time"
+
+	"github.com/StealthC/exodus-mcp/internal/bridge"
 )
 
 const (
@@ -39,6 +43,15 @@ type response struct {
 // NewHandler returns the local HTTP handler. The native bridge is not connected
 // yet; the initial tool set exposes that state honestly.
 func NewHandler(version string) http.Handler {
+	return NewHandlerWithBridge(version, bridge.UnavailableClient())
+}
+
+// NewHandlerWithBridge returns the local HTTP handler backed by one native
+// bridge client. A nil client is treated as unavailable.
+func NewHandlerWithBridge(version string, client bridge.Client) http.Handler {
+	if client == nil {
+		client = bridge.UnavailableClient()
+	}
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if !validOrigin(r.Header.Get("Origin")) {
 			http.Error(w, "forbidden origin", http.StatusForbidden)
@@ -57,7 +70,7 @@ func NewHandler(version string) http.Handler {
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 			return
 		}
-		dispatch(version, w, r)
+		dispatch(version, client, w, r)
 	})
 }
 
@@ -73,7 +86,7 @@ func health(version string, w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-func dispatch(version string, w http.ResponseWriter, r *http.Request) {
+func dispatch(version string, client bridge.Client, w http.ResponseWriter, r *http.Request) {
 	defer r.Body.Close()
 	body, err := io.ReadAll(io.LimitReader(r.Body, 1<<20))
 	if err != nil {
@@ -93,13 +106,13 @@ func dispatch(version string, w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if modern {
-		dispatchModern(version, w, r, request, protocolVersion)
+		dispatchModern(version, client, w, r, request, protocolVersion)
 		return
 	}
-	dispatchLegacy(version, w, request)
+	dispatchLegacy(version, client, w, r, request)
 }
 
-func dispatchModern(version string, w http.ResponseWriter, r *http.Request, request request, protocolVersion string) {
+func dispatchModern(version string, client bridge.Client, w http.ResponseWriter, r *http.Request, request request, protocolVersion string) {
 	if protocolVersion != ModernProtocolVersion {
 		writeError(w, http.StatusBadRequest, request.ID, -32022, "Unsupported protocol version", map[string]any{
 			"supported": []string{ModernProtocolVersion, LegacyProtocolVersion},
@@ -112,7 +125,7 @@ func dispatchModern(version string, w http.ResponseWriter, r *http.Request, requ
 		return
 	}
 
-	result, rpcErr, status := modernResult(version, request)
+	result, rpcErr, status := modernResult(version, client, r, request)
 	if rpcErr != nil {
 		writeError(w, status, request.ID, rpcErr.Code, rpcErr.Message, rpcErr.Data)
 		return
@@ -120,7 +133,7 @@ func dispatchModern(version string, w http.ResponseWriter, r *http.Request, requ
 	writeJSON(w, status, response{JSONRPC: "2.0", ID: request.ID, Result: result})
 }
 
-func dispatchLegacy(version string, w http.ResponseWriter, request request) {
+func dispatchLegacy(version string, client bridge.Client, w http.ResponseWriter, r *http.Request, request request) {
 	var result any
 	switch request.Method {
 	case "initialize":
@@ -135,7 +148,7 @@ func dispatchLegacy(version string, w http.ResponseWriter, request request) {
 	case "tools/list":
 		result = map[string]any{"tools": toolSchemas()}
 	case "tools/call":
-		result = callTool(request.Params, false)
+		result = callTool(r.Context(), client, request.Params, false)
 	default:
 		writeError(w, http.StatusOK, request.ID, -32601, "Method not found", nil)
 		return
@@ -143,7 +156,7 @@ func dispatchLegacy(version string, w http.ResponseWriter, request request) {
 	writeJSON(w, http.StatusOK, response{JSONRPC: "2.0", ID: request.ID, Result: result})
 }
 
-func modernResult(version string, request request) (map[string]any, *rpcError, int) {
+func modernResult(version string, client bridge.Client, r *http.Request, request request) (map[string]any, *rpcError, int) {
 	var result map[string]any
 	switch request.Method {
 	case "server/discover":
@@ -151,7 +164,7 @@ func modernResult(version string, request request) (map[string]any, *rpcError, i
 			"supportedVersions": []string{ModernProtocolVersion, LegacyProtocolVersion},
 			"capabilities":      capabilities(),
 			"serverInfo":        serverInfo(version),
-			"instructions":      "Use bridge_status before requesting emulator data. The native Exodus bridge is not connected in this build.",
+			"instructions":      "Use bridge_status before requesting emulator data. It reports whether the local Exodus native bridge is currently connected.",
 			"ttlMs":             3600000,
 			"cacheScope":        "public",
 		}
@@ -162,7 +175,7 @@ func modernResult(version string, request request) (map[string]any, *rpcError, i
 			"cacheScope": "public",
 		}
 	case "tools/call":
-		result = callTool(request.Params, true)
+		result = callTool(r.Context(), client, request.Params, true)
 	default:
 		return nil, &rpcError{Code: -32601, Message: "Method not found"}, http.StatusNotFound
 	}
@@ -194,7 +207,7 @@ func toolSchemas() []map[string]any {
 	}
 }
 
-func callTool(params json.RawMessage, modern bool) map[string]any {
+func callTool(ctx context.Context, client bridge.Client, params json.RawMessage, modern bool) map[string]any {
 	var call struct {
 		Name string `json:"name"`
 	}
@@ -203,11 +216,26 @@ func callTool(params json.RawMessage, modern bool) map[string]any {
 	}
 	switch call.Name {
 	case "bridge_status":
+		statusContext, cancel := context.WithTimeout(ctx, 3*time.Second)
+		defer cancel()
+		status, err := client.Status(statusContext)
+		if err == nil {
+			return toolSuccess(map[string]any{
+				"connected":            true,
+				"transport":            "windows-named-pipe",
+				"protocol_version":     status.ProtocolVersion,
+				"plugin_version":       status.PluginVersion,
+				"lifecycle":            status.Lifecycle,
+				"bridge_enabled":       status.BridgeEnabled,
+				"loaded_module_count":  status.LoadedModuleCount,
+				"supported_operations": []string{"status"},
+			}, modern)
+		}
 		return toolSuccess(map[string]any{
 			"connected":            false,
 			"transport":            "windows-named-pipe",
 			"supported_operations": []string{},
-			"message":              "The Exodus native bridge is not connected yet.",
+			"message":              "The Exodus native bridge is unavailable: " + err.Error(),
 		}, modern)
 	case "target_info":
 		return toolError("bridge_unavailable", "The Exodus native bridge is not connected.", modern)

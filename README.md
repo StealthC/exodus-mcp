@@ -90,8 +90,9 @@ contract are in [native-plugin](native-plugin/README.md).
   initialization compatibility, and transport tests.
 - [x] Native extension source, lifecycle status, and authenticated named-pipe
   contract.
-- [ ] Go named-pipe client, extension deployment verification, and serialized
-  command scheduler.
+- [x] Go named-pipe client and live `bridge_status` reporting.
+- [x] Server-owned capability generation and optional Exodus launcher.
+- [ ] Extension deployment verification and serialized command scheduler.
 - [ ] Native extension discovery, authenticated IPC, and read-only live data.
 - [ ] Legacy-client compatibility tests with OpenCode.
 
