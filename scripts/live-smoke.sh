@@ -121,6 +121,15 @@ if [ "$FULL" = 1 ]; then
 	paused=$(tool_call "cpu_pause")
 	check "cpu_pause succeeds" "[ -n \"\$paused\" ]"
 
+	# Purge anything left armed by an earlier session: an armed watchpoint or
+	# breakpoint re-pauses every resumed run and poisons the checks below.
+	for stale_id in $(json_get "$(tool_call "cpu_breakpoint_list")" "' '.join(str(i.get('breakpoint_id')) for i in parsed.get('breakpoints', []))" 2>/dev/null); do
+		tool_call "cpu_breakpoint_remove" "{\"breakpoint_id\": $stale_id}" >/dev/null
+	done
+	for stale_id in $(json_get "$(tool_call "cpu_watchpoint_list")" "' '.join(str(i.get('watchpoint_id')) for i in parsed.get('watchpoints', []))" 2>/dev/null); do
+		tool_call "cpu_watchpoint_remove" "{\"watchpoint_id\": $stale_id}" >/dev/null
+	done
+
 	step_result=$(tool_call "m68k_step")
 	check "m68k_step succeeds while paused" "[ -n \"\$step_result\" ]"
 
@@ -131,8 +140,9 @@ if [ "$FULL" = 1 ]; then
 	bp_id=$(json_get "$bp" "parsed.get('breakpoint_id')" 2>/dev/null)
 	if [ -n "$bp_id" ]; then
 		check "breakpoint set returns an id" true
-		tool_call "cpu_breakpoint_remove" "{\"id\": \"$bp_id\"}" >/dev/null
-		check "breakpoint removed cleanly" true
+		bp_rm=$(tool_call "cpu_breakpoint_remove" "{\"breakpoint_id\": $bp_id}")
+		check "breakpoint removed cleanly" \
+			"[ \"\$(json_get \"\$bp_rm\" \"str(parsed.get('removed', False)).lower()\" 2>/dev/null)\" = 'true' ]"
 	else
 		check "breakpoint set returns an id" false
 	fi
@@ -141,30 +151,52 @@ if [ "$FULL" = 1 ]; then
 	wp_id=$(json_get "$wp" "parsed.get('watchpoint_id')" 2>/dev/null)
 	if [ -n "$wp_id" ]; then
 		check "watchpoint set returns an id" true
-		tool_call "cpu_watchpoint_remove" "{\"id\": \"$wp_id\"}" >/dev/null
-		check "watchpoint removed cleanly" true
+		wp_rm=$(tool_call "cpu_watchpoint_remove" "{\"watchpoint_id\": $wp_id}")
+		check "watchpoint removed cleanly" \
+			"[ \"\$(json_get \"\$wp_rm\" \"str(parsed.get('removed', False)).lower()\" 2>/dev/null)\" = 'true' ]"
 	else
 		check "watchpoint set returns an id" false
 	fi
 
+	# Throwaway capture: pausing is asynchronous, and the last timeslice can
+	# still complete one buffer swap after cpu_pause returns. Settle first so
+	# the compared pair observes a frozen image buffer.
+	tool_call "frame_capture" >/dev/null
 	frame_a=$(tool_call "frame_capture")
-	code_a=$(json_get "$frame_a" "parsed.get('code', '')" 2>/dev/null)
+	# The response is artifact-first: the digest lives under summary.sha256.
+	code_a=$(json_get "$frame_a" "parsed.get('code', parsed.get('error', {}).get('code', ''))" 2>/dev/null)
 	if [ "$code_a" = "frame_capture_failed" ]; then
 		echo "SKIP  frame determinism (no rendered VDP frame yet; load a ROM and run first)"
 	else
 		frame_b=$(tool_call "frame_capture")
-		hash_a=$(json_get "$frame_a" "parsed.get('sha256', '')" 2>/dev/null)
-		hash_b=$(json_get "$frame_b" "parsed.get('sha256', '')" 2>/dev/null)
+		hash_a=$(json_get "$frame_a" "parsed.get('summary', {}).get('sha256', '')" 2>/dev/null)
+		hash_b=$(json_get "$frame_b" "parsed.get('summary', {}).get('sha256', '')" 2>/dev/null)
 		if [ -n "$hash_a" ]; then
 			check "paused frame captures are deterministic" "[ \"\$hash_a\" = \"\$hash_b\" ]"
 		else
 			check "paused frame captures are deterministic" false
 		fi
+		# Regression stress for the paused back-to-back capture hang: several
+		# consecutive large inline responses through the plugin pipe must all
+		# complete within the client deadline with identical digests. An empty
+		# digest counts as failure so a silent bridge error cannot pass here.
+		stress_ok=true
+		for _ in 1 2 3; do
+			frame_s=$(tool_call "frame_capture")
+			hash_s=$(json_get "$frame_s" "parsed.get('summary', {}).get('sha256', '')" 2>/dev/null)
+			if [ -z "$hash_s" ] || [ "$hash_s" != "$hash_a" ]; then
+				stress_ok=false
+				break
+			fi
+		done
+		check "consecutive paused captures stay responsive" "$stress_ok"
 	fi
 
 	if [ "$was_running" = "True" ] || [ "$was_running" = "true" ]; then
 		tool_call "cpu_run" >/dev/null
-		echo "note  restored running state"
+		emu_after=$(tool_call "emulator_status")
+		check "restored running state" \
+			"[ \"\$(json_get \"\$emu_after\" \"str(parsed.get('system_running', False)).lower()\" 2>/dev/null)\" = 'true' ]"
 	fi
 fi
 
