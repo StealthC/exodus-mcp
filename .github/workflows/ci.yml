@@ -10,8 +10,8 @@ permissions:
   contents: read
 
 jobs:
-  go:
-    name: Go tests
+  go-linux:
+    name: Go gates (Linux)
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
@@ -20,5 +20,43 @@ jobs:
       - uses: actions/setup-go@v6
         with:
           go-version-file: go.mod
-      - run: test -z "$(gofmt -l cmd)"
-      - run: go test ./...
+      - name: Check formatting
+        run: test -z "$(gofmt -l cmd internal)"
+      - name: Vet
+        run: go vet ./...
+      - name: Test with the race detector
+        run: go test -race ./...
+      - name: Windows cross-compilation gates
+        run: |
+          GOOS=windows GOARCH=amd64 go build ./...
+          GOOS=windows GOARCH=amd64 go vet ./...
+
+  windows:
+    name: Go tests + native plugin (Windows)
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+      - name: Build
+        run: go build ./...
+      - name: Vet
+        run: go vet ./...
+      - name: Test with the race detector
+        run: go test -race ./...
+      - name: Build native plugin (Debug x64)
+        shell: cmd
+        run: |-
+          for /f "usebackq tokens=*" %%i in (`"%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * -requires Microsoft.Component.MSBuild -find MSBuild\**\Bin\MSBuild.exe`) do set "MSBUILD=%%i"
+          if not defined MSBUILD (echo ERROR: MSBuild not found & exit /b 1)
+          "%MSBUILD%" native-plugin\ExodusMcpPlugin.vcxproj -nologo -m -t:Build -p:Configuration=Debug -p:Platform=x64 -p:SolutionDir="%CD%\vendor\exodus\\" -verbosity:minimal
+      - name: Upload plugin artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ExodusMcpPlugin-debug-x64
+          path: |
+            vendor/exodus/Assemblies/ExodusMcpPlugin.dll
+          if-no-files-found: error

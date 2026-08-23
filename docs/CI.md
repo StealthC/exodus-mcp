@@ -35,12 +35,21 @@ not in this repository.
 
 ## Plugin CI evolution
 
-The native plugin should be an independent `native-plugin/` project. It must
-consume a tested Exodus SDK/build through an explicit `ExodusRoot` MSBuild
-property, not developer-specific paths. Publish a separate plugin artifact
-containing only the plugin DLL, required sidecars, `build-info.json`, and
-install instructions.
+The native plugin is an independent `native-plugin/` project consuming the
+Exodus SDK through the submodule's property sheets and project references.
+The Windows CI job compiles it with `Debug | x64` against the pinned
+submodule and uploads the DLL as an artifact. A `Release | x64` plugin build
+additionally requires Release third-party libraries from the fork
+(`ThirdPartyLibraries.sln`), so it stays a local, documented step for now.
 
-Required checks over time: Exodus Debug/Release x64 builds, plugin compilation,
-HTTP/IPC unit tests without an emulator, and a legal-ROM or open-fixture smoke
-test on a Windows runner.
+Current jobs:
+
+- `go-linux`: formatting, vet, race-enabled tests, and `GOOS=windows`
+  cross-compilation gates on Ubuntu.
+- `windows`: native Go test run with the race detector plus the native
+  plugin compile on `windows-2022` (v143 toolset baseline).
+
+Required checks over time: Exodus Debug/Release x64 builds in the fork
+pipeline, HTTP/IPC unit tests without an emulator (done), live named-pipe
+client integration tests on the Windows runner (in place via the fake
+plugin suite), and a legal-ROM or open-fixture smoke test.
