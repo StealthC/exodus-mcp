@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/url"
@@ -285,9 +286,12 @@ func (server *Server) executeCommand(ctx context.Context, operation string, para
 	data, err := server.bridge.Execute(callContext, operation, params)
 	if err != nil {
 		var commandErr *bridge.CommandError
-		if errorsAs(err, &commandErr) {
+		if errors.As(err, &commandErr) {
 			return nil, &toolFailure{Code: commandErr.Code, Message: commandErr.Message}
 		}
+		// A transport-class failure means the cached status may describe a
+		// dead or restarted bridge; force the next command to re-probe.
+		server.invalidateStatusCache()
 		return nil, &toolFailure{Code: "bridge_error", Message: err.Error()}
 	}
 	var payload map[string]any
@@ -312,20 +316,12 @@ func commandTimeout(operation string) time.Duration {
 	}
 }
 
-// errorsAs avoids importing errors just for As at every call site.
-func errorsAs(err error, target **bridge.CommandError) bool {
-	for err != nil {
-		if typed, ok := err.(*bridge.CommandError); ok {
-			*target = typed
-			return true
-		}
-		unwrapper, ok := err.(interface{ Unwrap() error })
-		if !ok {
-			return false
-		}
-		err = unwrapper.Unwrap()
-	}
-	return false
+// invalidateStatusCache drops any cached plugin status so the next command
+// re-probes the bridge instead of trusting a possibly stale snapshot.
+func (server *Server) invalidateStatusCache() {
+	server.statusMu.Lock()
+	defer server.statusMu.Unlock()
+	server.statusExpires = time.Time{}
 }
 
 func modernProtocol(params json.RawMessage) (bool, string, error) {

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"strings"
 	"testing"
@@ -35,11 +36,13 @@ type recordedCall struct {
 type fakeBridgeClient struct {
 	status        bridge.Status
 	statusErr     error
+	statusCalls   int
 	executeFunc   func(ctx context.Context, method string, params map[string]string) (json.RawMessage, error)
 	recordedCalls []recordedCall
 }
 
 func (client *fakeBridgeClient) Status(context.Context) (bridge.Status, error) {
+	client.statusCalls++
 	if client.statusErr != nil {
 		return bridge.Status{}, client.statusErr
 	}
@@ -212,5 +215,36 @@ func TestEmulatorDataRequiresBridgeOperationSupport(t *testing.T) {
 	content := structured(result)
 	if content["code"] != "unsupported_plugin" {
 		t.Fatalf("code = %v, want unsupported_plugin", content["code"])
+	}
+}
+
+func TestTransportFailureInvalidatesStatusCache(t *testing.T) {
+	client := &fakeBridgeClient{status: newFakeStatus()}
+	client.executeFunc = func(context.Context, string, map[string]string) (json.RawMessage, error) {
+		return nil, errors.New("pipe is broken")
+	}
+	server := newTestServer(t, client)
+
+	if _, failure := server.executeCommand(context.Background(), "emulator_status", nil); failure == nil || failure.Code != "bridge_error" {
+		t.Fatalf("first call failure = %v, want bridge_error", failure)
+	}
+	if client.statusCalls != 1 {
+		t.Fatalf("status calls after first command = %d, want 1", client.statusCalls)
+	}
+
+	// A second immediate command inside the cache TTL must re-probe because
+	// the transport failure invalidated the cached status.
+	client.executeFunc = func(context.Context, string, map[string]string) (json.RawMessage, error) {
+		return json.RawMessage(`{"ok":true}`), nil
+	}
+	payload, failure := server.executeCommand(context.Background(), "emulator_status", nil)
+	if failure != nil {
+		t.Fatalf("recovered call failed: %+v", failure)
+	}
+	if payload["ok"] != true {
+		t.Fatalf("unexpected payload: %v", payload)
+	}
+	if client.statusCalls != 2 {
+		t.Fatalf("status calls after recovery = %d, want 2; stale cache was reused", client.statusCalls)
 	}
 }
