@@ -70,6 +70,14 @@ Guidance for contributors and coding agents working in this workspace.
   child is paired with one generated capability. Check `bridge_status` before
   launching; never start a second pair. For a code or plugin change, obtain
   the user's approval before using the wrapper to restart and test the pair.
+- The harness caches the MCP tool catalog per session. Even after the agent
+  rebuilds, reinstalls the plugin, restarts Exodus and the launcher, newly
+  added or changed tools stay invisible or stale inside the running harness
+  session until the user reloads the MCP connection (for example in OpenCode:
+  `/mcp`, then disable and re-enable the `exodus` server). After every plugin
+  or server change that alters the tool surface, always ask the user to reload
+  the MCP and wait for their confirmation before testing new tools directly or
+  through subagents.
 
 ## Git and upstream discipline
 
