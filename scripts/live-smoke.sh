@@ -57,10 +57,16 @@ params = json.loads(sys.argv[1])
 params['_meta'] = {'io.modelcontextprotocol/protocolVersion': '2026-07-28'}
 print(json.dumps({'jsonrpc': '2.0', 'id': 1, 'method': sys.argv[2], 'params': params}))
 " "$params" "$method") || return 1
+	local extra_headers=()
+	if [ "$method" = "tools/call" ]; then
+		name=$(json_get "$params" "parsed['name']" 2>/dev/null) || return 1
+		extra_headers+=(-H "Mcp-Name: $name")
+	fi
 	curl -fsS --max-time 30 -X POST "$BASE_URL/mcp" \
 		-H 'Content-Type: application/json' \
 		-H "MCP-Protocol-Version: 2026-07-28" \
 		-H "$header_name" \
+		"${extra_headers[@]}" \
 		-d "$body" 2>/dev/null | python3 -c "
 import json, sys
 envelope = json.load(sys.stdin)
@@ -71,13 +77,18 @@ print(json.dumps(envelope.get('result', {})))
 }
 
 tool_call() {
-	# tool_call <name> <args-json> -> structuredContent JSON or empty
+	# tool_call <name> [arguments-json] -> structuredContent JSON or empty
+	local name="$1"
+	local arguments="${2:-}"
+	if [ -z "$arguments" ]; then
+		arguments='{}'
+	fi
 	local result
 	result=$(rpc_call "tools/call" "$(python3 -c "
 import json, sys
 print(json.dumps({'name': sys.argv[1], 'arguments': json.loads(sys.argv[2])}))
-" "$1" "${2:-{}}")") || return 1
-	json_get "$result" "result.get('structuredContent', {})" 2>/dev/null
+" "$name" "$arguments")") || return 1
+	json_get "$result" "parsed.get('structuredContent', {})" 2>/dev/null
 }
 
 step "Health endpoint"
@@ -105,7 +116,7 @@ check "emulator_status returns structured data" "[ -n \"\$emu\" ]"
 
 if [ "$FULL" = 1 ]; then
 	step "CPU control (mutating; restores running state)"
-	was_running=$(json_get "$emu" "parsed.get('running', False)" 2>/dev/null)
+	was_running=$(json_get "$emu" "parsed.get('system_running', False)" 2>/dev/null)
 
 	paused=$(tool_call "cpu_pause")
 	check "cpu_pause succeeds" "[ -n \"\$paused\" ]"
@@ -116,8 +127,8 @@ if [ "$FULL" = 1 ]; then
 	pc_before=$(json_get "$step_result" "parsed.get('pc', parsed)" 2>/dev/null)
 	check "m68k_step echoes a program counter" "[ -n \"\$pc_before\" ]"
 
-	bp=$(tool_call "cpu_breakpoint_set" '{"address": "0x00000200"}')
-	bp_id=$(json_get "$bp" "parsed.get('id')" 2>/dev/null)
+	bp=$(tool_call "cpu_breakpoint_set" '{"cpu": "m68k", "address": "0x00000200"}')
+	bp_id=$(json_get "$bp" "parsed.get('breakpoint_id')" 2>/dev/null)
 	if [ -n "$bp_id" ]; then
 		check "breakpoint set returns an id" true
 		tool_call "cpu_breakpoint_remove" "{\"id\": \"$bp_id\"}" >/dev/null
@@ -126,8 +137,8 @@ if [ "$FULL" = 1 ]; then
 		check "breakpoint set returns an id" false
 	fi
 
-	wp=$(tool_call "cpu_watchpoint_set" '{"address": "0xFF0000", "length": 1}')
-	wp_id=$(json_get "$wp" "parsed.get('id')" 2>/dev/null)
+	wp=$(tool_call "cpu_watchpoint_set" '{"cpu": "m68k", "address": "0xFF0000", "length": 1}')
+	wp_id=$(json_get "$wp" "parsed.get('watchpoint_id')" 2>/dev/null)
 	if [ -n "$wp_id" ]; then
 		check "watchpoint set returns an id" true
 		tool_call "cpu_watchpoint_remove" "{\"id\": \"$wp_id\"}" >/dev/null
@@ -137,13 +148,18 @@ if [ "$FULL" = 1 ]; then
 	fi
 
 	frame_a=$(tool_call "frame_capture")
-	frame_b=$(tool_call "frame_capture")
-	hash_a=$(json_get "$frame_a" "parsed.get('sha256', '')" 2>/dev/null)
-	hash_b=$(json_get "$frame_b" "parsed.get('sha256', '')" 2>/dev/null)
-	if [ -n "$hash_a" ]; then
-		check "paused frame captures are deterministic" "[ \"\$hash_a\" = \"\$hash_b\" ]"
+	code_a=$(json_get "$frame_a" "parsed.get('code', '')" 2>/dev/null)
+	if [ "$code_a" = "frame_capture_failed" ]; then
+		echo "SKIP  frame determinism (no rendered VDP frame yet; load a ROM and run first)"
 	else
-		echo "SKIP  frame determinism (no sha256 in response)"
+		frame_b=$(tool_call "frame_capture")
+		hash_a=$(json_get "$frame_a" "parsed.get('sha256', '')" 2>/dev/null)
+		hash_b=$(json_get "$frame_b" "parsed.get('sha256', '')" 2>/dev/null)
+		if [ -n "$hash_a" ]; then
+			check "paused frame captures are deterministic" "[ \"\$hash_a\" = \"\$hash_b\" ]"
+		else
+			check "paused frame captures are deterministic" false
+		fi
 	fi
 
 	if [ "$was_running" = "True" ] || [ "$was_running" = "true" ]; then

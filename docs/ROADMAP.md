@@ -66,6 +66,13 @@ not manually decode opaque dumps in its prompt.
   sink; the server encodes PNG into an artifact. Validated live against Kid
   Chameleon: PNG integrity end-to-end via HTTP download, liveness (frame
   token advances while running), and paused determinism (identical hashes).
+  **Known intermittent issue (2026-08-23, nightly pair):** while the system is
+  paused, a frame capture that follows another successful capture can block
+  the plugin pipe thread until the client deadline (`bridge_error: i/o
+  timeout`); the next attempt succeeds and returns the same paused-frame hash.
+  Reproduce with `scripts/live-smoke.sh --full` plus a loaded ROM. The
+  screenshot access path needs a look at its wait-for-frame semantics under
+  pause; trace-capture-style synchronization bugs are the first suspect.
 - `vdp_memory_read`: VRAM, CRAM, and VSRAM with raw and decoded modes.
 - `vdp_plane_export`, `vdp_tile_export`, `vdp_palette_export`: image/JSON
   artifacts plus concise structural summaries.
