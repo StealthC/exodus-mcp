@@ -56,8 +56,19 @@ and this project will use [Semantic Versioning](https://semver.org/spec/v2.0.0.h
 - WSL wrappers for driving the Windows build and launcher.
 - Controlled execution tools: pause/run, M68K/Z80 single-instruction step,
   step-over/out, plus MCP-managed exact-address execution breakpoints.
+- MCP-managed read/write watchpoints: `cpu_watchpoint_set` (byte range with
+  `read`, `write`, or `any` access), `cpu_watchpoint_list` (hit counters
+  included), and `cpu_watchpoint_remove`. A hit pauses the system through the
+  Exodus debugger path, enabling deterministic "stop on access" experiments.
+- Address arguments now accept `$`-prefixed Motorola hex and Zilog
+  `h`-suffixed hex in addition to decimal and `0x` hex, matching the roadmap
+  address-format rule.
 - Live validation of pause, M68K/Z80 single-instruction steps, and the
   MCP-managed breakpoint lifecycle against Kid Chameleon.
+- Live validation of the watchpoint lifecycle against Kid Chameleon: hit
+  pauses the system at the offending instruction (rollback confirmed via
+  frozen PC/registers), all address formats and access modes, exact error
+  codes, removal, and purge-on-ROM-swap without dangling-pointer crashes.
 - Roadmap expansion informed by a review of the independent
   `sadnescity/exodus-mcp-extension` project: decoded `vdp_sprite_table` and
   nametable views, `vdp_pixel_info` per-pixel rendering attribution,
@@ -84,6 +95,11 @@ and this project will use [Semantic Versioning](https://semver.org/spec/v2.0.0.h
 
 - The launcher now reserves its HTTP listener before starting Exodus and
   terminates its child when the MCP server exits unexpectedly.
+
+- `rom_load` now purges MCP-managed breakpoints and watchpoints before
+  unloading the previous program module; the processor devices that own them
+  are destroyed with the module, so keeping the entries would leave dangling
+  pointers behind a cartridge swap.
 
 - Removed the non-reproducible Exodus build job from the MCP CI. Its clean
   checkout did not contain the upstream-ignored third-party source trees.

@@ -2,6 +2,7 @@
 
 #include "Processor/Processor.pkg"
 #include "Processor/IBreakpoint.h"
+#include "Processor/IWatchpoint.h"
 #include "DeviceInterface/IDeviceContext.h"
 #include "M68000/IM68000.h"
 #include "Z80/IZ80.h"
@@ -18,7 +19,7 @@
 namespace
 {
 const wchar_t* const kPipePrefix = L"\\\\.\\pipe\\";
-const char* const kPluginVersion = "0.4.0";
+const char* const kPluginVersion = "0.5.0";
 const size_t kMaxRequestSize = 64 * 1024;
 const size_t kMaxWriteChunk = 32 * 1024;
 const unsigned long long kMaxReadLength = 8 * 1024 * 1024;
@@ -28,7 +29,7 @@ const unsigned int kDefaultTraceEntries = 1000;
 const unsigned int kMaxTraceEntries = 10000;
 const unsigned long long kDefaultTraceTimeoutMs = 5000;
 const unsigned long long kMaxTraceTimeoutMs = 30000;
-const char* const kSupportedOperations[] = {"status", "emulator_status", "mem_spaces", "mem_read", "regs_get", "disasm", "cpu_control", "breakpoint_set", "breakpoint_list", "breakpoint_remove", "rom_load", "trace_capture"};
+const char* const kSupportedOperations[] = {"status", "emulator_status", "mem_spaces", "mem_read", "regs_get", "disasm", "cpu_control", "breakpoint_set", "breakpoint_list", "breakpoint_remove", "watchpoint_set", "watchpoint_list", "watchpoint_remove", "rom_load", "trace_capture"};
 const size_t kSupportedOperationCount = sizeof(kSupportedOperations) / sizeof(kSupportedOperations[0]);
 
 bool ReadEnvironment(const wchar_t* name, std::wstring& value)
@@ -176,7 +177,8 @@ ExodusMcpPlugin::ExodusMcpPlugin(const std::wstring& implementationName, const s
 	_pipeThread(0),
 	_loadedModuleCount(0),
 	_bridgeEnabled(false),
-	_nextBreakpointID(1)
+	_nextBreakpointID(1),
+	_nextWatchpointID(1)
 { }
 
 ExodusMcpPlugin::~ExodusMcpPlugin()
@@ -564,6 +566,18 @@ std::string ExodusMcpPlugin::ExecuteCommand(const BridgeRequest& request, bool& 
 	{
 		success = BuildBreakpointRemoveData(request, payload, errorCode, errorMessage);
 	}
+	else if (strcmp(method, "watchpoint_set") == 0)
+	{
+		success = BuildWatchpointSetData(request, payload, errorCode, errorMessage);
+	}
+	else if (strcmp(method, "watchpoint_list") == 0)
+	{
+		success = BuildWatchpointListData(request, payload, errorCode, errorMessage);
+	}
+	else if (strcmp(method, "watchpoint_remove") == 0)
+	{
+		success = BuildWatchpointRemoveData(request, payload, errorCode, errorMessage);
+	}
 	else if (strcmp(method, "rom_load") == 0)
 	{
 		success = BuildROMLoadData(request, payload, errorCode, errorMessage);
@@ -818,6 +832,25 @@ unsigned int ExodusMcpPlugin::TypedGetPC(const std::string& cpu, IProcessor& tar
 	return target.GetCurrentPC();
 }
 
+//----------------------------------------------------------------------------------------------------------------------
+void ExodusMcpPlugin::PurgeManagedDebugState()
+{
+	// Processor-owned debug objects die with the loaded module. Every managed
+	// breakpoint and watchpoint must be deleted before a ROM swap unloads the
+	// current module, otherwise the managed maps would hold dangling pointers.
+	for (std::map<unsigned long long, ManagedBreakpoint>::iterator i = _managedBreakpoints.begin(); i != _managedBreakpoints.end(); ++i)
+	{
+		i->second.processor->DeleteBreakpoint(i->second.breakpoint);
+	}
+	_managedBreakpoints.clear();
+	for (std::map<unsigned long long, ManagedWatchpoint>::iterator i = _managedWatchpoints.begin(); i != _managedWatchpoints.end(); ++i)
+	{
+		i->second.processor->DeleteWatchpoint(i->second.watchpoint);
+	}
+	_managedWatchpoints.clear();
+}
+
+//----------------------------------------------------------------------------------------------------------------------
 bool ExodusMcpPlugin::BuildMemoryReadData(const BridgeRequest& request, std::string& data, std::string& errorCode, std::string& errorMessage)
 {
 	const std::string spaceId = ParamValue(request.params, "space");
@@ -1384,6 +1417,157 @@ bool ExodusMcpPlugin::BuildBreakpointRemoveData(const BridgeRequest& request, st
 }
 
 //----------------------------------------------------------------------------------------------------------------------
+bool ExodusMcpPlugin::BuildWatchpointSetData(const BridgeRequest& request, std::string& data, std::string& errorCode, std::string& errorMessage)
+{
+	const std::string cpu = ParamValue(request.params, "cpu");
+	bool validName = false;
+	IProcessor* processor = FindProcessor(cpu, validName);
+	unsigned long long address = 0;
+	unsigned long long length = 1;
+	const bool validAddress = ParseUnsigned(ParamValue(request.params, "address"), address);
+	const std::string lengthParam = ParamValue(request.params, "length");
+	const bool validLength = lengthParam.empty() || ParseUnsigned(lengthParam, length);
+	std::string access = ParamValue(request.params, "access");
+	if (access.empty())
+	{
+		access = "any";
+	}
+	if (!validName || !validAddress || !validLength || (access != "read" && access != "write" && access != "any"))
+	{
+		errorCode = "invalid_params";
+		errorMessage = "cpu must be m68k or z80, address and length must be unsigned integers, and access must be read, write, or any";
+		return false;
+	}
+	if (length == 0)
+	{
+		errorCode = "invalid_params";
+		errorMessage = "length must be at least 1";
+		return false;
+	}
+	if (processor == 0 || address > processor->GetAddressBusMask() || (address + length - 1) > processor->GetAddressBusMask())
+	{
+		errorCode = "invalid_params";
+		errorMessage = "watched range is outside the selected processor address bus";
+		return false;
+	}
+
+	IWatchpoint* watchpoint = processor->CreateWatchpoint();
+	if (watchpoint == 0 || !processor->LockWatchpoint(watchpoint))
+	{
+		errorCode = "watchpoint_error";
+		errorMessage = "Exodus could not create a watchpoint";
+		return false;
+	}
+	watchpoint->SetEnabled(true);
+	watchpoint->SetLogEvent(false);
+	watchpoint->SetBreakEvent(true);
+	watchpoint->SetOnRead(access == "read" || access == "any");
+	watchpoint->SetOnWrite(access == "write" || access == "any");
+	watchpoint->SetLocationMask(processor->GetAddressBusMask());
+	if (length == 1)
+	{
+		watchpoint->SetLocationCondition(IWatchpoint::Condition::Equal);
+		watchpoint->SetLocationConditionData1((unsigned int)address);
+	}
+	else
+	{
+		// Exodus range conditions are strict (location > data1 && location < data2),
+		// so an inclusive [address, address+length-1] range needs the neighbors.
+		// A range starting at 0 cannot be expressed because data1 would wrap.
+		watchpoint->SetLocationCondition(IWatchpoint::Condition::GreaterAndLess);
+		watchpoint->SetLocationConditionData1((unsigned int)(address - 1));
+		watchpoint->SetLocationConditionData2((unsigned int)(address + length));
+	}
+	const unsigned long long watchpointID = _nextWatchpointID++;
+	watchpoint->SetName(L"MCP watchpoint " + std::to_wstring(watchpointID));
+	processor->UnlockWatchpoint(watchpoint);
+
+	ManagedWatchpoint managed;
+	managed.processor = processor;
+	managed.watchpoint = watchpoint;
+	managed.cpu = cpu;
+	managed.address = address;
+	managed.length = length;
+	managed.access = (access == "read") ? "read" : ((access == "write") ? "write" : "any");
+	_managedWatchpoints[watchpointID] = managed;
+	data = "{\"watchpoint_id\":";
+	AppendNumber(data, watchpointID);
+	data += ",\"cpu\":";
+	AppendJsonStringAscii(data, cpu);
+	data += ",\"address\":";
+	AppendNumber(data, address);
+	data += ",\"length\":";
+	AppendNumber(data, length);
+	data += ",\"access\":";
+	AppendJsonStringAscii(data, managed.access);
+	data += ",\"break_on_hit\":true}";
+	return true;
+}
+
+//----------------------------------------------------------------------------------------------------------------------
+bool ExodusMcpPlugin::BuildWatchpointListData(const BridgeRequest&, std::string& data, std::string&, std::string&)
+{
+	data = "{\"watchpoints\":[";
+	bool first = true;
+	for (std::map<unsigned long long, ManagedWatchpoint>::const_iterator i = _managedWatchpoints.begin(); i != _managedWatchpoints.end(); ++i)
+	{
+		const ManagedWatchpoint& managed = i->second;
+		if (!managed.processor->LockWatchpoint(managed.watchpoint))
+		{
+			continue;
+		}
+		if (!first)
+		{
+			data += ",";
+		}
+		first = false;
+		data += "{\"watchpoint_id\":";
+		AppendNumber(data, i->first);
+		data += ",\"cpu\":";
+		AppendJsonStringAscii(data, managed.cpu);
+		data += ",\"address\":";
+		AppendNumber(data, managed.address);
+		data += ",\"length\":";
+		AppendNumber(data, managed.length);
+		data += ",\"access\":";
+		AppendJsonStringAscii(data, managed.access);
+		data += ",\"enabled\":";
+		data += managed.watchpoint->GetEnabled() ? "true" : "false";
+		data += ",\"hit_count\":";
+		AppendNumber(data, managed.watchpoint->GetHitCounter());
+		data += "}";
+		managed.processor->UnlockWatchpoint(managed.watchpoint);
+	}
+	data += "]}";
+	return true;
+}
+
+//----------------------------------------------------------------------------------------------------------------------
+bool ExodusMcpPlugin::BuildWatchpointRemoveData(const BridgeRequest& request, std::string& data, std::string& errorCode, std::string& errorMessage)
+{
+	unsigned long long watchpointID = 0;
+	if (!ParseUnsigned(ParamValue(request.params, "watchpoint_id"), watchpointID))
+	{
+		errorCode = "invalid_params";
+		errorMessage = "watchpoint_id must be an unsigned integer";
+		return false;
+	}
+	std::map<unsigned long long, ManagedWatchpoint>::iterator found = _managedWatchpoints.find(watchpointID);
+	if (found == _managedWatchpoints.end())
+	{
+		errorCode = "watchpoint_not_found";
+		errorMessage = "No MCP-managed watchpoint has that id";
+		return false;
+	}
+	found->second.processor->DeleteWatchpoint(found->second.watchpoint);
+	_managedWatchpoints.erase(found);
+	data = "{\"removed\":true,\"watchpoint_id\":";
+	AppendNumber(data, watchpointID);
+	data += "}";
+	return true;
+}
+
+//----------------------------------------------------------------------------------------------------------------------
 bool ExodusMcpPlugin::BuildROMLoadData(const BridgeRequest& request, std::string& data, std::string& errorCode, std::string& errorMessage)
 {
 	std::wstring romPath;
@@ -1406,6 +1590,7 @@ bool ExodusMcpPlugin::BuildROMLoadData(const BridgeRequest& request, std::string
 	IGUIExtensionInterface& gui = GetGUIInterface();
 	const bool wasRunning = system.SystemRunning();
 	const bool runAfterLoad = wasRunning || (ParamValue(request.params, "run") == "true");
+	PurgeManagedDebugState();
 	system.StopSystem();
 
 	const std::list<unsigned int> moduleIDs = system.GetLoadedModuleIDs();

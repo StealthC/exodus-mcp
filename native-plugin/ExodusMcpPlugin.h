@@ -10,6 +10,7 @@
 class IProcessor;
 class IMemory;
 class IBreakpoint;
+class IWatchpoint;
 
 // ExodusMcpPlugin is the persistent native bridge for exodus-mcp. It is
 // read-only in this increment: it never mutates emulator state, loads ROMs,
@@ -51,6 +52,16 @@ private:
 		std::string cpu;
 	};
 
+	struct ManagedWatchpoint
+	{
+		IProcessor* processor;
+		IWatchpoint* watchpoint;
+		std::string cpu;
+		unsigned long long address;
+		unsigned long long length;
+		const char* access;
+	};
+
 	// Bridge lifecycle
 	bool LoadBridgeConfiguration();
 	bool StartBridge();
@@ -78,6 +89,9 @@ private:
 	bool BuildBreakpointSetData(const BridgeRequest& request, std::string& data, std::string& errorCode, std::string& errorMessage);
 	bool BuildBreakpointListData(const BridgeRequest& request, std::string& data, std::string& errorCode, std::string& errorMessage);
 	bool BuildBreakpointRemoveData(const BridgeRequest& request, std::string& data, std::string& errorCode, std::string& errorMessage);
+	bool BuildWatchpointSetData(const BridgeRequest& request, std::string& data, std::string& errorCode, std::string& errorMessage);
+	bool BuildWatchpointListData(const BridgeRequest& request, std::string& data, std::string& errorCode, std::string& errorMessage);
+	bool BuildWatchpointRemoveData(const BridgeRequest& request, std::string& data, std::string& errorCode, std::string& errorMessage);
 	bool BuildROMLoadData(const BridgeRequest& request, std::string& data, std::string& errorCode, std::string& errorMessage);
 	bool BuildTraceCaptureData(const BridgeRequest& request, std::string& data, std::string& errorCode, std::string& errorMessage);
 
@@ -86,6 +100,7 @@ private:
 	const MemorySpace* FindSpace(const std::vector<MemorySpace>& catalog, const std::string& spaceId) const;
 	IProcessor* FindProcessor(const std::string& cpuName, bool& validName) const;
 	unsigned int TypedGetPC(const std::string& cpuName, IProcessor& target) const;
+	void PurgeManagedDebugState();
 
 	// Formatting helpers
 	static std::string ToUtf8(const std::wstring& value);
@@ -104,6 +119,8 @@ private:
 	bool _bridgeEnabled;
 	unsigned long long _nextBreakpointID;
 	std::map<unsigned long long, ManagedBreakpoint> _managedBreakpoints;
+	unsigned long long _nextWatchpointID;
+	std::map<unsigned long long, ManagedWatchpoint> _managedWatchpoints;
 };
 
 #endif

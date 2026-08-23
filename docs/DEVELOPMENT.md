@@ -78,6 +78,15 @@ generic `cpu_step_over` and `cpu_step_out` use Exodus debugger semantics.
 manage exact-address execution breakpoints owned by the current MCP process.
 Breakpoint IDs are invalid after an emulator restart.
 
+`cpu_watchpoint_set`, `cpu_watchpoint_list`, and `cpu_watchpoint_remove`
+manage read/write watchpoints owned by the current MCP process. A watchpoint
+watches a byte range (`length`, default 1) for reads, writes, or both
+(`access`). When the running system hits a watchpoint, Exodus pauses
+execution with rollback, so the standard pause/run flow turns "who writes
+this RAM address" into a deterministic stop. Watchpoints and breakpoints are
+purged automatically when `rom_load` swaps cartridges, because the processor
+devices that own them are destroyed with the loaded module.
+
 ## Quality gates
 
 Before every commit:

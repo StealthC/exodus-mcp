@@ -318,6 +318,15 @@ func TestControlToolsPassExpectedCommands(t *testing.T) {
 			if params["cpu"] != "z80" || params["address"] != "4660" {
 				t.Fatalf("unexpected breakpoint params: %v", params)
 			}
+		case "watchpoint_set":
+			if params["cpu"] != "m68k" || params["address"] != "8192" || params["length"] != "4" || params["access"] != "write" {
+				t.Fatalf("unexpected watchpoint params: %v", params)
+			}
+		case "watchpoint_list":
+		case "watchpoint_remove":
+			if params["watchpoint_id"] != "3" {
+				t.Fatalf("unexpected watchpoint remove params: %v", params)
+			}
 		default:
 			t.Fatalf("unexpected command: %s", method)
 		}
@@ -328,6 +337,49 @@ func TestControlToolsPassExpectedCommands(t *testing.T) {
 	}
 	if structured(callTool(t, client, "cpu_breakpoint_set", `{"cpu":"z80","address":"0x1234"}`))["ok"] != true {
 		t.Fatal("breakpoint result lost")
+	}
+	setResult := structured(callTool(t, client, "cpu_watchpoint_set", `{"cpu":"m68k","address":"$2000","length":4,"access":"write"}`))
+	if setResult["ok"] != true {
+		t.Fatalf("watchpoint result lost: %v", setResult)
+	}
+	if structured(callTool(t, client, "cpu_watchpoint_list", "{}"))["ok"] != true {
+		t.Fatal("watchpoint list lost")
+	}
+	if structured(callTool(t, client, "cpu_watchpoint_remove", `{"watchpoint_id":3}`))["ok"] != true {
+		t.Fatal("watchpoint remove lost")
+	}
+
+	badAccess := callTool(t, client, "cpu_watchpoint_set", `{"cpu":"m68k","address":"$2000","access":"execute"}`)
+	if structured(badAccess)["code"] != "invalid_params" {
+		t.Fatalf("invalid access must be rejected: %v", badAccess)
+	}
+	badLength := callTool(t, client, "cpu_watchpoint_set", `{"cpu":"m68k","address":"$2000","length":0}`)
+	if structured(badLength)["code"] != "invalid_params" {
+		t.Fatalf("zero length must be rejected: %v", badLength)
+	}
+}
+
+func TestParseAddressFormats(t *testing.T) {
+	cases := map[string]uint64{
+		"4660":     0x1234,
+		"0x1234":   0x1234,
+		"0XFF0000": 0xFF0000,
+		"$2000":    0x2000,
+		"$ff0000":  0xFF0000,
+		"C000h":    0xC000,
+		"c000H":    0xC000,
+		"0":        0,
+	}
+	for input, want := range cases {
+		got, failure := parseAddress(input)
+		if failure != nil || got != want {
+			t.Fatalf("parseAddress(%q) = %d, %v; want %d", input, got, failure, want)
+		}
+	}
+	for _, input := range []string{"", "$", "h", "12x34", "-5", "$GG"} {
+		if _, failure := parseAddress(input); failure == nil {
+			t.Fatalf("parseAddress(%q) accepted invalid input", input)
+		}
 	}
 }
 

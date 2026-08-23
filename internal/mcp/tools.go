@@ -146,7 +146,7 @@ func enumProperty(description string, values []string) map[string]any {
 }
 
 func addressProperty() map[string]any {
-	return stringProperty("Address as an integer or 0x-prefixed hex string.")
+	return stringProperty("Address as an integer, 0x hex, $ Motorola hex, or h-suffixed Zilog hex.")
 }
 
 func decodeSchemaProperty() map[string]any {
@@ -176,7 +176,9 @@ func decodeArgs[T any](args json.RawMessage) (*T, *toolFailure) {
 	return &parsed, nil
 }
 
-// parseAddress accepts integral JSON numbers or hex strings such as "0xFF0000".
+// parseAddress accepts integral JSON numbers or the roadmap address string
+// formats: decimal, 0x-prefixed hex, $-prefixed Motorola hex, and Zilog
+// h-suffixed hex such as "C000h".
 func parseAddress(raw any) (uint64, *toolFailure) {
 	switch value := raw.(type) {
 	case float64:
@@ -185,14 +187,29 @@ func parseAddress(raw any) (uint64, *toolFailure) {
 		}
 		return uint64(value), nil
 	case string:
-		parsed, err := strconv.ParseUint(value, 0, 64)
-		if err != nil {
-			return 0, &toolFailure{Code: "invalid_params", Message: fmt.Sprintf("invalid address %q: use an integer or 0x-prefixed hex string", value)}
+		if parsed, ok := parseFlexibleNumber(value); ok {
+			return parsed, nil
 		}
-		return parsed, nil
+		return 0, &toolFailure{Code: "invalid_params", Message: fmt.Sprintf("invalid address %q: use an integer, 0x hex, $ hex, or h-suffixed hex", value)}
 	default:
 		return 0, &toolFailure{Code: "invalid_params", Message: "address must be a number or hex string"}
 	}
+}
+
+func parseFlexibleNumber(value string) (uint64, bool) {
+	if value == "" {
+		return 0, false
+	}
+	if value[0] == '$' {
+		parsed, err := strconv.ParseUint(value[1:], 16, 64)
+		return parsed, err == nil
+	}
+	if last := len(value) - 1; last > 0 && (value[last] == 'h' || value[last] == 'H') {
+		parsed, err := strconv.ParseUint(value[:last], 16, 64)
+		return parsed, err == nil
+	}
+	parsed, err := strconv.ParseUint(value, 0, 64)
+	return parsed, err == nil
 }
 
 func resolveContext(server *Server, handle string) (*analysis.Context, *toolFailure) {

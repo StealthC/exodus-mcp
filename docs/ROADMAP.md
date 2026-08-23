@@ -85,8 +85,12 @@ not manually decode opaque dumps in its prompt.
   execution breakpoints. Pause, M68K/Z80 step, and the breakpoint lifecycle
   are validated live against Kid Chameleon. These are more useful for ROM
   analysis than the unsafe trace path.
-- MCP-managed read/write watchpoints with range conditions, owned and listed
-  like the existing execution breakpoints.
+- [x] MCP-managed read/write watchpoints with range conditions, owned and
+  listed like the existing execution breakpoints.
+  `cpu_watchpoint_set`/`cpu_watchpoint_list`/`cpu_watchpoint_remove` support
+  byte ranges, read/write/any access filtering, and live hit counters. The
+  full lifecycle, deterministic hit-and-pause with rollback, error codes, and
+  the purge-on-ROM-swap regression are validated live against Kid Chameleon.
 - Explicit context lease tools for mutation.
 - `state_save`, `state_load`, `state_list` using context-scoped snapshots.
 - `frame_advance`, `input_set`, and bounded scripted fixtures.
