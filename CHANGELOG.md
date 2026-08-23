@@ -20,7 +20,8 @@ and this project will use [Semantic Versioning](https://semver.org/spec/v2.0.0.h
   timed-buffer path with explicit byte-order metadata. Representations cover
   raw views (`hexdump`, `array_u8`, `raw_base64`), big-endian `array_u16`
   words, and a CRAM-specific decode expanding 9-bit RGB palette entries into
-  8-bit RGB with hex colors. While the system runs, the plugin briefly stops
+  8-bit RGB with hex colors. CRAM words pack the channels as
+  `-RRR-GGG-BBB-` (bits 1-3, 5-7, 9-11, with zero padding at bits 0, 4, 8). While the system runs, the plugin briefly stops
   execution around timed-buffer reads and restores the prior state; the
   response reports whether that happened.
 

@@ -191,7 +191,7 @@ func representationNote(representation string) string {
 	case "array_u16":
 		return "16-bit words assembled from big-endian byte pairs at consecutive even offsets."
 	case "cram_rgb333":
-		return "CRAM entries are 9-bit RGB (3 bits per channel, R in bits 0-2); channels scale to 8-bit by (c*255+3)/7."
+		return "CRAM entries pack 9-bit RGB as -RRR-GGG-BBB- (channels at bits 1-3, 5-7, 9-11); each channel scales to 8-bit by (c*255+3)/7."
 	default:
 		return "Raw buffer bytes preserve address order."
 	}
@@ -210,9 +210,11 @@ func cramRGB333Entries(raw []byte) []map[string]any {
 	entries := make([]map[string]any, 0, count)
 	for index := 0; index < count; index++ {
 		word := int(raw[index*2])<<8 | int(raw[index*2+1])
-		r9 := word & 0x07
-		g9 := (word >> 3) & 0x07
-		b9 := (word >> 6) & 0x07
+		// Mega Drive CRAM words pack 9-bit RGB with a zero padding bit below
+		// each channel: -RRR-GGG-BBB- occupies bits 1-3, 5-7, and 9-11.
+		r9 := (word >> 1) & 0x0007
+		g9 := (word >> 5) & 0x0007
+		b9 := (word >> 9) & 0x0007
 		r := (r9*255 + 3) / 7
 		g := (g9*255 + 3) / 7
 		b := (b9*255 + 3) / 7

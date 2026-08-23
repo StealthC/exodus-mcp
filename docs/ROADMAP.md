@@ -86,7 +86,8 @@ not manually decode opaque dumps in its prompt.
 - [x] `vdp_memory_read`: VRAM, CRAM, and VSRAM through the proven
   timed-buffer path (`ITimedBufferInt::ReadLatest`), with inline raw views
   (hexdump, array_u8, base64), big-endian word views, and a decoded CRAM
-  view expanding 9-bit RGB entries into 8-bit RGB. When the system is
+  view expanding 9-bit RGB entries into 8-bit RGB using the hardware
+  channel layout (`-RRR-GGG-BBB-`, padding at bits 0, 4, 8). When the system is
   running, the plugin briefly stops execution around timed-buffer reads and
   restores it afterwards; responses report `system_paused_during_read`.
   The same work fixed a latent crash in generic `memory_read`: bus metadata

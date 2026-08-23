@@ -430,7 +430,7 @@ func TestVDPMemoryReadCramRGB333View(t *testing.T) {
 		t.Fatalf("entries = %v", entries)
 	}
 	first := entries[0].(map[string]any)
-	if first["index"] != float64(0) || first["r"] != float64(109) || first["g"] != float64(146) || first["b"] != float64(146) || first["color_hex"] != "#6D9292" {
+	if first["index"] != float64(0) || first["r"] != float64(36) || first["g"] != float64(36) || first["b"] != float64(0) || first["color_hex"] != "#242400" {
 		t.Fatalf("first entry decode wrong: %v", first)
 	}
 	second := entries[1].(map[string]any)
