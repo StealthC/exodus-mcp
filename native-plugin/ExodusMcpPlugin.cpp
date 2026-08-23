@@ -344,7 +344,10 @@ void ExodusMcpPlugin::PipeThread()
 			PIPE_ACCESS_DUPLEX,
 			PIPE_TYPE_MESSAGE | PIPE_READMODE_MESSAGE | PIPE_NOWAIT,
 			1,
-			262144,
+			// Headroom above a full-speed frame capture response (about 290 KB
+			// framed for a 320x224 RGB24 frame) so typical captures fit the
+			// buffer without leaning on the WriteAll retry path.
+			524288,
 			4096,
 			0,
 			0);
@@ -524,16 +527,32 @@ bool ExodusMcpPlugin::WriteAll(HANDLE pipe, const std::string& data)
 		DWORD written = 0;
 		if (!WriteFile(pipe, framed.data() + offset, toWrite, &written, 0))
 		{
-			if (GetLastError() == ERROR_MORE_DATA && written > 0)
+			const DWORD error = GetLastError();
+			if (error == ERROR_MORE_DATA && written > 0)
 			{
 				offset += written;
+				continue;
+			}
+			if (error == ERROR_NO_DATA)
+			{
+				// The outbound buffer is momentarily full because the client
+				// has not drained the earlier chunks yet. On this nonblocking
+				// message-mode pipe that is transient while the client stays
+				// alive; aborting here would truncate large responses such as
+				// frame captures mid-frame and strand the client until its
+				// deadline. Retry the same chunk after a short yield.
+				Sleep(1);
 				continue;
 			}
 			return false;
 		}
 		if (written == 0)
 		{
-			return false;
+			// Documented nonblocking message-pipe behavior can also report a
+			// full buffer as a successful write of zero bytes; treat it like
+			// ERROR_NO_DATA above instead of truncating the response.
+			Sleep(1);
+			continue;
 		}
 		offset += written;
 	}
