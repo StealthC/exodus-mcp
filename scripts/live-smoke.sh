@@ -192,6 +192,26 @@ if [ "$FULL" = 1 ]; then
 		check "consecutive paused captures stay responsive" "$stress_ok"
 	fi
 
+	step "VDP memory reads (read-only)"
+	# Cross-check the dedicated VDP reader against the generic memory reader:
+	# both must return the same bytes for the same range while paused.
+	spaces=$(tool_call "memory_spaces_list")
+	cram_space=$(json_get "$spaces" "[i['id'] for i in parsed.get('spaces', []) if i.get('device_instance') == 'VDP - CRAM'][0]")
+	cram_vdp=$(tool_call "vdp_memory_read" '{"target": "cram", "address": 0, "length": 128, "representation": "raw_base64"}')
+	cram_vdp_data=$(json_get "$cram_vdp" "parsed.get('data_base64', '')" 2>/dev/null)
+	cram_mem=$(tool_call "memory_read" "{\"space\": \"$cram_space\", \"address\": 0, \"length\": 128, \"representation\": \"raw_base64\"}")
+	cram_mem_data=$(json_get "$cram_mem" "parsed.get('data_base64', '')" 2>/dev/null)
+	check "vdp_memory_read matches generic memory bytes" \
+		"[ -n \"\$cram_vdp_data\" ] && [ \"\$cram_vdp_data\" = \"\$cram_mem_data\" ]"
+
+	decoded=$(tool_call "vdp_memory_read" '{"target": "cram", "address": 0, "length": 128, "representation": "cram_rgb333"}')
+	entry_count=$(json_get "$decoded" "len(parsed.get('entries', []))" 2>/dev/null)
+	check "cram decode yields 64 palette entries" "[ \"\$entry_count\" = '64' ]"
+
+	oob=$(tool_call "vdp_memory_read" '{"target": "vsram", "address": 79, "length": 4}')
+	check "vsram range is enforced" \
+		"[ \"\$(json_get \"\$oob\" \"parsed.get('code', '')\" 2>/dev/null)\" = 'out_of_range' ]"
+
 	if [ "$was_running" = "True" ] || [ "$was_running" = "true" ]; then
 		tool_call "cpu_run" >/dev/null
 		emu_after=$(tool_call "emulator_status")

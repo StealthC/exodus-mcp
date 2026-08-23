@@ -39,6 +39,7 @@ private:
 		std::string kind;
 		IProcessor* processor;
 		IMemory* memory;
+		IDevice* device;
 		unsigned long long sizeBytes;
 		unsigned int entrySize;
 		const char* byteOrder;
@@ -96,6 +97,7 @@ private:
 	bool BuildROMLoadData(const BridgeRequest& request, std::string& data, std::string& errorCode, std::string& errorMessage);
 	bool BuildTraceCaptureData(const BridgeRequest& request, std::string& data, std::string& errorCode, std::string& errorMessage);
 	std::string BuildVdpStatusData();
+	bool BuildVDPMemoryReadData(const BridgeRequest& request, std::string& data, std::string& errorCode, std::string& errorMessage);
 	bool BuildFrameCaptureData(const BridgeRequest& request, std::string& data, std::string& errorCode, std::string& errorMessage);
 
 	// Emulator inspection helpers

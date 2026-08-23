@@ -405,6 +405,92 @@ func TestVdpTools(t *testing.T) {
 	}
 }
 
+func TestVDPMemoryReadCramRGB333View(t *testing.T) {
+	client := &fakeBridgeClient{status: newFakeStatus()}
+	client.executeFunc = func(_ context.Context, method string, params map[string]string) (json.RawMessage, error) {
+		if method != "vdp_mem_read" {
+			t.Fatalf("method = %s", method)
+		}
+		if params["target"] != "cram" || params["address"] != "0" || params["length"] != "4" {
+			t.Fatalf("params = %v", params)
+		}
+		cram := []byte{0x01, 0x23, 0x00, 0x00}
+		return json.RawMessage(`{"target":"cram","address_space":"315-5313 CRAM","address":0,"length":4,"buffer_size":128,"entry_size":2,"byte_order":"big-endian","encoding":"base64","consistency":"live","data":"` + base64.StdEncoding.EncodeToString(cram) + `"}`), nil
+	}
+
+	content := structured(callTool(t, client, "vdp_memory_read", `{"target":"cram","address":0,"length":4,"representation":"cram_rgb333"}`))
+	if content["code"] != "" && content["code"] != nil {
+		t.Fatalf("unexpected failure: %v", content)
+	}
+	if content["address_space"] != "315-5313 CRAM" || content["byte_order"] != "big-endian" || content["entry_size"] != float64(2) {
+		t.Fatalf("metadata lost: %v", content)
+	}
+	entries, _ := content["entries"].([]any)
+	if len(entries) != 2 {
+		t.Fatalf("entries = %v", entries)
+	}
+	first := entries[0].(map[string]any)
+	if first["index"] != float64(0) || first["r"] != float64(109) || first["g"] != float64(146) || first["b"] != float64(146) || first["color_hex"] != "#6D9292" {
+		t.Fatalf("first entry decode wrong: %v", first)
+	}
+	second := entries[1].(map[string]any)
+	if second["color_hex"] != "#000000" {
+		t.Fatalf("second entry decode wrong: %v", second)
+	}
+}
+
+func TestVDPMemoryReadDefaultsAndMetadata(t *testing.T) {
+	client := &fakeBridgeClient{status: newFakeStatus()}
+	client.executeFunc = func(_ context.Context, method string, params map[string]string) (json.RawMessage, error) {
+		if method != "vdp_mem_read" {
+			t.Fatalf("method = %s", method)
+		}
+		if params["target"] != "vsram" || params["address"] != "4660" || params["length"] != fmt.Sprintf("%d", defaultVDPMemoryReadLen) {
+			t.Fatalf("params = %v", params)
+		}
+		vsram := make([]byte, defaultVDPMemoryReadLen)
+		for i := range vsram {
+			vsram[i] = byte(i)
+		}
+		return json.RawMessage(`{"target":"vsram","address_space":"315-5313 VSRAM","address":4660,"length":128,"buffer_size":80,"entry_size":2,"byte_order":"big-endian","encoding":"base64","consistency":"live","data":"` + base64.StdEncoding.EncodeToString(vsram) + `"}`), nil
+	}
+
+	content := structured(callTool(t, client, "vdp_memory_read", `{"target":"vsram","address":"$1234"}`))
+	if content["representation"] != "hexdump" {
+		t.Fatalf("default representation must be hexdump: %v", content["representation"])
+	}
+	hexText := fmt.Sprintf("%v", content["hex"])
+	if !strings.Contains(strings.ToUpper(hexText), "00001234") {
+		t.Fatalf("hexdump must echo the start address column: %v", hexText)
+	}
+}
+
+func TestVDPMemoryReadRejectsBadRequests(t *testing.T) {
+	client := &fakeBridgeClient{status: newFakeStatus()}
+	client.executeFunc = func(_ context.Context, method string, _ map[string]string) (json.RawMessage, error) {
+		t.Fatalf("bridge must not be reached for invalid requests: %s", method)
+		return nil, nil
+	}
+
+	cases := []struct {
+		name      string
+		arguments string
+		code      string
+	}{
+		{"unknown target", `{"target":"oam","address":0}`, "invalid_params"},
+		{"cram view on vram", `{"target":"vram","address":0,"length":4,"representation":"cram_rgb333"}`, "invalid_params"},
+		{"unaligned word view", `{"target":"cram","address":1,"length":4,"representation":"array_u16"}`, "unaligned_request"},
+		{"unaligned word length", `{"target":"vsram","address":0,"length":3,"representation":"array_u16"}`, "unaligned_request"},
+		{"length above cap", fmt.Sprintf(`{"target":"vram","address":0,"length":%d}`, inlineReadCapBytes+1), "length_exceeds_inline_cap"},
+	}
+	for _, testCase := range cases {
+		result := structured(callTool(t, client, "vdp_memory_read", testCase.arguments))
+		if result["code"] != testCase.code {
+			t.Fatalf("%s: code = %v (%v)", testCase.name, result["code"], result)
+		}
+	}
+}
+
 func TestParseAddressFormats(t *testing.T) {
 	cases := map[string]uint64{
 		"4660":     0x1234,

@@ -7,6 +7,28 @@ and this project will use [Semantic Versioning](https://semver.org/spec/v2.0.0.h
 
 ## [Unreleased]
 
+### Added
+
+- `vdp_memory_read`: inline VRAM, CRAM, and VSRAM reads through the plugin's
+  timed-buffer path with explicit byte-order metadata. Representations cover
+  raw views (`hexdump`, `array_u8`, `raw_base64`), big-endian `array_u16`
+  words, and a CRAM-specific decode expanding 9-bit RGB palette entries into
+  8-bit RGB with hex colors. While the system runs, the plugin briefly stops
+  execution around timed-buffer reads and restores the prior state; the
+  response reports whether that happened.
+
+### Fixed
+
+- Generic `memory_read` (and therefore `memory_dump`) crashed the emulator
+  with an access violation on every memory-kind space such as RAM blocks and
+  the VDP buffers: bus metadata was derived from the space's processor
+  pointer, which is null outside processor bus spaces. Bus metadata is now
+  computed only for bus spaces.
+- Foreign device memory reads in the plugin are wrapped in structured
+  exception guards, so a fault inside emulator-owned objects now returns a
+  diagnostic bridge error naming the faulting module and offset instead of
+  terminating the emulator.
+
 ### Fixed
 
 - The native plugin no longer truncates large bridge responses. On the

@@ -83,7 +83,22 @@ not manually decode opaque dumps in its prompt.
   leftover state, verifies removals, reads `summary.sha256`, stresses
   consecutive paused captures, and verifies the restored running state.
   Reproduce with `scripts/live-smoke.sh --full` plus a loaded ROM.
-- `vdp_memory_read`: VRAM, CRAM, and VSRAM with raw and decoded modes.
+- [x] `vdp_memory_read`: VRAM, CRAM, and VSRAM through the proven
+  timed-buffer path (`ITimedBufferInt::ReadLatest`), with inline raw views
+  (hexdump, array_u8, base64), big-endian word views, and a decoded CRAM
+  view expanding 9-bit RGB entries into 8-bit RGB. When the system is
+  running, the plugin briefly stops execution around timed-buffer reads and
+  restores it afterwards; responses report `system_paused_during_read`.
+  The same work fixed a latent crash in generic `memory_read`: bus metadata
+  was derived from a null processor pointer for every memory-kind space, so
+  any read of RAM-block or VDP spaces took down the emulator. Foreign
+  device reads are now wrapped in SEH guards that surface a diagnostic
+  error instead of crashing if another fault class appears.
+  Validated live against Kid Chameleon: byte equality between
+  `vdp_memory_read` and `memory_read` on all three buffers, palette decode
+  against the live frame, name-table reads at the register-reported bases,
+  range/alignment/target error codes, and smoke coverage of the
+  cross-check.
 - `vdp_plane_export`, `vdp_tile_export`, `vdp_palette_export`: image/JSON
   artifacts plus concise structural summaries.
 - `vdp_sprite_table`: link-chain-aware decoded sprite attribute table with

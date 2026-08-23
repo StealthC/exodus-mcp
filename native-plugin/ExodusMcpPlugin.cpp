@@ -6,6 +6,7 @@
 #include "Processor/IBreakpoint.h"
 #include "Processor/IWatchpoint.h"
 #include "315-5313/IS315_5313.h"
+#include "Memory/TimedBufferIntDevice.h"
 #include "ImageInterface/IImage.h"
 #include "DeviceInterface/IDeviceContext.h"
 #include "M68000/IM68000.h"
@@ -33,7 +34,7 @@ const unsigned int kDefaultTraceEntries = 1000;
 const unsigned int kMaxTraceEntries = 10000;
 const unsigned long long kDefaultTraceTimeoutMs = 5000;
 const unsigned long long kMaxTraceTimeoutMs = 30000;
-const char* const kSupportedOperations[] = {"status", "emulator_status", "mem_spaces", "mem_read", "regs_get", "disasm", "cpu_control", "breakpoint_set", "breakpoint_list", "breakpoint_remove", "watchpoint_set", "watchpoint_list", "watchpoint_remove", "vdp_status", "frame_capture", "rom_load", "trace_capture"};
+const char* const kSupportedOperations[] = {"status", "emulator_status", "mem_spaces", "mem_read", "regs_get", "disasm", "cpu_control", "breakpoint_set", "breakpoint_list", "breakpoint_remove", "watchpoint_set", "watchpoint_list", "watchpoint_remove", "vdp_status", "vdp_mem_read", "frame_capture", "rom_load", "trace_capture"};
 const size_t kSupportedOperationCount = sizeof(kSupportedOperations) / sizeof(kSupportedOperations[0]);
 
 // ScreenshotSink collects the RGB 8-bit pixels that S315_5313::GetScreenshot
@@ -142,6 +143,13 @@ std::string NumberToString(unsigned long long value)
 	std::string text;
 	AppendNumber(text, value);
 	return text;
+}
+
+std::string NumberToStringHex(unsigned long long value)
+{
+	char buffer[32] = {0};
+	sprintf_s(buffer, sizeof(buffer), "%llX", value);
+	return buffer;
 }
 
 std::string ParamValue(const std::map<std::string, std::string>& params, const char* key)
@@ -559,6 +567,95 @@ bool ExodusMcpPlugin::WriteAll(HANDLE pipe, const std::string& data)
 	return true;
 }
 
+namespace
+{
+// SEH-guarded wrappers around foreign device memory access. These virtual
+// calls cross into emulator-owned objects whose internals we do not control;
+// an access violation there used to take down the whole emulator process.
+// The helpers keep only trivially destructible state so they satisfy the
+// MSVC restriction on __try within functions requiring unwinding.
+
+DWORD CaptureFault(void* faultingAddress, void** capturedAddress)
+{
+	*capturedAddress = faultingAddress;
+	return EXCEPTION_EXECUTE_HANDLER;
+}
+
+DWORD ReadMemoryEntriesGuarded(IMemory* memory, unsigned int entrySize, unsigned long long address, unsigned long long length, unsigned char* output, void** faultingAddress)
+{
+	__try
+	{
+		unsigned int entryValue = 0;
+		unsigned long long lastEntryIndex = ~0ULL;
+		for (unsigned long long offset = 0; offset < length; ++offset)
+		{
+			const unsigned long long location = address + offset;
+			const unsigned long long entryIndex = location / entrySize;
+			if (entryIndex != lastEntryIndex)
+			{
+				entryValue = memory->ReadMemoryEntry((unsigned int)entryIndex);
+				lastEntryIndex = entryIndex;
+			}
+			const unsigned int shiftInEntry = (unsigned int)(location % entrySize);
+			const unsigned int byteShift = 8u * (entrySize - 1 - shiftInEntry);
+			output[offset] = (unsigned char)((entryValue >> byteShift) & 0xFF);
+		}
+		return 0;
+	}
+	__except (CaptureFault(GetExceptionInformation()->ExceptionRecord->ExceptionAddress, faultingAddress))
+	{
+		return GetExceptionCode();
+	}
+}
+
+DWORD ReadLatestGuarded(ITimedBufferInt* buffer, unsigned long long address, unsigned long long length, unsigned char* output, void** faultingAddress)
+{
+	__try
+	{
+		for (unsigned long long offset = 0; offset < length; ++offset)
+		{
+			output[offset] = (unsigned char)(buffer->ReadLatest((unsigned int)(address + offset)) & 0xFF);
+		}
+		return 0;
+	}
+	__except (CaptureFault(GetExceptionInformation()->ExceptionRecord->ExceptionAddress, faultingAddress))
+	{
+		return GetExceptionCode();
+	}
+}
+
+void DescribeFaultingModule(void* exceptionAddress, std::string& modulePath, unsigned long long& offset)
+{
+	HMODULE moduleBase = 0;
+	char resolved[MAX_PATH] = {0};
+	if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, (LPCSTR)exceptionAddress, &moduleBase))
+	{
+		GetModuleFileNameA(moduleBase, resolved, MAX_PATH);
+	}
+	const uintptr_t baseValue = (uintptr_t)moduleBase;
+	modulePath = resolved;
+	const uintptr_t addressValue = (uintptr_t)exceptionAddress;
+	offset = (baseValue != 0) ? (addressValue - baseValue) : addressValue;
+}
+
+// Builds an error message carrying the faulting module and offset for an
+// exception address captured by one of the guarded readers above.
+std::string DescribeCaughtException(void* exceptionAddress, DWORD exceptionCode)
+{
+	std::string modulePath;
+	unsigned long long offset = 0;
+	DescribeFaultingModule(exceptionAddress, modulePath, offset);
+	std::string message = "The emulator raised exception 0x";
+	message += NumberToStringHex(exceptionCode);
+	message += " while servicing this read at ";
+	message += modulePath.empty() ? "unknown module" : modulePath;
+	message += "+0x";
+	message += NumberToStringHex(offset);
+	message += "; the read was aborted without crashing the emulator";
+	return message;
+}
+}
+
 //----------------------------------------------------------------------------------------------------------------------
 // Command dispatch
 //----------------------------------------------------------------------------------------------------------------------
@@ -628,6 +725,10 @@ std::string ExodusMcpPlugin::ExecuteCommand(const BridgeRequest& request, bool& 
 	{
 		payload = BuildVdpStatusData();
 		success = true;
+	}
+	else if (strcmp(method, "vdp_mem_read") == 0)
+	{
+		success = BuildVDPMemoryReadData(request, payload, errorCode, errorMessage);
 	}
 	else if (strcmp(method, "frame_capture") == 0)
 	{
@@ -753,6 +854,7 @@ std::vector<ExodusMcpPlugin::MemorySpace> ExodusMcpPlugin::BuildSpaceCatalog()
 		MemorySpace space;
 		space.processor = 0;
 		space.memory = 0;
+		space.device = device;
 		space.entrySize = 1;
 		space.byteOrder = "unknown";
 
@@ -1010,6 +1112,116 @@ bool ExodusMcpPlugin::BuildFrameCaptureData(const BridgeRequest& request, std::s
 }
 
 //----------------------------------------------------------------------------------------------------------------------
+bool ExodusMcpPlugin::BuildVDPMemoryReadData(const BridgeRequest& request, std::string& data, std::string& errorCode, std::string& errorMessage)
+{
+	const std::string target = ParamValue(request.params, "target");
+	unsigned long long requestedAddress = 0;
+	unsigned long long length = 0;
+	const bool validAddress = ParseUnsigned(ParamValue(request.params, "address"), requestedAddress);
+	const bool validLength = ParseUnsigned(ParamValue(request.params, "length"), length);
+	if (target.empty() || !validAddress || !validLength)
+	{
+		errorCode = "invalid_params";
+		errorMessage = "vdp_mem_read requires target, address, and length parameters";
+		return false;
+	}
+	if (length < 1 || length > kMaxReadLength)
+	{
+		errorCode = "length_out_of_range";
+		errorMessage = "length must be between 1 and " + NumberToString(kMaxReadLength) + " bytes";
+		return false;
+	}
+
+	IS315_5313* vdp = FindVdp();
+	if (vdp == 0)
+	{
+		errorCode = "vdp_not_found";
+		errorMessage = "No Mega Drive VDP (315-5313) device is present in the loaded target";
+		return false;
+	}
+
+	ITimedBufferInt* buffer = 0;
+	const char* spaceName = 0;
+	if (target == "vram")
+	{
+		buffer = vdp->GetVRAMBuffer();
+		spaceName = "VRAM";
+	}
+	else if (target == "cram")
+	{
+		buffer = vdp->GetCRAMBuffer();
+		spaceName = "CRAM";
+	}
+	else if (target == "vsram")
+	{
+		buffer = vdp->GetVSRAMBuffer();
+		spaceName = "VSRAM";
+	}
+	else
+	{
+		errorCode = "invalid_params";
+		errorMessage = "target must be vram, cram, or vsram";
+		return false;
+	}
+
+	const unsigned long long bufferSize = buffer->Size();
+	if (requestedAddress >= bufferSize || length > bufferSize - requestedAddress)
+	{
+		errorCode = "out_of_range";
+		errorMessage = "Requested range exceeds ";
+		errorMessage += spaceName;
+		errorMessage += " size of ";
+		errorMessage += NumberToString(bufferSize);
+		errorMessage += " bytes";
+		return false;
+	}
+
+	// Same synchronization rule as mem_read: ReadLatest on these buffers is
+	// only safe once the owning worker threads are parked.
+	const bool wasRunning = GetSystemInterface().SystemRunning();
+	if (wasRunning)
+	{
+		GetSystemInterface().StopSystem();
+	}
+
+	std::vector<unsigned char> bytes((size_t)length);
+	void* faultingAddress = 0;
+	const DWORD faultCode = ReadLatestGuarded(buffer, requestedAddress, length, bytes.empty() ? 0 : &bytes[0], &faultingAddress);
+	if (faultCode != 0)
+	{
+		if (wasRunning)
+		{
+			GetSystemInterface().RunSystem();
+		}
+		errorCode = "read_fault";
+		errorMessage = DescribeCaughtException(faultingAddress, faultCode);
+		return false;
+	}
+
+	if (wasRunning)
+	{
+		GetSystemInterface().RunSystem();
+	}
+
+	data = "{\"target\":";
+	AppendJsonStringAscii(data, target);
+	data += ",\"address_space\":\"315-5313 ";
+	data += spaceName;
+	data += "\",\"address\":";
+	AppendNumber(data, requestedAddress);
+	data += ",\"length\":";
+	AppendNumber(data, length);
+	data += ",\"buffer_size\":";
+	AppendNumber(data, bufferSize);
+	data += ",\"entry_size\":2,\"byte_order\":\"big-endian\",\"encoding\":\"base64\",\"consistency\":\"live\",\"system_paused_during_read\":";
+	data += wasRunning ? "true" : "false";
+	data += ",\"data\":\"";
+	data += Base64Encode(bytes.empty() ? 0 : &bytes[0], bytes.size());
+	data += "\"}";
+	return true;
+}
+
+//----------------------------------------------------------------------------------------------------------------------
 bool ExodusMcpPlugin::BuildMemoryReadData(const BridgeRequest& request, std::string& data, std::string& errorCode, std::string& errorMessage)
 {
 	const std::string spaceId = ParamValue(request.params, "space");
@@ -1049,19 +1261,37 @@ bool ExodusMcpPlugin::BuildMemoryReadData(const BridgeRequest& request, std::str
 		return false;
 	}
 
-	unsigned int busMask = space->processor->GetAddressBusMask();
-	if (busMask == 0)
-	{
-		const unsigned int busWidth = space->processor->GetAddressBusWidth();
-		busMask = (busWidth > 0 && busWidth < 32) ? ((1u << busWidth) - 1u) : 0xFFFFFFFFu;
-	}
+	// Bus-derived metadata only exists for processor spaces; memory-kind
+	// spaces (RAM blocks and the VDP buffers) carry a null processor here,
+	// so touching it crashed every generic read of those spaces.
+	const bool isBusSpace = (space->kind == "bus");
+	unsigned int busMask = 0;
 	unsigned long long address = requestedAddress;
-	if (space->kind == "bus")
+	if (isBusSpace)
 	{
+		busMask = space->processor->GetAddressBusMask();
+		if (busMask == 0)
+		{
+			const unsigned int busWidth = space->processor->GetAddressBusWidth();
+			busMask = (busWidth > 0 && busWidth < 32) ? ((1u << busWidth) - 1u) : 0xFFFFFFFFu;
+		}
 		address &= busMask;
 	}
+
+	// Timed-buffer devices (the VDP memory shells) mutate their write lists
+	// on the owning worker thread; ReadLatest against them while the system
+	// runs is an unsynchronized cross-thread access that has crashed the
+	// emulator. StopSystem blocks until every worker is parked, so a brief
+	// stop around the read makes it safe, and we restore the prior state.
+	ITimedBufferIntDevice* timedBufferDevice = (space->device != 0) ? dynamic_cast<ITimedBufferIntDevice*>(space->device) : 0;
+	const bool pauseForRead = (timedBufferDevice != 0) && GetSystemInterface().SystemRunning();
+	if (pauseForRead)
+	{
+		GetSystemInterface().StopSystem();
+	}
+
 	std::vector<unsigned char> bytes((size_t)length);
-	if (space->kind == "bus")
+	if (isBusSpace)
 	{
 		for (unsigned long long offset = 0; offset < length; ++offset)
 		{
@@ -1071,21 +1301,23 @@ bool ExodusMcpPlugin::BuildMemoryReadData(const BridgeRequest& request, std::str
 	else
 	{
 		const unsigned int entrySize = (space->entrySize > 0) ? space->entrySize : 1;
-		unsigned long long lastEntryIndex = ~0ULL;
-		unsigned int entryValue = 0;
-		for (unsigned long long offset = 0; offset < length; ++offset)
+		void* faultingAddress = 0;
+		const DWORD faultCode = ReadMemoryEntriesGuarded(space->memory, entrySize, address, length, bytes.empty() ? 0 : &bytes[0], &faultingAddress);
+		if (faultCode != 0)
 		{
-			const unsigned long long location = address + offset;
-			const unsigned long long entryIndex = location / entrySize;
-			if (entryIndex != lastEntryIndex)
+			if (pauseForRead)
 			{
-				entryValue = space->memory->ReadMemoryEntry((unsigned int)entryIndex);
-				lastEntryIndex = entryIndex;
+				GetSystemInterface().RunSystem();
 			}
-			const unsigned int shiftInEntry = (unsigned int)(location % entrySize);
-			const unsigned int byteShift = 8u * (entrySize - 1 - shiftInEntry);
-			bytes[(size_t)offset] = (unsigned char)((entryValue >> byteShift) & 0xFF);
+			errorCode = "read_fault";
+			errorMessage = DescribeCaughtException(faultingAddress, faultCode);
+			return false;
 		}
+	}
+
+	if (pauseForRead)
+	{
+		GetSystemInterface().RunSystem();
 	}
 
 	data = "{\"space_id\":";

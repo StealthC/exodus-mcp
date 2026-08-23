@@ -64,7 +64,7 @@ func newFakeStatus() bridge.Status {
 		Lifecycle:           "ready",
 		BridgeEnabled:       true,
 		LoadedModuleCount:   3,
-		SupportedOperations: []string{"status", "emulator_status", "mem_spaces", "mem_read", "regs_get", "disasm", "cpu_control", "breakpoint_set", "breakpoint_list", "breakpoint_remove", "watchpoint_set", "watchpoint_list", "watchpoint_remove", "vdp_status", "frame_capture", "rom_load", "trace_capture"},
+		SupportedOperations: []string{"status", "emulator_status", "mem_spaces", "mem_read", "regs_get", "disasm", "cpu_control", "breakpoint_set", "breakpoint_list", "breakpoint_remove", "watchpoint_set", "watchpoint_list", "watchpoint_remove", "vdp_status", "vdp_mem_read", "frame_capture", "rom_load", "trace_capture"},
 	}
 }
 
