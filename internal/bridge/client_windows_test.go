@@ -30,8 +30,11 @@ var (
 )
 
 const (
-	pipeAccessDuplex   = 0x3
-	errorPipeConnected = syscall.Errno(539)
+	pipeAccessDuplex = 0x3
+	// ERROR_PIPE_CONNECTED is 535: ConnectNamedPipe reports it when a client
+	// already connected between CreateNamedPipeW and ConnectNamedPipe. That
+	// outcome is success; treating it as fatal strands the client.
+	errorPipeConnected = syscall.Errno(535)
 	invalidHandleValue = ^uintptr(0)
 )
 
