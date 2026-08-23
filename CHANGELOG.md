@@ -7,6 +7,25 @@ and this project will use [Semantic Versioning](https://semver.org/spec/v2.0.0.h
 
 ## [Unreleased]
 
+### Fixed
+
+- The native plugin no longer truncates large bridge responses. On the
+  message-mode `PIPE_NOWAIT` pipe, a full outbound buffer surfaces as
+  `ERROR_NO_DATA` (or a zero-byte successful write); `WriteAll` treated
+  both as fatal and abandoned the response mid-frame, which stranded the
+  client until its deadline and made back-to-back paused `frame_capture`
+  calls fail intermittently. Transient full-buffer conditions are now
+  retried while the client drains, and the pipe outbound buffer grew from
+  256 KiB to 512 KiB.
+- `scripts/live-smoke.sh`: fixed breakpoint/watchpoint cleanup (wrong
+  argument names sent numeric ids as JSON strings, so removals always
+  failed with `invalid_params` and left armed debug state that froze later
+  `cpu_run` calls), verified removals instead of asserting success,
+  purged leftovers from earlier sessions, read capture digests through the
+  artifact-first response (`summary.sha256`; the old path compared empty
+  strings), added a consecutive paused-capture stress check, and verified
+  that running state is actually restored at the end.
+
 ### Added
 
 - `scripts/build-fork.sh`: builds the vendored Exodus emulator
