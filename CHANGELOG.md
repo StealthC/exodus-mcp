@@ -74,6 +74,9 @@ and this project will use [Semantic Versioning](https://semver.org/spec/v2.0.0.h
   geometry) and `frame_capture` (plugin streams live RGB24 from the VDP
   render buffer; the server encodes a PNG artifact and returns a compact
   summary plus descriptor).
+- Live validation of both Phase 3 tools against Kid Chameleon: end-to-end PNG
+  delivery over HTTP, frame-token monotonicity while running, identical
+  capture hashes while paused, and the `unknown_context` error contract.
 - Control tools now report live state; validated against Kid Chameleon
   alongside the watchpoint lifecycle.
 - Roadmap expansion informed by a review of the independent

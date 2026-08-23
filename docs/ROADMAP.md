@@ -57,12 +57,15 @@ silently mixing their conventions.
 **Outcome:** an agent can inspect graphics state through structured outputs,
 not manually decode opaque dumps in its prompt.
 
-- `vdp_status`: registers and explicit register/value representation.
-  Implemented (24 raw registers, typed decode of display/EVRAM/name-table/
-  pattern/hscroll-base fields, completed-plane geometry); pending live check.
-- `frame_capture`: screenshot artifact with frame/timing metadata.
-  Implemented (plugin streams live RGB24 from the VDP render buffer; the Go
-  server encodes PNG into an artifact); pending live check.
+- [x] `vdp_status`: registers and explicit register/value representation.
+  All 24 registers plus typed decode of display enable, extended VRAM,
+  name-table, pattern, and h-scroll-base fields, with completed-plane
+  geometry. Validated live against Kid Chameleon.
+- [x] `frame_capture`: screenshot artifact with frame/timing metadata. The
+  plugin streams the live rendered frame as RGB24 through a minimal IImage
+  sink; the server encodes PNG into an artifact. Validated live against Kid
+  Chameleon: PNG integrity end-to-end via HTTP download, liveness (frame
+  token advances while running), and paused determinism (identical hashes).
 - `vdp_memory_read`: VRAM, CRAM, and VSRAM with raw and decoded modes.
 - `vdp_plane_export`, `vdp_tile_export`, `vdp_palette_export`: image/JSON
   artifacts plus concise structural summaries.
