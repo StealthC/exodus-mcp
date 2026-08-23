@@ -69,6 +69,13 @@ and this project will use [Semantic Versioning](https://semver.org/spec/v2.0.0.h
   pauses the system at the offending instruction (rollback confirmed via
   frozen PC/registers), all address formats and access modes, exact error
   codes, removal, and purge-on-ROM-swap without dangling-pointer crashes.
+- Phase 3 tools: `vdp_status` (raw registers plus typed decode of display,
+  EVRAM, name-table, pattern, and h-scroll-base fields with image buffer
+  geometry) and `frame_capture` (plugin streams live RGB24 from the VDP
+  render buffer; the server encodes a PNG artifact and returns a compact
+  summary plus descriptor).
+- Control tools now report live state; validated against Kid Chameleon
+  alongside the watchpoint lifecycle.
 - Roadmap expansion informed by a review of the independent
   `sadnescity/exodus-mcp-extension` project: decoded `vdp_sprite_table` and
   nametable views, `vdp_pixel_info` per-pixel rendering attribution,

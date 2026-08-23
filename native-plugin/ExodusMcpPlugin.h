@@ -11,6 +11,7 @@ class IProcessor;
 class IMemory;
 class IBreakpoint;
 class IWatchpoint;
+class IS315_5313;
 
 // ExodusMcpPlugin is the persistent native bridge for exodus-mcp. It is
 // read-only in this increment: it never mutates emulator state, loads ROMs,
@@ -94,12 +95,15 @@ private:
 	bool BuildWatchpointRemoveData(const BridgeRequest& request, std::string& data, std::string& errorCode, std::string& errorMessage);
 	bool BuildROMLoadData(const BridgeRequest& request, std::string& data, std::string& errorCode, std::string& errorMessage);
 	bool BuildTraceCaptureData(const BridgeRequest& request, std::string& data, std::string& errorCode, std::string& errorMessage);
+	std::string BuildVdpStatusData();
+	bool BuildFrameCaptureData(const BridgeRequest& request, std::string& data, std::string& errorCode, std::string& errorMessage);
 
 	// Emulator inspection helpers
 	std::vector<MemorySpace> BuildSpaceCatalog();
 	const MemorySpace* FindSpace(const std::vector<MemorySpace>& catalog, const std::string& spaceId) const;
 	IProcessor* FindProcessor(const std::string& cpuName, bool& validName) const;
 	unsigned int TypedGetPC(const std::string& cpuName, IProcessor& target) const;
+	IS315_5313* FindVdp() const;
 	void PurgeManagedDebugState();
 
 	// Formatting helpers

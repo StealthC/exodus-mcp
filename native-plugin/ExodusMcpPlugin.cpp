@@ -3,6 +3,8 @@
 #include "Processor/Processor.pkg"
 #include "Processor/IBreakpoint.h"
 #include "Processor/IWatchpoint.h"
+#include "315-5313/IS315_5313.h"
+#include "ImageInterface/IImage.h"
 #include "DeviceInterface/IDeviceContext.h"
 #include "M68000/IM68000.h"
 #include "Z80/IZ80.h"
@@ -19,7 +21,7 @@
 namespace
 {
 const wchar_t* const kPipePrefix = L"\\\\.\\pipe\\";
-const char* const kPluginVersion = "0.5.0";
+const char* const kPluginVersion = "0.6.0";
 const size_t kMaxRequestSize = 64 * 1024;
 const size_t kMaxWriteChunk = 32 * 1024;
 const unsigned long long kMaxReadLength = 8 * 1024 * 1024;
@@ -29,8 +31,77 @@ const unsigned int kDefaultTraceEntries = 1000;
 const unsigned int kMaxTraceEntries = 10000;
 const unsigned long long kDefaultTraceTimeoutMs = 5000;
 const unsigned long long kMaxTraceTimeoutMs = 30000;
-const char* const kSupportedOperations[] = {"status", "emulator_status", "mem_spaces", "mem_read", "regs_get", "disasm", "cpu_control", "breakpoint_set", "breakpoint_list", "breakpoint_remove", "watchpoint_set", "watchpoint_list", "watchpoint_remove", "rom_load", "trace_capture"};
+const char* const kSupportedOperations[] = {"status", "emulator_status", "mem_spaces", "mem_read", "regs_get", "disasm", "cpu_control", "breakpoint_set", "breakpoint_list", "breakpoint_remove", "watchpoint_set", "watchpoint_list", "watchpoint_remove", "vdp_status", "frame_capture", "rom_load", "trace_capture"};
 const size_t kSupportedOperationCount = sizeof(kSupportedOperations) / sizeof(kSupportedOperations[0]);
+
+// ScreenshotSink collects the RGB 8-bit pixels that S315_5313::GetScreenshot
+// writes into an IImage target. Exodus addresses channels through planeNo
+// (0=r, 1=g, 2=b), so the buffer layout is tightly packed RGB24 in scanline
+// order. Every other IImage member is intentionally inert: the sink exists
+// only to receive this one render pass.
+class ScreenshotSink : public IImage
+{
+public:
+	ScreenshotSink()
+	:_width(0), _height(0)
+	{ }
+
+	virtual void SetImageFormat(unsigned int imageWidth, unsigned int imageHeight, PixelFormat pixelFormat = PIXELFORMAT_RGB, DataFormat dataFormat = DATAFORMAT_8BIT)
+	{
+		_width = (pixelFormat == PIXELFORMAT_RGB && dataFormat == DATAFORMAT_8BIT) ? imageWidth : 0;
+		_height = (_width != 0) ? imageHeight : 0;
+		_pixels.assign((size_t)_width * _height * 3, 0);
+	}
+	virtual void WritePixelData(unsigned int posX, unsigned int posY, unsigned int planeNo, unsigned char data)
+	{
+		if (posX >= _width || posY >= _height || planeNo >= 3)
+		{
+			return;
+		}
+		_pixels[((size_t)posY * _width + posX) * 3 + planeNo] = data;
+	}
+
+	unsigned int GetWidth() const { return _width; }
+	unsigned int GetHeight() const { return _height; }
+	const std::vector<unsigned char>& GetPixels() const { return _pixels; }
+
+private:
+	virtual unsigned int GetImageWidth() const { return _width; }
+	virtual unsigned int GetImageHeight() const { return _height; }
+	virtual PixelFormat GetPixelFormat() const { return PIXELFORMAT_RGB; }
+	virtual DataFormat GetDataFormat() const { return DATAFORMAT_8BIT; }
+	virtual unsigned int GetDataPlaneCount() const { return 3; }
+	virtual void GetRawPixelData(unsigned int, unsigned int, unsigned int, PixelData&) const { }
+	virtual void SetRawPixelData(unsigned int, unsigned int, unsigned int, PixelData) { }
+	virtual void ReadPixelData(unsigned int, unsigned int, unsigned int, float&) const { }
+	virtual void ReadPixelData(unsigned int, unsigned int, unsigned int, unsigned char&) const { }
+	virtual void ReadPixelData(unsigned int, unsigned int, unsigned int, unsigned int&, unsigned int) const { }
+	virtual void WritePixelData(unsigned int, unsigned int, unsigned int, float) { }
+	virtual void WritePixelData(unsigned int, unsigned int, unsigned int, unsigned int, unsigned int) { }
+	virtual bool LoadImageFile(Stream::IStream&) { return false; }
+	virtual bool LoadPCXImage(Stream::IStream&) { return false; }
+	virtual bool SavePCXImage(Stream::IStream&) { return false; }
+	virtual bool LoadTIFFImage(Stream::IStream&) { return false; }
+	virtual bool SaveTIFFImage(Stream::IStream&) { return false; }
+	virtual bool LoadJPGImage(Stream::IStream&) { return false; }
+	virtual bool SaveJPGImage(Stream::IStream&) { return false; }
+	virtual bool LoadTGAImage(Stream::IStream&) { return false; }
+	virtual bool SaveTGAImage(Stream::IStream&) { return false; }
+	virtual bool LoadPNGImage(Stream::IStream&) { return false; }
+	virtual bool SavePNGImage(Stream::IStream&) { return false; }
+	virtual bool LoadBMPImage(Stream::IStream&) { return false; }
+	virtual bool SaveBMPImage(Stream::IStream&) { return false; }
+	virtual bool LoadDIBImage(Stream::IStream&, const BITMAPINFOHEADER*) { return false; }
+	virtual bool SaveDIBImage(Stream::IStream&, BITMAPINFOHEADER*) { return false; }
+	virtual void ResampleNearest(unsigned int, unsigned int) { }
+	virtual void ResampleNearest(const IImage&, unsigned int, unsigned int) { }
+	virtual void ResampleBilinear(unsigned int, unsigned int) { }
+	virtual void ResampleBilinear(const IImage&, unsigned int, unsigned int) { }
+
+	unsigned int _width;
+	unsigned int _height;
+	std::vector<unsigned char> _pixels;
+};
 
 bool ReadEnvironment(const wchar_t* name, std::wstring& value)
 {
@@ -578,6 +649,15 @@ std::string ExodusMcpPlugin::ExecuteCommand(const BridgeRequest& request, bool& 
 	{
 		success = BuildWatchpointRemoveData(request, payload, errorCode, errorMessage);
 	}
+	else if (strcmp(method, "vdp_status") == 0)
+	{
+		payload = BuildVdpStatusData();
+		success = true;
+	}
+	else if (strcmp(method, "frame_capture") == 0)
+	{
+		success = BuildFrameCaptureData(request, payload, errorCode, errorMessage);
+	}
 	else if (strcmp(method, "rom_load") == 0)
 	{
 		success = BuildROMLoadData(request, payload, errorCode, errorMessage);
@@ -848,6 +928,110 @@ void ExodusMcpPlugin::PurgeManagedDebugState()
 		i->second.processor->DeleteWatchpoint(i->second.watchpoint);
 	}
 	_managedWatchpoints.clear();
+}
+
+//----------------------------------------------------------------------------------------------------------------------
+IS315_5313* ExodusMcpPlugin::FindVdp() const
+{
+	const std::list<IDevice*> devices = GetSystemInterface().GetLoadedDevices();
+	for (std::list<IDevice*>::const_iterator i = devices.begin(); i != devices.end(); ++i)
+	{
+		if (IS315_5313* vdp = dynamic_cast<IS315_5313*>(*i))
+		{
+			return vdp;
+		}
+	}
+	return 0;
+}
+
+//----------------------------------------------------------------------------------------------------------------------
+std::string ExodusMcpPlugin::BuildVdpStatusData()
+{
+	IS315_5313* vdp = FindVdp();
+	if (vdp == 0)
+	{
+		return "{\"vdp_found\":false}";
+	}
+
+	std::string data = "{\"vdp_found\":true,\"registers\":[";
+	bool first = true;
+	for (unsigned int location = 0; location < IS315_5313::RegisterCount; ++location)
+	{
+		if (!first)
+		{
+			data += ",";
+		}
+		first = false;
+		data += "{\"register\":";
+		AppendNumber(data, location);
+		data += ",\"value\":";
+		AppendNumber(data, vdp->GetRegisterData(location));
+		data += "}";
+	}
+	data += "],\"decoded\":{\"display_enabled\":";
+	data += vdp->RegGetDisplayEnabled() ? "true" : "false";
+	data += ",\"extended_vram\":";
+	data += vdp->RegGetEVRAM() ? "true" : "false";
+	data += ",\"name_table_base_a\":";
+	AppendNumber(data, vdp->RegGetNameTableBaseScrollA());
+	data += ",\"name_table_base_b\":";
+	AppendNumber(data, vdp->RegGetNameTableBaseScrollB());
+	data += ",\"name_table_base_window\":";
+	AppendNumber(data, vdp->RegGetNameTableBaseWindow());
+	data += ",\"name_table_base_sprite\":";
+	AppendNumber(data, vdp->RegGetNameTableBaseSprite());
+	data += ",\"pattern_base_a\":";
+	AppendNumber(data, vdp->RegGetPatternBaseScrollA());
+	data += ",\"pattern_base_b\":";
+	AppendNumber(data, vdp->RegGetPatternBaseScrollB());
+	data += ",\"pattern_base_sprite\":";
+	AppendNumber(data, vdp->RegGetPatternBaseSprite());
+	data += ",\"hscroll_data_base\":";
+	AppendNumber(data, vdp->RegGetHScrollDataBase());
+	data += "},\"image_buffer\":{\"completed_plane\":";
+	const unsigned int planeNo = vdp->GetImageCompletedBufferPlaneNo();
+	AppendNumber(data, planeNo);
+	data += ",\"line_count\":";
+	AppendNumber(data, vdp->GetImageBufferLineCount(planeNo));
+	data += ",\"line_width\":";
+	AppendNumber(data, vdp->GetImageBufferLineWidth(planeNo, 0));
+	data += ",\"last_rendered_frame_token\":";
+	AppendNumber(data, vdp->GetImageLastRenderedFrameToken());
+	data += "}}";
+	return data;
+}
+
+//----------------------------------------------------------------------------------------------------------------------
+bool ExodusMcpPlugin::BuildFrameCaptureData(const BridgeRequest& request, std::string& data, std::string& errorCode, std::string& errorMessage)
+{
+	IS315_5313* vdp = FindVdp();
+	if (vdp == 0)
+	{
+		errorCode = "vdp_not_found";
+		errorMessage = "No Mega Drive VDP (315-5313) device is present in the loaded target";
+		return false;
+	}
+
+	ScreenshotSink sink;
+	if (!vdp->GetDevice()->GetScreenshot(sink) || sink.GetWidth() == 0 || sink.GetHeight() == 0)
+	{
+		errorCode = "frame_capture_failed";
+		errorMessage = "Exodus could not provide a rendered frame from the VDP";
+		return false;
+	}
+
+	const std::vector<unsigned char>& pixels = sink.GetPixels();
+	data = "{\"width\":";
+	AppendNumber(data, sink.GetWidth());
+	data += ",\"height\":";
+	AppendNumber(data, sink.GetHeight());
+	data += ",\"pixel_format\":\"rgb24\",\"byte_order\":\"not-applicable\",\"encoding\":\"base64\",\"consistency\":\"live\",\"frame_token\":";
+	AppendNumber(data, vdp->GetImageLastRenderedFrameToken());
+	data += ",\"data\":\"";
+	std::string encoded = Base64Encode(pixels.empty() ? (const unsigned char*)"" : &pixels[0], pixels.size());
+	data += encoded;
+	data += "\"}";
+	return true;
 }
 
 //----------------------------------------------------------------------------------------------------------------------

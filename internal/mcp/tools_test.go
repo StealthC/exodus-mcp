@@ -359,6 +359,52 @@ func TestControlToolsPassExpectedCommands(t *testing.T) {
 	}
 }
 
+func TestVdpTools(t *testing.T) {
+	client := &fakeBridgeClient{status: newFakeStatus()}
+	client.executeFunc = func(_ context.Context, method string, params map[string]string) (json.RawMessage, error) {
+		switch method {
+		case "vdp_status":
+			return json.RawMessage(`{"vdp_found":true,"registers":[{"register":0,"value":4}],"decoded":{"display_enabled":true},"image_buffer":{"line_count":224,"line_width":320}}`), nil
+		case "frame_capture":
+			// 2x1 frame: red pixel then green pixel.
+			frame := []byte{0xFF, 0x00, 0x00, 0x00, 0xFF, 0x00}
+			return json.RawMessage(`{"width":2,"height":1,"pixel_format":"rgb24","byte_order":"not-applicable","encoding":"base64","consistency":"live","frame_token":77,"data":"` + base64.StdEncoding.EncodeToString(frame) + `"}`), nil
+		default:
+			t.Fatalf("unexpected command: %s", method)
+		}
+		return nil, nil
+	}
+
+	server := newTestServer(t, client)
+	status := structured(postToolCall(t, server, "vdp_status", "{}"))
+	if status["vdp_found"] != true {
+		t.Fatalf("vdp_status passthrough lost: %v", status)
+	}
+
+	capture := structured(postToolCall(t, server, "frame_capture", "{}"))
+	if capture["code"] != nil {
+		t.Fatalf("frame_capture failed: %v", capture)
+	}
+	summary := capture["summary"].(map[string]any)
+	if summary["width"] != float64(2) || summary["height"] != float64(1) || summary["frame_token"] != float64(77) {
+		t.Fatalf("capture summary wrong: %v", summary)
+	}
+	artifactInfo := capture["artifact"].(map[string]any)
+	preview := structured(postToolCall(t, server, "artifact_preview", fmt.Sprintf(`{"artifact_id":%q,"mode":"hex","length":8}`, artifactInfo["id"])))
+	if !strings.Contains(strings.ToUpper(fmt.Sprintf("%v", preview)), "89 50 4E 47 0D 0A 1A 0A") {
+		t.Fatalf("stored artifact must start with the PNG magic bytes: %v", preview)
+	}
+
+	mismatchClient := &fakeBridgeClient{status: newFakeStatus()}
+	mismatchClient.executeFunc = func(_ context.Context, method string, _ map[string]string) (json.RawMessage, error) {
+		return json.RawMessage(`{"width":4,"height":4,"data":"AAAA"}`), nil
+	}
+	mismatch := callTool(t, mismatchClient, "frame_capture", "{}")
+	if structured(mismatch)["code"] != "bridge_error" {
+		t.Fatalf("dimension mismatch must be rejected: %v", mismatch)
+	}
+}
+
 func TestParseAddressFormats(t *testing.T) {
 	cases := map[string]uint64{
 		"4660":     0x1234,

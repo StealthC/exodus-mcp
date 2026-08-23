@@ -58,12 +58,16 @@ silently mixing their conventions.
 not manually decode opaque dumps in its prompt.
 
 - `vdp_status`: registers and explicit register/value representation.
+  Implemented (24 raw registers, typed decode of display/EVRAM/name-table/
+  pattern/hscroll-base fields, completed-plane geometry); pending live check.
+- `frame_capture`: screenshot artifact with frame/timing metadata.
+  Implemented (plugin streams live RGB24 from the VDP render buffer; the Go
+  server encodes PNG into an artifact); pending live check.
 - `vdp_memory_read`: VRAM, CRAM, and VSRAM with raw and decoded modes.
 - `vdp_plane_export`, `vdp_tile_export`, `vdp_palette_export`: image/JSON
   artifacts plus concise structural summaries.
 - `vdp_sprite_table`: link-chain-aware decoded sprite attribute table with
   bounded paging.
-- `frame_capture`: screenshot artifact with frame/timing metadata.
 - `vdp_pixel_info`: per-pixel rendering attribution (source layer, tile
   mapping, palette entry, shadow/highlight result) from the VDP full image
   buffer, with lazy enable and an explicit retry-after-one-frame contract.
