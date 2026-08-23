@@ -7,3 +7,6 @@
 /.coverage/
 /tmp
 .env
+
+# Exodus runtime artifact created when it runs with this repo as cwd.
+/settings.xml
