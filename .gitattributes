@@ -4,3 +4,5 @@
 *.vcxproj text eol=crlf
 *.props text eol=crlf
 *.targets text eol=crlf
+*.bat text eol=crlf
+*.sh text eol=lf

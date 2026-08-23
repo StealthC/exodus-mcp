@@ -9,6 +9,43 @@ and this project will use [Semantic Versioning](https://semver.org/spec/v2.0.0.h
 
 ### Added
 
+- Consolidated build/run/launch tooling under `scripts/`. The WSL wrappers
+  keep their names (`scripts/build-windows.sh`, `scripts/run-windows.sh`);
+  the Windows batch entry points moved to `scripts/internal/` and the root
+  `build.bat` / `run.bat` were removed.
+- Standardized configuration through the environment with `.env` fallback
+  (documented in `.env.example`): `EXODUS_MCP_EXODUS_DIR`,
+  `EXODUS_MCP_EXODUS_EXE`, `EXODUS_MCP_PLUGINS_DIR`, `EXODUS_MCP_LISTEN`,
+  and `EXODUS_MCP_ARTIFACTS`. One precedence rule everywhere: explicit flag
+  beats environment variable beats `.env` beats built-in default. WSL
+  wrappers publish the variables to Windows processes via `WSLENV`.
+- `scripts/test.sh`: local quality gates mirroring CI (format check, vet,
+  race-enabled tests, `GOOS=windows` build/vet) plus an optional
+  `--windows-live` mode that runs the named-pipe integration suite against a
+  real Windows pipe through WSL interop.
+- `build-windows.bat` now validates the configured Exodus directory before
+  building, accepts `--config Debug|Release` (Release requires prior Release
+  builds of the fork's third-party libraries), accepts `--plugins <dir>`,
+  and stamps the Go binary version from `git describe`.
+- Live named-pipe client integration tests backed by an in-process fake
+  plugin speaking wire protocol v2 over a real byte-mode pipe: round trips,
+  structured command errors, capability rejection, multi-megabyte framing,
+  context cancellation, oversized-frame rejection, and split-header assembly.
+
+### Changed
+
+- `--base-url` is now resolved after flag parsing from the final `--listen`
+  address, so artifact links no longer advertise the default port when a
+  custom listen address is used. Explicit `--base-url` still wins.
+
+### Fixed
+
+- Cached bridge status is invalidated after transport-class command failures
+  so a dead or restarted plugin is re-probed instead of serving a stale
+  healthy snapshot for up to five seconds.
+- The named-pipe client sleeps instead of hot-spinning while the plugin pipe
+  does not exist yet, logging once on the first wait.
+
 - Initial `exodus-mcp` repository structure.
 - Pinned `StealthC/Exodus` as the `vendor/exodus` submodule.
 - Reproducible Exodus build and CI documentation.
