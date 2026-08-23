@@ -224,6 +224,16 @@ if [ "$FULL" = 1 ]; then
 	artifact_count=$(json_get "$palette" "len(parsed.get('artifacts', []))" 2>/dev/null)
 	check "palette export attaches png and json artifacts" "[ \"\$artifact_count\" = '2' ]"
 
+	tiles=$(tool_call "vdp_tile_export" '{"tile": 0, "count": 2}')
+	tile_artifacts=$(json_get "$tiles" "len(parsed.get('artifacts', []))" 2>/dev/null)
+	check "tile export attaches png and json artifacts" "[ \"\$tile_artifacts\" = '2' ]"
+
+	plane=$(tool_call "vdp_plane_export" '{"plane": "b"}')
+	size_cells=$(json_get "$plane" "len(parsed.get('summary', {}).get('size_cells', []))" 2>/dev/null)
+	check "plane export reports register geometry" "[ \"\$size_cells\" = '2' ]"
+	plane_artifacts=$(json_get "$plane" "len(parsed.get('artifacts', []))" 2>/dev/null)
+	check "plane export attaches png and json artifacts" "[ \"\$plane_artifacts\" = '2' ]"
+
 	if [ "$was_running" = "True" ] || [ "$was_running" = "true" ]; then
 		tool_call "cpu_run" >/dev/null
 		emu_after=$(tool_call "emulator_status")

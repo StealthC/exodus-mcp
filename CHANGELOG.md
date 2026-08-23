@@ -9,6 +9,15 @@ and this project will use [Semantic Versioning](https://semver.org/spec/v2.0.0.h
 
 ### Added
 
+- `vdp_tile_export`: exports consecutive 8x8 4bpp VRAM patterns as a scaled
+  PNG artifact plus a JSON pixel-index decode, colored through a chosen CRAM
+  palette line.
+- `vdp_plane_export`: renders a full scroll plane (A, B, or window) as an
+  unscrolled texture view into PNG and JSON artifacts, with plane geometry
+  decoded from VDP register 16 and a snapshot-coherence flag derived from the
+  plugin's per-read pause telemetry.
+- `vdp_memory_read` responses now include `system_paused_during_read`,
+  reporting whether the read had to stop a running system.
 - `vdp_sprite_table`: decoded Mega Drive sprite attribute table with
   positions, cell sizes, tile mapping, palette, priority, and link-chain
   display order including termination/cycle/dangling detection; paged over

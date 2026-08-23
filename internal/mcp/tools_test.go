@@ -1,11 +1,15 @@
 package mcp
 
 import (
+	"bytes"
 	"context"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"image"
+	"image/png"
 	"net/http"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -488,6 +492,222 @@ func TestVDPMemoryReadRejectsBadRequests(t *testing.T) {
 		if result["code"] != testCase.code {
 			t.Fatalf("%s: code = %v (%v)", testCase.name, result["code"], result)
 		}
+	}
+}
+
+// fakeVDPMemoryClient serves vdp_status plus chunked vdp_mem_read calls from
+// one in-memory VRAM/CRAM pair, mirroring the plugin payload shape.
+type fakeVDPMemoryClient struct {
+	fakeBridgeClient
+	vram           []byte
+	cram           []byte
+	statusResponse string
+	bridgeHits     int
+}
+
+// newFakeVDPMemoryClient wires a client whose capability advertisement covers
+// every VDP op while responses serve from the given buffers.
+func newFakeVDPMemoryClient(vram, cram []byte) *fakeVDPMemoryClient {
+	return &fakeVDPMemoryClient{
+		fakeBridgeClient: fakeBridgeClient{status: newFakeStatus()},
+		vram:             vram,
+		cram:             cram,
+		statusResponse:   newFakeVDPStatus(),
+	}
+}
+
+func (f *fakeVDPMemoryClient) Execute(ctx context.Context, method string, params map[string]string) (json.RawMessage, error) {
+	if f.executeFunc != nil {
+		return f.executeFunc(ctx, method, params)
+	}
+	switch method {
+	case "vdp_status":
+		return json.RawMessage(f.statusResponse), nil
+	case "vdp_mem_read":
+		f.bridgeHits++
+		address, _ := strconv.ParseUint(params["address"], 10, 64)
+		length, _ := strconv.ParseUint(params["length"], 10, 64)
+		var blob []byte
+		if params["target"] == "vram" {
+			blob = f.vram[address : address+length]
+		} else {
+			blob = f.cram[address : address+length]
+		}
+		payload := map[string]any{
+			"target": params["target"], "address_space": "fake",
+			"address": address, "length": length,
+			"entry_size": 1, "byte_order": "big-endian", "encoding": "base64",
+			"consistency": "live", "system_paused_during_read": true,
+			"data": base64.StdEncoding.EncodeToString(blob),
+		}
+		raw, err := json.Marshal(payload)
+		if err != nil {
+			return nil, err
+		}
+		return raw, nil
+	}
+	return nil, fmt.Errorf("unexpected command %s", method)
+}
+
+func newFakeVDPStatus() string {
+	return `{"decoded":{"extended_vram":false,"name_table_base_b":8192},"registers":[{"register":12,"value":0},{"register":16,"value":0}]}`
+}
+
+// testContextID resolves the implicit default analysis context handle.
+func testContextID(t *testing.T, server *Server) string {
+	t.Helper()
+	resolved, err := server.contexts.Resolve("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	return resolved.ID
+}
+
+// pixelAt samples any decoded image as straight 8-bit RGBA.
+func pixelAt(t *testing.T, img image.Image, x, y int) [4]uint8 {
+	t.Helper()
+	red, green, blue, alpha := img.At(x, y).RGBA()
+	return [4]uint8{uint8(red >> 8), uint8(green >> 8), uint8(blue >> 8), uint8(alpha >> 8)}
+}
+
+func TestVDPTileExportDecodeAndPNG(t *testing.T) {
+	vram := make([]byte, 65536)
+	copy(vram[5*32:], []byte{0x01, 0x23, 0x45, 0x67}) // row zero: pixels 0..7
+	cram := make([]byte, 128)
+	for entry := 1; entry < 16; entry++ {
+		word := 0x0EEE // all channels max: white
+		cram[entry*2] = byte(word >> 8)
+		cram[entry*2+1] = byte(word)
+	}
+	client := newFakeVDPMemoryClient(vram, cram)
+	server := newTestServer(t, client)
+
+	content := structured(postToolCall(t, server, "vdp_tile_export", `{"tile": 5, "scale": 2}`))
+	summary := content["summary"].(map[string]any)
+	if summary["tile_count"] != float64(1) || summary["bpp"] != float64(4) {
+		t.Fatalf("summary wrong: %v", summary)
+	}
+	// The fake reports system_paused_during_read=true (each read stopped a
+	// running system), so the composite cannot claim snapshot coherence.
+	if summary["coherent_snapshot"] != false {
+		t.Fatalf("incoherent reads must not claim snapshot coherence: %v", summary["coherent_snapshot"])
+	}
+	if fmt.Sprintf("%v", summary["nonzero_pixels_per_tile"]) != "[7]" {
+		t.Fatalf("nonzero pixels wrong: %v", summary["nonzero_pixels_per_tile"])
+	}
+	pngInfo := content["artifacts"].([]any)[0].(map[string]any)
+
+	rawPNG, _, err := server.store.Bytes(pngInfo["id"].(string), testContextID(t, server))
+	if err != nil {
+		t.Fatal(err)
+	}
+	decodedImg, err := png.Decode(bytes.NewReader(rawPNG))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bounds := decodedImg.Bounds(); bounds.Dx() != 16 || bounds.Dy() != 16 {
+		t.Fatalf("png size %dx%d, want 16x16", bounds.Dx(), bounds.Dy())
+	}
+	transparent := pixelAt(t, decodedImg, 0, 0) // pixel index 0
+	if transparent[3] != 0 {
+		t.Fatalf("pixel 0 must stay transparent: %v", transparent)
+	}
+	white := pixelAt(t, decodedImg, 3, 1) // pixel index 1 at scale 2
+	if white != [4]uint8{255, 255, 255, 255} {
+		t.Fatalf("pixel 1 must be white: %v", white)
+	}
+}
+
+func TestVDPTileExportRejectsBadRequests(t *testing.T) {
+	client := newFakeVDPMemoryClient(make([]byte, 65536), make([]byte, 128))
+	server := newTestServer(t, client)
+	for _, arguments := range []string{
+		`{"palette": 4}`,
+		`{"count": 65}`,
+		`{"scale": 33}`,
+	} {
+		result := structured(postToolCall(t, server, "vdp_tile_export", arguments))
+		if result["code"] != "invalid_params" {
+			t.Fatalf("%s: code = %v (%v)", arguments, result["code"], result)
+		}
+	}
+	if hits := client.bridgeHits; hits != 0 {
+		t.Fatalf("static validation must not reach the bridge, got %d hits", hits)
+	}
+	result := structured(postToolCall(t, server, "vdp_tile_export", `{"tile": 2048}`))
+	if result["code"] != "out_of_range" {
+		t.Fatalf("out of range tile: %v", result)
+	}
+}
+
+func TestVDPPlaneExportRender(t *testing.T) {
+	vram := make([]byte, 65536)
+	writeWord := func(address uint64, word int) {
+		vram[address] = byte(word >> 8)
+		vram[address+1] = byte(word)
+	}
+	// Name table at 8192; cells: plain pal1, hflip, vflip, priority+pal3.
+	writeWord(8192, 0x2004)    // (0,0) tile 4 palette 1
+	writeWord(8192+2, 0x2804)  // (1,0) horizontal flip
+	writeWord(8192+64, 0x3004) // (0,1) vertical flip
+	writeWord(8192+66, 0xE004) // (1,1) priority + palette 3
+	vram[4*32] = 0x59          // pixel row 0: indices 5 then 9
+
+	cram := make([]byte, 128)
+	setColor := func(entry, word int) {
+		cram[entry*2] = byte(word >> 8)
+		cram[entry*2+1] = byte(word)
+	}
+	setColor(21, 0x0555) // palette 1 index 5: gray 73
+	setColor(48, 0x0AAA) // palette 3 index 0: gray 183
+	setColor(53, 0x0333) // palette 3 index 5: gray 36
+
+	client := newFakeVDPMemoryClient(vram, cram)
+	server := newTestServer(t, client)
+
+	content := structured(postToolCall(t, server, "vdp_plane_export", `{"plane": "b", "transparent_zero": false}`))
+	summary := content["summary"].(map[string]any)
+	if summary["distinct_tiles"] != float64(2) || summary["priority_entries"] != float64(1) ||
+		summary["invalid_entries"] != float64(0) || summary["interlace_active"] != false {
+		t.Fatalf("summary wrong: %v", summary)
+	}
+	sizeCells := summary["size_cells"].([]any)
+	if sizeCells[0] != float64(32) || sizeCells[1] != float64(32) {
+		t.Fatalf("plane geometry wrong: %v", sizeCells)
+	}
+	pngInfo := content["artifacts"].([]any)[0].(map[string]any)
+
+	rawPNG, _, err := server.store.Bytes(pngInfo["id"].(string), testContextID(t, server))
+	if err != nil {
+		t.Fatal(err)
+	}
+	decodedImg, err := png.Decode(bytes.NewReader(rawPNG))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bounds := decodedImg.Bounds(); bounds.Dx() != 256 || bounds.Dy() != 256 {
+		t.Fatalf("png size %dx%d, want 256x256", bounds.Dx(), bounds.Dy())
+	}
+	expectations := map[[2]int][4]uint8{
+		{0, 0}:     {73, 73, 73, 255}, // pixel index 5 through palette 1
+		{8, 0}:     {0, 0, 0, 255},    // hflip moves index 0 over this corner
+		{0, 8}:     {0, 0, 0, 255},    // vflip likewise
+		{8, 8}:     {36, 36, 36, 255}, // palette 3 index 5
+		{100, 100}: {0, 0, 0, 255},    // empty cells use palette line of entry... entry word 0 -> palette 0 -> black opaque
+	}
+	for point, want := range expectations {
+		if got := pixelAt(t, decodedImg, point[0], point[1]); got != want {
+			t.Fatalf("pixel %v = %v, want %v", point, got, want)
+		}
+	}
+}
+
+func TestVDPPlaneExportRejectsBadPlane(t *testing.T) {
+	client := newFakeVDPMemoryClient(make([]byte, 65536), make([]byte, 128))
+	server := newTestServer(t, client)
+	result := structured(postToolCall(t, server, "vdp_plane_export", `{"plane": "c"}`))
+	if result["code"] != "invalid_params" {
+		t.Fatalf("bad plane accepted: %v", result)
 	}
 }
 

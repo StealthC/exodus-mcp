@@ -50,6 +50,30 @@ func vdpToolSpecs() []toolSpec {
 			run:         runVDPPaletteExport,
 		},
 		{
+			name:        "vdp_tile_export",
+			description: "Export one or more consecutive 8x8 4bpp VRAM patterns (tiles) as a scaled PNG artifact plus a JSON pixel-decode artifact, colored through a chosen CRAM palette line.",
+			schema: objectSchema(map[string]any{
+				"tile":             integerProperty("First tile index counted from VRAM offset 0 (default 0). Each tile occupies 32 bytes.", 0),
+				"count":            integerProperty(fmt.Sprintf("Consecutive tile count between 1 and %d (default 1).", maxVDPTileStripCount), 1),
+				"palette":          integerProperty("CRAM palette line 0-3 used to color pixel indices 1-15 (default 0).", 0),
+				"scale":            integerProperty("Nearest-neighbor upscale factor 1-32 (default 8).", 1),
+				"transparent_zero": booleanProperty("Render pixel index 0 as transparent instead of its palette color (default true)."),
+				"context":          contextProperty(),
+			}, nil),
+			run: runVDPTileExport,
+		},
+		{
+			name:        "vdp_plane_export",
+			description: "Render a full scroll plane (A, B, or window) from VRAM as an unscrolled texture view: scaled PNG artifact plus JSON structural summary with distinct tiles and priority counts.",
+			schema: objectSchema(map[string]any{
+				"plane":            enumProperty("Which name table to render.", []string{"a", "b", "window"}),
+				"scale":            integerProperty("Nearest-neighbor upscale factor 1-4 (default 1).", 1),
+				"transparent_zero": booleanProperty("Render pixel index 0 as transparent instead of its palette color (default true)."),
+				"context":          contextProperty(),
+			}, nil),
+			run: runVDPPlaneExport,
+		},
+		{
 			name:        "frame_capture",
 			description: "Capture the current rendered VDP frame as a PNG image artifact.",
 			schema:      objectSchema(map[string]any{"context": contextProperty()}, nil),
@@ -150,22 +174,26 @@ func runVDPMemoryRead(tc toolContext, args json.RawMessage) map[string]any {
 	addressSpace, _ := payload["address_space"].(string)
 	entrySize, _ := payload["entry_size"].(float64)
 	bufferSize, _ := payload["buffer_size"].(float64)
+	// The bridge reports whether the read had to stop a running system;
+	// surfacing it lets callers judge snapshot coherence.
+	pausedDuringRead, _ := payload["system_paused_during_read"].(bool)
 	raw, err := base64.StdEncoding.DecodeString(rawDataBase64)
 	if err != nil {
 		return failureResult(&toolFailure{Code: "bridge_error", Message: "decode base64 vdp memory payload: " + err.Error()}, tc.modern)
 	}
 
 	value := map[string]any{
-		"target":              parsed.Target,
-		"address_space":       addressSpace,
-		"address":             address,
-		"length":              len(raw),
-		"buffer_size":         uint64(bufferSize),
-		"entry_size":          uint64(entrySize),
-		"byte_order":          byteOrder,
-		"consistency":         payload["consistency"],
-		"representation":      representation,
-		"representation_note": representationNote(representation),
+		"target":                    parsed.Target,
+		"address_space":             addressSpace,
+		"address":                   address,
+		"length":                    len(raw),
+		"buffer_size":               uint64(bufferSize),
+		"entry_size":                uint64(entrySize),
+		"byte_order":                byteOrder,
+		"consistency":               payload["consistency"],
+		"representation":            representation,
+		"representation_note":       representationNote(representation),
+		"system_paused_during_read": pausedDuringRead,
 	}
 	switch representation {
 	case "hexdump":
@@ -640,4 +668,470 @@ func buildPaletteJSON(entries []map[string]any) []byte {
 	}
 	data, _ := json.MarshalIndent(document, "", "  ")
 	return data
+}
+
+const (
+	mdTileSizeBytes      = 32
+	mdTileEdgePixels     = 8
+	defaultVDPTileScale  = 8
+	defaultVDPPlaneScale = 1
+)
+
+const (
+	maxVDPTileStripCount = 64
+	maxVDPTileUpscale    = 32
+	maxVDPPlaneUpscale   = 4
+)
+
+type vdpTileExportArgs struct {
+	Tile            uint64 `json:"tile"`
+	Count           uint64 `json:"count"`
+	Palette         uint64 `json:"palette"`
+	Scale           uint64 `json:"scale"`
+	TransparentZero *bool  `json:"transparent_zero"`
+	Context         string `json:"context"`
+}
+
+type vdpPlaneExportArgs struct {
+	Plane           string `json:"plane"`
+	Scale           uint64 `json:"scale"`
+	TransparentZero *bool  `json:"transparent_zero"`
+	Context         string `json:"context"`
+}
+
+// fetchVDPBytesChunked reads length bytes through repeated timed-buffer reads,
+// because a single inline read is capped at inlineReadCapBytes. The returned
+// flag reports whether every underlying read found the system already paused;
+// when true the composite buffer is a coherent snapshot.
+func fetchVDPBytesChunked(tc toolContext, target string, address uint64, length uint64) ([]byte, bool, *toolFailure) {
+	raw := make([]byte, 0, length)
+	allPaused := true
+	for offset := uint64(0); offset < length; {
+		chunk := length - offset
+		if chunk > inlineReadCapBytes {
+			chunk = inlineReadCapBytes
+		}
+		payload, failure := tc.server.executeCommand(tc.ctx, "vdp_mem_read", map[string]string{
+			"target":  target,
+			"address": strconv.FormatUint(address+offset, 10),
+			"length":  strconv.FormatUint(chunk, 10),
+		})
+		if failure != nil {
+			return nil, false, failure
+		}
+		rawDataBase64, _ := payload["data"].(string)
+		decodedChunk, err := base64.StdEncoding.DecodeString(rawDataBase64)
+		if err != nil {
+			return nil, false, &toolFailure{Code: "bridge_error", Message: "decode base64 vdp payload: " + err.Error()}
+		}
+		raw = append(raw, decodedChunk...)
+		// The bridge flag reports that the read had to stop a RUNNING
+		// system; any such chunk means emulation resumed between reads,
+		// so the composite buffer spans multiple emulated moments.
+		if hadToPause, ok := payload["system_paused_during_read"].(bool); ok && hadToPause {
+			allPaused = false
+		}
+		offset += chunk
+	}
+	return raw, allPaused, nil
+}
+
+// statusRegisters flattens the vdp_status register dump into an index/value map.
+func statusRegisters(status map[string]any) map[int]int {
+	registers := map[int]int{}
+	rawList, ok := status["registers"].([]any)
+	if !ok {
+		return registers
+	}
+	for _, item := range rawList {
+		entry, ok := item.(map[string]any)
+		if !ok {
+			continue
+		}
+		index, hasIndex := entry["register"].(float64)
+		value, hasValue := entry["value"].(float64)
+		if hasIndex && hasValue {
+			registers[int(index)] = int(value)
+		}
+	}
+	return registers
+}
+
+// planeCellSpan decodes one nibble of VDP register 16 into plane cells:
+// 00 selects 32 cells, 01 selects 64, anything else selects 128.
+func planeCellSpan(layout int) int {
+	switch layout & 3 {
+	case 0:
+		return 32
+	case 1:
+		return 64
+	default:
+		return 128
+	}
+}
+
+// cramPaletteColors converts the decoded CRAM entries into packed RGB triples.
+func cramPaletteColors(entries []map[string]any) [][3]uint8 {
+	colors := make([][3]uint8, len(entries))
+	for index, entry := range entries {
+		colors[index] = [3]uint8{uint8(entry["r"].(int)), uint8(entry["g"].(int)), uint8(entry["b"].(int))}
+	}
+	return colors
+}
+
+// decodeMDTile expands one 4bpp Mega Drive pattern into 8x8 palette indices.
+// Every row holds four bytes packing two pixels each with the high nibble on
+// the left.
+func decodeMDTile(pattern []byte) [mdTileEdgePixels][mdTileEdgePixels]int {
+	var tile [mdTileEdgePixels][mdTileEdgePixels]int
+	for row := 0; row < mdTileEdgePixels; row++ {
+		base := row * 4
+		for column := 0; column < mdTileEdgePixels; column++ {
+			packed := pattern[base+column/2]
+			if column%2 == 0 {
+				tile[row][column] = int(packed >> 4)
+			} else {
+				tile[row][column] = int(packed & 0x0F)
+			}
+		}
+	}
+	return tile
+}
+
+// drawMDTile blits one decoded tile with optional flips. Transparent pixels
+// are skipped so the destination stays at alpha zero.
+func drawMDTile(img *image.NRGBA, tile *[mdTileEdgePixels][mdTileEdgePixels]int, colors [][3]uint8, paletteLine int, transparentZero bool, originX, originY, scale int, hflip, vflip bool) {
+	for row := 0; row < mdTileEdgePixels; row++ {
+		sourceRow := row
+		if vflip {
+			sourceRow = mdTileEdgePixels - 1 - row
+		}
+		for column := 0; column < mdTileEdgePixels; column++ {
+			sourceColumn := column
+			if hflip {
+				sourceColumn = mdTileEdgePixels - 1 - column
+			}
+			index := tile[sourceRow][sourceColumn]
+			if transparentZero && index == 0 {
+				continue
+			}
+			rgb := colors[paletteLine*16+index]
+			fill := color.NRGBA{R: rgb[0], G: rgb[1], B: rgb[2], A: 0xFF}
+			for offsetY := 0; offsetY < scale; offsetY++ {
+				for offsetX := 0; offsetX < scale; offsetX++ {
+					img.Set(originX+column*scale+offsetX, originY+row*scale+offsetY, fill)
+				}
+			}
+		}
+	}
+}
+
+func storeArtifactAndDescriptor(tc toolContext, contextID, kind, mimeType string, payload []byte) (artifact.Artifact, map[string]any, error) {
+	stored, err := tc.server.store.Put(contextID, kind, mimeType, payload)
+	if err != nil {
+		return artifact.Artifact{}, nil, err
+	}
+	return stored, artifactDescriptor(tc.server, stored, contextID), nil
+}
+
+type exportedTile struct {
+	Index   int                                     `json:"index"`
+	Address int                                     `json:"vram_address"`
+	Rows    [mdTileEdgePixels][mdTileEdgePixels]int `json:"pixel_indices"`
+}
+
+func runVDPTileExport(tc toolContext, args json.RawMessage) map[string]any {
+	parsed, failure := decodeArgs[vdpTileExportArgs](args)
+	if failure != nil {
+		return failureResult(failure, tc.modern)
+	}
+	context, failure := resolveContext(tc.server, parsed.Context)
+	if failure != nil {
+		return failureResult(failure, tc.modern)
+	}
+
+	count := parsed.Count
+	if count == 0 {
+		count = 1
+	}
+	scale := int(parsed.Scale)
+	if scale == 0 {
+		scale = defaultVDPTileScale
+	}
+	transparentZero := parsed.TransparentZero == nil || *parsed.TransparentZero
+
+	if parsed.Palette > 3 || count > maxVDPTileStripCount || scale < 1 || scale > maxVDPTileUpscale {
+		return failureResult(&toolFailure{
+			Code: "invalid_params",
+			Message: fmt.Sprintf("vdp_tile_export requires palette 0-3, count 1-%d, and scale 1-%d.",
+				maxVDPTileStripCount, maxVDPTileUpscale),
+			Data: map[string]any{"max_tiles": maxVDPTileStripCount, "max_scale": maxVDPTileUpscale},
+		}, tc.modern)
+	}
+
+	statusPayload, failure := tc.server.executeCommand(tc.ctx, "vdp_status", nil)
+	if failure != nil {
+		return failureResult(failure, tc.modern)
+	}
+	vramSize := fetchVRAMSize(statusPayload)
+	firstByte := parsed.Tile * mdTileSizeBytes
+	totalBytes := count * mdTileSizeBytes
+	if firstByte+totalBytes > vramSize {
+		return failureResult(&toolFailure{
+			Code: "out_of_range",
+			Message: fmt.Sprintf("Tiles %d-%d exceed the VRAM capacity of %d bytes (%d tiles).",
+				parsed.Tile, parsed.Tile+count-1, vramSize, vramSize/mdTileSizeBytes),
+			Data: map[string]any{"vram_size": vramSize},
+		}, tc.modern)
+	}
+
+	vram, coherent, failure := fetchVDPBytesChunked(tc, "vram", firstByte, totalBytes)
+	if failure != nil {
+		return failureResult(failure, tc.modern)
+	}
+	cramRaw, _, failure := fetchVDPBytesChunked(tc, "cram", 0, 128)
+	if failure != nil {
+		return failureResult(failure, tc.modern)
+	}
+	colors := cramPaletteColors(cramRGB333Entries(cramRaw))
+
+	width := int(count) * mdTileEdgePixels * scale
+	height := mdTileEdgePixels * scale
+	img := image.NewNRGBA(image.Rect(0, 0, width, height))
+	tiles := make([]exportedTile, 0, int(count))
+	nonzeroPerTile := make([]int, 0, int(count))
+	for index := 0; index < int(count); index++ {
+		tile := decodeMDTile(vram[index*mdTileSizeBytes : (index+1)*mdTileSizeBytes])
+		drawMDTile(img, &tile, colors, int(parsed.Palette), transparentZero, index*mdTileEdgePixels*scale, 0, scale, false, false)
+		nonzero := 0
+		for _, rowValues := range tile {
+			for _, value := range rowValues {
+				if value != 0 {
+					nonzero++
+				}
+			}
+		}
+		nonzeroPerTile = append(nonzeroPerTile, nonzero)
+		tiles = append(tiles, exportedTile{
+			Index:   int(parsed.Tile) + index,
+			Address: int(firstByte) + index*mdTileSizeBytes,
+			Rows:    tile,
+		})
+	}
+
+	var pngBuffer bytes.Buffer
+	if err := png.Encode(&pngBuffer, img); err != nil {
+		return failureResult(&toolFailure{Code: "artifact_error", Message: "encode PNG: " + err.Error()}, tc.modern)
+	}
+	jsonDocument, err := json.MarshalIndent(struct {
+		Kind       string         `json:"kind"`
+		PixelOrder string         `json:"pixel_order"`
+		ByteOrder  string         `json:"byte_order"`
+		Palette    int            `json:"palette_line"`
+		Tiles      []exportedTile `json:"tiles"`
+	}{
+		Kind:       "vdp-tiles",
+		PixelOrder: "high-nibble-left",
+		ByteOrder:  "big-endian",
+		Palette:    int(parsed.Palette),
+		Tiles:      tiles,
+	}, "", "  ")
+	if err != nil {
+		return failureResult(&toolFailure{Code: "artifact_error", Message: err.Error()}, tc.modern)
+	}
+
+	pngStored, pngDescriptor, err := storeArtifactAndDescriptor(tc, context.ID, "vdp-tiles", "image/png", pngBuffer.Bytes())
+	if err != nil {
+		return failureResult(&toolFailure{Code: "artifact_error", Message: err.Error()}, tc.modern)
+	}
+	jsonStored, jsonDescriptor, err := storeArtifactAndDescriptor(tc, context.ID, "vdp-tiles-json", "application/json", jsonDocument)
+	if err != nil {
+		return failureResult(&toolFailure{Code: "artifact_error", Message: err.Error()}, tc.modern)
+	}
+
+	return okResult(map[string]any{
+		"summary": map[string]any{
+			"kind":                    "vdp-tiles",
+			"tile_count":              count,
+			"tile_size_bytes":         mdTileSizeBytes,
+			"bpp":                     4,
+			"vram_address_start":      firstByte,
+			"vram_address_end":        firstByte + totalBytes - 1,
+			"palette_line":            parsed.Palette,
+			"nonzero_pixels_per_tile": nonzeroPerTile,
+			"coherent_snapshot":       coherent,
+			"consistency":             "live",
+			"byte_order":              "big-endian",
+			"layout_note":             "Each tile is 8x8 4bpp: four bytes per row, two pixels per byte, high nibble left. Pixel 0 is transparent unless transparent_zero is false.",
+			"png_size_bytes":          pngBuffer.Len(),
+			"png_sha256":              pngStored.SHA256,
+			"json_size_bytes":         len(jsonDocument),
+			"json_sha256":             jsonStored.SHA256,
+		},
+		"artifacts": []map[string]any{pngDescriptor, jsonDescriptor},
+	}, tc.modern)
+}
+
+func runVDPPlaneExport(tc toolContext, args json.RawMessage) map[string]any {
+	parsed, failure := decodeArgs[vdpPlaneExportArgs](args)
+	if failure != nil {
+		return failureResult(failure, tc.modern)
+	}
+	context, failure := resolveContext(tc.server, parsed.Context)
+	if failure != nil {
+		return failureResult(failure, tc.modern)
+	}
+
+	scale := int(parsed.Scale)
+	if scale == 0 {
+		scale = defaultVDPPlaneScale
+	}
+	transparentZero := parsed.TransparentZero == nil || *parsed.TransparentZero
+
+	if parsed.Plane != "a" && parsed.Plane != "b" && parsed.Plane != "window" {
+		return failureResult(&toolFailure{
+			Code:    "invalid_params",
+			Message: "vdp_plane_export plane must be one of: a, b, window.",
+		}, tc.modern)
+	}
+	if scale < 1 || scale > maxVDPPlaneUpscale {
+		return failureResult(&toolFailure{
+			Code:    "invalid_params",
+			Message: fmt.Sprintf("vdp_plane_export scale must be between 1 and %d.", maxVDPPlaneUpscale),
+		}, tc.modern)
+	}
+
+	statusPayload, failure := tc.server.executeCommand(tc.ctx, "vdp_status", nil)
+	if failure != nil {
+		return failureResult(failure, tc.modern)
+	}
+	decoded, _ := statusPayload["decoded"].(map[string]any)
+	baseValue, _ := decoded["name_table_base_"+parsed.Plane].(float64)
+	nameTableBase := uint64(baseValue)
+	registers := statusRegisters(statusPayload)
+	widthCells := planeCellSpan(registers[16])
+	heightCells := planeCellSpan(registers[16] >> 4)
+	interlaceActive := registers[12]&0x2 != 0
+
+	vramAll, coherent, failure := fetchVDPBytesChunked(tc, "vram", 0, fetchVRAMSize(statusPayload))
+	if failure != nil {
+		return failureResult(failure, tc.modern)
+	}
+	cramRaw, _, failure := fetchVDPBytesChunked(tc, "cram", 0, 128)
+	if failure != nil {
+		return failureResult(failure, tc.modern)
+	}
+	colors := cramPaletteColors(cramRGB333Entries(cramRaw))
+
+	nameTableBytes := widthCells * heightCells * 2
+	truncated := false
+	if nameTableBase+uint64(nameTableBytes) > uint64(len(vramAll)) {
+		nameTableBytes = len(vramAll) - int(nameTableBase)
+		truncated = true
+	}
+	nameTable := vramAll[nameTableBase : nameTableBase+uint64(nameTableBytes)]
+
+	width := widthCells * mdTileEdgePixels * scale
+	height := heightCells * mdTileEdgePixels * scale
+	img := image.NewNRGBA(image.Rect(0, 0, width, height))
+	histogram := map[int]int{}
+	priorityEntries := 0
+	invalidEntries := 0
+	for cellRow := 0; cellRow < heightCells; cellRow++ {
+		for cellColumn := 0; cellColumn < widthCells; cellColumn++ {
+			entryOffset := (cellRow*widthCells + cellColumn) * 2
+			if entryOffset+1 >= len(nameTable) {
+				break
+			}
+			word := int(nameTable[entryOffset])<<8 | int(nameTable[entryOffset+1])
+			tileIndex := word & 0x07FF
+			hflip := word&0x0800 != 0
+			vflip := word&0x1000 != 0
+			paletteLine := (word >> 13) & 0x3
+			if word&0x8000 != 0 {
+				priorityEntries++
+			}
+			histogram[tileIndex]++
+			if (tileIndex+1)*mdTileSizeBytes > len(vramAll) {
+				invalidEntries++
+				continue
+			}
+			tile := decodeMDTile(vramAll[tileIndex*mdTileSizeBytes : (tileIndex+1)*mdTileSizeBytes])
+			drawMDTile(img, &tile, colors, paletteLine, transparentZero,
+				cellColumn*mdTileEdgePixels*scale, cellRow*mdTileEdgePixels*scale, scale, hflip, vflip)
+		}
+	}
+
+	var pngBuffer bytes.Buffer
+	if err := png.Encode(&pngBuffer, img); err != nil {
+		return failureResult(&toolFailure{Code: "artifact_error", Message: "encode PNG: " + err.Error()}, tc.modern)
+	}
+	jsonDocument, err := json.MarshalIndent(struct {
+		Kind            string      `json:"kind"`
+		Plane           string      `json:"plane"`
+		ByteOrder       string      `json:"byte_order"`
+		NameEntryFormat string      `json:"name_entry_format"`
+		NameTableBase   int         `json:"name_table_base"`
+		SizeCells       [2]int      `json:"size_cells"`
+		DistinctTiles   map[int]int `json:"distinct_tiles"`
+		PriorityEntries int         `json:"priority_entries"`
+		InvalidEntries  int         `json:"invalid_entries"`
+		Truncated       bool        `json:"truncated"`
+	}{
+		Kind:            "vdp-plane",
+		Plane:           parsed.Plane,
+		ByteOrder:       "big-endian",
+		NameEntryFormat: "bits 0-10 tile, 11 hflip, 12 vflip, 13-14 palette, 15 priority",
+		NameTableBase:   int(nameTableBase),
+		SizeCells:       [2]int{widthCells, heightCells},
+		DistinctTiles:   histogram,
+		PriorityEntries: priorityEntries,
+		InvalidEntries:  invalidEntries,
+		Truncated:       truncated,
+	}, "", "  ")
+	if err != nil {
+		return failureResult(&toolFailure{Code: "artifact_error", Message: err.Error()}, tc.modern)
+	}
+
+	pngStored, pngDescriptor, err := storeArtifactAndDescriptor(tc, context.ID, "vdp-plane", "image/png", pngBuffer.Bytes())
+	if err != nil {
+		return failureResult(&toolFailure{Code: "artifact_error", Message: err.Error()}, tc.modern)
+	}
+	jsonStored, jsonDescriptor, err := storeArtifactAndDescriptor(tc, context.ID, "vdp-plane-json", "application/json", jsonDocument)
+	if err != nil {
+		return failureResult(&toolFailure{Code: "artifact_error", Message: err.Error()}, tc.modern)
+	}
+
+	notes := []string{
+		"This is an unscrolled texture view of the name table; hardware scrolling, window boundaries, and sprite layering are not applied.",
+		"Priority bit counts are reported but not rendered; the image shows every cell regardless of priority.",
+	}
+	if interlaceActive {
+		notes = append(notes, "Interlace mode is active; cells render here at single height.")
+	}
+
+	return okResult(map[string]any{
+		"summary": map[string]any{
+			"kind":              "vdp-plane",
+			"plane":             parsed.Plane,
+			"name_table_base":   nameTableBase,
+			"size_cells":        []int{widthCells, heightCells},
+			"png_size_bytes":    pngBuffer.Len(),
+			"png_width":         width,
+			"png_height":        height,
+			"png_sha256":        pngStored.SHA256,
+			"json_size_bytes":   len(jsonDocument),
+			"json_sha256":       jsonStored.SHA256,
+			"distinct_tiles":    len(histogram),
+			"priority_entries":  priorityEntries,
+			"invalid_entries":   invalidEntries,
+			"truncated":         truncated,
+			"interlace_active":  interlaceActive,
+			"coherent_snapshot": coherent,
+			"consistency":       "live",
+			"byte_order":        "big-endian",
+			"notes":             notes,
+		},
+		"artifacts": []map[string]any{pngDescriptor, jsonDescriptor},
+	}, tc.modern)
 }

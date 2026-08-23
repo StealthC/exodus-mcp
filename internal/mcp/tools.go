@@ -146,6 +146,10 @@ func enumProperty(description string, values []string) map[string]any {
 	return map[string]any{"type": "string", "enum": values, "description": description}
 }
 
+func booleanProperty(description string) map[string]any {
+	return map[string]any{"type": "boolean", "description": description}
+}
+
 func addressProperty() map[string]any {
 	return stringProperty("Address as an integer, 0x hex, $ Motorola hex, or h-suffixed Zilog hex.")
 }

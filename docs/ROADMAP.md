@@ -100,8 +100,16 @@ not manually decode opaque dumps in its prompt.
   against the live frame, name-table reads at the register-reported bases,
   range/alignment/target error codes, and smoke coverage of the
   cross-check.
-- `vdp_plane_export`, `vdp_tile_export`: image/JSON artifacts plus concise
-  structural summaries.
+- [x] `vdp_tile_export`: consecutive 8x8 4bpp patterns as a scaled PNG plus a
+  JSON pixel-index artifact, colored through a chosen CRAM palette line with
+  optional transparent color 0. Pixel order is high-nibble-left; validated
+  live against Kid Chameleon title graphics.
+- [x] `vdp_plane_export`: full unscrolled scroll-plane texture view (A, B, or
+  window) rendered from the name table with flip, palette, and priority
+  decoding. Plane geometry comes from VDP register 16 in the `vdp_status`
+  dump; the summary reports distinct tiles, priority counts, and a
+  `coherent_snapshot` flag derived from per-read pause telemetry. Validated
+  live: plane A reproduces the title screen art and plane B the sky bands.
 - [x] `vdp_palette_export`: CRAM as four 16-color lines into a PNG swatch
   artifact plus a JSON decode artifact, with nonzero counts per line and the
   backdrop color inline. Validated live against Kid Chameleon.
