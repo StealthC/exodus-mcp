@@ -27,6 +27,40 @@ and this project will use [Semantic Versioning](https://semver.org/spec/v2.0.0.h
   child process without logging the capability.
 - Windows launcher now starts Exodus in its executable directory, preserving
   its relative settings and workspace paths.
+- Bridge wire protocol v2: flat key/value requests, one streamed JSON envelope
+  response with machine-readable error codes, and deadline-based cancellation
+  on the Windows named pipe.
+- Native command scheduler increment: all commands execute serially on the
+  plugin pipe thread with stop-event responsiveness and clean shutdown.
+  Read-only emulator access uses the same debugger paths as the built-in
+  Exodus debug windows; responses declare `consistency: live`.
+- Phase 1 tools: `emulator_status`, `target_info`, `context_create`,
+  `context_list`, `context_close`, `memory_spaces_list`, `memory_read`
+  (bounded inline reads with byte-order echo and decode validation),
+  `memory_dump`, `artifact_get`, and `artifact_preview`.
+- Phase 2 tools: `m68k_registers`, `m68k_disassemble`, `m68k_read_memory`,
+  `z80_registers`, `z80_disassemble`, `z80_read_memory`,
+  `cpu_trace_capture` (artifact-first), and context-scoped `symbols_set`,
+  `symbols_list`, `symbols_clear`.
+- Immutable artifact store with SHA-256 descriptors, ETag plus HTTP byte-range
+  downloads on `/artifacts/{id}`, bounded previews, startup sweeps, and
+  per-analysis-context scoping.
+- Analysis-context registry (`ctx_...` handles) with an implicit default
+  context and protected close semantics.
+- Investigation report `docs/TRACE-CRASH-INVESTIGATION.md` documenting a
+  reproducible emulator crash triggered by `cpu_trace_capture`, including the
+  trace machinery audit, eliminated causes, ranked hypotheses, and the
+  recommended file-based capture route.
+
+### Changed
+
+- Tool responses now use MCP `structuredContent` plus a compact JSON text
+  fallback; domain failures return `isError: true` results instead of
+  JSON-RPC protocol errors.
+- `tools/list` is generated from a deterministic alphabetical tool registry
+  shared by modern and legacy dispatchers.
+- `cpu_trace_capture` is marked experimental in its schema pending the trace
+  crash investigation.
 
 ### Changed
 

@@ -63,6 +63,11 @@ Guidance for contributors and coding agents working in this workspace.
 - When running under WSL, do not start the MCP server manually from the agent
   shell. The server runs on the Windows side and is managed outside WSL; check
   connectivity through the bridge status instead of launching processes.
+- Only one `exodus-mcp` instance can bind `127.0.0.1:8767`, and each Exodus
+  child is paired with one generated capability. Never launch a second
+  instance or restart the pair silently: when a code or plugin change requires
+  a restart, tell the user first, provide the exact PowerShell steps, and wait
+  for confirmation before testing against the bridge.
 
 ## Git and upstream discipline
 

@@ -34,7 +34,8 @@ go run ./cmd/exodus-mcp --exodus 'C:\path\to\Exodus.exe'
 
 Repeat `--exodus-arg` for any Exodus command-line arguments. This mode creates
 a new pipe name and capability for that one child process and never logs the
-capability.
+capability. When that child Exodus process exits, `exodus-mcp` shuts down its
+local HTTP server and exits too.
 
 ## Windows server used from WSL
 

@@ -3,6 +3,7 @@ package mcp
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"net/http"
 	"strings"
 	"testing"
@@ -26,14 +27,47 @@ func (r *recorder) Write(data []byte) (int, error) {
 }
 func (r *recorder) WriteHeader(status int) { r.status = status }
 
-type fakeBridgeClient struct {
-	status bridge.Status
-	err    error
+type recordedCall struct {
+	Method string
+	Params map[string]string
 }
 
-func (client fakeBridgeClient) Status(context.Context) (bridge.Status, error) {
-	return client.status, client.err
+type fakeBridgeClient struct {
+	status        bridge.Status
+	statusErr     error
+	executeFunc   func(ctx context.Context, method string, params map[string]string) (json.RawMessage, error)
+	recordedCalls []recordedCall
 }
+
+func (client *fakeBridgeClient) Status(context.Context) (bridge.Status, error) {
+	if client.statusErr != nil {
+		return bridge.Status{}, client.statusErr
+	}
+	return client.status, nil
+}
+
+func (client *fakeBridgeClient) Execute(ctx context.Context, method string, params map[string]string) (json.RawMessage, error) {
+	client.recordedCalls = append(client.recordedCalls, recordedCall{Method: method, Params: params})
+	if client.executeFunc == nil {
+		return json.RawMessage(`{}`), nil
+	}
+	return client.executeFunc(ctx, method, params)
+}
+
+func newFakeStatus() bridge.Status {
+	return bridge.Status{
+		ProtocolVersion:     2,
+		PluginVersion:       "0.2.0",
+		Lifecycle:           "ready",
+		BridgeEnabled:       true,
+		LoadedModuleCount:   3,
+		SupportedOperations: []string{"status", "emulator_status", "mem_spaces", "mem_read", "regs_get", "disasm", "trace_capture"},
+	}
+}
+
+//----------------------------------------------------------------------------------------------------------------------
+// Transport fixtures
+//----------------------------------------------------------------------------------------------------------------------
 
 func TestModernDiscover(t *testing.T) {
 	body := `{"jsonrpc":"2.0","id":1,"method":"server/discover","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientCapabilities":{}}}}`
@@ -69,6 +103,24 @@ func TestModernRejectsMissingHeaders(t *testing.T) {
 	}
 }
 
+func TestModernRejectsUnsupportedProtocolVersion(t *testing.T) {
+	body := `{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"2024-11-05"}}}`
+	request, err := http.NewRequest(http.MethodPost, "http://127.0.0.1:8767/mcp", strings.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	request.Header.Set("MCP-Protocol-Version", "2024-11-05")
+	request.Header.Set("Mcp-Method", "tools/list")
+	recorder := newRecorder()
+	NewHandler("test").ServeHTTP(recorder, request)
+	if recorder.status != http.StatusBadRequest {
+		t.Fatalf("status = %d, want %d", recorder.status, http.StatusBadRequest)
+	}
+	if !strings.Contains(recorder.body.String(), `"code":-32022`) || !strings.Contains(recorder.body.String(), ModernProtocolVersion) {
+		t.Fatalf("response missing UnsupportedProtocolVersionError: %s", recorder.body.String())
+	}
+}
+
 func TestLegacyInitialize(t *testing.T) {
 	body := `{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{}}}`
 	request, err := http.NewRequest(http.MethodPost, "http://127.0.0.1:8767/mcp", strings.NewReader(body))
@@ -99,29 +151,66 @@ func TestRejectsForeignOrigin(t *testing.T) {
 }
 
 func TestBridgeStatusReportsConnectedPlugin(t *testing.T) {
-	body := `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"bridge_status","_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28"}}}`
-	request, err := http.NewRequest(http.MethodPost, "http://127.0.0.1:8767/mcp", strings.NewReader(body))
-	if err != nil {
-		t.Fatal(err)
+	result := callTool(t, &fakeBridgeClient{status: newFakeStatus()}, "bridge_status", "{}")
+	if result["isError"] == true {
+		t.Fatalf("unexpected error result: %v", result)
 	}
-	request.Header.Set("MCP-Protocol-Version", ModernProtocolVersion)
-	request.Header.Set("Mcp-Method", "tools/call")
-	request.Header.Set("Mcp-Name", "bridge_status")
-	recorder := newRecorder()
-	NewHandlerWithBridge("test", fakeBridgeClient{status: bridge.Status{
-		ProtocolVersion:   1,
-		PluginVersion:     "0.1.0",
-		Lifecycle:         "ready",
-		BridgeEnabled:     true,
-		LoadedModuleCount: 3,
-	}}).ServeHTTP(recorder, request)
-
-	if recorder.status != http.StatusOK {
-		t.Fatalf("status = %d, body = %s", recorder.status, recorder.body.String())
-	}
-	for _, expected := range []string{`"connected":true`, `"plugin_version":"0.1.0"`, `"loaded_module_count":3`} {
-		if !strings.Contains(recorder.body.String(), expected) {
-			t.Fatalf("response missing %s: %s", expected, recorder.body.String())
+	content := structured(result)
+	for _, key := range []string{"connected", "plugin_version", "loaded_module_count", "supported_operations"} {
+		if _, present := content[key]; !present {
+			t.Fatalf("structured content missing %s: %v", key, content)
 		}
+	}
+	if content["connected"] != true {
+		t.Fatalf("connected = %v, want true", content["connected"])
+	}
+}
+
+func TestBridgeStatusWithoutBridgeIsHonest(t *testing.T) {
+	result := callTool(t, &fakeBridgeClient{statusErr: bridge.ErrUnavailable}, "bridge_status", "{}")
+	content := structured(result)
+	if content["connected"] != false {
+		t.Fatalf("connected = %v, want false", content["connected"])
+	}
+}
+
+func TestToolsListDeterministicAndComplete(t *testing.T) {
+	first := jsonText(toolSchemas())
+	second := jsonText(toolSchemas())
+	if first != second {
+		t.Fatal("tools/list order is not deterministic")
+	}
+	expected := []string{
+		"artifact_get", "artifact_preview", "bridge_status", "context_close",
+		"context_create", "context_list", "cpu_trace_capture",
+		"m68k_disassemble", "m68k_read_memory", "m68k_registers",
+		"memory_dump", "memory_read", "memory_spaces_list",
+		"symbols_clear", "symbols_list", "symbols_set",
+		"target_info", "z80_disassemble", "z80_read_memory", "z80_registers",
+		"emulator_status",
+	}
+	listed := first
+	for _, name := range expected {
+		if !strings.Contains(listed, `"`+name+`"`) {
+			t.Fatalf("tools/list missing tool %s", name)
+		}
+	}
+	names := make([]string, 0, len(toolRegistry))
+	for _, spec := range toolRegistry {
+		names = append(names, spec.name)
+	}
+	for i := 1; i < len(names); i++ {
+		if names[i-1] >= names[i] {
+			t.Fatalf("registry not sorted at %q", names[i])
+		}
+	}
+}
+
+func TestEmulatorDataRequiresBridgeOperationSupport(t *testing.T) {
+	client := &fakeBridgeClient{status: bridge.Status{ProtocolVersion: 2}}
+	result := callTool(t, client, "target_info", "{}")
+	content := structured(result)
+	if content["code"] != "unsupported_plugin" {
+		t.Fatalf("code = %v, want unsupported_plugin", content["code"])
 	}
 }

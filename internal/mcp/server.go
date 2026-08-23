@@ -8,16 +8,23 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"os"
 	"strings"
+	"sync"
 	"time"
 
+	"github.com/StealthC/exodus-mcp/internal/analysis"
+	"github.com/StealthC/exodus-mcp/internal/artifact"
 	"github.com/StealthC/exodus-mcp/internal/bridge"
 )
 
 const (
+	// ModernProtocolVersion is the normative MCP revision this server targets.
 	ModernProtocolVersion = "2026-07-28"
+	// LegacyProtocolVersion is the initial legacy compatibility target.
 	LegacyProtocolVersion = "2025-11-25"
 	serverName            = "exodus-mcp"
+	statusCacheTTL        = 5 * time.Second
 )
 
 type request struct {
@@ -40,38 +47,88 @@ type response struct {
 	Error   *rpcError       `json:"error,omitempty"`
 }
 
-// NewHandler returns the local HTTP handler. The native bridge is not connected
-// yet; the initial tool set exposes that state honestly.
-func NewHandler(version string) http.Handler {
-	return NewHandlerWithBridge(version, bridge.UnavailableClient())
+// Server wires the HTTP boundary, the native bridge client, the artifact
+// store, and the analysis-context registry together.
+type Server struct {
+	version  string
+	bridge   bridge.Client
+	store    *artifact.Store
+	contexts *analysis.Registry
+	baseURL  string
+
+	statusMu      sync.Mutex
+	statusExpires time.Time
+	statusCache   bridge.Status
 }
 
-// NewHandlerWithBridge returns the local HTTP handler backed by one native
-// bridge client. A nil client is treated as unavailable.
-func NewHandlerWithBridge(version string, client bridge.Client) http.Handler {
+// NewServer constructs the full server. A nil client is treated as
+// unavailable; baseURL anchors artifact download links.
+func NewServer(version string, client bridge.Client, store *artifact.Store, contexts *analysis.Registry, baseURL string) *Server {
 	if client == nil {
 		client = bridge.UnavailableClient()
 	}
+	if baseURL == "" {
+		baseURL = "http://127.0.0.1"
+	}
+	return &Server{
+		version:  version,
+		bridge:   client,
+		store:    store,
+		contexts: contexts,
+		baseURL:  strings.TrimRight(baseURL, "/"),
+	}
+}
+
+// Handler returns the local HTTP handler covering /healthz, /mcp, and
+// /artifacts/{id}.
+func (server *Server) Handler() http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if !validOrigin(r.Header.Get("Origin")) {
 			http.Error(w, "forbidden origin", http.StatusForbidden)
 			return
 		}
-		if r.URL.Path == "/healthz" {
-			health(version, w, r)
-			return
-		}
-		if r.URL.Path != "/mcp" {
+		switch {
+		case r.URL.Path == "/healthz":
+			health(server.version, w, r)
+		case strings.HasPrefix(r.URL.Path, "/artifacts/"):
+			server.store.Handler().ServeHTTP(w, r)
+		case r.URL.Path == "/mcp":
+			if r.Method != http.MethodPost {
+				w.Header().Set("Allow", http.MethodPost)
+				http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+				return
+			}
+			dispatch(server, w, r)
+		default:
 			http.NotFound(w, r)
-			return
 		}
-		if r.Method != http.MethodPost {
-			w.Header().Set("Allow", http.MethodPost)
-			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-			return
-		}
-		dispatch(version, client, w, r)
 	})
+}
+
+// NewHandler returns the local HTTP handler without an available bridge.
+func NewHandler(version string) http.Handler {
+	return NewHandlerWithBridge(version, nil)
+}
+
+// NewHandlerWithBridge returns the local HTTP handler backed by one native
+// bridge client, using throwaway storage. Production callers should construct
+// a Server explicitly.
+func NewHandlerWithBridge(version string, client bridge.Client) http.Handler {
+	store, err := artifact.NewStore(tempArtifactDir())
+	if err != nil {
+		panic(err)
+	}
+	return NewServer(version, client, store, analysis.NewRegistry(), "").Handler()
+}
+
+// tempArtifactDir returns a session-scoped directory for handler wrappers
+// that do not receive an explicit store.
+func tempArtifactDir() string {
+	dir, err := os.MkdirTemp("", "exodus-mcp-artifacts-")
+	if err != nil {
+		panic(err)
+	}
+	return dir
 }
 
 func health(version string, w http.ResponseWriter, r *http.Request) {
@@ -81,12 +138,12 @@ func health(version string, w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
-		"status":  "bridge_unavailable",
+		"status":  "ok",
 		"version": version,
 	})
 }
 
-func dispatch(version string, client bridge.Client, w http.ResponseWriter, r *http.Request) {
+func dispatch(server *Server, w http.ResponseWriter, r *http.Request) {
 	defer r.Body.Close()
 	body, err := io.ReadAll(io.LimitReader(r.Body, 1<<20))
 	if err != nil {
@@ -94,53 +151,53 @@ func dispatch(version string, client bridge.Client, w http.ResponseWriter, r *ht
 		return
 	}
 
-	var request request
-	if err := json.Unmarshal(body, &request); err != nil || request.JSONRPC != "2.0" || request.Method == "" {
+	var req request
+	if err := json.Unmarshal(body, &req); err != nil || req.JSONRPC != "2.0" || req.Method == "" {
 		writeError(w, http.StatusBadRequest, nil, -32700, "parse error", nil)
 		return
 	}
 
-	modern, protocolVersion, err := modernProtocol(request.Params)
+	modern, protocolVersion, err := modernProtocol(req.Params)
 	if err != nil {
-		writeError(w, http.StatusBadRequest, request.ID, -32602, err.Error(), nil)
+		writeError(w, http.StatusBadRequest, req.ID, -32602, err.Error(), nil)
 		return
 	}
 	if modern {
-		dispatchModern(version, client, w, r, request, protocolVersion)
+		dispatchModern(server, w, r, req, protocolVersion)
 		return
 	}
-	dispatchLegacy(version, client, w, r, request)
+	dispatchLegacy(server, w, r, req)
 }
 
-func dispatchModern(version string, client bridge.Client, w http.ResponseWriter, r *http.Request, request request, protocolVersion string) {
+func dispatchModern(server *Server, w http.ResponseWriter, r *http.Request, req request, protocolVersion string) {
 	if protocolVersion != ModernProtocolVersion {
-		writeError(w, http.StatusBadRequest, request.ID, -32022, "Unsupported protocol version", map[string]any{
+		writeError(w, http.StatusBadRequest, req.ID, -32022, "Unsupported protocol version", map[string]any{
 			"supported": []string{ModernProtocolVersion, LegacyProtocolVersion},
 			"requested": protocolVersion,
 		})
 		return
 	}
-	if err := validateModernHeaders(r.Header, request); err != nil {
-		writeError(w, http.StatusBadRequest, request.ID, -32020, "Header mismatch", err.Error())
+	if err := validateModernHeaders(r.Header, req); err != nil {
+		writeError(w, http.StatusBadRequest, req.ID, -32020, "Header mismatch", err.Error())
 		return
 	}
 
-	result, rpcErr, status := modernResult(version, client, r, request)
+	result, rpcErr, status := server.modernResult(r, req)
 	if rpcErr != nil {
-		writeError(w, status, request.ID, rpcErr.Code, rpcErr.Message, rpcErr.Data)
+		writeError(w, status, req.ID, rpcErr.Code, rpcErr.Message, rpcErr.Data)
 		return
 	}
-	writeJSON(w, status, response{JSONRPC: "2.0", ID: request.ID, Result: result})
+	writeJSON(w, status, response{JSONRPC: "2.0", ID: req.ID, Result: result})
 }
 
-func dispatchLegacy(version string, client bridge.Client, w http.ResponseWriter, r *http.Request, request request) {
+func dispatchLegacy(server *Server, w http.ResponseWriter, r *http.Request, req request) {
 	var result any
-	switch request.Method {
+	switch req.Method {
 	case "initialize":
 		result = map[string]any{
 			"protocolVersion": LegacyProtocolVersion,
 			"capabilities":    capabilities(),
-			"serverInfo":      serverInfo(version),
+			"serverInfo":      server.serverInfo(),
 		}
 	case "notifications/initialized":
 		w.WriteHeader(http.StatusAccepted)
@@ -148,23 +205,23 @@ func dispatchLegacy(version string, client bridge.Client, w http.ResponseWriter,
 	case "tools/list":
 		result = map[string]any{"tools": toolSchemas()}
 	case "tools/call":
-		result = callTool(r.Context(), client, request.Params, false)
+		result = server.callTool(r.Context(), req.Params, false)
 	default:
-		writeError(w, http.StatusOK, request.ID, -32601, "Method not found", nil)
+		writeError(w, http.StatusOK, req.ID, -32601, "Method not found", nil)
 		return
 	}
-	writeJSON(w, http.StatusOK, response{JSONRPC: "2.0", ID: request.ID, Result: result})
+	writeJSON(w, http.StatusOK, response{JSONRPC: "2.0", ID: req.ID, Result: result})
 }
 
-func modernResult(version string, client bridge.Client, r *http.Request, request request) (map[string]any, *rpcError, int) {
+func (server *Server) modernResult(r *http.Request, req request) (map[string]any, *rpcError, int) {
 	var result map[string]any
-	switch request.Method {
+	switch req.Method {
 	case "server/discover":
 		result = map[string]any{
 			"supportedVersions": []string{ModernProtocolVersion, LegacyProtocolVersion},
 			"capabilities":      capabilities(),
-			"serverInfo":        serverInfo(version),
-			"instructions":      "Use bridge_status before requesting emulator data. It reports whether the local Exodus native bridge is currently connected.",
+			"serverInfo":        server.serverInfo(),
+			"instructions":      "Call bridge_status before requesting emulator data. Large outputs are delivered as artifacts with bounded inline summaries.",
 			"ttlMs":             3600000,
 			"cacheScope":        "public",
 		}
@@ -175,12 +232,12 @@ func modernResult(version string, client bridge.Client, r *http.Request, request
 			"cacheScope": "public",
 		}
 	case "tools/call":
-		result = callTool(r.Context(), client, request.Params, true)
+		result = server.callTool(r.Context(), req.Params, true)
 	default:
 		return nil, &rpcError{Code: -32601, Message: "Method not found"}, http.StatusNotFound
 	}
 	result["resultType"] = "complete"
-	result["_meta"] = map[string]any{"io.modelcontextprotocol/serverInfo": serverInfo(version)}
+	result["_meta"] = map[string]any{"io.modelcontextprotocol/serverInfo": server.serverInfo()}
 	return result, nil, http.StatusOK
 }
 
@@ -188,93 +245,85 @@ func capabilities() map[string]any {
 	return map[string]any{"tools": map[string]any{"listChanged": false}}
 }
 
-func serverInfo(version string) map[string]string {
-	return map[string]string{"name": serverName, "version": version}
+func (server *Server) serverInfo() map[string]string {
+	return map[string]string{"name": serverName, "version": server.version}
 }
 
-func toolSchemas() []map[string]any {
-	return []map[string]any{
-		{
-			"name":        "bridge_status",
-			"description": "Report native Exodus bridge connectivity and supported operations.",
-			"inputSchema": map[string]any{"type": "object", "properties": map[string]any{}},
-		},
-		{
-			"name":        "target_info",
-			"description": "Report the loaded emulator target. Requires a connected native Exodus bridge.",
-			"inputSchema": map[string]any{"type": "object", "properties": map[string]any{}},
-		},
+// statusFor returns the cached plugin status, refreshing it at most once per
+// cache interval so composite tools avoid duplicate round trips.
+func (server *Server) statusFor(ctx context.Context) (bridge.Status, error) {
+	server.statusMu.Lock()
+	defer server.statusMu.Unlock()
+	if time.Now().Before(server.statusExpires) {
+		return server.statusCache, nil
 	}
-}
-
-func callTool(ctx context.Context, client bridge.Client, params json.RawMessage, modern bool) map[string]any {
-	var call struct {
-		Name string `json:"name"`
-	}
-	if err := json.Unmarshal(params, &call); err != nil || call.Name == "" {
-		return toolError("invalid_params", "tools/call requires a tool name", modern)
-	}
-	switch call.Name {
-	case "bridge_status":
-		statusContext, cancel := context.WithTimeout(ctx, 3*time.Second)
-		defer cancel()
-		status, err := client.Status(statusContext)
-		if err == nil {
-			return toolSuccess(map[string]any{
-				"connected":            true,
-				"transport":            "windows-named-pipe",
-				"protocol_version":     status.ProtocolVersion,
-				"plugin_version":       status.PluginVersion,
-				"lifecycle":            status.Lifecycle,
-				"bridge_enabled":       status.BridgeEnabled,
-				"loaded_module_count":  status.LoadedModuleCount,
-				"supported_operations": []string{"status"},
-			}, modern)
-		}
-		return toolSuccess(map[string]any{
-			"connected":            false,
-			"transport":            "windows-named-pipe",
-			"supported_operations": []string{},
-			"message":              "The Exodus native bridge is unavailable: " + err.Error(),
-		}, modern)
-	case "target_info":
-		return toolError("bridge_unavailable", "The Exodus native bridge is not connected.", modern)
-	default:
-		return toolError("unknown_tool", "Unknown tool: "+call.Name, modern)
-	}
-}
-
-func toolSuccess(value any, modern bool) map[string]any {
-	result := map[string]any{
-		"content":           []map[string]string{{"type": "text", "text": "ok"}},
-		"structuredContent": value,
-		"isError":           false,
-	}
-	if !modern {
-		delete(result, "structuredContent")
-		result["content"] = []map[string]string{{"type": "text", "text": jsonText(value)}}
-	}
-	return result
-}
-
-func toolError(code, message string, modern bool) map[string]any {
-	result := map[string]any{
-		"content":           []map[string]string{{"type": "text", "text": message}},
-		"structuredContent": map[string]string{"code": code, "message": message},
-		"isError":           true,
-	}
-	if !modern {
-		delete(result, "structuredContent")
-	}
-	return result
-}
-
-func jsonText(value any) string {
-	encoded, err := json.Marshal(value)
+	statusContext, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	status, err := server.bridge.Status(statusContext)
 	if err != nil {
-		return "{}"
+		return bridge.Status{}, err
 	}
-	return string(encoded)
+	server.statusCache = status
+	server.statusExpires = time.Now().Add(statusCacheTTL)
+	return status, nil
+}
+
+func (server *Server) executeCommand(ctx context.Context, operation string, params map[string]string) (map[string]any, *toolFailure) {
+	status, err := server.statusFor(ctx)
+	if err != nil {
+		return nil, &toolFailure{Code: "bridge_unavailable", Message: "The Exodus native bridge is unavailable: " + err.Error()}
+	}
+	if !status.SupportsOperation(operation) {
+		return nil, &toolFailure{
+			Code:    "unsupported_plugin",
+			Message: "The connected ExodusMcpPlugin does not advertise '" + operation + "'. Update the extension DLL to protocol version 2.",
+			Data:    map[string]any{"supported_operations": status.SupportedOperations},
+		}
+	}
+	callContext, cancel := context.WithTimeout(ctx, commandTimeout(operation))
+	defer cancel()
+	data, err := server.bridge.Execute(callContext, operation, params)
+	if err != nil {
+		var commandErr *bridge.CommandError
+		if errorsAs(err, &commandErr) {
+			return nil, &toolFailure{Code: commandErr.Code, Message: commandErr.Message}
+		}
+		return nil, &toolFailure{Code: "bridge_error", Message: err.Error()}
+	}
+	var payload map[string]any
+	if len(data) > 0 {
+		if err := json.Unmarshal(data, &payload); err != nil {
+			return nil, &toolFailure{Code: "bridge_error", Message: "decode bridge payload: " + err.Error()}
+		}
+	}
+	return payload, nil
+}
+
+func commandTimeout(operation string) time.Duration {
+	switch operation {
+	case "trace_capture":
+		return 60 * time.Second
+	case "mem_read":
+		return 30 * time.Second
+	default:
+		return 15 * time.Second
+	}
+}
+
+// errorsAs avoids importing errors just for As at every call site.
+func errorsAs(err error, target **bridge.CommandError) bool {
+	for err != nil {
+		if typed, ok := err.(*bridge.CommandError); ok {
+			*target = typed
+			return true
+		}
+		unwrapper, ok := err.(interface{ Unwrap() error })
+		if !ok {
+			return false
+		}
+		err = unwrapper.Unwrap()
+	}
+	return false
 }
 
 func modernProtocol(params json.RawMessage) (bool, string, error) {
@@ -302,20 +351,20 @@ type invalidParamError string
 
 func (e invalidParamError) Error() string { return string(e) }
 
-func validateModernHeaders(headers http.Header, request request) error {
+func validateModernHeaders(headers http.Header, req request) error {
 	if headers.Get("MCP-Protocol-Version") != ModernProtocolVersion {
 		return invalidParamError("MCP-Protocol-Version does not match request metadata")
 	}
-	if headers.Get("Mcp-Method") != request.Method {
+	if headers.Get("Mcp-Method") != req.Method {
 		return invalidParamError("Mcp-Method does not match request method")
 	}
-	if request.Method != "tools/call" {
+	if req.Method != "tools/call" {
 		return nil
 	}
 	var call struct {
 		Name string `json:"name"`
 	}
-	if err := json.Unmarshal(request.Params, &call); err != nil {
+	if err := json.Unmarshal(req.Params, &call); err != nil {
 		return invalidParamError("invalid tools/call parameters")
 	}
 	name, err := decodeHeaderValue(headers.Get("Mcp-Name"))

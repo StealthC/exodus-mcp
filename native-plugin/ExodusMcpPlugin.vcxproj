@@ -27,6 +27,12 @@
     <ProjectReference Include="..\vendor\exodus\ExodusSDK\Extension\Extension.vcxproj">
       <Project>{8196F896-D9AE-4F6B-9B5A-AF2553EA0B32}</Project><ReferenceOutputAssembly>true</ReferenceOutputAssembly>
     </ProjectReference>
+    <ProjectReference Include="..\vendor\exodus\ExodusSDK\GenericAccess\GenericAccess.vcxproj">
+      <Project>{2F6DD00A-03EB-4FE1-95BE-F1AF9232F302}</Project><ReferenceOutputAssembly>true</ReferenceOutputAssembly>
+    </ProjectReference>
+    <ProjectReference Include="..\vendor\exodus\ExodusSDK\Processor\Processor.vcxproj">
+      <Project>{47967EF3-5853-4BC8-B863-E6674079871B}</Project><ReferenceOutputAssembly>true</ReferenceOutputAssembly>
+    </ProjectReference>
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="ExodusMcpPlugin.cpp" /><ClCompile Include="interface.cpp" />

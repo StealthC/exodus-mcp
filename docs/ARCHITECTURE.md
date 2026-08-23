@@ -82,19 +82,24 @@ The first native plugin must prove only these capabilities:
 3. A read-only request is scheduled safely on the correct emulator thread.
 4. Shutdown disconnects cleanly without blocking Exodus.
 
-## Native spike status
+## Native bridge status
 
-`native-plugin/ExodusMcpPlugin` now implements the extension side of this
-spike. It is a persistent global extension and deliberately starts no network
-listener. When the launcher provides `EXODUS_MCP_PIPE_NAME` and
-`EXODUS_MCP_CAPABILITY`, it listens on that named pipe and authorizes only a
-small `status` request. The reply contains lifecycle information and the count
-of modules observed while the extension initialized.
+`native-plugin/ExodusMcpPlugin` implements bridge wire protocol v2. The plugin
+listens on the capability-gated named pipe and accepts flat key/value requests
+(`capability`, `id`, `method`, plus command parameters). Every response is one
+UTF-8 JSON envelope streamed in bounded chunks, with `status: ok|error`,
+machine-readable error codes, and `consistency: live` metadata.
 
-The Go server now has the named-pipe client used by `bridge_status`. The
-remaining work is a launcher that generates and injects the capability, plus
-the serialized command scheduler. Do not expose emulator data until that
-scheduler dispatches every read safely on the Exodus emulation thread.
+Commands are serialized by construction: a single pipe thread accepts one
+connection at a time, executes the command inline, and polls the stop event so
+shutdown never blocks Exodus. Read-only emulator access uses the same debugger
+paths as the built-in Exodus debug windows (`IMemory::ReadMemoryEntry`,
+`IProcessor::GetMemorySpaceByte`, typed register interfaces, `GetOpcodeInfo`,
+and the trace ring buffer). No memory mutation, frame advance, ROM loading,
+input injection, or scripting is implemented.
 
-No memory mutation, frame advance, ROM loading, or scripting is in scope for
-that spike.
+The Go server owns an artifact store (immutable bytes, SHA-256 descriptors,
+ETag plus byte-range downloads under `/artifacts/{id}`, startup sweeps) and an
+analysis-context registry with an implicit default context. Tools return
+bounded summaries plus artifact descriptors; domain failures use MCP
+`isError: true` results rather than JSON-RPC protocol errors.

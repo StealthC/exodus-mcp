@@ -9,15 +9,16 @@ next phase begins.
 
 **Outcome:** the external Go process can safely ask a loaded Exodus extension
 for a small amount of read-only state.
-
 - `server/discover` and a conformant `tools/list` / `tools/call` shell.
 - [x] Native persistent extension with a capability-gated named-pipe `status`
   response and an initialization-time module snapshot.
 - [x] `bridge_status`: plugin version, bridge connectivity, and initialization
   module count over the authenticated named pipe. Queue state follows with the
   scheduler.
-- `emulator_status`: loaded modules, running/paused state, and target identity.
-- Named-pipe authentication, serialized command queue, cancellation, and clean
+- [x] `emulator_status`: loaded modules, running/paused state, and device
+  identity summary.
+- [x] Named-pipe authentication, serialized command queue (single pipe thread
+  with stop-event responsiveness), deadline-based cancellation, and clean
   shutdown.
 
 ## Phase 1 — First useful analysis server
@@ -25,26 +26,30 @@ for a small amount of read-only state.
 **Outcome:** an agent can identify the running Mega Drive system and inspect
 bounded memory without loading large bytes into its context.
 
-- `context_create`, `context_list`, `context_close`.
-- `target_info`: emulator, ROM, system, module, and timing summary.
-- `memory_spaces_list`: named spaces, processor/device owner, size, address
-  ranges, access permissions, and byte-order metadata.
-- `memory_read`: scalar or bounded byte reads with explicit representation and
-  byte order.
-- `memory_dump`: artifact-first memory range output with hash and direct URL.
-- `artifact_get` and `artifact_preview`: metadata, bounded previews, and range
-  retrieval guidance.
+- [x] `context_create`, `context_list`, `context_close`.
+- [x] `target_info`: emulator, system, module, and device summary. ROM header
+  parsing stays deferred to Phase 5.
+- [x] `memory_spaces_list`: named spaces, processor/device owner, size,
+  entry width, read permissions, and byte-order metadata.
+- [x] `memory_read`: bounded inline reads with explicit representation,
+  effective-address echo, and decode validation against declared byte order.
+- [x] `memory_dump`: artifact-first memory range output with hash and direct
+  URL (8 MiB per-call cap).
+- [x] `artifact_get` and `artifact_preview`: metadata, bounded previews, and
+  range retrieval guidance.
 
 ## Phase 2 — CPU-aware inspection
 
 **Outcome:** an agent can reason about both Mega Drive processors without
 silently mixing their conventions.
 
-- `m68k_registers`, `m68k_disassemble`, `m68k_read_memory`.
-- `z80_registers`, `z80_disassemble`, `z80_read_memory`.
-- `cpu_trace_capture`: bounded capture summarized inline and stored as an
-  artifact.
-- `symbols_set`, `symbols_list`, `symbols_clear`, scoped to an analysis context.
+- [x] `m68k_registers`, `m68k_disassemble`, `m68k_read_memory`.
+- [x] `z80_registers`, `z80_disassemble`, `z80_read_memory`.
+- [x] `cpu_trace_capture`: bounded capture summarized inline and stored as an
+  artifact. Sampling follows live emulation only; a paused system yields few
+  or no entries.
+- [x] `symbols_set`, `symbols_list`, `symbols_clear`, scoped to an analysis
+  context.
 
 ## Phase 3 — VDP and graphics analysis
 
