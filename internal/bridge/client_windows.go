@@ -6,6 +6,8 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
+	"log"
 	"os"
 	"strconv"
 	"syscall"
@@ -21,7 +23,11 @@ const (
 	invalidHandle      = ^uintptr(0)
 	pipeWaitInterval   = 100 * time.Millisecond
 	defaultCommandTTL  = 30 * time.Second
-	maxResponseSize    = 64 << 20
+	// maxResponseSize bounds one bridge envelope in memory. The plugin-side
+	// per-command caps stay well below it: an 8 MiB memory_dump becomes about
+	// 10.7 MiB of base64 inside the JSON envelope, so this limit leaves room
+	// without allowing unbounded allocations from a misbehaving peer.
+	maxResponseSize = 64 << 20
 )
 
 var (
@@ -85,7 +91,7 @@ func (client *namedPipeClient) Execute(ctx context.Context, method string, param
 // followed by exactly that many bytes). Framing removes any dependence on
 // disconnect timing or EOF: the plugin holds the connection until this side
 // closes it, which doubles as its drain-complete signal.
-func readFramedResponse(file *os.File) ([]byte, error) {
+func readFramedResponse(reader io.Reader) ([]byte, error) {
 	const lengthPrefixBytes = 8
 	buffer := make([]byte, 0, 4096)
 	chunk := make([]byte, 64*1024)
@@ -102,7 +108,7 @@ func readFramedResponse(file *os.File) ([]byte, error) {
 				return buffer[lengthPrefixBytes : lengthPrefixBytes+uint64(target)], nil
 			}
 		}
-		read, err := file.Read(chunk)
+		read, err := reader.Read(chunk)
 		if read > 0 {
 			buffer = append(buffer, chunk[:read]...)
 			continue
@@ -129,8 +135,9 @@ func openPipe(ctx context.Context, pipeName string) (*os.File, error) {
 	if err != nil {
 		return nil, fmt.Errorf("invalid pipe name: %w", err)
 	}
+	loggedWaiting := false
 	for {
-		handle, _, callErr := createFileW.Call(
+		handle, _, _ := createFileW.Call(
 			uintptr(unsafe.Pointer(path)),
 			uintptr(genericRead|genericWrite),
 			0,
@@ -145,9 +152,19 @@ func openPipe(ctx context.Context, pipeName string) (*os.File, error) {
 		if ctx.Err() != nil {
 			return nil, ctx.Err()
 		}
-		waitNamedPipeW.Call(uintptr(unsafe.Pointer(path)), uintptr(pipeWaitInterval.Milliseconds()))
-		if callErr != syscall.Errno(0) {
-			continue
+		if !loggedWaiting {
+			log.Printf("bridge pipe %s not ready yet; waiting", pipeName)
+			loggedWaiting = true
+		}
+		// WaitNamedPipeW returns zero when the pipe does not exist (the
+		// plugin has not created it yet); sleep instead of hot-spinning.
+		result, _, _ := waitNamedPipeW.Call(uintptr(unsafe.Pointer(path)), uintptr(pipeWaitInterval.Milliseconds()))
+		if result == 0 {
+			select {
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			case <-time.After(pipeWaitInterval):
+			}
 		}
 	}
 }
