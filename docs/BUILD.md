@@ -59,6 +59,21 @@ Start with `Debug | x64`. Use `Release | x64` after debug succeeds. Use
 
 ## WSL driving Windows MSBuild
 
+The automated path is the repository wrapper; it builds `Exodus.sln` in the
+submodule and copies the generated `vendor/exodus/Exodus.exe` into the test
+install configured by `.env`, under that install's emulator file name:
+
+```bash
+./scripts/build-fork.sh               # Debug x64
+./scripts/build-fork.sh --config Release
+```
+
+Close the running emulator first: Windows locks the exe image while the
+process is alive. A Release build additionally requires the fork's Release
+third-party libraries (`ThirdPartyLibraries.sln`).
+
+The equivalent manual commands are:
+
 ```bash
 MSBUILD='/mnt/c/Program Files/Microsoft Visual Studio/18/Community/MSBuild/Current/Bin/MSBuild.exe'
 cd /mnt/f/projects/kid/emulators/Exodus/vendor/exodus

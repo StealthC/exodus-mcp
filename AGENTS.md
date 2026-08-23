@@ -62,7 +62,10 @@ Guidance for contributors and coding agents working in this workspace.
 
 - Under WSL, use `./scripts/build-windows.sh` and
   `./scripts/run-windows.sh` to build and launch the Windows pair. Do not run
-  `exodus-mcp.exe` or Exodus directly from the Linux shell.
+  `exodus-mcp.exe` or Exodus directly from the Linux shell. For fork-side
+  experiments, `./scripts/build-fork.sh` rebuilds the submodule's emulator
+  and installs the exe into the configured test install; close the running
+  emulator first (Windows locks the exe image).
 - Configuration lives in `.env` (copy from `.env.example`; required:
   `EXODUS_MCP_EXODUS_DIR`). Precedence is flag > environment > `.env` >
   default everywhere. The wrappers publish `EXODUS_MCP_*` variables to

@@ -9,6 +9,13 @@ and this project will use [Semantic Versioning](https://semver.org/spec/v2.0.0.h
 
 ### Added
 
+- `scripts/build-fork.sh`: builds the vendored Exodus emulator
+  (`vendor/exodus/Exodus.sln`, Debug or Release x64) and installs the
+  generated exe into the configured test install
+  (`EXODUS_MCP_EXODUS_DIR`), under that install's emulator file name
+  (`EXODUS_MCP_EXODUS_EXE`). This is the supported path for testing fork-side
+  modifications; close the running emulator first because Windows locks the
+  exe image.
 - `scripts/live-smoke.sh`: a curl/python3 driver that validates a running
   pair through the MCP endpoint. Default checks are read-only (health,
   discovery, tool catalog, bridge and emulator status); `--full` adds

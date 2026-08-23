@@ -17,6 +17,9 @@ go run ./cmd/exodus-mcp
 ./scripts/test.sh --windows-live   # also runs the named-pipe integration
                                    # suite against a real Windows pipe via
                                    # WSL interop
+./scripts/build-fork.sh            # builds vendored Exodus and installs the
+                                   # generated exe into the configured test
+                                   # install (close the emulator first)
 ```
 
 After launching the pair (`./scripts/run-windows.sh`), validate it without
