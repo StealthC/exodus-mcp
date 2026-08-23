@@ -63,6 +63,11 @@ Guidance for contributors and coding agents working in this workspace.
 - Under WSL, use `./scripts/build-windows.sh` and
   `./scripts/run-windows.sh` to build and launch the Windows pair. Do not run
   `exodus-mcp.exe` or Exodus directly from the Linux shell.
+- Configuration lives in `.env` (copy from `.env.example`; required:
+  `EXODUS_MCP_EXODUS_DIR`). Precedence is flag > environment > `.env` >
+  default everywhere. The wrappers publish `EXODUS_MCP_*` variables to
+  Windows processes via `WSLENV`; without that plumbing Windows children
+  silently never see WSL-side overrides.
 - The launcher reserves `127.0.0.1:8767` before it starts Exodus and
   terminates its child when the MCP server exits. This is the supported agent
   path to restart and test the MCP pair after explicit user approval.
@@ -70,6 +75,8 @@ Guidance for contributors and coding agents working in this workspace.
   child is paired with one generated capability. Check `bridge_status` before
   launching; never start a second pair. For a code or plugin change, obtain
   the user's approval before using the wrapper to restart and test the pair.
+- `./scripts/test.sh --windows-live` runs the named-pipe integration suite
+  against a real Windows pipe through interop; it does not start Exodus.
 - The harness caches the MCP tool catalog per session. Even after the agent
   rebuilds, reinstalls the plugin, restarts Exodus and the launcher, newly
   added or changed tools stay invisible or stale inside the running harness

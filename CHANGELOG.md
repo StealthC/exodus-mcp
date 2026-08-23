@@ -9,6 +9,11 @@ and this project will use [Semantic Versioning](https://semver.org/spec/v2.0.0.h
 
 ### Added
 
+- `scripts/live-smoke.sh`: a curl/python3 driver that validates a running
+  pair through the MCP endpoint. Default checks are read-only (health,
+  discovery, tool catalog, bridge and emulator status); `--full` adds
+  pause/run, M68K step, breakpoint and watchpoint lifecycle, and paused
+  frame-capture determinism, restoring running state afterwards.
 - Consolidated build/run/launch tooling under `scripts/`. The WSL wrappers
   keep their names (`scripts/build-windows.sh`, `scripts/run-windows.sh`);
   the Windows batch entry points moved to `scripts/internal/` and the root

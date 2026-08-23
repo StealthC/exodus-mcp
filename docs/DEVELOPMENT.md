@@ -9,9 +9,24 @@
 ## Commands
 
 ```bash
-gofmt -w cmd
-go test ./...
+gofmt -w cmd internal
+go test -race ./...
 go run ./cmd/exodus-mcp
+./scripts/test.sh                  # all local gates: format, vet, tests,
+                                   # GOOS=windows build/vet
+./scripts/test.sh --windows-live   # also runs the named-pipe integration
+                                   # suite against a real Windows pipe via
+                                   # WSL interop
+```
+
+After launching the pair (`./scripts/run-windows.sh`), validate it without
+touching emulator state:
+
+```bash
+./scripts/live-smoke.sh            # read-only protocol/tool checks
+./scripts/live-smoke.sh --full     # adds pause/step/breakpoint/watchpoint/
+                                   # frame-determinism checks and restores
+                                   # running state afterwards
 ```
 
 The current binary exposes `GET /healthz` and `POST /mcp`. The MCP endpoint
@@ -53,12 +68,16 @@ Run the Windows build and launcher from WSL with the repository wrappers:
 
 ```bash
 ./scripts/build-windows.sh
-EXODUS_MCP_EXODUS_DIR='F:\projects\kid\emulators\Exodus_2.1' ./scripts/run-windows.sh
+./scripts/run-windows.sh
 ```
 
-`EXODUS_MCP_EXODUS_DIR` must be a Windows path because `build.bat` and
-`run.bat` run through `cmd.exe`. Extra launcher arguments can be forwarded,
-for example `./scripts/run-windows.sh --listen 127.0.0.1:9000`.
+Both wrappers read configuration from the environment and `.env` (copy
+`.env.example`), with one precedence chain everywhere: explicit flag >
+environment variable > `.env` > built-in default. The required value is
+`EXODUS_MCP_EXODUS_DIR`, a Windows path to the Exodus install; set
+`EXODUS_MCP_EXODUS_EXE` when the emulator binary is not `Exodus.exe`. Extra
+launcher arguments are forwarded, for example
+`./scripts/run-windows.sh --listen 127.0.0.1:9000`.
 
 ## ROM Loading
 
@@ -91,8 +110,12 @@ devices that own them are destroyed with the loaded module.
 
 Before every commit:
 
-1. Run `gofmt -w` on changed Go files.
-2. Run `go test ./...`.
+1. Run `./scripts/test.sh` (format check, vet, race-enabled tests, and
+   `GOOS=windows` build/vet gates mirroring CI). Use `gofmt -w` on changed
+   Go files it reports.
+2. For changes to `internal/bridge`, also run
+   `./scripts/test.sh --windows-live` so the named-pipe integration suite
+   executes against a real pipe.
 3. Update `CHANGELOG.md` under `Unreleased` when behavior, compatibility,
    security, or user-visible functionality changes.
 4. Update the relevant document when changing build, protocol, architecture,
