@@ -51,7 +51,6 @@ and this project will use [Semantic Versioning](https://semver.org/spec/v2.0.0.h
   reproducible emulator crash triggered by `cpu_trace_capture`, including the
   trace machinery audit, eliminated causes, ranked hypotheses, and the
   recommended file-based capture route.
-
 - `rom_load` for replacing the Mega Drive cartridge with a Windows-visible ROM
   path during local test automation.
 - WSL wrappers for driving the Windows build and launcher.
@@ -59,6 +58,13 @@ and this project will use [Semantic Versioning](https://semver.org/spec/v2.0.0.h
   step-over/out, plus MCP-managed exact-address execution breakpoints.
 - Live validation of pause, M68K/Z80 single-instruction steps, and the
   MCP-managed breakpoint lifecycle against Kid Chameleon.
+- Roadmap expansion informed by a review of the independent
+  `sadnescity/exodus-mcp-extension` project: decoded `vdp_sprite_table` and
+  nametable views, `vdp_pixel_info` per-pixel rendering attribution,
+  MCP-managed watchpoints moved up to Phase 4, snapshot-based
+  `memory_search`, and flexible address argument formats, with deliberately
+  rejected alternatives recorded in the roadmap for traceability.
+
 ### Changed
 
 - Tool responses now use MCP `structuredContent` plus a compact JSON text

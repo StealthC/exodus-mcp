@@ -61,7 +61,17 @@ not manually decode opaque dumps in its prompt.
 - `vdp_memory_read`: VRAM, CRAM, and VSRAM with raw and decoded modes.
 - `vdp_plane_export`, `vdp_tile_export`, `vdp_palette_export`: image/JSON
   artifacts plus concise structural summaries.
+- `vdp_sprite_table`: link-chain-aware decoded sprite attribute table with
+  bounded paging.
 - `frame_capture`: screenshot artifact with frame/timing metadata.
+- `vdp_pixel_info`: per-pixel rendering attribution (source layer, tile
+  mapping, palette entry, shadow/highlight result) from the VDP full image
+  buffer, with lazy enable and an explicit retry-after-one-frame contract.
+- Native access paths already proven to work against Exodus for this phase:
+  typed `IS315_5313` register, palette, and sprite accessors;
+  `ITimedBufferInt::ReadLatest` for VRAM, CRAM, and VSRAM; and
+  `IDevice::GetScreenshot` plus PNG encoding for frame capture. See
+  [Adopted external input](#adopted-external-input).
 
 ## Phase 4 — Controlled experimentation
 
@@ -75,18 +85,38 @@ not manually decode opaque dumps in its prompt.
   execution breakpoints. Pause, M68K/Z80 step, and the breakpoint lifecycle
   are validated live against Kid Chameleon. These are more useful for ROM
   analysis than the unsafe trace path.
+- MCP-managed read/write watchpoints with range conditions, owned and listed
+  like the existing execution breakpoints.
 - Explicit context lease tools for mutation.
 - `state_save`, `state_load`, `state_list` using context-scoped snapshots.
 - `frame_advance`, `input_set`, and bounded scripted fixtures.
-- `memory_write` and optional freeze/watch facilities, all with audit metadata.
+- `memory_write` and optional value-freeze facilities, all with audit metadata.
+  Watchpoint capture belongs to the dedicated watchpoint item above.
 
 ## Phase 5 — Advanced analysis
 
 - Code/data logging and coverage artifacts.
-- Breakpoints, watchpoints, and event-driven trace capture.
+- `memory_search`: byte-pattern search over a consistent dump-artifact
+  snapshot instead of a live racy scan; bounded inline matches plus a
+  full-results artifact.
+- Event-driven trace capture triggered by watchpoints after the trace crash
+  is fixed.
 - ROM/header parsing, checksums, mapping, and cartridge metadata.
 - Optional external scripting with strict allowlists and artifact-first output.
 - Multi-instance orchestration for real parallel experiments.
+
+## Adopted external input
+
+A review of the independent in-process `sadnescity/exodus-mcp-extension`
+project (August 2026) produced the following adoptions, now recorded as
+first-class roadmap items above: the decoded sprite-table view,
+`vdp_pixel_info` rendering attribution, MCP-managed watchpoints pulled
+forward from Phase 5 into Phase 4, snapshot-based `memory_search`,
+and flexible address argument formats. Deliberately rejected: an HTTP
+listener inside the emulator process, unauthenticated transport, floating
+upstream CI references, and lease-free mutation tools such as free-form
+memory writes. Its source also validates the native access paths noted in
+Phase 3.
 
 ## Tool design rules
 
@@ -94,6 +124,9 @@ not manually decode opaque dumps in its prompt.
   order, or state why byte order is not applicable.
 - Every raw range must state address space, start address, byte length, and the
   interpretation used for any decoded values.
+- Address arguments accept `$`-prefixed Motorola hex, `0x` hex, Zilog `h`
+  suffix, and decimal integers; every response echoes the canonical parsed
+  address.
 - Default responses are summaries; large output is an artifact. Inline raw
   output requires an explicit small limit.
 - Mutating tools require an exclusive analysis-context lease and return enough
