@@ -60,8 +60,8 @@ Guidance for contributors and coding agents working in this workspace.
 
 ## WSL environment
 
-- Under WSL, use `./scripts/build-windows.sh` and
-  `./scripts/run-windows.sh` to build and launch the Windows pair. Do not run
+- Under WSL, use `./scripts/build-windows.sh` to build the pair (native
+  plugin + Go server) and `./scripts/run-windows.sh` to launch it. Do not run
   `exodus-mcp.exe` or Exodus directly from the Linux shell. For fork-side
   experiments, `./scripts/build-fork.sh` rebuilds the submodule's emulator
   and installs the exe into the configured test install; close the running
@@ -71,23 +71,35 @@ Guidance for contributors and coding agents working in this workspace.
   default everywhere. The wrappers publish `EXODUS_MCP_*` variables to
   Windows processes via `WSLENV`; without that plumbing Windows children
   silently never see WSL-side overrides.
-- The launcher reserves `127.0.0.1:8767` before it starts Exodus and
-  terminates its child when the MCP server exits. This is the supported agent
-  path to restart and test the MCP pair after explicit user approval.
-- Only one `exodus-mcp` instance can bind `127.0.0.1:8767`, and each Exodus
-  child is paired with one generated capability. Check `bridge_status` before
-  launching; never start a second pair. For a code or plugin change, obtain
-  the user's approval before using the wrapper to restart and test the pair.
+- Starting, stopping, and restarting the pair is routine agent work and does
+  not need per-restart user approval. The supported lifecycle is:
+  - Check first whether a pair is already running (`tasklist.exe` for
+    `Exodus.nightly.exe` and `exodus-mcp.exe`, plus port `127.0.0.1:8767`).
+    Never start a second instance: only one process can bind the port, and
+    each Exodus child pairs with one generated capability.
+  - Stop a running pair before installing a new build
+    (`taskkill /F /IM Exodus.nightly.exe /IM exodus-mcp.exe`): Windows locks
+    loaded images, so the plugin DLL cannot be copied while Exodus runs, and
+    a stale pair keeps serving old code.
+  - Launch `run-windows.sh` in the background, then wait for
+    `http://127.0.0.1:8767/healthz` before issuing calls. The launcher
+    reserves the port before starting Exodus and terminates its child when
+    the MCP server exits; its log reports child exit codes such as
+    `0xc0000005`.
+  - Load test ROMs through `rom_load` instead of asking for manual UI steps.
+- Validation does not require the harness MCP connection: `live-smoke.sh`
+  and raw HTTP calls against `http://127.0.0.1:8767/mcp` exercise every tool
+  without the cached catalog. Prefer this path for build/test loops so a
+  stale harness catalog never blocks verification.
+- The harness caches the MCP tool catalog per session. Newly added or changed
+  tools stay invisible or stale inside the running harness session even after
+  a successful rebuild, reinstall, and pair restart. Whenever the work needs
+  fresh harness MCP context — new tools, changed schemas, or first use — ask
+  the user to reload the connection (`/mcp`, then disable and re-enable the
+  `exodus` server) and wait for their confirmation before calling those tools
+  through the harness or subagents; keep validating over raw HTTP meanwhile.
 - `./scripts/test.sh --windows-live` runs the named-pipe integration suite
   against a real Windows pipe through interop; it does not start Exodus.
-- The harness caches the MCP tool catalog per session. Even after the agent
-  rebuilds, reinstalls the plugin, restarts Exodus and the launcher, newly
-  added or changed tools stay invisible or stale inside the running harness
-  session until the user reloads the MCP connection (for example in OpenCode:
-  `/mcp`, then disable and re-enable the `exodus` server). After every plugin
-  or server change that alters the tool surface, always ask the user to reload
-  the MCP and wait for their confirmation before testing new tools directly or
-  through subagents.
 
 ## Git and upstream discipline
 
