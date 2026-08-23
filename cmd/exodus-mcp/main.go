@@ -35,13 +35,13 @@ func (values *stringList) Set(value string) error {
 }
 
 func main() {
-	listen := flag.String("listen", "127.0.0.1:8767", "local address for the MCP HTTP endpoint")
+	listen := flag.String("listen", envOrDefault("EXODUS_MCP_LISTEN", "127.0.0.1:8767"), "local address for the MCP HTTP endpoint")
 	pipeName := flag.String("pipe-name", os.Getenv("EXODUS_MCP_PIPE_NAME"), "Windows named pipe used by ExodusMcpPlugin")
 	pipeCapability := flag.String("pipe-capability", os.Getenv("EXODUS_MCP_CAPABILITY"), "capability for the Windows named pipe")
 	exodusExecutable := flag.String("exodus", "", "launch Exodus with a generated bridge pipe and capability")
 	defaultArtifactDir := filepath.Join(os.TempDir(), "exodus-mcp", "artifacts")
-	artifactDir := flag.String("artifacts", defaultArtifactDir, "directory for immutable tool artifacts")
-	baseURL := flag.String("base-url", fmt.Sprintf("http://127.0.0.1:%s", portOf(*listen)), "external base URL advertised in artifact links")
+	artifactDir := flag.String("artifacts", envOrDefault("EXODUS_MCP_ARTIFACTS", defaultArtifactDir), "directory for immutable tool artifacts")
+	baseURL := flag.String("base-url", "", "external base URL advertised in artifact links; defaults to the listen address's loopback port")
 	var exodusArguments stringList
 	flag.Var(&exodusArguments, "exodus-arg", "argument passed to Exodus; repeat for multiple arguments")
 	showVersion := flag.Bool("version", false, "print version and exit")
@@ -51,6 +51,7 @@ func main() {
 		fmt.Fprintln(os.Stdout, version)
 		return
 	}
+	*baseURL = resolveBaseURL(*listen, *baseURL)
 	store, err := artifact.NewStore(*artifactDir)
 	if err != nil {
 		log.Fatal(err)
@@ -104,6 +105,25 @@ func portOf(address string) string {
 		return "8767"
 	}
 	return port
+}
+
+// resolveBaseURL derives the artifact-link base from the final listen address
+// unless an explicit base URL was supplied. It must run after flag.Parse so
+// the advertised port always matches the bound one.
+func resolveBaseURL(listenAddress, explicit string) string {
+	if explicit != "" {
+		return strings.TrimRight(explicit, "/")
+	}
+	return fmt.Sprintf("http://127.0.0.1:%s", portOf(listenAddress))
+}
+
+// envOrDefault resolves launch configuration from the process environment so
+// wrapper scripts can supply .env values; explicit flags still win.
+func envOrDefault(key, fallback string) string {
+	if value := os.Getenv(key); value != "" {
+		return value
+	}
+	return fallback
 }
 
 func waitForProcess(wait func() error) <-chan error {
