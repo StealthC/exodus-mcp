@@ -87,6 +87,9 @@ Guidance for contributors and coding agents working in this workspace.
     the MCP server exits; its log reports child exit codes such as
     `0xc0000005`.
   - Load test ROMs through `rom_load` instead of asking for manual UI steps.
+- Download artifacts and write scratch files into the workspace `tmp/`
+  directory (`<repo>/tmp`), not the system temp path; the user inspects that
+  directory visually. It is gitignored, so leftovers never reach commits.
 - Validation does not require the harness MCP connection: `live-smoke.sh`
   and raw HTTP calls against `http://127.0.0.1:8767/mcp` exercise every tool
   without the cached catalog. Prefer this path for build/test loops so a
