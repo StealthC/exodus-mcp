@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"image"
+	"image/color"
 	"image/png"
 	"strconv"
 
@@ -33,6 +34,22 @@ func vdpToolSpecs() []toolSpec {
 			run: runVDPMemoryRead,
 		},
 		{
+			name:        "vdp_sprite_table",
+			description: "Decode the VDP sprite attribute table from VRAM: positions, size, tile mapping, palette, priority, and link-chain order with cycle detection. Bounded paging over at most 80 entries.",
+			schema: objectSchema(map[string]any{
+				"offset":  integerProperty("First sprite index to return (default 0, max 79).", 0),
+				"count":   integerProperty(fmt.Sprintf("Entry count between 1 and %d (default %d). The link chain always covers the whole table.", vdpSpriteTableMaxEntries, defaultVDPSpritePage), 0),
+				"context": contextProperty(),
+			}, nil),
+			run: runVDPSpriteTable,
+		},
+		{
+			name:        "vdp_palette_export",
+			description: "Export CRAM as four 16-color palette lines: a PNG swatch artifact, a JSON decode artifact, and a compact structural summary.",
+			schema:      objectSchema(map[string]any{"context": contextProperty()}, nil),
+			run:         runVDPPaletteExport,
+		},
+		{
 			name:        "frame_capture",
 			description: "Capture the current rendered VDP frame as a PNG image artifact.",
 			schema:      objectSchema(map[string]any{"context": contextProperty()}, nil),
@@ -52,6 +69,11 @@ func runVdpStatus(tc toolContext, _ json.RawMessage) map[string]any {
 // defaultVDPMemoryReadLen keeps casual register-adjacent peeks small while
 // still covering a full CRAM or a meaningful VSRAM window in one call.
 const defaultVDPMemoryReadLen = 128
+
+// vdpSpriteTableMaxEntries is the hardware maximum across H32 (64) and H40
+// (80) modes; link fields may address up to 127 but entries beyond this bound
+// are not part of any real sprite table.
+const vdpSpriteTableMaxEntries = 80
 
 type vdpMemoryReadArgs struct {
 	Target         string `json:"target"`
@@ -290,4 +312,330 @@ func rgb24ToNRGBA(raw []byte, width, height int) (*image.NRGBA, error) {
 		}
 	}
 	return frame, nil
+}
+
+const defaultVDPSpritePage = 16
+
+type vdpSpriteTableArgs struct {
+	Offset  uint64 `json:"offset"`
+	Count   uint64 `json:"count"`
+	Context string `json:"context"`
+}
+
+type spriteEntry struct {
+	Index       int  `json:"index"`
+	YRaw        int  `json:"y_raw"`
+	ScreenY     int  `json:"screen_y"`
+	WidthCells  int  `json:"width_cells"`
+	HeightCells int  `json:"height_cells"`
+	Link        int  `json:"link"`
+	Tile        int  `json:"tile"`
+	HFlip       bool `json:"hflip"`
+	VFlip       bool `json:"vflip"`
+	Palette     int  `json:"palette"`
+	Priority    bool `json:"priority"`
+	XRaw        int  `json:"x_raw"`
+	ScreenX     int  `json:"screen_x"`
+}
+
+// fetchVDPBytes reads raw bytes through the plugin timed-buffer path.
+func fetchVDPBytes(tc toolContext, target string, address uint64, length uint64) ([]byte, *toolFailure) {
+	payload, failure := tc.server.executeCommand(tc.ctx, "vdp_mem_read", map[string]string{
+		"target":  target,
+		"address": strconv.FormatUint(address, 10),
+		"length":  strconv.FormatUint(length, 10),
+	})
+	if failure != nil {
+		return nil, failure
+	}
+	rawDataBase64, _ := payload["data"].(string)
+	raw, err := base64.StdEncoding.DecodeString(rawDataBase64)
+	if err != nil {
+		return nil, &toolFailure{Code: "bridge_error", Message: "decode base64 vdp payload: " + err.Error()}
+	}
+	return raw, nil
+}
+
+// fetchVRAMSize resolves the active VRAM byte size from the status payload so
+// sprite-table reads can clamp against extended VRAM configurations.
+func fetchVRAMSize(status map[string]any) uint64 {
+	const standard = uint64(65536)
+	const extended = uint64(131072)
+	size := standard
+	if decoded, ok := status["decoded"].(map[string]any); ok {
+		if extendedFlag, ok := decoded["extended_vram"].(bool); ok && extendedFlag {
+			size = extended
+		}
+	}
+	return size
+}
+
+func runVDPSpriteTable(tc toolContext, args json.RawMessage) map[string]any {
+	parsed, failure := decodeArgs[vdpSpriteTableArgs](args)
+	if failure != nil {
+		return failureResult(failure, tc.modern)
+	}
+	if _, failure = resolveContext(tc.server, parsed.Context); failure != nil {
+		return failureResult(failure, tc.modern)
+	}
+	offset := parsed.Offset
+	count := parsed.Count
+	if count == 0 {
+		count = defaultVDPSpritePage
+	}
+	if offset >= vdpSpriteTableMaxEntries || count > vdpSpriteTableMaxEntries || offset+count > vdpSpriteTableMaxEntries {
+		return failureResult(&toolFailure{
+			Code:    "invalid_params",
+			Message: fmt.Sprintf("sprite paging must satisfy offset+count <= %d.", vdpSpriteTableMaxEntries),
+			Data:    map[string]any{"max_entries": vdpSpriteTableMaxEntries},
+		}, tc.modern)
+	}
+
+	statusPayload, failure := tc.server.executeCommand(tc.ctx, "vdp_status", nil)
+	if failure != nil {
+		return failureResult(failure, tc.modern)
+	}
+	baseValue, _ := statusPayload["decoded"].(map[string]any)["name_table_base_sprite"].(float64)
+	base := uint64(baseValue)
+	vramSize := fetchVRAMSize(statusPayload)
+
+	// Fetch the whole table so the link chain is always globally accurate;
+	// only the returned window honors the paging arguments.
+	fetchCount := vdpSpriteTableMaxEntries
+	if remaining := (vramSize - base) / 8; remaining < uint64(fetchCount) {
+		fetchCount = int(remaining)
+	}
+	raw, failure := fetchVDPBytes(tc, "vram", base, uint64(fetchCount)*8)
+	if failure != nil {
+		return failureResult(failure, tc.modern)
+	}
+	all := parseSpriteEntries(raw)
+
+	windowEnd := int(offset + count)
+	if windowEnd > len(all) {
+		windowEnd = len(all)
+	}
+	window := all[offset:windowEnd]
+	chain := walkLinkChain(all, vdpSpriteTableMaxEntries)
+
+	value := map[string]any{
+		"address_space":       "315-5313 VRAM",
+		"sprite_table_base":   base,
+		"byte_order":          "big-endian",
+		"consistency":         "live",
+		"entries":             window,
+		"returned_entries":    len(window),
+		"table_entries_valid": len(all),
+		"paging":              map[string]any{"offset": offset, "count": len(window)},
+		"chain":               chain,
+		"layout_note":         "8 bytes per entry; X/Y are 9-bit offsets minus 128; link occupies bits 8-14 of word 1; chain starts at sprite 0 and ends when a link returns 0.",
+	}
+	return okResult(value, tc.modern)
+}
+
+func parseSpriteEntries(raw []byte) []spriteEntry {
+	count := len(raw) / 8
+	entries := make([]spriteEntry, 0, count)
+	for index := 0; index < count; index++ {
+		w0 := int(raw[index*8])<<8 | int(raw[index*8+1])
+		w1 := int(raw[index*8+2])<<8 | int(raw[index*8+3])
+		w2 := int(raw[index*8+4])<<8 | int(raw[index*8+5])
+		w3 := int(raw[index*8+6])<<8 | int(raw[index*8+7])
+		yRaw := w0 & 0x1FF
+		xRaw := w3 & 0x1FF
+		entries = append(entries, spriteEntry{
+			Index:       index,
+			YRaw:        yRaw,
+			ScreenY:     yRaw - 128,
+			WidthCells:  (w1 & 0x3) + 1,
+			HeightCells: ((w1 >> 2) & 0x3) + 1,
+			Link:        (w1 >> 8) & 0x7F,
+			Tile:        w2 & 0x7FF,
+			HFlip:       (w2>>11)&1 != 0,
+			VFlip:       (w2>>12)&1 != 0,
+			Palette:     (w2 >> 13) & 0x3,
+			Priority:    (w2>>15)&1 != 0,
+			XRaw:        xRaw,
+			ScreenX:     xRaw - 128,
+		})
+	}
+	return entries
+}
+
+// walkLinkChain follows the hardware display order starting at sprite 0. The
+// chain ends when a link field returns to 0 after at least one hop or repeats.
+func walkLinkChain(entries []spriteEntry, tableMax int) map[string]any {
+	order := make([]int, 0, len(entries))
+	visited := map[int]bool{}
+	dangling := []int{}
+	cycleDetected := false
+	terminatedByZero := false
+	incomplete := false
+	current := 0
+	steps := 0
+	for steps <= len(entries) {
+		if current >= len(entries) {
+			incomplete = true
+			break
+		}
+		if visited[current] {
+			cycleDetected = true
+			break
+		}
+		visited[current] = true
+		order = append(order, current)
+		link := entries[current].Link
+		if link == 0 {
+			terminatedByZero = true
+			break
+		}
+		if int(link) >= tableMax {
+			dangling = append(dangling, int(link))
+			break
+		}
+		current = int(link)
+		steps++
+	}
+	return map[string]any{
+		"order":              order,
+		"length":             len(order),
+		"terminated_by_zero": terminatedByZero,
+		"cycle_detected":     cycleDetected,
+		"dangling_links":     dangling,
+		"incomplete":         incomplete,
+	}
+}
+
+type vdpPaletteExportArgs struct {
+	Context string `json:"context"`
+}
+
+func runVDPPaletteExport(tc toolContext, args json.RawMessage) map[string]any {
+	parsed, failure := decodeArgs[vdpPaletteExportArgs](args)
+	if failure != nil {
+		return failureResult(failure, tc.modern)
+	}
+	context, failure := resolveContext(tc.server, parsed.Context)
+	if failure != nil {
+		return failureResult(failure, tc.modern)
+	}
+	raw, failure := fetchVDPBytes(tc, "cram", 0, 128)
+	if failure != nil {
+		return failureResult(failure, tc.modern)
+	}
+	decoded := cramRGB333Entries(raw)
+	if len(decoded) != 64 {
+		return failureResult(&toolFailure{
+			Code:    "bridge_error",
+			Message: fmt.Sprintf("CRAM payload decoded to %d entries instead of 64.", len(decoded)),
+		}, tc.modern)
+	}
+
+	paletteImg := renderPalettePNG(decoded)
+	var pngBuffer bytes.Buffer
+	if err := png.Encode(&pngBuffer, paletteImg); err != nil {
+		return failureResult(&toolFailure{Code: "artifact_error", Message: "encode PNG: " + err.Error()}, tc.modern)
+	}
+	pngStored, err := tc.server.store.Put(context.ID, "vdp-palette", "image/png", pngBuffer.Bytes())
+	if err != nil {
+		return failureResult(&toolFailure{Code: "artifact_error", Message: err.Error()}, tc.modern)
+	}
+
+	jsonDocument := buildPaletteJSON(decoded)
+	jsonStored, err := tc.server.store.Put(context.ID, "vdp-palette-json", "application/json", jsonDocument)
+	if err != nil {
+		return failureResult(&toolFailure{Code: "artifact_error", Message: err.Error()}, tc.modern)
+	}
+
+	linesNonZero := make([]int, 4)
+	for _, entry := range decoded {
+		if entry["word"].(int) != 0 {
+			linesNonZero[entry["index"].(int)/16]++
+		}
+	}
+	return okResult(map[string]any{
+		"summary": map[string]any{
+			"kind":             "vdp-palette",
+			"line_count":       4,
+			"colors_per_line":  16,
+			"nonzero_per_line": linesNonZero,
+			"backdrop_color":   decoded[0]["color_hex"],
+			"color_format":     "9-bit RGB expanded to 8-bit",
+			"byte_order":       "big-endian",
+			"consistency":      "live",
+			"png_size_bytes":   pngBuffer.Len(),
+			"png_sha256":       pngStored.SHA256,
+			"json_size_bytes":  len(jsonDocument),
+			"json_sha256":      jsonStored.SHA256,
+		},
+		"artifacts": []map[string]any{
+			artifactDescriptor(tc.server, pngStored, context.ID),
+			artifactDescriptor(tc.server, jsonStored, context.ID),
+		},
+	}, tc.modern)
+}
+
+func renderPalettePNG(entries []map[string]any) image.Image {
+	const swatch = 24
+	const border = 1
+	width := 16*(swatch+border) + border
+	height := 4*(swatch+border) + border
+	img := image.NewNRGBA(image.Rect(0, 0, width, height))
+	grid := color.RGBA{R: 0x20, G: 0x20, B: 0x20, A: 0xFF}
+	for y := 0; y < height; y++ {
+		for x := 0; x < width; x++ {
+			img.Set(x, y, grid)
+		}
+	}
+	for _, entry := range entries {
+		index := entry["index"].(int)
+		line := index / 16
+		column := index % 16
+		r := uint8(entry["r"].(int))
+		g := uint8(entry["g"].(int))
+		b := uint8(entry["b"].(int))
+		fill := color.RGBA{R: r, G: g, B: b, A: 0xFF}
+		x0 := border + column*(swatch+border)
+		y0 := border + line*(swatch+border)
+		for y := 0; y < swatch; y++ {
+			for x := 0; x < swatch; x++ {
+				img.Set(x0+x, y0+y, fill)
+			}
+		}
+	}
+	return img
+}
+
+func buildPaletteJSON(entries []map[string]any) []byte {
+	type colorEntry struct {
+		Index     int    `json:"index"`
+		Word      int    `json:"word"`
+		RGB333    [3]int `json:"rgb333_r_g_b"`
+		RGB888Hex string `json:"rgb888_hex"`
+	}
+	document := struct {
+		Kind        string           `json:"kind"`
+		ColorFormat string           `json:"color_format"`
+		ByteOrder   string           `json:"byte_order"`
+		Lines       [][16]colorEntry `json:"lines"`
+	}{}
+	document.Kind = "vdp-palette"
+	document.ColorFormat = "9-bit RGB expanded to 8-bit"
+	document.ByteOrder = "big-endian"
+	for line := 0; line < 4; line++ {
+		var row [16]colorEntry
+		for column := 0; column < 16; column++ {
+			source := entries[line*16+column]
+			nineBit := source["nine_bit"].([3]int)
+			row[column] = colorEntry{
+				Index:     source["index"].(int),
+				Word:      source["word"].(int),
+				RGB333:    nineBit,
+				RGB888Hex: source["color_hex"].(string),
+			}
+		}
+		document.Lines = append(document.Lines, row)
+	}
+	data, _ := json.MarshalIndent(document, "", "  ")
+	return data
 }

@@ -212,6 +212,18 @@ if [ "$FULL" = 1 ]; then
 	check "vsram range is enforced" \
 		"[ \"\$(json_get \"\$oob\" \"parsed.get('code', '')\" 2>/dev/null)\" = 'out_of_range' ]"
 
+	sprites=$(tool_call "vdp_sprite_table" '{"offset": 0, "count": 4}')
+	sprite_count=$(json_get "$sprites" "len(parsed.get('entries', []))" 2>/dev/null)
+	check "sprite table decodes paged entries" "[ \"\$sprite_count\" = '4' ]"
+	chain_len=$(json_get "$sprites" "len(parsed.get('chain', {}).get('order', []))" 2>/dev/null)
+	check "sprite link chain walks" "[ -n \"\$chain_len\" ] && [ \"\$chain_len\" -ge 1 ]"
+
+	palette=$(tool_call "vdp_palette_export")
+	line_count=$(json_get "$palette" "parsed.get('summary', {}).get('line_count')" 2>/dev/null)
+	check "palette export yields four lines" "[ \"\$line_count\" = '4' ]"
+	artifact_count=$(json_get "$palette" "len(parsed.get('artifacts', []))" 2>/dev/null)
+	check "palette export attaches png and json artifacts" "[ \"\$artifact_count\" = '2' ]"
+
 	if [ "$was_running" = "True" ] || [ "$was_running" = "true" ]; then
 		tool_call "cpu_run" >/dev/null
 		emu_after=$(tool_call "emulator_status")

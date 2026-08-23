@@ -99,10 +99,17 @@ not manually decode opaque dumps in its prompt.
   against the live frame, name-table reads at the register-reported bases,
   range/alignment/target error codes, and smoke coverage of the
   cross-check.
-- `vdp_plane_export`, `vdp_tile_export`, `vdp_palette_export`: image/JSON
-  artifacts plus concise structural summaries.
-- `vdp_sprite_table`: link-chain-aware decoded sprite attribute table with
-  bounded paging.
+- `vdp_plane_export`, `vdp_tile_export`: image/JSON artifacts plus concise
+  structural summaries.
+- [x] `vdp_palette_export`: CRAM as four 16-color lines into a PNG swatch
+  artifact plus a JSON decode artifact, with nonzero counts per line and the
+  backdrop color inline. Validated live against Kid Chameleon.
+- [x] `vdp_sprite_table`: decoded sprite attribute table with bounded
+  paging over at most 80 entries and a globally accurate link-chain walk
+  (termination, cycle, dangling-link, and truncation flags). Implemented
+  entirely server-side on top of `vdp_status` plus the timed-buffer
+  `vdp_mem_read` path; validated live against Kid Chameleon attract mode
+  including a terminating chain `[0, 4, 15]`.
 - `vdp_pixel_info`: per-pixel rendering attribution (source layer, tile
   mapping, palette entry, shadow/highlight result) from the VDP full image
   buffer, with lazy enable and an explicit retry-after-one-frame contract.

@@ -491,6 +491,132 @@ func TestVDPMemoryReadRejectsBadRequests(t *testing.T) {
 	}
 }
 
+func TestVDPSpriteTableDecodeAndChain(t *testing.T) {
+	client := &fakeBridgeClient{status: newFakeStatus()}
+	client.executeFunc = func(_ context.Context, method string, params map[string]string) (json.RawMessage, error) {
+		switch method {
+		case "vdp_status":
+			return json.RawMessage(`{"decoded":{"name_table_base_sprite":53248,"extended_vram":false}}`), nil
+		case "vdp_mem_read":
+			if params["target"] != "vram" || params["address"] != "53248" {
+				t.Fatalf("params = %v", params)
+			}
+			table := make([]byte, vdpSpriteTableMaxEntries*8)
+			writeSprite := func(index int, w0, w1, w2, w3 int) {
+				table[index*8+0] = byte(w0 >> 8)
+				table[index*8+1] = byte(w0)
+				table[index*8+2] = byte(w1 >> 8)
+				table[index*8+3] = byte(w1)
+				table[index*8+4] = byte(w2 >> 8)
+				table[index*8+5] = byte(w2)
+				table[index*8+6] = byte(w3 >> 8)
+				table[index*8+7] = byte(w3)
+			}
+			// Sprite 0: y=100 (raw 228), 2x3 cells, link=5, tile 0x155,
+			// hflip, palette 2, priority; x=200 (raw 328).
+			writeSprite(0, 228, 0x0529, 0x8000|(2<<13)|(1<<11)|0x155, 328)
+			// Sprite 5 terminates the chain with link 0.
+			writeSprite(5, 300, 0x0000, 0x0001, 100)
+			return json.RawMessage(`{"target":"vram","address_space":"315-5313 VRAM","address":53248,"length":640,"buffer_size":65536,"entry_size":2,"byte_order":"big-endian","encoding":"base64","consistency":"live","data":"` + base64.StdEncoding.EncodeToString(table) + `"}`), nil
+		default:
+			t.Fatalf("unexpected command: %s", method)
+		}
+		return nil, nil
+	}
+
+	content := structured(callTool(t, client, "vdp_sprite_table", `{"offset":0,"count":8}`))
+	if content["sprite_table_base"] != float64(53248) {
+		t.Fatalf("base lost: %v", content["sprite_table_base"])
+	}
+	entries := content["entries"].([]any)
+	first := entries[0].(map[string]any)
+	if first["screen_y"] != float64(100) || first["width_cells"] != float64(2) || first["height_cells"] != float64(3) ||
+		first["link"] != float64(5) || first["tile"] != float64(0x155) || first["hflip"] != true ||
+		first["palette"] != float64(2) || first["priority"] != true || first["screen_x"] != float64(200) {
+		t.Fatalf("first entry decode wrong: %v", first)
+	}
+	if len(entries) != 8 {
+		t.Fatalf("paging window wrong: %d", len(entries))
+	}
+	chain := content["chain"].(map[string]any)
+	order := fmt.Sprintf("%v", chain["order"])
+	if order != "[0 5]" || chain["terminated_by_zero"] != true || chain["cycle_detected"] != false {
+		t.Fatalf("chain walk wrong: %v", chain)
+	}
+}
+
+func TestVDPSpriteTableCycleDetection(t *testing.T) {
+	client := &fakeBridgeClient{status: newFakeStatus()}
+	client.executeFunc = func(_ context.Context, method string, _ map[string]string) (json.RawMessage, error) {
+		if method == "vdp_status" {
+			return json.RawMessage(`{"decoded":{"name_table_base_sprite":0,"extended_vram":false}}`), nil
+		}
+		table := make([]byte, vdpSpriteTableMaxEntries*8)
+		setLink := func(index, link int) { table[index*8+2] = byte(link) }
+		setLink(0, 1)
+		setLink(1, 2)
+		setLink(2, 1) // cycle back to sprite 1
+		return json.RawMessage(`{"data":"` + base64.StdEncoding.EncodeToString(table) + `"}`), nil
+	}
+	content := structured(callTool(t, client, "vdp_sprite_table", "{}"))
+	chain := content["chain"].(map[string]any)
+	if fmt.Sprintf("%v", chain["order"]) != "[0 1 2]" || chain["cycle_detected"] != true {
+		t.Fatalf("cycle not detected: %v", chain)
+	}
+}
+
+func TestVDPSpriteTableRejectsBadPaging(t *testing.T) {
+	client := &fakeBridgeClient{status: newFakeStatus()}
+	client.executeFunc = func(_ context.Context, method string, _ map[string]string) (json.RawMessage, error) {
+		t.Fatalf("bridge must not be reached: %s", method)
+		return nil, nil
+	}
+	for _, arguments := range []string{
+		`{"offset":80}`,
+		`{"count":81}`,
+		`{"offset":70,"count":11}`,
+	} {
+		result := structured(callTool(t, client, "vdp_sprite_table", arguments))
+		if result["code"] != "invalid_params" {
+			t.Fatalf("%s: code = %v (%v)", arguments, result["code"], result)
+		}
+	}
+}
+
+func TestVDPPaletteExportArtifacts(t *testing.T) {
+	client := &fakeBridgeClient{status: newFakeStatus()}
+	client.executeFunc = func(_ context.Context, method string, _ map[string]string) (json.RawMessage, error) {
+		if method != "vdp_mem_read" {
+			t.Fatalf("method = %s", method)
+		}
+		cram := make([]byte, 128)
+		cram[2] = 0x02 // entry 1 word 0x0200: blue channel 8 -> clipped 9-bit max blue
+		cram[3] = 0x00
+		return json.RawMessage(`{"target":"cram","address_space":"315-5313 CRAM","address":0,"length":128,"buffer_size":128,"entry_size":2,"byte_order":"big-endian","encoding":"base64","consistency":"live","data":"` + base64.StdEncoding.EncodeToString(cram) + `"}`), nil
+	}
+
+	server := newTestServer(t, client)
+	content := structured(postToolCall(t, server, "vdp_palette_export", "{}"))
+	summary := content["summary"].(map[string]any)
+	if summary["line_count"] != float64(4) || summary["colors_per_line"] != float64(16) {
+		t.Fatalf("palette summary wrong: %v", summary)
+	}
+	artifacts := content["artifacts"].([]any)
+	if len(artifacts) != 2 {
+		t.Fatalf("expected png and json artifacts: %v", artifacts)
+	}
+	pngInfo := artifacts[0].(map[string]any)
+	preview := structured(postToolCall(t, server, "artifact_preview", fmt.Sprintf(`{"artifact_id":%q,"mode":"hex","length":8}`, pngInfo["id"])))
+	if !strings.Contains(strings.ToUpper(fmt.Sprintf("%v", preview)), "89 50 4E 47") {
+		t.Fatalf("palette artifact must be a PNG: %v", preview)
+	}
+	jsonInfo := artifacts[1].(map[string]any)
+	download := structured(postToolCall(t, server, "artifact_get", fmt.Sprintf(`{"artifact_id":%q}`, jsonInfo["id"])))
+	if !strings.Contains(fmt.Sprintf("%v", download), "application/json") {
+		t.Fatalf("json artifact mime lost: %v", download)
+	}
+}
+
 func TestParseAddressFormats(t *testing.T) {
 	cases := map[string]uint64{
 		"4660":     0x1234,

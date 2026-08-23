@@ -9,6 +9,13 @@ and this project will use [Semantic Versioning](https://semver.org/spec/v2.0.0.h
 
 ### Added
 
+- `vdp_sprite_table`: decoded Mega Drive sprite attribute table with
+  positions, cell sizes, tile mapping, palette, priority, and link-chain
+  display order including termination/cycle/dangling detection; paged over
+  at most 80 entries while always walking the full chain.
+- `vdp_palette_export`: exports CRAM as four 16-color palette lines into a
+  PNG swatch artifact and a JSON decode artifact, returning nonzero counts
+  per line and the backdrop color inline.
 - `vdp_memory_read`: inline VRAM, CRAM, and VSRAM reads through the plugin's
   timed-buffer path with explicit byte-order metadata. Representations cover
   raw views (`hexdump`, `array_u8`, `raw_base64`), big-endian `array_u16`
