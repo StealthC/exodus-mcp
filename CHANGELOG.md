@@ -100,6 +100,11 @@ and this project will use [Semantic Versioning](https://semver.org/spec/v2.0.0.h
   unloading the previous program module; the processor devices that own them
   are destroyed with the module, so keeping the entries would leave dangling
   pointers behind a cartridge swap.
+- Control tools (`cpu_pause`, `cpu_run`, `m68k_step`, `z80_step`,
+  `cpu_step_over`, `cpu_step_out`) now report `system_running` from a live
+  read instead of a hardcoded literal. Previously `cpu_step_over` and
+  `cpu_step_out` always claimed the system was running even when their
+  internal break had already paused execution before the response was built.
 
 - Removed the non-reproducible Exodus build job from the MCP CI. Its clean
   checkout did not contain the upstream-ignored third-party source trees.

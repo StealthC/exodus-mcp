@@ -1300,7 +1300,10 @@ bool ExodusMcpPlugin::BuildCPUControlData(const BridgeRequest& request, std::str
 	data += ",\"processor_pc\":";
 	AppendNumber(data, TypedGetPC(cpu, *processor));
 	data += ",\"system_running\":";
-	data += ((action == "step") ? "false" : "true");
+	// Read the live state instead of assuming it: async actions such as
+	// step_over/step_out can have their internal break land before this
+	// response is built, so the processor may already be paused again.
+	data += GetSystemInterface().SystemRunning() ? "true" : "false";
 	data += "}";
 	return true;
 }
