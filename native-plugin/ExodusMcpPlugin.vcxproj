@@ -41,8 +41,8 @@
     </ProjectReference>
   </ItemGroup>
   <ItemGroup>
-    <ClCompile Include="ExodusMcpPlugin.cpp" /><ClCompile Include="interface.cpp" />
-    <ClInclude Include="ExodusMcpPlugin.h" />
+    <ClCompile Include="ExodusMcpPlugin.cpp" /><ClCompile Include="BridgeWire.cpp" /><ClCompile Include="interface.cpp" />
+    <ClInclude Include="ExodusMcpPlugin.h" /><ClInclude Include="BridgeWire.h" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
 </Project>

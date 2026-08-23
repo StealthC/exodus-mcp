@@ -53,6 +53,9 @@ jobs:
           for /f "usebackq tokens=*" %%i in (`"%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * -requires Microsoft.Component.MSBuild -find MSBuild\**\Bin\MSBuild.exe`) do set "MSBUILD=%%i"
           if not defined MSBUILD (echo ERROR: MSBuild not found & exit /b 1)
           "%MSBUILD%" native-plugin\ExodusMcpPlugin.vcxproj -nologo -m -t:Build -p:Configuration=Debug -p:Platform=x64 -p:SolutionDir="%CD%\vendor\exodus\\" -verbosity:minimal
+      - name: Run native bridge-wire unit tests
+        shell: cmd
+        run: scripts\internal\test-native.bat
       - name: Upload plugin artifact
         uses: actions/upload-artifact@v4
         with:
