@@ -52,6 +52,13 @@ and this project will use [Semantic Versioning](https://semver.org/spec/v2.0.0.h
   trace machinery audit, eliminated causes, ranked hypotheses, and the
   recommended file-based capture route.
 
+- `rom_load` for replacing the Mega Drive cartridge with a Windows-visible ROM
+  path during local test automation.
+- WSL wrappers for driving the Windows build and launcher.
+- Controlled execution tools: pause/run, M68K/Z80 single-instruction step,
+  step-over/out, plus MCP-managed exact-address execution breakpoints.
+- Live validation of pause, M68K/Z80 single-instruction steps, and the
+  MCP-managed breakpoint lifecycle against Kid Chameleon.
 ### Changed
 
 - Tool responses now use MCP `structuredContent` plus a compact JSON text
@@ -68,6 +75,9 @@ and this project will use [Semantic Versioning](https://semver.org/spec/v2.0.0.h
   Exodus fork owns its Windows build and binary artifacts.
 
 ### Fixed
+
+- The launcher now reserves its HTTP listener before starting Exodus and
+  terminates its child when the MCP server exits unexpectedly.
 
 - Removed the non-reproducible Exodus build job from the MCP CI. Its clean
   checkout did not contain the upstream-ignored third-party source trees.

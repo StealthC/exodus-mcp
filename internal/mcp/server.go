@@ -301,6 +301,8 @@ func (server *Server) executeCommand(ctx context.Context, operation string, para
 
 func commandTimeout(operation string) time.Duration {
 	switch operation {
+	case "rom_load":
+		return 60 * time.Second
 	case "trace_capture":
 		return 60 * time.Second
 	case "mem_read":

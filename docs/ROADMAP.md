@@ -45,9 +45,10 @@ silently mixing their conventions.
 
 - [x] `m68k_registers`, `m68k_disassemble`, `m68k_read_memory`.
 - [x] `z80_registers`, `z80_disassemble`, `z80_read_memory`.
-- [x] `cpu_trace_capture`: bounded capture summarized inline and stored as an
-  artifact. Sampling follows live emulation only; a paused system yields few
-  or no entries.
+- [!] `cpu_trace_capture` is quarantined pending the reproducible M68K and
+  Z80 access violation documented in `TRACE-CRASH-INVESTIGATION.md`. Repair
+  the upstream trace-enable synchronization and disassembly path before this
+  tool is used for normal analysis.
 - [x] `symbols_set`, `symbols_list`, `symbols_clear`, scoped to an analysis
   context.
 
@@ -66,6 +67,14 @@ not manually decode opaque dumps in its prompt.
 
 **Outcome:** authorized agents can perform reproducible experiments.
 
+- [x] `rom_load`: controlled local cartridge replacement that preserves the
+  previous running state. Context leases remain required before broader
+  mutation support.
+- [x] Deterministic processor control: `cpu_pause`, `cpu_run`, M68K/Z80
+  single-instruction step, step-over, step-out, and MCP-managed exact-address
+  execution breakpoints. Pause, M68K/Z80 step, and the breakpoint lifecycle
+  are validated live against Kid Chameleon. These are more useful for ROM
+  analysis than the unsafe trace path.
 - Explicit context lease tools for mutation.
 - `state_save`, `state_load`, `state_list` using context-scoped snapshots.
 - `frame_advance`, `input_set`, and bounded scripted fixtures.

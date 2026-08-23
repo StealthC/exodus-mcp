@@ -9,6 +9,7 @@
 
 class IProcessor;
 class IMemory;
+class IBreakpoint;
 
 // ExodusMcpPlugin is the persistent native bridge for exodus-mcp. It is
 // read-only in this increment: it never mutates emulator state, loads ROMs,
@@ -43,6 +44,13 @@ private:
 		std::wstring deviceDisplayName;
 	};
 
+	struct ManagedBreakpoint
+	{
+		IProcessor* processor;
+		IBreakpoint* breakpoint;
+		std::string cpu;
+	};
+
 	// Bridge lifecycle
 	bool LoadBridgeConfiguration();
 	bool StartBridge();
@@ -66,6 +74,11 @@ private:
 	bool BuildMemoryReadData(const BridgeRequest& request, std::string& data, std::string& errorCode, std::string& errorMessage);
 	bool BuildRegistersData(const BridgeRequest& request, std::string& data, std::string& errorCode, std::string& errorMessage);
 	bool BuildDisassemblyData(const BridgeRequest& request, std::string& data, std::string& errorCode, std::string& errorMessage);
+	bool BuildCPUControlData(const BridgeRequest& request, std::string& data, std::string& errorCode, std::string& errorMessage);
+	bool BuildBreakpointSetData(const BridgeRequest& request, std::string& data, std::string& errorCode, std::string& errorMessage);
+	bool BuildBreakpointListData(const BridgeRequest& request, std::string& data, std::string& errorCode, std::string& errorMessage);
+	bool BuildBreakpointRemoveData(const BridgeRequest& request, std::string& data, std::string& errorCode, std::string& errorMessage);
+	bool BuildROMLoadData(const BridgeRequest& request, std::string& data, std::string& errorCode, std::string& errorMessage);
 	bool BuildTraceCaptureData(const BridgeRequest& request, std::string& data, std::string& errorCode, std::string& errorMessage);
 
 	// Emulator inspection helpers
@@ -89,6 +102,8 @@ private:
 	std::wstring _capability;
 	unsigned int _loadedModuleCount;
 	bool _bridgeEnabled;
+	unsigned long long _nextBreakpointID;
+	std::map<unsigned long long, ManagedBreakpoint> _managedBreakpoints;
 };
 
 #endif

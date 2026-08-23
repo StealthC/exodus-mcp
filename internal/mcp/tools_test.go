@@ -287,6 +287,50 @@ func TestTraceCaptureWritesArtifact(t *testing.T) {
 	}
 }
 
+func TestROMLoadPassesWindowsPath(t *testing.T) {
+	client := &fakeBridgeClient{status: newFakeStatus()}
+	client.executeFunc = func(_ context.Context, method string, params map[string]string) (json.RawMessage, error) {
+		if method != "rom_load" || params["path"] != `F:\roms\kid.bin` || params["run"] != "true" {
+			t.Fatalf("unexpected call %s %v", method, params)
+		}
+		return json.RawMessage(`{"path":"F:\\roms\\kid.bin","loaded":true}`), nil
+	}
+	result := callTool(t, client, "rom_load", `{"path":"F:\\roms\\kid.bin","run":true}`)
+	if !structured(result)["loaded"].(bool) {
+		t.Fatalf("ROM load result lost: %v", structured(result))
+	}
+
+	invalid := callTool(t, client, "rom_load", `{"path":"F:\\roms\\kid.bin\nmethod=status"}`)
+	if structured(invalid)["code"] != "invalid_params" {
+		t.Fatalf("newline path must be rejected: %v", invalid)
+	}
+}
+
+func TestControlToolsPassExpectedCommands(t *testing.T) {
+	client := &fakeBridgeClient{status: newFakeStatus()}
+	client.executeFunc = func(_ context.Context, method string, params map[string]string) (json.RawMessage, error) {
+		switch method {
+		case "cpu_control":
+			if params["cpu"] != "m68k" || params["action"] != "step" {
+				t.Fatalf("unexpected control params: %v", params)
+			}
+		case "breakpoint_set":
+			if params["cpu"] != "z80" || params["address"] != "4660" {
+				t.Fatalf("unexpected breakpoint params: %v", params)
+			}
+		default:
+			t.Fatalf("unexpected command: %s", method)
+		}
+		return json.RawMessage(`{"ok":true}`), nil
+	}
+	if structured(callTool(t, client, "m68k_step", "{}"))["ok"] != true {
+		t.Fatal("step result lost")
+	}
+	if structured(callTool(t, client, "cpu_breakpoint_set", `{"cpu":"z80","address":"0x1234"}`))["ok"] != true {
+		t.Fatal("breakpoint result lost")
+	}
+}
+
 func TestSymbolsLifecycle(t *testing.T) {
 	server := newTestServer(t, &fakeBridgeClient{status: newFakeStatus()})
 	setArgs := `{"symbols":[{"name":"main","space_id":"m68k-bus","address":"0x2064"},{"name":"lives","address":4242}]}`

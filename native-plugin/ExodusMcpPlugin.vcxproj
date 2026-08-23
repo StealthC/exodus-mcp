@@ -33,6 +33,12 @@
     <ProjectReference Include="..\vendor\exodus\ExodusSDK\Processor\Processor.vcxproj">
       <Project>{47967EF3-5853-4BC8-B863-E6674079871B}</Project><ReferenceOutputAssembly>true</ReferenceOutputAssembly>
     </ProjectReference>
+    <ProjectReference Include="..\vendor\exodus\Support Libraries\HierarchicalStorage\HierarchicalStorage.vcxproj">
+      <Project>{ECC567B9-0DD5-4130-9685-CB9B5C6BD96E}</Project><ReferenceOutputAssembly>true</ReferenceOutputAssembly>
+    </ProjectReference>
+    <ProjectReference Include="..\vendor\exodus\Support Libraries\Stream\Stream.vcxproj">
+      <Project>{D4F63DCA-8FA8-4FD3-B449-DBB7E5AD7FFB}</Project><ReferenceOutputAssembly>true</ReferenceOutputAssembly>
+    </ProjectReference>
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="ExodusMcpPlugin.cpp" /><ClCompile Include="interface.cpp" />

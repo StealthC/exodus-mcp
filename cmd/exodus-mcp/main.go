@@ -10,6 +10,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"time"
@@ -50,13 +51,24 @@ func main() {
 		fmt.Fprintln(os.Stdout, version)
 		return
 	}
+	store, err := artifact.NewStore(*artifactDir)
+	if err != nil {
+		log.Fatal(err)
+	}
+	listener, err := net.Listen("tcp", *listen)
+	if err != nil {
+		log.Fatalf("listen on %s: %v", *listen, err)
+	}
+	defer listener.Close()
+
+	var exodus *exec.Cmd
 	var exodusDone <-chan error
 	if *exodusExecutable != "" {
 		config, err := bridge.NewLaunchConfig(*exodusExecutable, exodusArguments)
 		if err != nil {
 			log.Fatal(err)
 		}
-		exodus, err := bridge.StartExodus(config)
+		exodus, err = bridge.StartExodus(config)
 		if err != nil {
 			log.Fatal(err)
 		}
@@ -66,10 +78,6 @@ func main() {
 		log.Printf("started Exodus with an authenticated local bridge on %s", config.PipeName)
 	}
 
-	store, err := artifact.NewStore(*artifactDir)
-	if err != nil {
-		log.Fatal(err)
-	}
 	client := bridge.NewNamedPipeClient(*pipeName, *pipeCapability)
 	server := &http.Server{
 		Addr:    *listen,
@@ -79,9 +87,13 @@ func main() {
 	log.Printf("exodus-mcp listening on http://%s/mcp", *listen)
 	log.Printf("artifact store at %s", store.Dir())
 	if exodusDone == nil {
-		log.Fatal(server.ListenAndServe())
+		log.Fatal(server.Serve(listener))
 	}
-	if err := runUntilExodusExits(server, exodusDone, server.ListenAndServe); err != nil {
+	if err := runUntilExodusExits(server, exodusDone, func() error {
+		return server.Serve(listener)
+	}, func() error {
+		return stopExodus(exodus)
+	}); err != nil {
 		log.Fatal(err)
 	}
 }
@@ -102,7 +114,17 @@ func waitForProcess(wait func() error) <-chan error {
 	return done
 }
 
-func runUntilExodusExits(server *http.Server, exodusDone <-chan error, serve func() error) error {
+func stopExodus(exodus *exec.Cmd) error {
+	if exodus == nil || exodus.Process == nil {
+		return nil
+	}
+	if err := exodus.Process.Kill(); err != nil && !errors.Is(err, os.ErrProcessDone) {
+		return fmt.Errorf("terminate Exodus after MCP server exit: %w", err)
+	}
+	return nil
+}
+
+func runUntilExodusExits(server *http.Server, exodusDone <-chan error, serve func() error, stop func() error) error {
 	serverDone := make(chan error, 1)
 	go func() {
 		serverDone <- serve()
@@ -110,6 +132,9 @@ func runUntilExodusExits(server *http.Server, exodusDone <-chan error, serve fun
 
 	select {
 	case err := <-serverDone:
+		if stopErr := stop(); stopErr != nil {
+			return stopErr
+		}
 		return err
 	case err := <-exodusDone:
 		if err != nil {

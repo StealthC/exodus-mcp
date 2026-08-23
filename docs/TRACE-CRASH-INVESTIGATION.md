@@ -36,7 +36,13 @@ Everything else works. Validated live against this exact session:
    `tasklist` shows neither `Exodus.nightly.exe` nor `exodus-mcp.exe`
    (the server shuts down because its child died).
 
-Reproduced 3/3 times. Z80 variant untested (assumed same path — same base-class code).
+The original M68K reproduction was 3/3. On 2026-08-22, a fresh automated
+test loaded `F:\projects\kid\rom\kid.bin`, confirmed `system_running:true`,
+then ran both `m68k` and `z80` captures with `max_entries:50` and
+`timeout_ms:500`. Both calls returned `bridge_error: read bridge response:
+EOF`; the Exodus child exited with `0xc0000005` (access violation). The Go
+launcher then exited as designed, so the Z80 failure confirms that the defect
+is shared by the base `Processor` trace path rather than specific to M68000.
 
 ## 3. Attempt history (what changed between crashes)
 
@@ -80,9 +86,13 @@ All paths relative to `vendor/exodus/`.
 - `std::mutex` (non-recursive). Any second acquisition on the same thread is
   undefined behavior (deadlock or abort).
 - **`Processor::SetTraceEnabled` (`Processor.cpp:916`) is the only trace
-  mutator that does NOT take `_debugMutex`** — it writes the bare bool that
-  the CPU thread also reads unlocked (`Processor.inl:294`). Benign-looking,
-  listed here for completeness.
+  mutator that does NOT take `_debugMutex`** — it writes `_traceLogEnabled`
+  while the CPU thread reads it unlocked (`Processor.inl:294`). The member is
+  declared `volatile bool` (`Processor.h:421`), not `std::atomic<bool>`.
+  This is a C++ data race whenever MCP toggles tracing on a running system;
+  `volatile` does not provide inter-thread synchronization, so the behavior is
+  undefined. This is a confirmed concurrency defect, although it does not by
+  itself identify the observed crash instruction or exception.
 
 ### 4.3 What GetOpcodeInfo does under that lock
 
@@ -134,12 +144,14 @@ inside the emulation loop.
 
 ## 5. Ranked hypotheses
 
-1. **H-A (primary): upstream hazard in `RecordTraceInternal` running
-   `GetOpcodeInfo` under `_debugMutex` on the live CPU thread.** Either a
-   re-entrancy path we have not found, or sustained lock/alloc behavior that
-   corrupts state under contention with `ExecuteCommit`/`ExecuteRollback` and
-   debug views. Needs instrumented debugging inside Exodus (SEH/vectored
-   handler or logging around `RecordTraceInternal`) to pin precisely.
+1. **H-A (primary): upstream trace-enable concurrency defect plus a hazard in
+   `RecordTraceInternal`.** Toggling `_traceLogEnabled` has a confirmed data
+   race, and the newly enabled CPU path runs `GetOpcodeInfo` under
+   `_debugMutex`. Either this undefined behavior, a re-entrancy path not yet
+   found, or sustained lock/alloc behavior under contention with
+   `ExecuteCommit`/`ExecuteRollback` and debug views can cause the failure.
+   Instrumented debugging inside Exodus (SEH/vectored handler or logging
+   around `RecordTraceInternal`) is still needed to identify the crash site.
 2. **H-B: starvation/livelock escalation.** Holding `_debugMutex` per opcode
    for a full decode starves `ExecuteCommit`/`Rollback` and any debug UI;
    if any component reacts to that by destroying/rebuilding state, the process
@@ -186,10 +198,12 @@ belongs behind Phase 4 mutation leases.
 
 ### c. Upstream patch (fork commit)
 
-Move the disassembly branch out from under `_debugMutex` in
-`RecordTraceInternal` (pre-format outside the lock, or cache decoded text),
-or make `GetTraceLog`/ring use a seqlock-style snapshot. Small, reviewable
-fork commit per `AGENTS.md` upstream discipline.
+First replace `_traceLogEnabled` with `std::atomic<bool>` and use explicit
+acquire/release loads and stores in `RecordTrace`/`SetTraceEnabled`. Then move
+the disassembly branch out from under `_debugMutex` in `RecordTraceInternal`
+(pre-format outside the lock, or cache decoded text), or make
+`GetTraceLog`/ring use a seqlock-style snapshot. Small, reviewable fork commit
+per `AGENTS.md` upstream discipline.
 
 ## 8. Operational notes for whoever continues
 

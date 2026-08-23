@@ -95,12 +95,45 @@ func phase1ToolSpecs() []toolSpec {
 			run:         runMemorySpacesList,
 		},
 		{
+			name:        "rom_load",
+			description: "Replace the current Mega Drive cartridge with a ROM file visible to Windows. This mutates the running target and preserves its prior run state unless run is true.",
+			schema: objectSchema(map[string]any{
+				"path": stringProperty("Absolute Windows path to a .bin, .gen, or .md ROM file."),
+				"run":  map[string]any{"type": "boolean", "description": "Run the system after the ROM loads, even if it was paused before."},
+			}, []string{"path"}),
+			run: runROMLoad,
+		},
+		{
 			name:        "target_info",
 			description: "Report emulator identity, loaded modules, device summary, and the platform baseline. ROM header parsing arrives in a later phase.",
 			schema:      objectSchema(map[string]any{}, nil),
 			run:         runTargetInfo,
 		},
 	}
+}
+
+// ----------------------------------------------------------------------------------------------------------------------
+// ROM loading
+// ----------------------------------------------------------------------------------------------------------------------
+type romLoadArgs struct {
+	Path string `json:"path"`
+	Run  bool   `json:"run"`
+}
+
+func runROMLoad(tc toolContext, args json.RawMessage) map[string]any {
+	parsed, failure := decodeArgs[romLoadArgs](args)
+	if failure != nil {
+		return failureResult(failure, tc.modern)
+	}
+	path := strings.TrimSpace(parsed.Path)
+	if path == "" || strings.ContainsAny(path, "\r\n") {
+		return failureResult(&toolFailure{Code: "invalid_params", Message: "path must be one non-empty Windows file path"}, tc.modern)
+	}
+	payload, failure := tc.server.executeCommand(tc.ctx, "rom_load", map[string]string{"path": path, "run": strconv.FormatBool(parsed.Run)})
+	if failure != nil {
+		return failureResult(failure, tc.modern)
+	}
+	return okResult(payload, tc.modern)
 }
 
 // ----------------------------------------------------------------------------------------------------------------------

@@ -1,9 +1,14 @@
 #include "ExodusMcpPlugin.h"
 
 #include "Processor/Processor.pkg"
+#include "Processor/IBreakpoint.h"
+#include "DeviceInterface/IDeviceContext.h"
 #include "M68000/IM68000.h"
 #include "Z80/IZ80.h"
 #include "Memory/IMemory.h"
+#include "ExtensionInterface/LoadedModuleInfo.h"
+#include "HierarchicalStorage/HierarchicalStorage.pkg"
+#include "Stream/Stream.pkg"
 
 #include <cstdio>
 #include <cstdlib>
@@ -13,7 +18,7 @@
 namespace
 {
 const wchar_t* const kPipePrefix = L"\\\\.\\pipe\\";
-const char* const kPluginVersion = "0.2.0";
+const char* const kPluginVersion = "0.4.0";
 const size_t kMaxRequestSize = 64 * 1024;
 const size_t kMaxWriteChunk = 32 * 1024;
 const unsigned long long kMaxReadLength = 8 * 1024 * 1024;
@@ -23,7 +28,7 @@ const unsigned int kDefaultTraceEntries = 1000;
 const unsigned int kMaxTraceEntries = 10000;
 const unsigned long long kDefaultTraceTimeoutMs = 5000;
 const unsigned long long kMaxTraceTimeoutMs = 30000;
-const char* const kSupportedOperations[] = {"status", "emulator_status", "mem_spaces", "mem_read", "regs_get", "disasm", "trace_capture"};
+const char* const kSupportedOperations[] = {"status", "emulator_status", "mem_spaces", "mem_read", "regs_get", "disasm", "cpu_control", "breakpoint_set", "breakpoint_list", "breakpoint_remove", "rom_load", "trace_capture"};
 const size_t kSupportedOperationCount = sizeof(kSupportedOperations) / sizeof(kSupportedOperations[0]);
 
 bool ReadEnvironment(const wchar_t* name, std::wstring& value)
@@ -70,14 +75,108 @@ std::string ParamValue(const std::map<std::string, std::string>& params, const c
 	std::map<std::string, std::string>::const_iterator found = params.find(key);
 	return (found == params.end()) ? std::string() : found->second;
 }
+
+bool Utf8ToWide(const std::string& input, std::wstring& output)
+{
+	if (input.empty())
+	{
+		return false;
+	}
+	const int size = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, input.data(), (int)input.size(), 0, 0);
+	if (size <= 0)
+	{
+		return false;
+	}
+	output.resize(size);
+	return MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, input.data(), (int)input.size(), &output[0], size) == size;
+}
+
+std::wstring FileNameFromPath(const std::wstring& path)
+{
+	const size_t separator = path.find_last_of(L"\\/");
+	return (separator == std::wstring::npos) ? path : path.substr(separator + 1);
+}
+
+bool IsSupportedROMPath(const std::wstring& path)
+{
+	const size_t extension = path.find_last_of(L'.');
+	if (extension == std::wstring::npos)
+	{
+		return false;
+	}
+	const wchar_t* suffix = path.c_str() + extension;
+	return (_wcsicmp(suffix, L".bin") == 0) || (_wcsicmp(suffix, L".gen") == 0) || (_wcsicmp(suffix, L".md") == 0);
+}
+
+bool CreateROMModule(const std::wstring& romPath, std::wstring& modulePath)
+{
+	if (!IsSupportedROMPath(romPath))
+	{
+		return false;
+	}
+	WIN32_FILE_ATTRIBUTE_DATA attributes = {};
+	if (!GetFileAttributesExW(romPath.c_str(), GetFileExInfoStandard, &attributes) || (attributes.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY))
+	{
+		return false;
+	}
+	const unsigned long long romSize = (static_cast<unsigned long long>(attributes.nFileSizeHigh) << 32) | attributes.nFileSizeLow;
+	if (romSize == 0 || romSize > 0x1000000)
+	{
+		return false;
+	}
+	unsigned int paddedSize = 1;
+	while (paddedSize < romSize)
+	{
+		paddedSize <<= 1;
+	}
+
+	wchar_t tempPath[MAX_PATH] = {};
+	const DWORD tempPathLength = GetTempPathW(MAX_PATH, tempPath);
+	if (tempPathLength == 0 || tempPathLength >= MAX_PATH)
+	{
+		return false;
+	}
+	std::wstring moduleDirectory = std::wstring(tempPath) + L"exodus-mcp";
+	if (!CreateDirectoryW(moduleDirectory.c_str(), 0) && GetLastError() != ERROR_ALREADY_EXISTS)
+	{
+		return false;
+	}
+	modulePath = moduleDirectory + L"\\rom-" + std::to_wstring(GetCurrentProcessId()) + L"-" + std::to_wstring(GetTickCount()) + L".xml";
+
+	const std::wstring fileName = FileNameFromPath(romPath);
+	HierarchicalStorageTree tree;
+	IHierarchicalStorageNode& root = tree.GetRootNode();
+	root.SetName(L"Module");
+	root.CreateAttribute(L"SystemClassName", L"SegaMegaDrive");
+	root.CreateAttribute(L"ModuleClassName", fileName);
+	root.CreateAttribute(L"ModuleInstanceName", fileName);
+	root.CreateAttribute(L"ProgramModule", true);
+	root.CreateChild(L"System.ImportConnector").CreateAttribute(L"ConnectorClassName", L"CartridgePort").CreateAttribute(L"ConnectorInstanceName", L"Cartridge Port");
+	root.CreateChild(L"System.ImportBusInterface").CreateAttribute(L"ConnectorInstanceName", L"Cartridge Port").CreateAttribute(L"BusInterfaceName", L"BusInterface").CreateAttribute(L"ImportName", L"BusInterface");
+	root.CreateChild(L"System.ImportSystemLine").CreateAttribute(L"ConnectorInstanceName", L"Cartridge Port").CreateAttribute(L"SystemLineName", L"CART").CreateAttribute(L"ImportName", L"CART");
+	root.CreateChild(L"Device").CreateAttribute(L"DeviceName", L"ROM16").CreateAttribute(L"InstanceName", L"ROM").CreateAttribute(L"BinaryDataPresent", true).CreateAttribute(L"SeparateBinaryData", true).SetData(romPath);
+	root.CreateChild(L"BusInterface.MapDevice").CreateAttribute(L"BusInterfaceName", L"BusInterface").CreateAttribute(L"DeviceInstanceName", L"ROM").CreateAttribute(L"CELineConditions", L"FCCPUSpace=0, CE0=1").CreateAttributeHex(L"MemoryMapBase", 0, 6).CreateAttributeHex(L"MemoryMapSize", paddedSize, 0).CreateAttributeHex(L"AddressMask", paddedSize - 1, 0).CreateAttribute(L"AddressDiscardLowerBitCount", 1);
+	root.CreateChild(L"System.SetLineState").CreateAttribute(L"SystemLineName", L"CART").CreateAttribute(L"Value", 1);
+
+	Stream::File moduleFile(Stream::IStream::TextEncoding::UTF8);
+	if (!moduleFile.Open(modulePath, Stream::File::OpenMode::WriteOnly, Stream::File::CreateMode::Create))
+	{
+		return false;
+	}
+	moduleFile.InsertByteOrderMark();
+	const bool saved = tree.SaveTree(moduleFile);
+	moduleFile.Close();
+	return saved;
+}
 }
 
 ExodusMcpPlugin::ExodusMcpPlugin(const std::wstring& implementationName, const std::wstring& instanceName, unsigned int moduleID)
 : Extension(implementationName, instanceName, moduleID),
   _stopEvent(0),
-  _pipeThread(0),
-  _loadedModuleCount(0),
-  _bridgeEnabled(false)
+	_pipeThread(0),
+	_loadedModuleCount(0),
+	_bridgeEnabled(false),
+	_nextBreakpointID(1)
 { }
 
 ExodusMcpPlugin::~ExodusMcpPlugin()
@@ -448,6 +547,26 @@ std::string ExodusMcpPlugin::ExecuteCommand(const BridgeRequest& request, bool& 
 	else if (strcmp(method, "disasm") == 0)
 	{
 		success = BuildDisassemblyData(request, payload, errorCode, errorMessage);
+	}
+	else if (strcmp(method, "cpu_control") == 0)
+	{
+		success = BuildCPUControlData(request, payload, errorCode, errorMessage);
+	}
+	else if (strcmp(method, "breakpoint_set") == 0)
+	{
+		success = BuildBreakpointSetData(request, payload, errorCode, errorMessage);
+	}
+	else if (strcmp(method, "breakpoint_list") == 0)
+	{
+		success = BuildBreakpointListData(request, payload, errorCode, errorMessage);
+	}
+	else if (strcmp(method, "breakpoint_remove") == 0)
+	{
+		success = BuildBreakpointRemoveData(request, payload, errorCode, errorMessage);
+	}
+	else if (strcmp(method, "rom_load") == 0)
+	{
+		success = BuildROMLoadData(request, payload, errorCode, errorMessage);
 	}
 	else if (strcmp(method, "trace_capture") == 0)
 	{
@@ -1074,6 +1193,254 @@ bool ExodusMcpPlugin::BuildDisassemblyData(const BridgeRequest& request, std::st
 	data += ",\"disassembly_method\":\"linear sweep from the start address; not execution-verified\",\"lines\":[";
 	data += lines;
 	data += "]}";
+	return true;
+}
+
+//----------------------------------------------------------------------------------------------------------------------
+bool ExodusMcpPlugin::BuildCPUControlData(const BridgeRequest& request, std::string& data, std::string& errorCode, std::string& errorMessage)
+{
+	const std::string action = ParamValue(request.params, "action");
+	if (action == "pause")
+	{
+		GetSystemInterface().StopSystem();
+		data = "{\"action\":\"pause\",\"system_running\":false}";
+		return true;
+	}
+	if (action == "run")
+	{
+		GetSystemInterface().RunSystem();
+		data = "{\"action\":\"run\",\"system_running\":true}";
+		return true;
+	}
+
+	const std::string cpu = ParamValue(request.params, "cpu");
+	bool validName = false;
+	IProcessor* processor = FindProcessor(cpu, validName);
+	if (!validName)
+	{
+		errorCode = "invalid_params";
+		errorMessage = "cpu must be m68k or z80";
+		return false;
+	}
+	if (processor == 0)
+	{
+		errorCode = "cpu_not_found";
+		errorMessage = "No " + cpu + " processor is present in the loaded target";
+		return false;
+	}
+
+	IDeviceContext* deviceContext = processor->GetDevice()->GetDeviceContext();
+	if (deviceContext == 0)
+	{
+		errorCode = "cpu_not_found";
+		errorMessage = "The selected processor is not attached to a device context";
+		return false;
+	}
+	if (action == "step")
+	{
+		deviceContext->StopSystem();
+		deviceContext->ExecuteDeviceStep();
+	}
+	else if (action == "step_over")
+	{
+		deviceContext->StopSystem();
+		processor->BreakOnStepOverCurrentOpcode();
+		deviceContext->RunSystem();
+	}
+	else if (action == "step_out")
+	{
+		deviceContext->StopSystem();
+		processor->BreakOnStepOutCurrentOpcode();
+		deviceContext->RunSystem();
+	}
+	else
+	{
+		errorCode = "invalid_params";
+		errorMessage = "action must be pause, run, step, step_over, or step_out";
+		return false;
+	}
+
+	data = "{\"action\":";
+	AppendJsonStringAscii(data, action);
+	data += ",\"cpu\":";
+	AppendJsonStringAscii(data, cpu);
+	data += ",\"processor_pc\":";
+	AppendNumber(data, TypedGetPC(cpu, *processor));
+	data += ",\"system_running\":";
+	data += ((action == "step") ? "false" : "true");
+	data += "}";
+	return true;
+}
+
+//----------------------------------------------------------------------------------------------------------------------
+bool ExodusMcpPlugin::BuildBreakpointSetData(const BridgeRequest& request, std::string& data, std::string& errorCode, std::string& errorMessage)
+{
+	const std::string cpu = ParamValue(request.params, "cpu");
+	bool validName = false;
+	IProcessor* processor = FindProcessor(cpu, validName);
+	unsigned long long address = 0;
+	if (!validName || !ParseUnsigned(ParamValue(request.params, "address"), address))
+	{
+		errorCode = "invalid_params";
+		errorMessage = "cpu must be m68k or z80 and address must be an unsigned integer";
+		return false;
+	}
+	if (processor == 0 || address > processor->GetAddressBusMask())
+	{
+		errorCode = "invalid_params";
+		errorMessage = "address is outside the selected processor address bus";
+		return false;
+	}
+
+	IBreakpoint* breakpoint = processor->CreateBreakpoint();
+	if (breakpoint == 0 || !processor->LockBreakpoint(breakpoint))
+	{
+		errorCode = "breakpoint_error";
+		errorMessage = "Exodus could not create a breakpoint";
+		return false;
+	}
+	breakpoint->SetEnabled(true);
+	breakpoint->SetLogEvent(false);
+	breakpoint->SetBreakEvent(true);
+	breakpoint->SetLocationCondition(IBreakpoint::Condition::Equal);
+	breakpoint->SetLocationConditionData1((unsigned int)address);
+	breakpoint->SetLocationMask(processor->GetAddressBusMask());
+	const unsigned long long breakpointID = _nextBreakpointID++;
+	breakpoint->SetName(L"MCP breakpoint " + std::to_wstring(breakpointID));
+	processor->UnlockBreakpoint(breakpoint);
+
+	ManagedBreakpoint managed;
+	managed.processor = processor;
+	managed.breakpoint = breakpoint;
+	managed.cpu = cpu;
+	_managedBreakpoints[breakpointID] = managed;
+	data = "{\"breakpoint_id\":";
+	AppendNumber(data, breakpointID);
+	data += ",\"cpu\":";
+	AppendJsonStringAscii(data, cpu);
+	data += ",\"address\":";
+	AppendNumber(data, address);
+	data += "}";
+	return true;
+}
+
+//----------------------------------------------------------------------------------------------------------------------
+bool ExodusMcpPlugin::BuildBreakpointListData(const BridgeRequest&, std::string& data, std::string&, std::string&)
+{
+	data = "{\"breakpoints\":[";
+	bool first = true;
+	for (std::map<unsigned long long, ManagedBreakpoint>::const_iterator i = _managedBreakpoints.begin(); i != _managedBreakpoints.end(); ++i)
+	{
+		const ManagedBreakpoint& managed = i->second;
+		if (!managed.processor->LockBreakpoint(managed.breakpoint))
+		{
+			continue;
+		}
+		if (!first)
+		{
+			data += ",";
+		}
+		first = false;
+		data += "{\"breakpoint_id\":";
+		AppendNumber(data, i->first);
+		data += ",\"cpu\":";
+		AppendJsonStringAscii(data, managed.cpu);
+		data += ",\"address\":";
+		AppendNumber(data, managed.breakpoint->GetLocationConditionData1());
+		data += ",\"enabled\":";
+		data += managed.breakpoint->GetEnabled() ? "true" : "false";
+		data += ",\"hit_count\":";
+		AppendNumber(data, managed.breakpoint->GetHitCounter());
+		data += "}";
+		managed.processor->UnlockBreakpoint(managed.breakpoint);
+	}
+	data += "]}";
+	return true;
+}
+
+//----------------------------------------------------------------------------------------------------------------------
+bool ExodusMcpPlugin::BuildBreakpointRemoveData(const BridgeRequest& request, std::string& data, std::string& errorCode, std::string& errorMessage)
+{
+	unsigned long long breakpointID = 0;
+	if (!ParseUnsigned(ParamValue(request.params, "breakpoint_id"), breakpointID))
+	{
+		errorCode = "invalid_params";
+		errorMessage = "breakpoint_id must be an unsigned integer";
+		return false;
+	}
+	std::map<unsigned long long, ManagedBreakpoint>::iterator found = _managedBreakpoints.find(breakpointID);
+	if (found == _managedBreakpoints.end())
+	{
+		errorCode = "breakpoint_not_found";
+		errorMessage = "No MCP-managed breakpoint has that id";
+		return false;
+	}
+	found->second.processor->DeleteBreakpoint(found->second.breakpoint);
+	_managedBreakpoints.erase(found);
+	data = "{\"removed\":true,\"breakpoint_id\":";
+	AppendNumber(data, breakpointID);
+	data += "}";
+	return true;
+}
+
+//----------------------------------------------------------------------------------------------------------------------
+bool ExodusMcpPlugin::BuildROMLoadData(const BridgeRequest& request, std::string& data, std::string& errorCode, std::string& errorMessage)
+{
+	std::wstring romPath;
+	if (!Utf8ToWide(ParamValue(request.params, "path"), romPath))
+	{
+		errorCode = "invalid_params";
+		errorMessage = "path must be valid UTF-8";
+		return false;
+	}
+
+	std::wstring modulePath;
+	if (!CreateROMModule(romPath, modulePath))
+	{
+		errorCode = "rom_load_failed";
+		errorMessage = "ROM path must name an existing file no larger than 16 MiB";
+		return false;
+	}
+
+	ISystemExtensionInterface& system = GetSystemInterface();
+	IGUIExtensionInterface& gui = GetGUIInterface();
+	const bool wasRunning = system.SystemRunning();
+	const bool runAfterLoad = wasRunning || (ParamValue(request.params, "run") == "true");
+	system.StopSystem();
+
+	const std::list<unsigned int> moduleIDs = system.GetLoadedModuleIDs();
+	for (std::list<unsigned int>::const_iterator i = moduleIDs.begin(); i != moduleIDs.end(); ++i)
+	{
+		LoadedModuleInfo moduleInfo;
+		if (system.GetLoadedModuleInfo(*i, moduleInfo) && moduleInfo.GetIsProgramModule())
+		{
+			gui.UnloadModule(*i);
+		}
+	}
+
+	system.FlagInitialize();
+	if (!gui.LoadModuleFromFile(modulePath))
+	{
+		if (runAfterLoad)
+		{
+			system.RunSystem();
+		}
+		errorCode = "rom_load_failed";
+		errorMessage = "Exodus could not load the generated ROM module";
+		return false;
+	}
+	if (runAfterLoad)
+	{
+		system.RunSystem();
+	}
+
+	data = "{\"loaded\":true,\"path\":";
+	AppendJsonString(data, romPath);
+	data += ",\"module_path\":";
+	AppendJsonString(data, modulePath);
+	data += ",\"system_running\":";
+	data += runAfterLoad ? "true" : "false";
+	data += "}";
 	return true;
 }
 

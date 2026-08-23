@@ -37,6 +37,10 @@ a new pipe name and capability for that one child process and never logs the
 capability. When that child Exodus process exits, `exodus-mcp` shuts down its
 local HTTP server and exits too.
 
+The launcher reserves the HTTP port before it starts Exodus. A busy port fails
+without opening Exodus; if the server stops after the child starts, it
+terminates that child rather than leaving an orphaned emulator process.
+
 ## Windows server used from WSL
 
 Keep the MCP server bound to `127.0.0.1`. In the default WSL2 NAT mode, WSL
@@ -44,6 +48,35 @@ cannot reach a Windows loopback server. On Windows 11, enable WSL mirrored
 networking in `%USERPROFILE%\.wslconfig`, then restart the WSL VM; WSL and
 Windows can subsequently reach each other's loopback services through
 `127.0.0.1`.
+
+Run the Windows build and launcher from WSL with the repository wrappers:
+
+```bash
+./scripts/build-windows.sh
+EXODUS_MCP_EXODUS_DIR='F:\projects\kid\emulators\Exodus_2.1' ./scripts/run-windows.sh
+```
+
+`EXODUS_MCP_EXODUS_DIR` must be a Windows path because `build.bat` and
+`run.bat` run through `cmd.exe`. Extra launcher arguments can be forwarded,
+for example `./scripts/run-windows.sh --listen 127.0.0.1:9000`.
+
+## ROM Loading
+
+`rom_load` replaces the active Mega Drive cartridge with an existing `.bin`,
+`.gen`, or `.md` file. The `path` parameter is an absolute Windows path. The
+plugin creates a minimal temporary module definition, unloads the previous
+program module, and restores the prior running state after loading. Pass
+`run: true` to start the loaded ROM when the system was previously paused. It
+is a mutating operation intended for controlled local test automation.
+
+## Processor Control
+
+`cpu_pause` and `cpu_run` control global execution. `m68k_step` and
+`z80_step` execute one instruction while keeping the system paused. The
+generic `cpu_step_over` and `cpu_step_out` use Exodus debugger semantics.
+`cpu_breakpoint_set`, `cpu_breakpoint_list`, and `cpu_breakpoint_remove`
+manage exact-address execution breakpoints owned by the current MCP process.
+Breakpoint IDs are invalid after an emulator restart.
 
 ## Quality gates
 
