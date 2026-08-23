@@ -9,6 +9,11 @@ and this project will use [Semantic Versioning](https://semver.org/spec/v2.0.0.h
 
 ### Added
 
+- `vdp_pixel_info`: per-pixel rendering attribution from the VDP completed
+  image buffer (source layer, name-entry mapping, palette entry,
+  shadow/highlight with resolved color, sprite cell data). Enables full
+  image buffer info lazily and fails with `pixel_info_pending` until one
+  frame has rendered with attribution active.
 - `vdp_tile_export`: exports consecutive 8x8 4bpp VRAM patterns as a scaled
   PNG artifact plus a JSON pixel-index decode, colored through a chosen CRAM
   palette line.

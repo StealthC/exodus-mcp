@@ -119,9 +119,18 @@ not manually decode opaque dumps in its prompt.
   entirely server-side on top of `vdp_status` plus the timed-buffer
   `vdp_mem_read` path; validated live against Kid Chameleon attract mode
   including a terminating chain `[0, 4, 15]`.
-- `vdp_pixel_info`: per-pixel rendering attribution (source layer, tile
-  mapping, palette entry, shadow/highlight result) from the VDP full image
-  buffer, with lazy enable and an explicit retry-after-one-frame contract.
+- [x] `vdp_pixel_info`: per-pixel rendering attribution from the VDP full
+  image buffer through the new `vdp_pixel_info` bridge op, which reads the
+  same `ImageBufferInfo` records as the Exodus debug UI: source layer
+  (sprite, layer A/B, window, background, border, blanking, CRAM write),
+  name-entry mapping with tile/flip/priority, palette row and entry,
+  shadow/highlight state with the resolved 8-bit color, h/v counters, and
+  sprite cell data. The plugin enables `VideoEnableFullImageBufferInfo`
+  lazily and reports `attribution_ready=false` until a frame has rendered
+  with it active; the tool surfaces that as a `pixel_info_pending` error
+  carrying a retry hint. The flag stays enabled once turned on. Validated
+  live against Kid Chameleon: border, layer B sky, layer A text/building,
+  and a bottom-row sprite all attribute correctly.
 - Native access paths already proven to work against Exodus for this phase:
   typed `IS315_5313` register, palette, and sprite accessors;
   `ITimedBufferInt::ReadLatest` for VRAM, CRAM, and VSRAM; and

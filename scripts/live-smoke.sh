@@ -234,6 +234,16 @@ if [ "$FULL" = 1 ]; then
 	plane_artifacts=$(json_get "$plane" "len(parsed.get('artifacts', []))" 2>/dev/null)
 	check "plane export attaches png and json artifacts" "[ \"\$plane_artifacts\" = '2' ]"
 
+	pixel=$(tool_call "vdp_pixel_info" '{"x": 160, "y": 100}')
+	if [ "$(json_get "$pixel" "parsed.get('code', '')" 2>/dev/null)" = "pixel_info_pending" ]; then
+		tool_call "cpu_run" >/dev/null
+		sleep 1
+		tool_call "cpu_pause" >/dev/null
+		pixel=$(tool_call "vdp_pixel_info" '{"x": 160, "y": 100}')
+	fi
+	pixel_source=$(json_get "$pixel" "parsed.get('source', '')" 2>/dev/null)
+	check "pixel info attributes a source layer" "[ -n \"\$pixel_source\" ]"
+
 	if [ "$was_running" = "True" ] || [ "$was_running" = "true" ]; then
 		tool_call "cpu_run" >/dev/null
 		emu_after=$(tool_call "emulator_status")

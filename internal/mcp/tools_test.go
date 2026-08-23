@@ -570,6 +570,60 @@ func pixelAt(t *testing.T, img image.Image, x, y int) [4]uint8 {
 	return [4]uint8{uint8(red >> 8), uint8(green >> 8), uint8(blue >> 8), uint8(alpha >> 8)}
 }
 
+func TestVDPPixelInfoReadyAndPending(t *testing.T) {
+	client := &fakeBridgeClient{status: newFakeStatus()}
+	readyPayload := `{"attribution_ready":true,"frame_token":42,"buffer_plane":1,"line_count":224,"line_width":320,` +
+		`"source":"layer_a","hcounter":279,"vcounter":120,"palette_row":2,"palette_entry":5,` +
+		`"shadow_highlight_enabled":false,"pixel_is_shadowed":false,"pixel_is_highlighted":false,` +
+		`"color_rgb333":[4,2,1],"color_888":"#DB9249",` +
+		`"mapping_present":true,"mapping_vram_address":4096,"mapping_data_word":8452,"tile":68,` +
+		`"hflip":false,"vflip":true,"priority":false,"pattern_row":3,"pattern_column":7,` +
+		`"sprite_present":false}`
+	pendingPayload := `{"attribution_ready":false,"frame_token":41,"buffer_plane":0,"line_count":224,"line_width":320}`
+	mode := "ready"
+	client.executeFunc = func(_ context.Context, method string, params map[string]string) (json.RawMessage, error) {
+		if method != "vdp_pixel_info" {
+			t.Fatalf("method = %s", method)
+		}
+		if params["x"] != "100" || params["y"] != "60" {
+			t.Fatalf("params = %v", params)
+		}
+		if mode == "ready" {
+			return json.RawMessage(readyPayload), nil
+		}
+		return json.RawMessage(pendingPayload), nil
+	}
+	content := structured(callTool(t, client, "vdp_pixel_info", `{"x": 100, "y": 60}`))
+	if content["source"] != "layer_a" || content["color_888"] != "#DB9249" || content["tile"] != float64(68) ||
+		content["vflip"] != true || content["pattern_row"] != float64(3) {
+		t.Fatalf("ready payload lost fields: %v", content)
+	}
+	if content["address_space"] != "315-5313 completed image buffer" {
+		t.Fatalf("metadata missing: %v", content["address_space"])
+	}
+
+	mode = "pending"
+	result := callTool(t, client, "vdp_pixel_info", `{"x": 100, "y": 60}`)
+	if result["isError"] != true {
+		t.Fatalf("pending must surface as tool error: %v", result)
+	}
+	structuredResult := structured(result)
+	if structuredResult["code"] != "pixel_info_pending" {
+		t.Fatalf("wrong pending code: %v", structuredResult["code"])
+	}
+}
+
+func TestVDPPixelInfoRejectsBridgeErrors(t *testing.T) {
+	client := &fakeBridgeClient{status: newFakeStatus()}
+	client.executeFunc = func(_ context.Context, method string, _ map[string]string) (json.RawMessage, error) {
+		return nil, &bridge.CommandError{Code: "out_of_range", Message: "y exceeds the completed image buffer line count"}
+	}
+	result := structured(callTool(t, client, "vdp_pixel_info", `{"x": 5, "y": 999}`))
+	if result["code"] != "out_of_range" {
+		t.Fatalf("bridge error code lost: %v", result)
+	}
+}
+
 func TestVDPTileExportDecodeAndPNG(t *testing.T) {
 	vram := make([]byte, 65536)
 	copy(vram[5*32:], []byte{0x01, 0x23, 0x45, 0x67}) // row zero: pixels 0..7

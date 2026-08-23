@@ -74,6 +74,16 @@ func vdpToolSpecs() []toolSpec {
 			run: runVDPPlaneExport,
 		},
 		{
+			name:        "vdp_pixel_info",
+			description: "Report per-pixel rendering attribution for one completed-frame coordinate: source layer, name-entry mapping, palette entry, shadow/highlight state, and sprite cell data. Enables full image buffer info lazily; if attribution is not ready yet the call fails with pixel_info_pending and must be retried after one rendered frame.",
+			schema: objectSchema(map[string]any{
+				"x":       integerProperty("Pixel X within the completed frame buffer, including border and blanking regions.", 0),
+				"y":       integerProperty("Pixel Y within the completed frame buffer.", 0),
+				"context": contextProperty(),
+			}, []string{"x", "y"}),
+			run: runVDPPixelInfo,
+		},
+		{
 			name:        "frame_capture",
 			description: "Capture the current rendered VDP frame as a PNG image artifact.",
 			schema:      objectSchema(map[string]any{"context": contextProperty()}, nil),
@@ -1134,4 +1144,47 @@ func runVDPPlaneExport(tc toolContext, args json.RawMessage) map[string]any {
 		},
 		"artifacts": []map[string]any{pngDescriptor, jsonDescriptor},
 	}, tc.modern)
+}
+
+type vdpPixelInfoArgs struct {
+	X       uint64 `json:"x"`
+	Y       uint64 `json:"y"`
+	Context string `json:"context"`
+}
+
+// runVDPPixelInfo reads one pixel's rendering attribution from the VDP
+// completed image buffer. The plugin enables full image buffer info lazily;
+// until one frame has been rendered with it active the bridge answers
+// attribution_ready=false and this tool surfaces the retry contract.
+func runVDPPixelInfo(tc toolContext, args json.RawMessage) map[string]any {
+	parsed, failure := decodeArgs[vdpPixelInfoArgs](args)
+	if failure != nil {
+		return failureResult(failure, tc.modern)
+	}
+	if _, failure = resolveContext(tc.server, parsed.Context); failure != nil {
+		return failureResult(failure, tc.modern)
+	}
+
+	payload, failure := tc.server.executeCommand(tc.ctx, "vdp_pixel_info", map[string]string{
+		"x": strconv.FormatUint(parsed.X, 10),
+		"y": strconv.FormatUint(parsed.Y, 10),
+	})
+	if failure != nil {
+		return failureResult(failure, tc.modern)
+	}
+	if ready, _ := payload["attribution_ready"].(bool); !ready {
+		frameToken, _ := payload["frame_token"].(float64)
+		return failureResult(&toolFailure{
+			Code:    "pixel_info_pending",
+			Message: "Pixel attribution is not ready: full image buffer info was just enabled and no frame has rendered with it active yet. Resume execution until at least one frame completes, then retry.",
+			Data: map[string]any{
+				"frame_token": uint64(frameToken),
+				"retry_hint":  "run the emulator for one frame, then call vdp_pixel_info again with the same coordinates",
+			},
+		}, tc.modern)
+	}
+	payload["address_space"] = "315-5313 completed image buffer"
+	payload["coordinate_space"] = "completed frame buffer coordinates, including border and blanking regions"
+	payload["consistency"] = "live"
+	return okResult(payload, tc.modern)
 }

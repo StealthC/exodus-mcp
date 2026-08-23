@@ -98,6 +98,7 @@ private:
 	bool BuildTraceCaptureData(const BridgeRequest& request, std::string& data, std::string& errorCode, std::string& errorMessage);
 	std::string BuildVdpStatusData();
 	bool BuildVDPMemoryReadData(const BridgeRequest& request, std::string& data, std::string& errorCode, std::string& errorMessage);
+	bool BuildVDPPixelInfoData(const BridgeRequest& request, std::string& data, std::string& errorCode, std::string& errorMessage);
 	bool BuildFrameCaptureData(const BridgeRequest& request, std::string& data, std::string& errorCode, std::string& errorMessage);
 
 	// Emulator inspection helpers
@@ -126,6 +127,7 @@ private:
 	unsigned long long _nextBreakpointID;
 	std::map<unsigned long long, ManagedBreakpoint> _managedBreakpoints;
 	unsigned long long _nextWatchpointID;
+	unsigned int _pixelInfoEnableFrameToken;
 	std::map<unsigned long long, ManagedWatchpoint> _managedWatchpoints;
 };
 

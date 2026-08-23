@@ -34,7 +34,7 @@ const unsigned int kDefaultTraceEntries = 1000;
 const unsigned int kMaxTraceEntries = 10000;
 const unsigned long long kDefaultTraceTimeoutMs = 5000;
 const unsigned long long kMaxTraceTimeoutMs = 30000;
-const char* const kSupportedOperations[] = {"status", "emulator_status", "mem_spaces", "mem_read", "regs_get", "disasm", "cpu_control", "breakpoint_set", "breakpoint_list", "breakpoint_remove", "watchpoint_set", "watchpoint_list", "watchpoint_remove", "vdp_status", "vdp_mem_read", "frame_capture", "rom_load", "trace_capture"};
+const char* const kSupportedOperations[] = {"status", "emulator_status", "mem_spaces", "mem_read", "regs_get", "disasm", "cpu_control", "breakpoint_set", "breakpoint_list", "breakpoint_remove", "watchpoint_set", "watchpoint_list", "watchpoint_remove", "vdp_status", "vdp_mem_read", "vdp_pixel_info", "frame_capture", "rom_load", "trace_capture"};
 const size_t kSupportedOperationCount = sizeof(kSupportedOperations) / sizeof(kSupportedOperations[0]);
 
 // ScreenshotSink collects the RGB 8-bit pixels that S315_5313::GetScreenshot
@@ -259,7 +259,8 @@ ExodusMcpPlugin::ExodusMcpPlugin(const std::wstring& implementationName, const s
 	_loadedModuleCount(0),
 	_bridgeEnabled(false),
 	_nextBreakpointID(1),
-	_nextWatchpointID(1)
+	_nextWatchpointID(1),
+	_pixelInfoEnableFrameToken(0)
 { }
 
 ExodusMcpPlugin::~ExodusMcpPlugin()
@@ -729,6 +730,10 @@ std::string ExodusMcpPlugin::ExecuteCommand(const BridgeRequest& request, bool& 
 	else if (strcmp(method, "vdp_mem_read") == 0)
 	{
 		success = BuildVDPMemoryReadData(request, payload, errorCode, errorMessage);
+	}
+	else if (strcmp(method, "vdp_pixel_info") == 0)
+	{
+		success = BuildVDPPixelInfoData(request, payload, errorCode, errorMessage);
 	}
 	else if (strcmp(method, "frame_capture") == 0)
 	{
@@ -1218,6 +1223,197 @@ bool ExodusMcpPlugin::BuildVDPMemoryReadData(const BridgeRequest& request, std::
 	data += ",\"data\":\"";
 	data += Base64Encode(bytes.empty() ? 0 : &bytes[0], bytes.size());
 	data += "\"}";
+	return true;
+}
+
+//----------------------------------------------------------------------------------------------------------------------
+//----------------------------------------------------------------------------------------------------------------------
+bool ExodusMcpPlugin::BuildVDPPixelInfoData(const BridgeRequest& request, std::string& data, std::string& errorCode, std::string& errorMessage)
+{
+	IS315_5313* vdp = FindVdp();
+	if (vdp == 0)
+	{
+		errorCode = "vdp_not_found";
+		errorMessage = "No Mega Drive VDP (315-5313) device is present in the loaded target";
+		return false;
+	}
+
+	unsigned long long parsedX = 0;
+	unsigned long long parsedY = 0;
+	const bool validX = ParseUnsigned(ParamValue(request.params, "x"), parsedX);
+	const bool validY = ParseUnsigned(ParamValue(request.params, "y"), parsedY);
+	if (!validX || !validY || parsedX > 0xFFFFFF || parsedY > 0xFFFF)
+	{
+		errorCode = "invalid_params";
+		errorMessage = "vdp_pixel_info requires x and y parameters";
+		return false;
+	}
+
+	// Full per-pixel attribution is only recorded while the VDP debug flag is
+	// enabled, because it costs render performance. Enable it lazily and
+	// remember the frame token at that moment: the completed buffer carries
+	// valid attribution only after a frame has been rendered with the flag
+	// active. Until then the caller retries after one frame.
+	const bool alreadyEnabled = vdp->GetVideoEnableFullImageBufferInfo();
+	if (!alreadyEnabled)
+	{
+		vdp->SetVideoEnableFullImageBufferInfo(true);
+		_pixelInfoEnableFrameToken = vdp->GetImageLastRenderedFrameToken();
+	}
+	const unsigned int frameToken = vdp->GetImageLastRenderedFrameToken();
+	const bool attributionReady = alreadyEnabled || (frameToken != _pixelInfoEnableFrameToken);
+
+	const unsigned int targetX = (unsigned int)parsedX;
+	const unsigned int targetY = (unsigned int)parsedY;
+	const unsigned int planeNo = vdp->GetImageCompletedBufferPlaneNo();
+	const unsigned int lineCount = vdp->GetImageBufferLineCount(planeNo);
+	if (targetY >= lineCount)
+	{
+		errorCode = "out_of_range";
+		errorMessage = "y exceeds the completed image buffer line count";
+		return false;
+	}
+	const unsigned int lineWidth = vdp->GetImageBufferLineWidth(planeNo, targetY);
+	if (targetX >= lineWidth)
+	{
+		errorCode = "out_of_range";
+		errorMessage = "x exceeds the completed image buffer line width";
+		return false;
+	}
+
+	data = "{\"attribution_ready\":";
+	data += attributionReady ? "true" : "false";
+	data += ",\"frame_token\":";
+	AppendNumber(data, frameToken);
+	data += ",\"buffer_plane\":";
+	AppendNumber(data, planeNo);
+	data += ",\"line_count\":";
+	AppendNumber(data, lineCount);
+	data += ",\"line_width\":";
+	AppendNumber(data, lineWidth);
+	if (!attributionReady)
+	{
+		data += "}";
+		return true;
+	}
+
+	vdp->LockImageBufferData(planeNo);
+	const IS315_5313::ImageBufferInfo* info = vdp->GetImageBufferInfo(planeNo, targetY, targetX);
+	if (info == 0)
+	{
+		vdp->UnlockImageBufferData(planeNo);
+		errorCode = "pixel_info_unavailable";
+		errorMessage = "The VDP did not provide attribution data for the target pixel";
+		return false;
+	}
+
+	const char* pixelSource = "unknown";
+	bool mappingPresent = false;
+	bool spritePresent = false;
+	switch (info->pixelSource)
+	{
+	case IS315_5313::PixelSource::Sprite:
+		pixelSource = "sprite";
+		mappingPresent = true;
+		spritePresent = true;
+		break;
+	case IS315_5313::PixelSource::LayerA:
+		pixelSource = "layer_a";
+		mappingPresent = true;
+		break;
+	case IS315_5313::PixelSource::LayerB:
+		pixelSource = "layer_b";
+		mappingPresent = true;
+		break;
+	case IS315_5313::PixelSource::Background:
+		pixelSource = "background";
+		break;
+	case IS315_5313::PixelSource::Window:
+		pixelSource = "window";
+		mappingPresent = true;
+		break;
+	case IS315_5313::PixelSource::CRAMWrite:
+		pixelSource = "cram_write";
+		break;
+	case IS315_5313::PixelSource::Border:
+		pixelSource = "border";
+		break;
+	case IS315_5313::PixelSource::Blanking:
+		pixelSource = "blanking";
+		break;
+	}
+
+	const unsigned char red8 = vdp->ColorValueTo8BitValue(info->colorComponentR, info->pixelIsShadowed, info->pixelIsHighlighted);
+	const unsigned char green8 = vdp->ColorValueTo8BitValue(info->colorComponentG, info->pixelIsShadowed, info->pixelIsHighlighted);
+	const unsigned char blue8 = vdp->ColorValueTo8BitValue(info->colorComponentB, info->pixelIsShadowed, info->pixelIsHighlighted);
+
+	data += ",\"source\":\"";
+	data += pixelSource;
+	data += "\",\"hcounter\":";
+	AppendNumber(data, info->hcounter);
+	data += ",\"vcounter\":";
+	AppendNumber(data, info->vcounter);
+	data += ",\"palette_row\":";
+	AppendNumber(data, info->paletteRow);
+	data += ",\"palette_entry\":";
+	AppendNumber(data, info->paletteEntry);
+	data += ",\"shadow_highlight_enabled\":";
+	data += info->shadowHighlightEnabled ? "true" : "false";
+	data += ",\"pixel_is_shadowed\":";
+	data += info->pixelIsShadowed ? "true" : "false";
+	data += ",\"pixel_is_highlighted\":";
+	data += info->pixelIsHighlighted ? "true" : "false";
+	data += ",\"color_rgb333\":[";
+	AppendNumber(data, info->colorComponentR);
+	data += ",";
+	AppendNumber(data, info->colorComponentG);
+	data += ",";
+	AppendNumber(data, info->colorComponentB);
+	data += "],\"color_888\":\"#";
+	char colorHex[8] = {0};
+	sprintf_s(colorHex, sizeof(colorHex), "%02X%02X%02X", red8, green8, blue8);
+	data += colorHex;
+	data += "\",\"mapping_present\":";
+	data += mappingPresent ? "true" : "false";
+	if (mappingPresent)
+	{
+		data += ",\"mapping_vram_address\":";
+		AppendNumber(data, info->mappingVRAMAddress);
+		data += ",\"mapping_data_word\":";
+		AppendNumber(data, info->mappingData.GetData());
+		data += ",\"tile\":";
+		AppendNumber(data, info->mappingData.GetDataSegment(0, 11));
+		data += ",\"hflip\":";
+		data += info->mappingData.GetBit(11) ? "true" : "false";
+		data += ",\"vflip\":";
+		data += info->mappingData.GetBit(12) ? "true" : "false";
+		data += ",\"priority\":";
+		data += info->mappingData.GetBit(15) ? "true" : "false";
+		data += ",\"pattern_row\":";
+		AppendNumber(data, info->patternRowNo);
+		data += ",\"pattern_column\":";
+		AppendNumber(data, info->patternColumnNo);
+	}
+	data += ",\"sprite_present\":";
+	data += spritePresent ? "true" : "false";
+	if (spritePresent)
+	{
+		data += ",\"sprite_table_entry_no\":";
+		AppendNumber(data, info->spriteTableEntryNo);
+		data += ",\"sprite_table_entry_address\":";
+		AppendNumber(data, info->spriteTableEntryAddress);
+		data += ",\"sprite_cell_width\":";
+		AppendNumber(data, info->spriteCellWidth);
+		data += ",\"sprite_cell_height\":";
+		AppendNumber(data, info->spriteCellHeight);
+		data += ",\"sprite_cell_pos_x\":";
+		AppendNumber(data, info->spriteCellPosX);
+		data += ",\"sprite_cell_pos_y\":";
+		AppendNumber(data, info->spriteCellPosY);
+	}
+	data += "}";
+
+	vdp->UnlockImageBufferData(planeNo);
 	return true;
 }
 
