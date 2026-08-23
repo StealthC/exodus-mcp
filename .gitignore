@@ -5,3 +5,5 @@
 /bin/
 *.test
 /.coverage/
+/tmp
+.env
