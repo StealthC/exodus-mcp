@@ -47,6 +47,12 @@ jobs:
         run: go vet ./...
       - name: Test with the race detector
         run: go test -race ./...
+      - name: Build third-party libraries (Debug x64)
+        shell: cmd
+        run: |-
+          for /f "usebackq tokens=*" %%i in (`"%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * -requires Microsoft.Component.MSBuild -find MSBuild\**\Bin\MSBuild.exe`) do set "MSBUILD=%%i"
+          if not defined MSBUILD (echo ERROR: MSBuild not found & exit /b 1)
+          "%MSBUILD%" vendor\exodus\ThirdPartyLibraries.sln -nologo -m -t:Build -p:Configuration=Debug -p:Platform=x64 -verbosity:minimal
       - name: Build native plugin (Debug x64)
         shell: cmd
         run: |-

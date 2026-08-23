@@ -7,10 +7,11 @@ CI is deliberately split by ownership:
 - `StealthC/Exodus` validates and publishes the forked emulator. It owns the
   Visual Studio build and its third-party source bootstrap.
 
-The MCP repository must not compile Exodus directly. The upstream repository
-intentionally ignores the contents of `Third/`; a clean submodule checkout has
-the Visual Studio project files but not the source code that those projects
-compile. The former job consequently could never be reproducible.
+The MCP repository must not compile the Exodus emulator itself; the fork
+builds and publishes that in its own pipeline. The fork vendors the
+third-party sources under `Third/`, so `ThirdPartyLibraries.sln` is fully
+reproducible from the submodule pin, and the Windows job may build those
+libraries for the native plugin link without downloading anything.
 
 ## Dependency update policy
 
@@ -37,10 +38,16 @@ not in this repository.
 
 The native plugin is an independent `native-plugin/` project consuming the
 Exodus SDK through the submodule's property sheets and project references.
-The Windows CI job compiles it with `Debug | x64` against the pinned
-submodule and uploads the DLL as an artifact. A `Release | x64` plugin build
-additionally requires Release third-party libraries from the fork
-(`ThirdPartyLibraries.sln`), so it stays a local, documented step for now.
+The Windows CI job first builds `ThirdPartyLibraries.sln`
+(`Debug | x64`) from the pinned submodule: the Exodus package headers
+auto-link their third-party dependencies through `#pragma comment(lib, ...)`
+directives, and those directives reach the plugin even when it uses none of
+the symbols (zlib arrives via `Stream.pkg` -> `Debug.pkg` -> private
+`ZIP.pkg`; expat via `HierarchicalStorage.pkg`). Without the generated
+libraries the plugin link fails with LNK1104. The job then compiles the
+plugin with `Debug | x64` against the pinned submodule and uploads the DLL
+as an artifact. A `Release | x64` plugin build needs the same libraries in
+Release configuration and stays a local, documented step for now.
 
 Current jobs:
 
