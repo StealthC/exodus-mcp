@@ -2,7 +2,10 @@
 
 ## Toolchains
 
-- Go 1.24 or newer for the HTTP server and its tests.
+- Go 1.26 or newer for the HTTP server and its tests. The bridge client relies
+  on Go 1.26 `os.NewFile` overlapped-handle detection so pipe deadlines arm
+  correctly; older toolchains fail every bridge command with "file type does
+  not support deadline".
 - Visual Studio with MSVC v143 and a Windows SDK for Exodus and the future
   native extension. See [Building Exodus](BUILD.md).
 

@@ -79,7 +79,7 @@ jobs:
   release-x64:
     runs-on: windows-2022
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Verify third-party source layout
         shell: pwsh
@@ -107,7 +107,7 @@ jobs:
           & '${{ steps.msbuild.outputs.path }}' Exodus.sln /m /t:Build /p:Configuration=Release /p:Platform=x64 /nologo /verbosity:minimal
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: exodus-release-x64
           if-no-files-found: error
