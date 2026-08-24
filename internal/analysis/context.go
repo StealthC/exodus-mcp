@@ -30,6 +30,12 @@ type Registry struct {
 	mu       sync.Mutex
 	defaults map[string]bool
 	contexts map[string]*Context
+
+	// Leases guards mutations and States stores context-scoped snapshots;
+	// both live for the server process like the contexts themselves.
+	Leases *LeaseRegistry
+	States *StateStore
+	Ledger *Ledger
 }
 
 // NewRegistry creates the registry plus the implicit default context.
@@ -37,6 +43,9 @@ func NewRegistry() *Registry {
 	registry := &Registry{
 		defaults: make(map[string]bool),
 		contexts: make(map[string]*Context),
+		Leases:   newLeaseRegistry(),
+		States:   newStateStore(),
+		Ledger:   newLedger(),
 	}
 	context := registry.create("default", true)
 	registry.defaults[context.ID] = true
@@ -108,6 +117,7 @@ func (registry *Registry) Close(id string) (*Context, error) {
 		return nil, fmt.Errorf("the default analysis context cannot be closed")
 	}
 	context.Closed = true
+	registry.Leases.ReleaseAll(id)
 	return context, nil
 }
 
