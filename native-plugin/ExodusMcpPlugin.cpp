@@ -15,9 +15,13 @@
 #include "Z80/IZ80.h"
 #include "Memory/IMemory.h"
 #include "ExtensionInterface/LoadedModuleInfo.h"
+#include "SystemInterface/ISystemGUIInterface.h"
 #include "HierarchicalStorage/HierarchicalStorage.pkg"
 #include "Stream/Stream.pkg"
+#include "MD1600IO/MDControl3.h"
+#include "MD1600IO/MDControl6.h"
 
+#include <cctype>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -26,17 +30,20 @@
 namespace
 {
 const wchar_t* const kPipePrefix = L"\\\\.\\pipe\\";
-const char* const kPluginVersion = "0.6.0";
+const char* const kPluginVersion = "0.7.0";
 const size_t kMaxRequestSize = 64 * 1024;
 const size_t kMaxWriteChunk = 32 * 1024;
 const unsigned long long kMaxReadLength = 8 * 1024 * 1024;
+const unsigned long long kMaxWriteLength = 4096;
 const unsigned int kDefaultDisassemblyCount = 32;
 const unsigned int kMaxDisassemblyCount = 256;
 const unsigned int kDefaultTraceEntries = 1000;
 const unsigned int kMaxTraceEntries = 10000;
 const unsigned long long kDefaultTraceTimeoutMs = 5000;
 const unsigned long long kMaxTraceTimeoutMs = 30000;
-const char* const kSupportedOperations[] = {"status", "emulator_status", "mem_spaces", "mem_read", "regs_get", "disasm", "cpu_control", "breakpoint_set", "breakpoint_list", "breakpoint_remove", "watchpoint_set", "watchpoint_list", "watchpoint_remove", "vdp_status", "vdp_mem_read", "vdp_pixel_info", "frame_capture", "rom_load", "trace_capture"};
+const unsigned int kMaxFrameAdvance = 60;
+const unsigned int kMaxInputButtons = 16;
+const char* const kSupportedOperations[] = {"status", "emulator_status", "mem_spaces", "mem_read", "regs_get", "disasm", "cpu_control", "breakpoint_set", "breakpoint_list", "breakpoint_remove", "watchpoint_set", "watchpoint_list", "watchpoint_remove", "vdp_status", "vdp_mem_read", "vdp_pixel_info", "frame_capture", "rom_load", "trace_capture", "mem_write", "state_save", "state_load", "frame_advance", "input_set"};
 const size_t kSupportedOperationCount = sizeof(kSupportedOperations) / sizeof(kSupportedOperations[0]);
 
 // ScreenshotSink collects the RGB 8-bit pixels that S315_5313::GetScreenshot
@@ -661,6 +668,56 @@ DWORD ReadLatestGuarded(ITimedBufferInt* buffer, unsigned long long address, uns
 	}
 }
 
+// Writes a byte range into an entry-based memory device, reading each entry,
+// patching its bytes, and writing it back. The byte order parameter controls
+// which byte of an entry each offset lands in; big-endian places the first
+// byte in the most significant position.
+DWORD WriteMemoryEntriesGuarded(IMemory* memory, unsigned int entrySize, bool bigEndian, unsigned long long address, unsigned long long length, const unsigned char* input, void** faultingAddress)
+{
+	__try
+	{
+		unsigned long long offset = 0;
+		while (offset < length)
+		{
+			const unsigned long long location = address + offset;
+			const unsigned long long entryIndex = location / entrySize;
+			const unsigned long long entryEnd = (entryIndex + 1) * entrySize;
+			unsigned int entryValue = memory->ReadMemoryEntry((unsigned int)entryIndex);
+			while (offset < length && (address + offset) < entryEnd)
+			{
+				const unsigned long long current = address + offset;
+				const unsigned int shiftInEntry = (unsigned int)(current % entrySize);
+				const unsigned int byteShift = bigEndian ? (8u * (entrySize - 1 - shiftInEntry)) : (8u * shiftInEntry);
+				entryValue = (entryValue & ~(0xFFu << byteShift)) | ((unsigned int)input[offset] << byteShift);
+				++offset;
+			}
+			memory->WriteMemoryEntry((unsigned int)entryIndex, entryValue);
+		}
+		return 0;
+	}
+	__except (CaptureFault(GetExceptionInformation()->ExceptionRecord->ExceptionAddress, faultingAddress))
+	{
+		return GetExceptionCode();
+	}
+}
+
+// Writes one byte range through a processor's debugger memory path.
+DWORD WriteBusBytesGuarded(IProcessor* processor, unsigned int busMask, unsigned long long address, unsigned long long length, const unsigned char* input, void** faultingAddress)
+{
+	__try
+	{
+		for (unsigned long long offset = 0; offset < length; ++offset)
+		{
+			processor->SetMemorySpaceByte((unsigned int)((address + offset) & busMask), input[offset]);
+		}
+		return 0;
+	}
+	__except (CaptureFault(GetExceptionInformation()->ExceptionRecord->ExceptionAddress, faultingAddress))
+	{
+		return GetExceptionCode();
+	}
+}
+
 void DescribeFaultingModule(void* exceptionAddress, std::string& modulePath, unsigned long long& offset)
 {
 	HMODULE moduleBase = 0;
@@ -782,6 +839,26 @@ std::string ExodusMcpPlugin::ExecuteCommand(const BridgeRequest& request, bool& 
 	else if (strcmp(method, "trace_capture") == 0)
 	{
 		success = BuildTraceCaptureData(request, payload, errorCode, errorMessage);
+	}
+	else if (strcmp(method, "mem_write") == 0)
+	{
+		success = BuildMemoryWriteData(request, payload, errorCode, errorMessage);
+	}
+	else if (strcmp(method, "state_save") == 0)
+	{
+		success = BuildStateSaveData(request, payload, errorCode, errorMessage);
+	}
+	else if (strcmp(method, "state_load") == 0)
+	{
+		success = BuildStateLoadData(request, payload, errorCode, errorMessage);
+	}
+	else if (strcmp(method, "frame_advance") == 0)
+	{
+		success = BuildFrameAdvanceData(request, payload, errorCode, errorMessage);
+	}
+	else if (strcmp(method, "input_set") == 0)
+	{
+		success = BuildInputSetData(request, payload, errorCode, errorMessage);
 	}
 	else
 	{
@@ -1060,6 +1137,16 @@ IS315_5313* ExodusMcpPlugin::FindVdp() const
 		}
 	}
 	return 0;
+}
+
+//----------------------------------------------------------------------------------------------------------------------
+ISystemGUIInterface* ExodusMcpPlugin::FindSystemGUIInterface() const
+{
+	// Extensions bind to the same System object the GUI uses, seen through
+	// the narrower ISystemExtensionInterface view. System implements both
+	// interfaces on one object, so the cross-cast down to the GUI view gives
+	// access to its save-state API without any fork change.
+	return dynamic_cast<ISystemGUIInterface*>(&GetSystemInterface());
 }
 
 //----------------------------------------------------------------------------------------------------------------------
@@ -2585,6 +2672,11 @@ std::string ExodusMcpPlugin::Base64Encode(const unsigned char* data, size_t size
 	return mcpwire::Base64Encode(data, size);
 }
 
+bool ExodusMcpPlugin::Base64Decode(const std::string& input, std::vector<unsigned char>& output)
+{
+	return mcpwire::Base64Decode(input, output);
+}
+
 std::string ExodusMcpPlugin::SanitizeIdentifier(const std::wstring& value)
 {
 	return mcpwire::SanitizeIdentifier(value);
@@ -2593,4 +2685,400 @@ std::string ExodusMcpPlugin::SanitizeIdentifier(const std::wstring& value)
 bool ExodusMcpPlugin::ParseUnsigned(const std::string& text, unsigned long long& value)
 {
 	return mcpwire::ParseUnsigned(text, value);
+}
+
+//----------------------------------------------------------------------------------------------------------------------
+// Phase 4 command payloads: controlled experimentation under exclusive
+// context leases. The Go server enforces the lease; these builders only
+// perform the requested emulator mutation.
+//----------------------------------------------------------------------------------------------------------------------
+
+bool ExodusMcpPlugin::BuildMemoryWriteData(const BridgeRequest& request, std::string& data, std::string& errorCode, std::string& errorMessage)
+{
+	const std::string spaceId = ParamValue(request.params, "space");
+	unsigned long long requestedAddress = 0;
+	unsigned long long length = 0;
+	const bool validAddress = ParseUnsigned(ParamValue(request.params, "address"), requestedAddress);
+	const bool validLength = ParseUnsigned(ParamValue(request.params, "length"), length);
+	if (spaceId.empty() || !validAddress || !validLength)
+	{
+		errorCode = "invalid_params";
+		errorMessage = "mem_write requires space, address, and length parameters";
+		return false;
+	}
+	if (length < 1 || length > kMaxWriteLength)
+	{
+		errorCode = "length_out_of_range";
+		errorMessage = "length must be between 1 and " + NumberToString(kMaxWriteLength) + " bytes";
+		return false;
+	}
+
+	std::vector<unsigned char> bytes;
+	if (!Base64Decode(ParamValue(request.params, "data"), bytes) || bytes.size() != (size_t)length)
+	{
+		errorCode = "invalid_params";
+		errorMessage = "data must be valid base64 matching the declared length";
+		return false;
+	}
+
+	const std::vector<MemorySpace> catalog = BuildSpaceCatalog();
+	const MemorySpace* space = FindSpace(catalog, spaceId);
+	if (space == 0)
+	{
+		errorCode = "unknown_space";
+		errorMessage = "Unknown space id: " + spaceId + ". Valid ids:";
+		for (size_t i = 0; i < catalog.size(); ++i)
+		{
+			errorMessage += " " + catalog[i].id;
+		}
+		return false;
+	}
+	if (requestedAddress >= space->sizeBytes || length > space->sizeBytes - requestedAddress)
+	{
+		errorCode = "out_of_range";
+		errorMessage = "Requested range exceeds space size of " + NumberToString(space->sizeBytes) + " bytes";
+		return false;
+	}
+
+	// Timed-buffer devices (the VDP memory shells) are owned by their worker
+	// thread and cannot be written through the debugger path; refuse instead
+	// of corrupting their write lists.
+	if (space->device != 0 && dynamic_cast<ITimedBufferIntDevice*>(space->device) != 0)
+	{
+		errorCode = "write_not_supported";
+		errorMessage = "space " + spaceId + " is a timed-buffer device and cannot be written through the debugger path";
+		return false;
+	}
+
+	const bool isBusSpace = (space->kind == "bus");
+	unsigned int busMask = 0;
+	unsigned long long address = requestedAddress;
+	if (isBusSpace)
+	{
+		busMask = space->processor->GetAddressBusMask();
+		if (busMask == 0)
+		{
+			const unsigned int busWidth = space->processor->GetAddressBusWidth();
+			busMask = (busWidth > 0 && busWidth < 32) ? ((1u << busWidth) - 1u) : 0xFFFFFFFFu;
+		}
+		address &= busMask;
+	}
+	else if (space->memory == 0)
+	{
+		errorCode = "write_not_supported";
+		errorMessage = "space " + spaceId + " has no writable memory backing";
+		return false;
+	}
+
+	// Pause around the write so the debug path never races the executing
+	// workers, mirroring the timed-buffer read discipline.
+	const bool pauseForWrite = GetSystemInterface().SystemRunning();
+	if (pauseForWrite)
+	{
+		GetSystemInterface().StopSystem();
+	}
+
+	bool written = true;
+	void* faultingAddress = 0;
+	DWORD faultCode = 0;
+	if (isBusSpace)
+	{
+		faultCode = WriteBusBytesGuarded(space->processor, busMask, address, length, bytes.empty() ? 0 : &bytes[0], &faultingAddress);
+		if (faultCode != 0)
+		{
+			written = false;
+		}
+	}
+	else
+	{
+		const unsigned int entrySize = (space->entrySize > 0) ? space->entrySize : 1;
+		const bool bigEndian = (strcmp(space->byteOrder, "big-endian") == 0);
+		faultCode = WriteMemoryEntriesGuarded(space->memory, entrySize, bigEndian, address, length, bytes.empty() ? 0 : &bytes[0], &faultingAddress);
+		if (faultCode != 0)
+		{
+			written = false;
+		}
+	}
+
+	if (pauseForWrite)
+	{
+		GetSystemInterface().RunSystem();
+	}
+
+	if (!written)
+	{
+		errorCode = "write_fault";
+		errorMessage = DescribeCaughtException(faultingAddress, faultCode);
+		return false;
+	}
+
+	data = "{\"space_id\":";
+	AppendJsonStringAscii(data, space->id);
+	data += ",\"kind\":";
+	AppendJsonStringAscii(data, space->kind);
+	data += ",\"address\":";
+	AppendNumber(data, requestedAddress);
+	data += ",\"effective_address\":";
+	AppendNumber(data, address);
+	data += ",\"length\":";
+	AppendNumber(data, length);
+	data += ",\"byte_order\":";
+	AppendJsonStringAscii(data, space->byteOrder);
+	data += ",\"encoding\":\"base64\",\"consistency\":\"live\",\"written\":\"";
+	data += Base64Encode(bytes.empty() ? 0 : &bytes[0], bytes.size());
+	data += "\",\"system_paused_during_write\":";
+	data += pauseForWrite ? "true" : "false";
+	data += "}";
+	return true;
+}
+
+bool ExodusMcpPlugin::BuildStateSaveData(const BridgeRequest& request, std::string& data, std::string& errorCode, std::string& errorMessage)
+{
+	std::wstring path;
+	if (!Utf8ToWide(ParamValue(request.params, "path"), path) || path.empty())
+	{
+		errorCode = "invalid_params";
+		errorMessage = "path must be a valid UTF-8 Windows file path";
+		return false;
+	}
+	ISystemGUIInterface* gui = FindSystemGUIInterface();
+	if (gui == 0)
+	{
+		errorCode = "state_api_unavailable";
+		errorMessage = "The connected Exodus build does not expose the system save-state interface";
+		return false;
+	}
+
+	// Create the parent directory so the zip writer never fails on a missing
+	// folder; only one level is expected (server-side per-context folders).
+	const size_t separator = path.find_last_of(L"\\/");
+	if (separator != std::wstring::npos)
+	{
+		const std::wstring directory = path.substr(0, separator);
+		if (!CreateDirectoryW(directory.c_str(), 0) && GetLastError() != ERROR_ALREADY_EXISTS)
+		{
+			errorCode = "state_save_failed";
+			errorMessage = "Could not create snapshot directory";
+			return false;
+		}
+	}
+
+	if (!gui->SaveState(path, ISystemGUIInterface::FileType::ZIP, false))
+	{
+		errorCode = "state_save_failed";
+		errorMessage = "Exodus could not save the system state to the requested path";
+		return false;
+	}
+	data = "{\"saved\":true,\"file_type\":\"zip\",\"system_running\":";
+	data += GetSystemInterface().SystemRunning() ? "true" : "false";
+	data += "}";
+	return true;
+}
+
+bool ExodusMcpPlugin::BuildStateLoadData(const BridgeRequest& request, std::string& data, std::string& errorCode, std::string& errorMessage)
+{
+	std::wstring path;
+	if (!Utf8ToWide(ParamValue(request.params, "path"), path) || path.empty())
+	{
+		errorCode = "invalid_params";
+		errorMessage = "path must be a valid UTF-8 Windows file path";
+		return false;
+	}
+	ISystemGUIInterface* gui = FindSystemGUIInterface();
+	if (gui == 0)
+	{
+		errorCode = "state_api_unavailable";
+		errorMessage = "The connected Exodus build does not expose the system save-state interface";
+		return false;
+	}
+	if (!gui->LoadState(path, ISystemGUIInterface::FileType::ZIP, false))
+	{
+		errorCode = "state_load_failed";
+		errorMessage = "Exodus could not load the system state from the requested path";
+		return false;
+	}
+	data = "{\"loaded\":true,\"file_type\":\"zip\",\"system_running\":";
+	data += GetSystemInterface().SystemRunning() ? "true" : "false";
+	data += "}";
+	return true;
+}
+
+bool ExodusMcpPlugin::BuildFrameAdvanceData(const BridgeRequest& request, std::string& data, std::string& errorCode, std::string& errorMessage)
+{
+	unsigned long long frames = 1;
+	if (!ParamValue(request.params, "frames").empty() && !ParseUnsigned(ParamValue(request.params, "frames"), frames))
+	{
+		errorCode = "invalid_params";
+		errorMessage = "frames must be an unsigned integer";
+		return false;
+	}
+	if (frames < 1 || frames > kMaxFrameAdvance)
+	{
+		errorCode = "invalid_params";
+		errorMessage = "frames must be between 1 and " + NumberToString(kMaxFrameAdvance);
+		return false;
+	}
+
+	IS315_5313* vdp = FindVdp();
+	if (vdp == 0)
+	{
+		errorCode = "vdp_not_found";
+		errorMessage = "No Mega Drive VDP (315-5313) device is present in the loaded target";
+		return false;
+	}
+
+	GetSystemInterface().StopSystem();
+	unsigned long long completed = 0;
+	for (unsigned long long frame = 0; frame < frames; ++frame)
+	{
+		const unsigned int tokenBefore = vdp->GetImageLastRenderedFrameToken();
+		GetSystemInterface().RunSystem();
+		bool advanced = false;
+		// One rendered frame takes about 16.7 ms at 60 Hz; wait up to two
+		// seconds per frame so a halted display (blank screen at boot) times
+		// out with a clear error instead of spinning forever.
+		for (int attempt = 0; attempt < 2000; ++attempt)
+		{
+			if (vdp->GetImageLastRenderedFrameToken() != tokenBefore)
+			{
+				advanced = true;
+				break;
+			}
+			Sleep(1);
+		}
+		GetSystemInterface().StopSystem();
+		if (!advanced)
+		{
+			errorCode = "frame_timeout";
+			errorMessage = "The VDP did not render a new frame within 2000 ms; the display may be disabled or the system halted. Completed " + NumberToString(completed) + " of " + NumberToString(frames) + " requested frames";
+			return false;
+		}
+		++completed;
+	}
+
+	data = "{\"frames_requested\":";
+	AppendNumber(data, frames);
+	data += ",\"frames_completed\":";
+	AppendNumber(data, completed);
+	data += ",\"frame_token\":";
+	AppendNumber(data, vdp->GetImageLastRenderedFrameToken());
+	data += ",\"system_running\":false}";
+	return true;
+}
+
+bool ExodusMcpPlugin::BuildInputSetData(const BridgeRequest& request, std::string& data, std::string& errorCode, std::string& errorMessage)
+{
+	const std::string state = ParamValue(request.params, "state");
+	if (state != "down" && state != "up")
+	{
+		errorCode = "invalid_params";
+		errorMessage = "state must be down or up";
+		return false;
+	}
+	unsigned long long player = 1;
+	if (!ParamValue(request.params, "player").empty() && !ParseUnsigned(ParamValue(request.params, "player"), player))
+	{
+		errorCode = "invalid_params";
+		errorMessage = "player must be an unsigned integer";
+		return false;
+	}
+	if (player < 1 || player > 4)
+	{
+		errorCode = "invalid_params";
+		errorMessage = "player must be between 1 and 4";
+		return false;
+	}
+	const std::string buttonsParam = ParamValue(request.params, "buttons");
+	if (buttonsParam.empty())
+	{
+		errorCode = "invalid_params";
+		errorMessage = "buttons must name at least one button";
+		return false;
+	}
+
+	// Collect the controller devices in instance order; the Nth controller
+	// answers player port N.
+	const std::list<IDevice*> devices = GetSystemInterface().GetLoadedDevices();
+	std::vector<IDevice*> controllers;
+	for (std::list<IDevice*>::const_iterator i = devices.begin(); i != devices.end(); ++i)
+	{
+		if (dynamic_cast<MDControl3*>(*i) != 0 || dynamic_cast<MDControl6*>(*i) != 0)
+		{
+			controllers.push_back(*i);
+		}
+	}
+	if (player > controllers.size())
+	{
+		errorCode = "controller_not_found";
+		errorMessage = "No controller device is connected to player port " + NumberToString(player);
+		return false;
+	}
+	IDevice* controller = controllers[(size_t)(player - 1)];
+
+	// Split the comma-separated button list and capitalize each name to match
+	// the key code vocabulary (Up, Down, Left, Right, A, B, C, Start, X, Y,
+	// Z, Mode).
+	std::vector<std::string> buttons;
+	std::string remaining = buttonsParam;
+	while (!remaining.empty())
+	{
+		const size_t comma = remaining.find(',');
+		const std::string button = (comma == std::string::npos) ? remaining : remaining.substr(0, comma);
+		if (!button.empty())
+		{
+			buttons.push_back(button);
+		}
+		remaining = (comma == std::string::npos) ? std::string() : remaining.substr(comma + 1);
+	}
+	if (buttons.empty() || buttons.size() > kMaxInputButtons)
+	{
+		errorCode = "invalid_params";
+		errorMessage = "buttons must name between 1 and " + NumberToString(kMaxInputButtons) + " buttons";
+		return false;
+	}
+
+	std::string applied;
+	for (size_t i = 0; i < buttons.size(); ++i)
+	{
+		const std::string& raw = buttons[i];
+		std::wstring keyName;
+		keyName += (raw.size() >= 1) ? (wchar_t)(unsigned char)toupper((unsigned char)raw[0]) : L'\0';
+		for (size_t c = 1; c < raw.size(); ++c)
+		{
+			keyName += (wchar_t)(unsigned char)tolower((unsigned char)raw[c]);
+		}
+		const unsigned int keyCodeID = controller->GetKeyCodeID(keyName);
+		if (keyCodeID == 0)
+		{
+			errorCode = "invalid_params";
+			errorMessage = "Unknown button: " + raw;
+			return false;
+		}
+		if (state == "down")
+		{
+			controller->HandleInputKeyDown(keyCodeID);
+		}
+		else
+		{
+			controller->HandleInputKeyUp(keyCodeID);
+		}
+		if (!applied.empty())
+		{
+			applied += ",";
+		}
+		applied += raw;
+	}
+
+	data = "{\"player\":";
+	AppendNumber(data, player);
+	data += ",\"buttons\":[";
+	AppendJsonStringAscii(data, applied);
+	data += "],\"state\":";
+	AppendJsonStringAscii(data, state);
+	data += ",\"controller_instance\":";
+	AppendJsonString(data, controller->GetDeviceInstanceName());
+	data += ",\"button_count\":";
+	AppendNumber(data, buttons.size());
+	data += "}";
+	return true;
 }

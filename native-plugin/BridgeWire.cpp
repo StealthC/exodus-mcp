@@ -3,6 +3,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <vector>
 
 namespace mcpwire
 {
@@ -131,6 +132,71 @@ namespace mcpwire
 			encoded += (remaining > 2) ? alphabet[triple & 0x3F] : '=';
 		}
 		return encoded;
+	}
+
+	bool Base64Decode(const std::string& input, std::vector<unsigned char>& output)
+	{
+		// RFC 4648 decoder: four base64 characters produce three bytes.
+		static const signed char decodeTable[256] = {
+			-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+			-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,62,-1,-1,-1,63,52,53,54,55,56,57,58,59,60,61,-1,-1,-1,-1,-1,-1,
+			-1, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,-1,-1,-1,-1,-1,
+			-1,26,27,28,29,30,31,32,33,34,35,36,37,38,39,40,41,42,43,44,45,46,47,48,49,50,51,-1,-1,-1,-1,-1,
+			-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+			-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+			-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+			-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1
+		};
+		output.clear();
+		if (input.empty())
+		{
+			return true;
+		}
+		if ((input.size() % 4) != 0)
+		{
+			return false;
+		}
+		size_t padding = 0;
+		if (input.size() >= 2 && input[input.size() - 1] == '=')
+		{
+			++padding;
+		}
+		if (input.size() >= 2 && input[input.size() - 2] == '=')
+		{
+			++padding;
+		}
+		if (padding > 2)
+		{
+			return false;
+		}
+		const size_t dataLength = input.size() - padding;
+		if ((dataLength % 4) == 1)
+		{
+			return false;
+		}
+		output.reserve((dataLength / 4) * 3 + padding);
+		for (size_t offset = 0; offset < dataLength; offset += 4)
+		{
+			const int a = decodeTable[(unsigned char)input[offset]];
+			const int b = decodeTable[(unsigned char)input[offset + 1]];
+			const int c = (offset + 2 < dataLength) ? decodeTable[(unsigned char)input[offset + 2]] : 0;
+			const int d = (offset + 3 < dataLength) ? decodeTable[(unsigned char)input[offset + 3]] : 0;
+			if (a < 0 || b < 0 || c < 0 || d < 0)
+			{
+				return false;
+			}
+			const unsigned int triple = ((unsigned int)a << 18) | ((unsigned int)b << 12) | ((unsigned int)c << 6) | (unsigned int)d;
+			output.push_back((unsigned char)(triple >> 16));
+			if (offset + 2 < dataLength)
+			{
+				output.push_back((unsigned char)(triple >> 8));
+			}
+			if (offset + 3 < dataLength)
+			{
+				output.push_back((unsigned char)triple);
+			}
+		}
+		return true;
 	}
 
 	std::string SanitizeIdentifier(const std::wstring& value)

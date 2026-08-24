@@ -7,6 +7,7 @@
 
 #include <map>
 #include <string>
+#include <vector>
 
 namespace mcpwire
 {
@@ -31,6 +32,9 @@ namespace mcpwire
 
 	// RFC 4648 base64 with padding.
 	std::string Base64Encode(const unsigned char* data, size_t size);
+
+	// Decodes RFC 4648 base64 with padding; returns false on invalid input.
+	bool Base64Decode(const std::string& input, std::vector<unsigned char>& output);
 
 	// Lowercases ASCII alphanumerics, collapses every other run to one dash,
 	// trims dashes, and falls back to "dev" when nothing survives.

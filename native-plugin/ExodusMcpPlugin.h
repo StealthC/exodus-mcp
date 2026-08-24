@@ -12,6 +12,7 @@ class IMemory;
 class IBreakpoint;
 class IWatchpoint;
 class IS315_5313;
+class ISystemGUIInterface;
 
 // ExodusMcpPlugin is the persistent native bridge for exodus-mcp. It is
 // read-only in this increment: it never mutates emulator state, loads ROMs,
@@ -102,6 +103,11 @@ private:
 	bool BuildVDPMemoryReadData(const BridgeRequest& request, std::string& data, std::string& errorCode, std::string& errorMessage);
 	bool BuildVDPPixelInfoData(const BridgeRequest& request, std::string& data, std::string& errorCode, std::string& errorMessage);
 	bool BuildFrameCaptureData(const BridgeRequest& request, std::string& data, std::string& errorCode, std::string& errorMessage);
+	bool BuildMemoryWriteData(const BridgeRequest& request, std::string& data, std::string& errorCode, std::string& errorMessage);
+	bool BuildStateSaveData(const BridgeRequest& request, std::string& data, std::string& errorCode, std::string& errorMessage);
+	bool BuildStateLoadData(const BridgeRequest& request, std::string& data, std::string& errorCode, std::string& errorMessage);
+	bool BuildFrameAdvanceData(const BridgeRequest& request, std::string& data, std::string& errorCode, std::string& errorMessage);
+	bool BuildInputSetData(const BridgeRequest& request, std::string& data, std::string& errorCode, std::string& errorMessage);
 
 	// Emulator inspection helpers
 	std::vector<MemorySpace> BuildSpaceCatalog();
@@ -110,12 +116,14 @@ private:
 	unsigned int TypedGetPC(const std::string& cpuName, IProcessor& target) const;
 	IS315_5313* FindVdp() const;
 	void PurgeManagedDebugState();
+	ISystemGUIInterface* FindSystemGUIInterface() const;
 
 	// Formatting helpers
 	static std::string ToUtf8(const std::wstring& value);
 	static void AppendJsonString(std::string& target, const std::wstring& value);
 	static void AppendJsonStringAscii(std::string& target, const std::string& value);
 	static std::string Base64Encode(const unsigned char* data, size_t size);
+	static bool Base64Decode(const std::string& input, std::vector<unsigned char>& output);
 	static std::string SanitizeIdentifier(const std::wstring& value);
 	static bool ParseUnsigned(const std::string& text, unsigned long long& value);
 	bool WriteAll(HANDLE pipe, const std::string& data);

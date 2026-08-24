@@ -6,6 +6,7 @@
 #include <cstdio>
 #include <cstring>
 #include <string>
+#include <vector>
 
 static int failures = 0;
 
@@ -104,6 +105,27 @@ static void TestBase64EncodeRfc4648Vectors()
 	CHECK_EQUAL(std::string("Zm9vYmFy"), mcpwire::Base64Encode((const unsigned char*)"foobar", 6));
 }
 
+static void TestBase64DecodeRfc4648Vectors()
+{
+	std::vector<unsigned char> output;
+	CHECK(mcpwire::Base64Decode("", output) && output.empty());
+	CHECK(mcpwire::Base64Decode("Zg==", output) && output.size() == 1 && output[0] == 'f');
+	CHECK(mcpwire::Base64Decode("Zm8=", output) && output.size() == 2 && output[0] == 'f' && output[1] == 'o');
+	CHECK(mcpwire::Base64Decode("Zm9v", output) && output.size() == 3 && output[0] == 'f' && output[1] == 'o' && output[2] == 'o');
+	CHECK(mcpwire::Base64Decode("Zm9vYmFy", output) && output.size() == 6 && output[5] == 'r');
+}
+
+static void TestBase64DecodeRejectsBadInput()
+{
+	std::vector<unsigned char> output;
+	CHECK(!mcpwire::Base64Decode("a", output));
+	CHECK(!mcpwire::Base64Decode("abc", output));
+	CHECK(!mcpwire::Base64Decode("====", output));
+	CHECK(!mcpwire::Base64Decode("Zm9v!", output));
+	CHECK(!mcpwire::Base64Decode("Zg=", output));
+	CHECK(!mcpwire::Base64Decode("Zm9v=====", output));
+}
+
 static void TestSanitizeIdentifier()
 {
 	CHECK_EQUAL(std::string("kid-chameleon"), mcpwire::SanitizeIdentifier(L"Kid Chameleon!"));
@@ -150,6 +172,8 @@ int main()
 	TestParseRequestMissingMethodFails();
 	TestAppendJsonStringEscaping();
 	TestBase64EncodeRfc4648Vectors();
+	TestBase64DecodeRfc4648Vectors();
+	TestBase64DecodeRejectsBadInput();
 	TestSanitizeIdentifier();
 	TestParseUnsignedAcceptsDecimalAndHex();
 	TestParseUnsignedRejectsBadInput();
