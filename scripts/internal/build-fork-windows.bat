@@ -73,6 +73,14 @@ echo [2/2] Installing generated exe into %DEST_EXE%
 copy /y "%ROOT%vendor\exodus\Exodus.exe" "%DEST_EXE%" >nul
 if errorlevel 1 goto copy_failed
 
+rem The extension interface gains slots and fixes together with the device
+rem DLLs; a fresh exe next to stale plugins mixes vtable layouts and marshal
+rem instantiations, so the whole binary set moves as one unit.
+copy /y "%ROOT%vendor\exodus\System.dll" "%EXODUS_MCP_EXODUS_DIR%\System.dll" >nul
+if errorlevel 1 goto copy_failed
+copy /y "%ROOT%vendor\exodus\Assemblies\*.dll" "%EXODUS_MCP_EXODUS_DIR%\Plugins\" >nul
+if errorlevel 1 goto copy_failed
+
 echo Done. Test install updated: %DEST_EXE% (%CONFIG% x64)
 endlocal
 exit /b 0

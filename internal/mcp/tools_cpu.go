@@ -19,7 +19,7 @@ func cpuToolSpecs() []toolSpec {
 	return []toolSpec{
 		{
 			name:        "cpu_trace_capture",
-			description: "Capture a bounded M68K or Z80 execution trace into a text artifact. WARNING: enabling tracing against a running system currently crashes the emulator in some conditions (see docs/TRACE-CRASH-INVESTIGATION.md). Treat as experimental; entries accumulate only while the system is running.",
+			description: "Capture a bounded M68K or Z80 execution trace into a text artifact. The capture stops the system, routes the processor trace log through a temporary on-disk file (the in-memory ring accessor is unsafe across the extension boundary), and restores the prior run state. Entries accumulate only while the system runs during the window; a paused system yields none. Tracing with disassembly slows emulation substantially while active.",
 			schema: objectSchema(map[string]any{
 				"cpu":         enumProperty("Processor to trace.", []string{"m68k", "z80"}),
 				"max_entries": integerProperty(fmt.Sprintf("Maximum entries (default %d, cap %d).", defaultTraceEntries, maxTraceEntries), 1),
@@ -248,17 +248,23 @@ func runCpuTraceCapture(tc toolContext, args json.RawMessage) map[string]any {
 	timedOut, _ := payload["timed_out"].(bool)
 	cpu, _ := payload["cpu"].(string)
 	sample, _ := payload["sample"].([]any)
+	captureChannel, _ := payload["capture_channel"].(string)
+
+	summary := map[string]any{
+		"kind":          "cpu-trace",
+		"cpu":           cpu,
+		"captured":      int(captured),
+		"timed_out":     timedOut,
+		"sampling_note": "Sampling follows live emulation only; a paused system yields few or no entries.",
+		"sample":        sample,
+		"sha256":        stored.SHA256,
+	}
+	if captureChannel != "" {
+		summary["capture_channel"] = captureChannel
+	}
 
 	return okResult(map[string]any{
-		"summary": map[string]any{
-			"kind":          "cpu-trace",
-			"cpu":           cpu,
-			"captured":      int(captured),
-			"timed_out":     timedOut,
-			"sampling_note": "Sampling follows live emulation only; a paused system yields few or no entries.",
-			"sample":        sample,
-			"sha256":        stored.SHA256,
-		},
+		"summary":  summary,
 		"artifact": artifactDescriptor(tc.server, stored, context.ID),
 	}, tc.modern)
 }

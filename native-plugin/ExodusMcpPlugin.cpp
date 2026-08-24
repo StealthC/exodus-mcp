@@ -1,4 +1,6 @@
 #include "ExodusMcpPlugin.h"
+#include <fstream>
+#include <istream>
 
 #include "BridgeWire.h"
 
@@ -268,8 +270,35 @@ ExodusMcpPlugin::~ExodusMcpPlugin()
 	StopBridge();
 }
 
+// Debug-CRT reports (assertions, invalid parameters) must never surface as
+// the modal Abort/Retry/Ignore dialog: it silently freezes whichever thread
+// triggered it, including the CPU worker and our pipe thread. Reports go to
+// a log file instead, and the invalid-parameter handler returns so the CRT
+// caller degrades to an error code rather than failing fast.
+static void __cdecl ExodusMcpInvalidParameterHandler(const wchar_t*, const wchar_t*, const wchar_t*, unsigned int, uintptr_t)
+{
+}
+
 bool ExodusMcpPlugin::BuildExtension()
 {
+	_set_invalid_parameter_handler(ExodusMcpInvalidParameterHandler);
+	_CrtSetReportMode(_CRT_ERROR, _CRTDBG_MODE_FILE);
+	_CrtSetReportMode(_CRT_ASSERT, _CRTDBG_MODE_FILE);
+	_CrtSetReportMode(_CRT_WARN, _CRTDBG_MODE_FILE);
+	char reportPath[MAX_PATH] = {0};
+	char tempDir[MAX_PATH] = {0};
+	if (GetTempPathA(MAX_PATH, tempDir) != 0)
+	{
+		_sprintf_p(reportPath, sizeof(reportPath), "%sexodus-mcp-crt.log", tempDir);
+		HANDLE reportFile = CreateFileA(reportPath, FILE_APPEND_DATA, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_ALWAYS, 0, NULL);
+		if (reportFile != INVALID_HANDLE_VALUE)
+		{
+			_CrtSetReportFile(_CRT_ERROR, reportFile);
+			_CrtSetReportFile(_CRT_ASSERT, reportFile);
+			_CrtSetReportFile(_CRT_WARN, reportFile);
+		}
+	}
+
 	CaptureModuleSnapshot();
 	if (!LoadBridgeConfiguration())
 	{
@@ -2219,7 +2248,40 @@ bool ExodusMcpPlugin::BuildROMLoadData(const BridgeRequest& request, std::string
 	return true;
 }
 
+// SEH wrapper around the trace capture body. The emulator has a history of
+// access violations inside trace capture paths (the original crash motivated
+// the flag-toggle workaround), so every entry into this code runs guarded and
+// reports the faulting module instead of killing the process.
+DWORD ExodusMcpPlugin::TraceCaptureGuarded(ExodusMcpPlugin* plugin, const BridgeRequest& request, std::string& data, std::string& errorCode, std::string& errorMessage, bool& success, void** faultingAddress)
+{
+	__try
+	{
+		success = plugin->TraceCaptureInner(request, data, errorCode, errorMessage);
+		return 0;
+	}
+	__except (CaptureFault(GetExceptionInformation()->ExceptionRecord->ExceptionAddress, faultingAddress))
+	{
+		return GetExceptionCode();
+	}
+}
+
+//----------------------------------------------------------------------------------------------------------------------
 bool ExodusMcpPlugin::BuildTraceCaptureData(const BridgeRequest& request, std::string& data, std::string& errorCode, std::string& errorMessage)
+{
+	void* faultingAddress = 0;
+	bool success = false;
+	const DWORD faultCode = TraceCaptureGuarded(this, request, data, errorCode, errorMessage, success, &faultingAddress);
+	if (faultCode != 0)
+	{
+		errorCode = "trace_capture_fault";
+		errorMessage = DescribeCaughtException(faultingAddress, faultCode);
+		return false;
+	}
+	return success;
+}
+
+//----------------------------------------------------------------------------------------------------------------------
+bool ExodusMcpPlugin::TraceCaptureInner(const BridgeRequest& request, std::string& data, std::string& errorCode, std::string& errorMessage)
 {
 	const std::string cpu = ParamValue(request.params, "cpu");
 	bool validName = false;
@@ -2259,16 +2321,51 @@ bool ExodusMcpPlugin::BuildTraceCaptureData(const BridgeRequest& request, std::s
 	}
 
 	IProcessor& target = *processor;
+
+	// The whole configuration sequence runs with the system stopped: the CPU
+	// worker contends for the same debug mutex our configuration calls take,
+	// and debug-state getters have been observed to starve against it while
+	// the system runs. Run state is captured first and restored at the end.
+	const bool wasRunning = GetSystemInterface().SystemRunning();
+	GetSystemInterface().StopSystem();
+
 	const bool priorEnabled = target.GetTraceEnabled();
 	const bool priorDisassemble = target.GetTraceDisassemble();
+	const bool priorToFile = target.IsTraceFileLoggingEnabled();
 
-	// Never resize or clear the trace ring here: SetTraceLength/ClearTraceLog
-	// mutate vectors the CPU worker thread pushes onto concurrently, and doing
-	// so against a running system corrupts the heap (observed as an emulator
-	// crash). Only toggle flags - the same operations the built-in debug
-	// windows perform live - and cap the returned window by taking the tail.
+	// Route trace output through the on-disk trace log. The in-memory ring
+	// accessor GetTraceLog returns STL containers with embedded strings
+	// through the marshal layer, and unpacking that marshaled return value in
+	// this plugin crashed the emulator with an access violation (observed
+	// inside Marshal::Ret<...>::operator vector, even on a paused system).
+	// The file path crosses the boundary as a plain string, the worker thread
+	// writes the entries host-side, and this plugin reads the bytes back
+	// itself, so no complex object ever crosses the boundary.
+	char tempDir[MAX_PATH] = {0};
+	char tempPath[MAX_PATH] = {0};
+	if (GetTempPathA(MAX_PATH, tempDir) == 0 || GetTempFileNameA(tempDir, "exmcp", 0, tempPath) == 0)
+	{
+		if (wasRunning)
+		{
+			GetSystemInterface().RunSystem();
+		}
+		errorCode = "trace_capture_failed";
+		errorMessage = "Could not create a temporary trace file path";
+		return false;
+	}
+	// The path crosses as plain UTF-8 bytes: SetTraceLoggingFilePath's
+	// Marshal::In<std::wstring> parameter does not interoperate with this
+	// plugin's template instantiations (the host stored an empty path), so
+	// the fork provides a POD-only setter instead.
+	target.SetTraceFileLoggingPathAscii(tempPath);
+	target.SetTraceFileLoggingEnabled(true);
 	target.SetTraceDisassemble(true);
 	target.SetTraceEnabled(true);
+
+	if (wasRunning)
+	{
+		GetSystemInterface().RunSystem();
+	}
 
 	const DWORD startTime = GetTickCount();
 	bool timedOut = false;
@@ -2287,28 +2384,110 @@ bool ExodusMcpPlugin::BuildTraceCaptureData(const BridgeRequest& request, std::s
 		}
 	}
 
+	GetSystemInterface().StopSystem();
 	target.SetTraceEnabled(priorEnabled);
 	target.SetTraceDisassemble(priorDisassemble);
+	// Disabling the file log closes the stream, flushing any pending entries
+	// the worker had queued for the next commit.
+	target.SetTraceFileLoggingEnabled(priorToFile);
+
+	// Parse the trace file: the worker writes one ASCII line per entry as
+	// 0xADDR(hex) \t opcode \t args \t ;comment \t cycle(decimal) \t time.
+	std::ifstream traceFile(tempPath, std::ios::binary);
+	std::vector<std::string> entryAddresses;
+	std::vector<std::string> entryOpcodes;
+	std::vector<std::string> entryArgs;
+	std::vector<unsigned long long> entryCycles;
+	if (traceFile)
+	{
+		std::string content((std::istreambuf_iterator<char>(traceFile)), std::istreambuf_iterator<char>());
+		size_t lineStart = 0;
+		while (lineStart < content.size())
+		{
+			size_t lineEnd = content.find('\n', lineStart);
+			if (lineEnd == std::string::npos)
+			{
+				lineEnd = content.size();
+			}
+			std::string line = content.substr(lineStart, lineEnd - lineStart);
+			lineStart = lineEnd + 1;
+			if (!line.empty() && line[line.size() - 1] == '\r')
+			{
+				line.erase(line.size() - 1);
+			}
+			if (line.empty())
+			{
+				continue;
+			}
+			std::vector<std::string> fields;
+			size_t fieldStart = 0;
+			while (true)
+			{
+				size_t tab = line.find('\t', fieldStart);
+				if (tab == std::string::npos)
+				{
+					fields.push_back(line.substr(fieldStart));
+					break;
+				}
+				fields.push_back(line.substr(fieldStart, tab - fieldStart));
+				fieldStart = tab + 1;
+			}
+			if (fields.size() < 6)
+			{
+				continue;
+			}
+			const std::string& addressField = fields[0];
+			const char* addressBegin = addressField.c_str();
+			if (addressBegin[0] == '0' && (addressBegin[1] == 'x' || addressBegin[1] == 'X'))
+			{
+				addressBegin += 2;
+			}
+			char* addressEnd = 0;
+			unsigned long long address = strtoull(addressBegin, &addressEnd, 16);
+			char* cycleEnd = 0;
+			unsigned long long cycle = strtoull(fields[4].c_str(), &cycleEnd, 10);
+			if (addressEnd == addressBegin || fields[4].empty() || cycleEnd == fields[4].c_str())
+			{
+				continue;
+			}
+			char addressText[16] = {0};
+			sprintf_s(addressText, sizeof(addressText), "%llX", address);
+			entryAddresses.push_back(addressText);
+			entryOpcodes.push_back(fields[1]);
+			entryArgs.push_back(fields[2]);
+			entryCycles.push_back(cycle);
+		}
+	}
+	traceFile.close();
+
 	if (stopped)
 	{
+		if (wasRunning)
+		{
+			GetSystemInterface().RunSystem();
+		}
 		errorCode = "shutting_down";
 		errorMessage = "Bridge shutdown interrupted the trace capture";
 		return false;
 	}
 
-	// Give the worker thread time to finish any in-flight entry, then take
-	// exactly one snapshot. Reading the log while tracing runs corrupts the
-	// heap (observed as an emulator crash), so there must be no concurrent
-	// access during the collection window.
-	Sleep(150);
-	std::vector<IProcessor::TraceLogEntry> entries = target.GetTraceLog();
-
-	size_t firstIndex = 0;
-	if (entries.size() > (size_t)maxEntries)
+	const size_t ringTotal = entryAddresses.size();
+	// Keep an empty capture file around for inspection; a non-empty one has
+	// already been consumed and is deleted.
+	if (ringTotal != 0)
 	{
-		firstIndex = entries.size() - (size_t)maxEntries;
+		DeleteFileA(tempPath);
 	}
-	const size_t captured = entries.size() - firstIndex;
+	if (wasRunning)
+	{
+		GetSystemInterface().RunSystem();
+	}
+	size_t firstIndex = 0;
+	if (ringTotal > (size_t)maxEntries)
+	{
+		firstIndex = ringTotal - (size_t)maxEntries;
+	}
+	const size_t captured = ringTotal - firstIndex;
 
 	std::string traceText;
 	std::string sampleLines;
@@ -2318,12 +2497,11 @@ bool ExodusMcpPlugin::BuildTraceCaptureData(const BridgeRequest& request, std::s
 	{
 		addressCharWidth = 8;
 	}
-	for (size_t i = firstIndex; i < entries.size(); ++i)
+	for (size_t i = firstIndex; i < ringTotal; ++i)
 	{
-		const IProcessor::TraceLogEntry& entry = entries[i];
 		char prefix[64] = {0};
-		sprintf_s(prefix, sizeof(prefix), "%0*X %llu ", addressCharWidth, entry.address, (unsigned long long)entry.currentCycle);
-		std::string text = prefix + ToUtf8(entry.disassemblyOpcode) + " " + ToUtf8(entry.disassemblyArgs);
+		sprintf_s(prefix, sizeof(prefix), "%0*X %llu ", addressCharWidth, (unsigned int)strtoul(entryAddresses[i].c_str(), 0, 16), entryCycles[i]);
+		std::string text = prefix + entryOpcodes[i] + " " + entryArgs[i];
 		if (!traceText.empty())
 		{
 			traceText += "\n";
@@ -2336,9 +2514,9 @@ bool ExodusMcpPlugin::BuildTraceCaptureData(const BridgeRequest& request, std::s
 				sampleLines += ",";
 			}
 			sampleLines += "{\"address\":";
-			AppendNumber(sampleLines, entry.address);
+			AppendNumber(sampleLines, (unsigned long long)strtoul(entryAddresses[i].c_str(), 0, 16));
 			sampleLines += ",\"cycle\":";
-			AppendNumber(sampleLines, entry.currentCycle);
+			AppendNumber(sampleLines, entryCycles[i]);
 			sampleLines += ",\"text\":";
 			AppendJsonStringAscii(sampleLines, text);
 			sampleLines += "}";
@@ -2352,12 +2530,13 @@ bool ExodusMcpPlugin::BuildTraceCaptureData(const BridgeRequest& request, std::s
 	data += ",\"captured\":";
 	AppendNumber(data, captured);
 	data += ",\"ring_total\":";
-	AppendNumber(data, entries.size());
+	AppendNumber(data, ringTotal);
 	data += ",\"timed_out\":";
 	data += timedOut ? "true" : "false";
 	data += ",\"duration_ms\":";
 	AppendNumber(data, GetTickCount() - startTime);
-	data += ",\"sampling_note\":\"Entries accumulate only while the system is running; a paused system yields few or none. Tracing is enabled for the capture window and the snapshot is taken once, after tracing is disabled again.\",\"sample\":[";
+	data += ",\"capture_channel\":\"trace-file\",";
+	data += "\"sampling_note\":\"Entries accumulate only while the system is running; a paused system yields none. The capture routes the processor trace log through a temporary on-disk file, because unpacking the marshaled in-memory ring across the extension boundary is unsafe for this plugin.\",\"sample\":[";
 	data += sampleLines;
 	data += "],\"trace_text\":";
 	AppendJsonStringAscii(data, traceText);

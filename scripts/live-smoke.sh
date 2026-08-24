@@ -26,6 +26,7 @@ done
 failures=0
 step() { printf '\n== %s\n' "$1"; }
 
+
 check() {
 	local label="$1" condition="$2"
 	if eval "$condition"; then
@@ -91,6 +92,22 @@ print(json.dumps({'name': sys.argv[1], 'arguments': json.loads(sys.argv[2])}))
 	json_get "$result" "parsed.get('structuredContent', {})" 2>/dev/null
 }
 
+
+# The plugin pipe can lag the HTTP health gate by tens of seconds on Debug
+# builds; wait until the bridge actually answers before driving tools.
+bridge_ready=0
+for _ in $(seq 1 200); do
+	if json_get "$(tool_call "emulator_status" 2>/dev/null)" "parsed.get('system_running') is not None" 2>/dev/null | grep -qi true; then
+		bridge_ready=1
+		break
+	fi
+	sleep 2
+done
+if [ "$bridge_ready" != 1 ]; then
+	echo "bridge never became ready; aborting"
+	exit 1
+fi
+
 step "Health endpoint"
 health=$(curl -fsS --max-time 10 "$BASE_URL/healthz" 2>/dev/null || echo "")
 check "healthz responds with status ok" "[ \"\$(json_get \"\$health\" \"parsed['status']\" 2>/dev/null)\" = 'ok' ]"
@@ -115,6 +132,18 @@ emu=$(tool_call "emulator_status")
 check "emulator_status returns structured data" "[ -n \"\$emu\" ]"
 
 if [ "$FULL" = 1 ]; then
+	# The frame-, pixel-, and trace-level checks need a running program.
+	# Override the location through EXODUS_MCP_SMOKE_ROM when needed.
+	rom_args='{"path": "F:\\projects\\kid\\rom\\kid.bin", "run": true}'
+	if [ -n "${EXODUS_MCP_SMOKE_ROM:-}" ]; then
+		rom_args=$(python3 -c "import json, sys; print(json.dumps({'path': sys.argv[1], 'run': True}))" "$EXODUS_MCP_SMOKE_ROM")
+	fi
+	step "Test ROM load"
+	rom_load_result=$(tool_call "rom_load" "$rom_args")
+	rom_loaded=$(json_get "$rom_load_result" "parsed.get('loaded', False)" 2>/dev/null)
+	check "test ROM loads and runs" "[ \"$rom_loaded\" = 'True' ] || [ \"$rom_loaded\" = 'true' ]"
+	sleep 3
+
 	step "CPU control (mutating; restores running state)"
 	was_running=$(json_get "$emu" "parsed.get('system_running', False)" 2>/dev/null)
 
@@ -243,6 +272,14 @@ if [ "$FULL" = 1 ]; then
 	fi
 	pixel_source=$(json_get "$pixel" "parsed.get('source', '')" 2>/dev/null)
 	check "pixel info attributes a source layer" "[ -n \"\$pixel_source\" ]"
+
+	# Entries accumulate only while the system runs, so resume it for the
+	# capture window and park it again afterwards.
+	tool_call "cpu_run" >/dev/null
+	trace=$(tool_call "cpu_trace_capture" '{"cpu": "m68k", "max_entries": 50, "timeout_ms": 400}')
+	tool_call "cpu_pause" >/dev/null
+	trace_captured=$(json_get "$trace" "parsed.get('summary', {}).get('captured', 0)" 2>/dev/null)
+	check "m68k trace capture yields entries" "[ -n \"\$trace_captured\" ] && [ \"\$trace_captured\" -ge 1 ]"
 
 	if [ "$was_running" = "True" ] || [ "$was_running" = "true" ]; then
 		tool_call "cpu_run" >/dev/null

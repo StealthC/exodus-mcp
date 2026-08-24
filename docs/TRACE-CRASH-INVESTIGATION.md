@@ -1,9 +1,46 @@
 # Trace Capture Crash Investigation
 
-Status: **unresolved** — handed off for deeper debugging. This document
-contains everything known about a reproducible emulator crash triggered by the
-`cpu_trace_capture` MCP tool, gathered across three live reproductions and a
-source-level audit of the Exodus trace machinery.
+Status: **resolved (2026-08-23)** — see section 0 for the resolution. The
+remaining sections preserve the investigation history exactly as handed off.
+
+## 0. Resolution
+
+Three independent defects were confirmed, and all are fixed:
+
+1. **The crash itself was plugin-side, not upstream.** A minidump of the
+   original 2026-08-22 crash placed the faulting instruction inside
+   `ExodusMcpPlugin.dll`, and a guarded (SEH) reproduction on 2026-08-23
+   caught the access violation inside
+   `Marshal::Ret<std::vector<TraceLogEntry>>::operator vector` while
+   unpacking `GetTraceLog()`'s marshaled return value — reproducing even
+   with the system paused, which rules out every enable-race hypothesis in
+   section 5. The marshal machinery is simply not safe to drive through this
+   plugin's template instantiations: `Ret<vector<TraceLogEntry>>` faults,
+   `In<std::wstring>` silently delivers an empty string host-side, and
+   complex-type probes hang nondeterministically, while plain POD virtual
+   calls and `Ret<std::wstring>` (verified with `GetDeviceInstanceName`)
+   work fine.
+2. **The test install mixed 2018 upstream binaries with fork builds.** The
+   launcher's install directory still shipped the original release-era
+   `M68000.dll`, `Z80.dll`, and `System.dll`, so interface extensions
+   appended in the fork (and any marshal behavior depending on them)
+   diverged from the vtables the plugin saw. `build-fork-windows.bat` now
+   installs `System.dll` and every rebuilt `Assemblies/*.dll` together with
+   the exe; binaries move as one unit.
+3. **The trace-enable flag raced.** `Processor::_traceLogEnabled` was a
+   `volatile bool` toggled across threads (section 4.2); it is now
+   `std::atomic<bool>`.
+
+The tool no longer calls `GetTraceLog()` at all. `cpu_trace_capture` now:
+stops the system, configures the processor trace with the new fork POD
+setter `IProcessor::SetTraceFileLoggingPathAscii(const char*)` (the
+`Marshal::In<std::wstring>` path setter silently failed per defect 1), lets
+the worker write the existing trace-file format to a temporary file during
+the capture window, stops the system again, parses the file itself, and
+restores the prior run state and trace flags. Verified live against Kid
+Chameleon: 10 alternating M68K/Z80 captures under stress with zero crashes,
+correct disassembly in both processors, and the emulator responsive
+throughout.
 
 ## 1. Context
 

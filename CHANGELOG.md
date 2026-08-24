@@ -7,6 +7,17 @@ and this project will use [Semantic Versioning](https://semver.org/spec/v2.0.0.h
 
 ## [Unreleased]
 
+### Fixed
+
+- `cpu_trace_capture` no longer crashes the emulator. The capture now routes
+  the processor trace log through a temporary on-disk file (parsed by the
+  server-side plugin itself) instead of unpacking the marshaled in-memory
+  ring, configures tracing with the system stopped, and restores the prior
+  run state. Requires the companion fork changes: a POD
+  `SetTraceFileLoggingPathAscii` setter on `IProcessor`, an atomic
+  `_traceLogEnabled`, and full device-DLL installation in
+  `build-fork-windows.bat`.
+
 ### Added
 
 - `vdp_pixel_info`: per-pixel rendering attribution from the VDP completed
