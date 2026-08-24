@@ -79,7 +79,7 @@ jobs:
   release-x64:
     runs-on: windows-2022
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Verify third-party source layout
         shell: pwsh
@@ -121,24 +121,11 @@ jobs:
           Copy-Item "$root\Data\Modules\*.xml" "$stage\Modules\"
           Copy-Item "$root\Data\Workspaces\*.xml" "$stage\Workspaces\"
 
-      - name: Create release archive
-        shell: pwsh
-        run: |
-          $sevenZip = "${env:ProgramFiles}\7-Zip\7z.exe"
-          if (-not (Test-Path $sevenZip)) { throw '7-Zip was not found on the runner.' }
-          $version = if ($env:GITHUB_REF_TYPE -eq 'tag') { $env:GITHUB_REF_NAME } else { $env:GITHUB_SHA.Substring(0, 7) }
-          Push-Location "$env:GITHUB_WORKSPACE\dist"
-          & $sevenZip a -t7z -mx=9 "Exodus-$version.7z" Exodus
-          if ($LASTEXITCODE) { exit $LASTEXITCODE }
-          Pop-Location
-
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v6
         with:
           name: exodus-release-x64
           if-no-files-found: error
-          path: |
-            dist/Exodus
-            dist/Exodus-*.7z
+          path: dist/Exodus
 ```
 
 The artifact replicates the original Exodus 2.1 distribution package: the
@@ -146,9 +133,13 @@ device/extension DLLs are assembled into `Plugins\` (never `Assemblies\`),
 `settings.xml` is the release-mode file from `Packaging/ReleaseSettings.xml`
 (root-relative `Modules`, `Workspaces`, `Savestates`, `PersistentState`,
 `Captures`, and `AssembliesPath=Plugins`), and the default module and
-workspace XMLs come from `Data\Modules` and `Data\Workspaces`. Tag pushes
-produce `Exodus-<tag>.7z` (for example `Exodus-2.1.7z`); branch pushes and
-PRs use the short SHA so every artifact is unique.
+workspace XMLs come from `Data\Modules` and `Data\Workspaces`. GitHub zips
+`dist\Exodus` into a single downloadable artifact, so no separate archive is
+produced.
+
+`actions/checkout` and `actions/upload-artifact` are pinned at v5/v6
+respectively, which run on the Node 24 runtime and avoid the Node 20
+deprecation warning shown by the v4 actions.
 
 Run it manually first and inspect the artifact before adding release publishing
 for signed tags.
