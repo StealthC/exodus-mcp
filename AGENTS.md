@@ -32,11 +32,20 @@ Guidance for contributors and coding agents working in this workspace.
 ## Verified build baseline
 
 - Upstream Exodus base: `08f388f77040af28d16d44fdfbddb73252953161` (`master`).
-- Pinned fork revision: `3cd0e6895196437250bbd00dc271f101ba8faaca`.
+- Pinned fork revision: `de9c69e7aa50b8d0c99cad0a2841c01f6e774d08`.
+- Build default: **`Release | x64`** for both wrappers (`build-fork.sh` and
+  `build-windows.sh`); the fork installs the full binary set (exe,
+  `System.dll`, `Assemblies/*.dll`) so interface slots never trail a stale
+  device DLL.
 - Validated host: Visual Studio 18 Community, MSVC 14.37 (`v143`), Windows SDK
   10.0.26100.
 - Build `ThirdPartyLibraries.sln` before `Exodus.sln`, with the same
-  configuration and platform. `Debug | x64` was fully built successfully.
+  configuration and platform. **`Release | x64` is the default** for both the
+  fork and the plugin wrappers: the CPU cores only run at realistic speed when
+  optimized, and the whole binary set (exe, `System.dll`, `Assemblies/*.dll`,
+  plugin) must move as one configuration. Pass `--config Debug` to either
+  wrapper only when a specific defect needs Debug-CRT checks; both
+  configurations were built successfully.
 - Do not select a `* - LLVM` profile. It requires the legacy `LLVM-vs2014`
   toolset, outside the supported baseline.
 

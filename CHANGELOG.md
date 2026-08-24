@@ -7,6 +7,14 @@ and this project will use [Semantic Versioning](https://semver.org/spec/v2.0.0.h
 
 ## [Unreleased]
 
+### Changed
+
+- Build wrappers now default to `Release | x64` for the Exodus fork and the
+  MCP plugin. Debug-CRT-only code in the plugin is guarded with `#ifdef
+  _DEBUG`, and both wrappers install the complete binary set (exe,
+  `System.dll`, `Assemblies/*.dll`, plugin) as one unit so stale or
+  config-mixed DLLs never end up in the test install.
+
 ### Fixed
 
 - `cpu_trace_capture` no longer crashes the emulator. The capture now routes

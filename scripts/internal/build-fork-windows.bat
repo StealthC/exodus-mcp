@@ -15,7 +15,7 @@ rem                            absolute path (default: Exodus.exe)
 for /f %%i in ("%~dp0..\..") do set "ROOT=%%~fi\"
 call "%ROOT%scripts\internal\common.bat"
 
-set "CONFIG=Debug"
+set "CONFIG=Release"
 :parse_args
 if "%~1"=="" goto args_done
 if /i "%~1"=="--config" (
