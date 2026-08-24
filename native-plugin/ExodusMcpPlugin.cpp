@@ -281,7 +281,13 @@ static void __cdecl ExodusMcpInvalidParameterHandler(const wchar_t*, const wchar
 
 bool ExodusMcpPlugin::BuildExtension()
 {
+	// In Debug builds, CRT errors and assertions would normally raise the
+	// modal Abort/Retry/Ignore dialog, silently freezing whichever thread
+	// triggered it. Route them to a log file instead and keep the invalid
+	// parameter handler so callers degrade to error codes. Release builds
+	// never show those dialogs, so only the shared handler is needed there.
 	_set_invalid_parameter_handler(ExodusMcpInvalidParameterHandler);
+#ifdef _DEBUG
 	_CrtSetReportMode(_CRT_ERROR, _CRTDBG_MODE_FILE);
 	_CrtSetReportMode(_CRT_ASSERT, _CRTDBG_MODE_FILE);
 	_CrtSetReportMode(_CRT_WARN, _CRTDBG_MODE_FILE);
@@ -298,6 +304,7 @@ bool ExodusMcpPlugin::BuildExtension()
 			_CrtSetReportFile(_CRT_WARN, reportFile);
 		}
 	}
+#endif
 
 	CaptureModuleSnapshot();
 	if (!LoadBridgeConfiguration())

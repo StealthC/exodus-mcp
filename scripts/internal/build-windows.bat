@@ -13,7 +13,7 @@ rem   EXODUS_MCP_PLUGINS_DIR   optional plugin destination override
 for /f %%i in ("%~dp0..\..") do set "ROOT=%%~fi\"
 call "%ROOT%scripts\internal\common.bat"
 
-set "CONFIG=Debug"
+set "CONFIG=Release"
 set "PLUGINS_DIR="
 :parse_args
 if "%~1"=="" goto args_done

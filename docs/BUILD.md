@@ -49,13 +49,17 @@ required.
 
 ## Build in Visual Studio
 
-1. Open `ThirdPartyLibraries.sln`; build `Debug | x64` (or `Release | x64`).
+1. Open `ThirdPartyLibraries.sln`; build `Release | x64` (the defaults below
+   assume Release).
 2. Open `Exodus.sln`; build the **same** configuration and platform.
 3. Run `Exodus.exe` from the Exodus source root, with that root as the working
    directory, so it can load `System.dll`, `Assemblies/`, `Data/`, and settings.
 
-Start with `Debug | x64`. Use `Release | x64` after debug succeeds. Use
-`Win32` only when a 32-bit binary is required.
+`Release | x64` is the default because emulator CPU cores are an order of
+magnitude slower under Debug (no optimization plus Debug-CRT checks). Use
+`Debug | x64` only when a specific defect needs Debug-CRT diagnostics; the
+whole binary set must always move as one configuration. Use `Win32` only when
+a 32-bit binary is required.
 
 ## WSL driving Windows MSBuild
 
@@ -64,21 +68,24 @@ submodule and copies the generated `vendor/exodus/Exodus.exe` into the test
 install configured by `.env`, under that install's emulator file name:
 
 ```bash
-./scripts/build-fork.sh               # Debug x64
-./scripts/build-fork.sh --config Release
+./scripts/build-fork.sh               # Release x64 (default)
+./scripts/build-fork.sh --config Debug
 ```
 
 Close the running emulator first: Windows locks the exe image while the
-process is alive. A Release build additionally requires the fork's Release
-third-party libraries (`ThirdPartyLibraries.sln`).
+process is alive. The wrapper installs `Exodus.exe`, `System.dll`, and every
+rebuilt `Assemblies/*.dll` into the test install as one unit, so device,
+extension, and plugin binaries never mix stale configurations. Release
+requires the fork's Release third-party libraries once
+(`ThirdPartyLibraries.sln`, Release x64).
 
 The equivalent manual commands are:
 
 ```bash
 MSBUILD='/mnt/c/Program Files/Microsoft Visual Studio/18/Community/MSBuild/Current/Bin/MSBuild.exe'
 cd /mnt/f/projects/kid/emulators/Exodus/vendor/exodus
-"$MSBUILD" ThirdPartyLibraries.sln /m /t:Build /p:Configuration=Debug /p:Platform=x64 /nologo /verbosity:minimal
-"$MSBUILD" Exodus.sln /m /t:Build /p:Configuration=Debug /p:Platform=x64 /nologo /verbosity:minimal
+"$MSBUILD" ThirdPartyLibraries.sln /m /t:Build /p:Configuration=Release /p:Platform=x64 /nologo /verbosity:minimal
+"$MSBUILD" Exodus.sln /m /t:Build /p:Configuration=Release /p:Platform=x64 /nologo /verbosity:minimal
 ```
 
 The first command generates third-party `.lib` files. The second generates
@@ -87,8 +94,9 @@ intermediates.
 
 ## Known-good result and troubleshooting
 
-Commit `08f388f77040af28d16d44fdfbddb73252953161` built as `Debug | x64` on
-2026-08-22. Legacy expat, libjpeg, and libtiff warnings were non-fatal.
+Release | x64 (fork base `08f388f`, plus the MCP trace-path fork commits) is
+the verified default. Legacy expat, libjpeg, and libtiff warnings were
+non-fatal in both configurations; `Debug | x64` was also built successfully.
 
 - Missing `v143`: add MSVC v143 x64/x86 build tools in Visual Studio Installer.
 - Missing third-party headers/libraries: build `ThirdPartyLibraries.sln` first,
