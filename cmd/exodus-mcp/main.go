@@ -41,6 +41,8 @@ func main() {
 	exodusExecutable := flag.String("exodus", "", "launch Exodus with a generated bridge pipe and capability")
 	defaultArtifactDir := filepath.Join(os.TempDir(), "exodus-mcp", "artifacts")
 	artifactDir := flag.String("artifacts", envOrDefault("EXODUS_MCP_ARTIFACTS", defaultArtifactDir), "directory for immutable tool artifacts")
+	defaultStatesDir := filepath.Join(os.TempDir(), "exodus-mcp", "states")
+	statesDir := flag.String("states", envOrDefault("EXODUS_MCP_STATES_DIR", defaultStatesDir), "directory anchoring context-scoped system snapshots")
 	baseURL := flag.String("base-url", "", "external base URL advertised in artifact links; defaults to the listen address's loopback port")
 	var exodusArguments stringList
 	flag.Var(&exodusArguments, "exodus-arg", "argument passed to Exodus; repeat for multiple arguments")
@@ -80,13 +82,16 @@ func main() {
 	}
 
 	client := bridge.NewNamedPipeClient(*pipeName, *pipeCapability)
+	mcpServer := mcp.NewServer(version, client, store, analysis.NewRegistry(), *baseURL)
+	mcpServer.SetStatesDir(*statesDir)
 	server := &http.Server{
 		Addr:    *listen,
-		Handler: mcp.NewServer(version, client, store, analysis.NewRegistry(), *baseURL).Handler(),
+		Handler: mcpServer.Handler(),
 	}
 
 	log.Printf("exodus-mcp listening on http://%s/mcp", *listen)
 	log.Printf("artifact store at %s", store.Dir())
+	log.Printf("state snapshots at %s", *statesDir)
 	if exodusDone == nil {
 		log.Fatal(server.Serve(listener))
 	}
