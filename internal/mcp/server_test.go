@@ -64,7 +64,7 @@ func newFakeStatus() bridge.Status {
 		Lifecycle:           "ready",
 		BridgeEnabled:       true,
 		LoadedModuleCount:   3,
-		SupportedOperations: []string{"status", "emulator_status", "mem_spaces", "mem_read", "regs_get", "disasm", "cpu_control", "breakpoint_set", "breakpoint_list", "breakpoint_remove", "watchpoint_set", "watchpoint_list", "watchpoint_remove", "vdp_status", "vdp_mem_read", "vdp_pixel_info", "frame_capture", "rom_load", "trace_capture"},
+		SupportedOperations: []string{"status", "emulator_status", "mem_spaces", "mem_read", "regs_get", "disasm", "cpu_control", "breakpoint_set", "breakpoint_list", "breakpoint_remove", "watchpoint_set", "watchpoint_list", "watchpoint_remove", "vdp_status", "vdp_mem_read", "vdp_pixel_info", "frame_capture", "rom_load", "trace_capture", "mem_write", "state_save", "state_load", "frame_advance", "input_set"},
 	}
 }
 
@@ -185,9 +185,13 @@ func TestToolsListDeterministicAndComplete(t *testing.T) {
 	}
 	expected := []string{
 		"artifact_get", "artifact_preview", "bridge_status", "context_close",
-		"context_create", "context_list", "cpu_trace_capture",
+		"context_create", "context_lease_acquire", "context_lease_list",
+		"context_lease_release", "context_lease_renew", "context_list",
+		"context_mutation_log", "cpu_trace_capture",
+		"frame_advance", "input_set",
 		"m68k_disassemble", "m68k_read_memory", "m68k_registers",
-		"memory_dump", "memory_read", "memory_spaces_list",
+		"memory_dump", "memory_read", "memory_spaces_list", "memory_write",
+		"state_list", "state_load", "state_save",
 		"symbols_clear", "symbols_list", "symbols_set",
 		"target_info", "z80_disassemble", "z80_read_memory", "z80_registers",
 		"emulator_status",

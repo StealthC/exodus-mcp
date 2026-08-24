@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -56,6 +57,10 @@ type Server struct {
 	store    *artifact.Store
 	contexts *analysis.Registry
 	baseURL  string
+
+	// statesDir anchors context-scoped system snapshots; empty means
+	// os.TempDir()/exodus-mcp/states.
+	statesDir string
 
 	statusMu      sync.Mutex
 	statusExpires time.Time
@@ -305,15 +310,62 @@ func (server *Server) executeCommand(ctx context.Context, operation string, para
 
 func commandTimeout(operation string) time.Duration {
 	switch operation {
-	case "rom_load":
-		return 60 * time.Second
-	case "trace_capture":
+	case "rom_load", "state_save", "state_load", "frame_advance", "trace_capture":
 		return 60 * time.Second
 	case "mem_read":
 		return 30 * time.Second
 	default:
 		return 15 * time.Second
 	}
+}
+
+// requireLease enforces the mutation guard for the Phase 4 tools. Every
+// mutating tool must present the id of the context's active lease; the
+// failure distinguishes "no lease at all" from "wrong lease id".
+func (server *Server) requireLease(context *analysis.Context, leaseID, tool string) *toolFailure {
+	if leaseID == "" {
+		return &toolFailure{
+			Code:    "lease_required",
+			Message: tool + " requires an exclusive context lease; acquire one with context_lease_acquire",
+		}
+	}
+	if server.contexts.Leases.Valid(context.ID, leaseID) {
+		return nil
+	}
+	if server.contexts.Leases.Active(context.ID) == nil {
+		return &toolFailure{
+			Code:    "lease_required",
+			Message: "context " + context.ID + " holds no active lease; acquire one with context_lease_acquire",
+		}
+	}
+	return &toolFailure{
+		Code:    "lease_invalid",
+		Message: "lease " + leaseID + " does not own context " + context.ID,
+	}
+}
+
+// recordMutation appends one audited entry to the context's mutation trail.
+func (server *Server) recordMutation(context *analysis.Context, leaseID, tool string, detail map[string]any) {
+	server.contexts.Ledger.Record(analysis.LedgerEntry{
+		Timestamp: time.Now().UTC(),
+		Tool:      tool,
+		ContextID: context.ID,
+		LeaseID:   leaseID,
+		Detail:    detail,
+	})
+}
+
+// SetStatesDir overrides the directory that anchors system snapshots.
+func (server *Server) SetStatesDir(dir string) {
+	server.statesDir = dir
+}
+
+// StatesDir returns the directory anchoring context-scoped system snapshots.
+func (server *Server) StatesDir() string {
+	if server.statesDir != "" {
+		return server.statesDir
+	}
+	return filepath.Join(os.TempDir(), "exodus-mcp", "states")
 }
 
 // invalidateStatusCache drops any cached plugin status so the next command
