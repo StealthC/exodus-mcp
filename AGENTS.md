@@ -90,11 +90,15 @@ Guidance for contributors and coding agents working in this workspace.
     (`taskkill /F /IM Exodus.nightly.exe /IM exodus-mcp.exe`): Windows locks
     loaded images, so the plugin DLL cannot be copied while Exodus runs, and
     a stale pair keeps serving old code.
-  - Launch `run-windows.sh` in the background, then wait for
-    `http://127.0.0.1:8767/healthz` before issuing calls. The launcher
-    reserves the port before starting Exodus and terminates its child when
-    the MCP server exits; its log reports child exit codes such as
-    `0xc0000005`.
+  - Launch `run-windows.sh` **in the background** — the launcher does not
+    return until the pair is closed, so a foreground invocation blocks the
+    shell (redirect its output to `tmp/run-windows.log`). Then check health
+    from a separate foreground command: poll
+    `curl -s http://127.0.0.1:8767/healthz` until it answers, and inspect
+    `tmp/run-windows.log` for startup errors. Only proceed with tool calls
+    once the health endpoint responds. The launcher reserves the port before
+    starting Exodus and terminates its child when the MCP server exits; its
+    log reports child exit codes such as `0xc0000005`.
   - Load test ROMs through `rom_load` instead of asking for manual UI steps.
 - Download artifacts and write scratch files into the workspace `tmp/`
   directory (`<repo>/tmp`), not the system temp path; the user inspects that

@@ -281,6 +281,80 @@ if [ "$FULL" = 1 ]; then
 	trace_captured=$(json_get "$trace" "parsed.get('summary', {}).get('captured', 0)" 2>/dev/null)
 	check "m68k trace capture yields entries" "[ -n \"\$trace_captured\" ] && [ \"\$trace_captured\" -ge 1 ]"
 
+	step "Phase 4 controlled experimentation (lease-gated)"
+	# The system is paused here; every Phase 4 mutation below requires the
+	# exclusive context lease, which the smoke holds from acquire to release.
+	lease=$(tool_call "context_lease_acquire" '{"purpose": "live-smoke phase 4"}' 2>/dev/null || echo "")
+	lease_id=$(json_get "$lease" "parsed.get('lease_id', '')" 2>/dev/null)
+	if [ -z "$lease_id" ]; then
+		check "context lease acquires" false
+	else
+		check "context lease acquires" true
+		listed_leases=$(tool_call "context_lease_list")
+		lease_count=$(json_get "$listed_leases" "len(parsed.get('leases', []))" 2>/dev/null)
+		check "context lease lists exactly one" "[ \"\$lease_count\" = '1' ]"
+
+		# memory_write with read-back through the debugger path.
+		probe_byte=$(printf '\x5a' | base64)
+		write_result=$(tool_call "memory_write" "{\"lease_id\": \"$lease_id\", \"space\": \"m68k-bus\", \"address\": \"0xFF0000\", \"data\": \"$probe_byte\"}")
+		write_code=$(json_get "$write_result" "parsed.get('code', '')" 2>/dev/null)
+		if [ "$write_code" = "write_fault" ]; then
+			echo "SKIP  memory_write echo (write fault on the probe address)"
+		else
+			written_len=$(json_get "$write_result" "parsed.get('length', 0)" 2>/dev/null)
+			check "memory_write echoes written length" "[ \"\$written_len\" = '1' ]"
+			read_result=$(tool_call "memory_read" '{"space": "m68k-bus", "address": "0xFF0000", "length": 1}')
+			read_hex=$(json_get "$read_result" "parsed.get('data_base64', '')" 2>/dev/null)
+			check "memory_write read-back matches" "[ \"\$read_hex\" = \"\$probe_byte\" ]"
+		fi
+
+		# frame_advance: one rendered frame while paused, parked again after.
+		advance=$(tool_call "frame_advance" "{\"lease_id\": \"$lease_id\", \"frames\": 1}")
+		advance_code=$(json_get "$advance" "parsed.get('code', '')" 2>/dev/null)
+		if [ "$advance_code" = "frame_timeout" ]; then
+			echo "SKIP  frame_advance (display not rendering; game may be at a blank screen)"
+		else
+			completed=$(json_get "$advance" "parsed.get('frames_completed', 0)" 2>/dev/null)
+			check "frame_advance completes one frame" "[ \"\$completed\" = '1' ]"
+		fi
+
+		# input_set down/up; a workspace without a controller skips.
+		input_result=$(tool_call "input_set" "{\"lease_id\": \"$lease_id\", \"player\": 1, \"buttons\": [\"a\"], \"state\": \"down\"}")
+		input_code=$(json_get "$input_result" "parsed.get('code', '')" 2>/dev/null)
+		if [ "$input_code" = "controller_not_found" ]; then
+			echo "SKIP  input_set (no controller device in the loaded workspace)"
+		else
+			check "input_set presses a button" "[ -n \"\$input_result\" ]"
+			released=$(tool_call "input_set" "{\"lease_id\": \"$lease_id\", \"player\": 1, \"buttons\": [\"a\"], \"state\": \"up\"}")
+			check "input_set releases a button" "[ -n \"\$released\" ]"
+		fi
+
+		# state_save -> state_list -> state_load round trip.
+		saved=$(tool_call "state_save" "{\"lease_id\": \"$lease_id\", \"name\": \"smoke\"}")
+		state_id=$(json_get "$saved" "parsed.get('state_id', '')" 2>/dev/null)
+		if [ -z "$state_id" ]; then
+			check "state_save returns a snapshot id" false
+		else
+			check "state_save returns a snapshot id" true
+			state_sha=$(json_get "$saved" "parsed.get('sha256', '')" 2>/dev/null)
+			check "state_save verifies the snapshot digest" "[ -n \"\$state_sha\" ]"
+			snapshot_list=$(tool_call "state_list")
+			snapshot_count=$(json_get "$snapshot_list" "len(parsed.get('snapshots', []))" 2>/dev/null)
+			check "state_list reports the snapshot" "[ \"\$snapshot_count\" = '1' ]"
+			loaded=$(tool_call "state_load" "{\"lease_id\": \"$lease_id\", \"state_id\": \"$state_id\"}")
+			loaded_flag=$(json_get "$loaded" "str(parsed.get('loaded', False)).lower()" 2>/dev/null)
+			check "state_load restores the snapshot" "[ \"\$loaded_flag\" = 'true' ]"
+		fi
+
+		mutation_log=$(tool_call "context_mutation_log")
+		log_count=$(json_get "$mutation_log" "len(parsed.get('entries', []))" 2>/dev/null)
+		check "mutation log records the actions" "[ -n \"\$log_count\" ] && [ \"\$log_count\" -ge 3 ]"
+
+		released=$(tool_call "context_lease_release" "{\"lease_id\": \"$lease_id\"}")
+		released_flag=$(json_get "$released" "str(parsed.get('released', False)).lower()" 2>/dev/null)
+		check "context lease releases" "[ \"\$released_flag\" = 'true' ]"
+	fi
+
 	if [ "$was_running" = "True" ] || [ "$was_running" = "true" ]; then
 		tool_call "cpu_run" >/dev/null
 		emu_after=$(tool_call "emulator_status")

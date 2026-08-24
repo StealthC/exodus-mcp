@@ -45,10 +45,11 @@ silently mixing their conventions.
 
 - [x] `m68k_registers`, `m68k_disassemble`, `m68k_read_memory`.
 - [x] `z80_registers`, `z80_disassemble`, `z80_read_memory`.
-- [!] `cpu_trace_capture` is quarantined pending the reproducible M68K and
-  Z80 access violation documented in `TRACE-CRASH-INVESTIGATION.md`. Repair
-  the upstream trace-enable synchronization and disassembly path before this
-  tool is used for normal analysis.
+- [x] `cpu_trace_capture`: the reproducible access violation documented in
+  `TRACE-CRASH-INVESTIGATION.md` is **resolved (2026-08-23)**. Capture routes
+  the processor trace log through a temporary on-disk file, configures
+  tracing with the system stopped, and restores the prior run state;
+  validated live by the smoke suite.
 - [x] `symbols_set`, `symbols_list`, `symbols_clear`, scoped to an analysis
   context.
 
@@ -155,11 +156,34 @@ not manually decode opaque dumps in its prompt.
   byte ranges, read/write/any access filtering, and live hit counters. The
   full lifecycle, deterministic hit-and-pause with rollback, error codes, and
   the purge-on-ROM-swap regression are validated live against Kid Chameleon.
-- Explicit context lease tools for mutation.
-- `state_save`, `state_load`, `state_list` using context-scoped snapshots.
-- `frame_advance`, `input_set`, and bounded scripted fixtures.
-- `memory_write` and optional value-freeze facilities, all with audit metadata.
-  Watchpoint capture belongs to the dedicated watchpoint item above.
+- [x] Explicit context lease tools for mutation: `context_lease_acquire`,
+  `context_lease_renew`, `context_lease_release`, `context_lease_list`. One
+  exclusive lease per context with TTL-based expiry and release-on-close.
+  Every new Phase 4 mutation tool requires the lease; the pre-existing
+  control tools (`rom_load`, pause/run, steps, breakpoints, watchpoints)
+  keep their established behavior. All mutations are recorded in
+  `context_mutation_log` with lease, echoed arguments, and timestamp.
+- [x] `state_save`, `state_load`, `state_list` using context-scoped
+  snapshots: the plugin drives the emulator's native save-state path
+  (`ISystemGUIInterface::SaveState`/`LoadState` through the cross-cast, ZIP
+  format), and the server verifies each snapshot with SHA-256 and size.
+  Validated live against Kid Chameleon including a save/list/load round
+  trip.
+- [x] `frame_advance` (pause, execute N rendered VDP frames, pause) and
+  `input_set` (press/release up, down, left, right, a, b, c, start, x, y,
+  z, mode on a controller by player port). Frame advance times out with a
+  diagnostic when the display is not rendering. Both validated live against
+  Kid Chameleon with a 3-button controller. Bounded scripted fixtures
+  (scripted down/advance/up sequences) belong to the Phase 5 scripting
+  item.
+- [x] `memory_write` through the emulator debugger path: CPU bus spaces
+  (`SetMemorySpaceByte`) and entry-based memory devices (read-modify-write
+  with declared byte order). Timed-buffer spaces are refused with
+  `write_not_supported`, ROM writes are discarded by the bus like real
+  hardware, and every call carries audit metadata plus a `context_mutation_log`
+  entry. Value-freeze facilities remain deferred as optional. Validated live
+  against Kid Chameleon: bus write with read-back, unaligned word-boundary
+  writes, Z80 RAM, and error codes.
 
 ## Phase 5 — Advanced analysis
 
@@ -167,8 +191,8 @@ not manually decode opaque dumps in its prompt.
 - `memory_search`: byte-pattern search over a consistent dump-artifact
   snapshot instead of a live racy scan; bounded inline matches plus a
   full-results artifact.
-- Event-driven trace capture triggered by watchpoints after the trace crash
-  is fixed.
+- Event-driven trace capture triggered by watchpoints (the trace crash is
+  resolved, so the capture path is available again).
 - ROM/header parsing, checksums, mapping, and cartridge metadata.
 - Optional external scripting with strict allowlists and artifact-first output.
 - Multi-instance orchestration for real parallel experiments.

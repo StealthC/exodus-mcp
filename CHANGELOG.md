@@ -7,6 +7,48 @@ and this project will use [Semantic Versioning](https://semver.org/spec/v2.0.0.h
 
 ## [Unreleased]
 
+### Added
+
+- Context lease tools: `context_lease_acquire`, `context_lease_renew`,
+  `context_lease_release`, and `context_lease_list`. One exclusive lease per
+  analysis context with TTL-based expiry and release-on-close; every Phase 4
+  mutation tool requires it. Pre-existing control tools (`rom_load`,
+  pause/run, steps, breakpoints, watchpoints) keep their established
+  behavior.
+- `context_mutation_log`: bounded per-context audit trail of every Phase 4
+  mutation with lease id, echoed arguments, and timestamp.
+- `state_save`, `state_load`, `state_list`: context-scoped system snapshots
+  through the emulator's native save-state path (ZIP format via the
+  `ISystemGUIInterface` cross-cast in the plugin), verified with SHA-256 and
+  size. Snapshots anchor under `EXODUS_MCP_STATES_DIR` (new `--states`
+  flag; default `%TEMP%\exodus-mcp\states`).
+- `memory_write`: debugger-path writes to CPU bus spaces
+  (`SetMemorySpaceByte`) and entry-based memory devices (read-modify-write
+  honoring the declared byte order); timed-buffer spaces are refused with
+  `write_not_supported`; every call records audit metadata and a mutation
+  log entry.
+- `frame_advance`: pause, execute exactly N rendered VDP frames, pause;
+  reports the final frame token and times out with a diagnostic when the
+  display is not rendering.
+- `input_set`: press/release buttons (up/down/left/right/a/b/c/start/x/y/
+  z/mode) on a controller by player port through the controller device
+  input path.
+- Plugin bridge operations `mem_write`, `state_save`, `state_load`,
+  `frame_advance`, and `input_set` (plugin version 0.7.0), plus a strict
+  RFC 4648 `Base64Decode` wire helper with unit vectors.
+- `scripts/live-smoke.sh --full` now exercises the Phase 4 surface: lease
+  lifecycle, memory write with read-back, frame advance, input press and
+  release, save/list/load round trip, and the mutation log.
+
+### Changed
+
+- The mutating Phase 4 tools (`state_save`, `state_load`, `memory_write`,
+  `frame_advance`, `input_set`) require the exclusive lease of their
+  analysis context; calls without one fail with `lease_required` and calls
+  with a foreign lease id fail with `lease_invalid`.
+- `docs/ROADMAP.md` marks Phase 4 complete and records the trace crash as
+  resolved (see `TRACE-CRASH-INVESTIGATION.md`).
+
 ### Changed
 
 - Build wrappers now default to `Release | x64` for the Exodus fork and the
