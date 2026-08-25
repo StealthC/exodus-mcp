@@ -52,7 +52,7 @@ func buildToolRegistry() []toolSpec {
 	specs := append(phase1ToolSpecs(), cpuToolSpecs()...)
 	specs = append(specs, controlToolSpecs()...)
 	specs = append(specs, vdpToolSpecs()...)
-	specs = append(specs, leaseToolSpecs()...)
+	specs = append(specs, targetToolSpecs()...)
 	specs = append(specs, phase4ToolSpecs()...)
 	specs = append(specs, freezeToolSpecs()...)
 	specs = append(specs, phase5ToolSpecs()...)
@@ -101,7 +101,10 @@ func (server *Server) callTool(ctx context.Context, params json.RawMessage, mode
 	if len(call.Arguments) == 0 {
 		call.Arguments = json.RawMessage("{}")
 	}
-	return spec.run(toolContext{server: server, ctx: ctx, modern: modern}, call.Arguments)
+	result := spec.run(toolContext{server: server, ctx: ctx, modern: modern}, call.Arguments)
+	// Every result carries the target generation observed at response
+	// completion; mutations additionally report before/after.
+	return injectTargetGeneration(server, result)
 }
 
 // ----------------------------------------------------------------------------------------------------------------------

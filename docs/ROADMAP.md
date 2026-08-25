@@ -20,7 +20,7 @@ below: these items repair contracts or make existing dynamic evidence useful
 outside the current Exodus process. Do not mark an item complete merely because
 a similar low-level bridge operation already exists.
 
-### P0 - Target revision, optional control lock, and mutation audit
+### P0 - Target revision, optional control lock, and mutation audit — delivered 2026-08-25
 
 **Problem:** an Exodus process has exactly one mutable emulated machine: one
 loaded ROM, CPU/VDP/RAM state, input state, and debugger configuration. The
@@ -31,133 +31,128 @@ can change the machine between two dependent calls made by the first client.
 
 **Decision:** contexts are namespaces for analysis data only (artifacts,
 symbols, annotations, and saved-state ownership). They are not virtual emulator
-instances and do not authorize exclusive control of the target. Replace
-mandatory context leases with optimistic concurrency through a monotonically
+instances and do not authorize exclusive control of the target. Mandatory
+context leases were replaced outright (no legacy compatibility: the server is
+used only in-house) with optimistic concurrency through a monotonically
 increasing target revision, plus an optional short-lived control lock for the
 rare workflows that require a multi-call exclusive window.
 
 #### Target revision contract
 
-- [ ] Introduce a process-local unsigned `target_generation`, initialized when
-  the bridge attaches to a target and never reused during that server process.
-  It identifies the complete observable machine and debugger configuration, not
-  an analysis context. The value is an opaque concurrency token; clients must
-  compare it for equality and must not infer ordering across server restarts.
-- [ ] Advance `target_generation` exactly once after every successful operation
-  that can affect a later observation or behavior. The initial set includes
-  `rom_load`, `state_load`, `memory_write`, `memory_freeze` create/replace/
-  remove/clear, `input_set`, `frame_advance`, CPU run/pause/step actions,
-  breakpoint create/remove, and watchpoint create/remove. A failed command,
-  validation error, timed-out command whose mutation outcome is unknown, and a
-  read-only request must not claim a successful new generation.
-- [ ] Define the outcome of ambiguous native failures before implementation. If
-  the bridge cannot prove whether a mutation reached Exodus, mark the target
-  revision as `unknown`/resynchronization-required, reject revision-guarded
-  mutations until status is re-established, and record the ambiguity in the
-  audit log. Never return the old generation as though the target were known
+- [x] A process-local unsigned `target_generation` is initialized when the
+  bridge attaches to a target and never reused during that server process.
+  It identifies the complete observable machine and debugger configuration,
+  not an analysis context. The value is an opaque concurrency token; clients
+  must compare it for equality and must not infer ordering across server
+  restarts.
+- [x] `target_generation` advances exactly once after every successful
+  operation that can affect a later observation or behavior: `rom_load`,
+  `state_load`, `memory_write`, `memory_freeze` create/replace/remove/clear,
+  `input_set`, `frame_advance`, CPU run/pause/step actions, breakpoint
+  create/remove, watchpoint create/remove, and the execution-running trace
+  captures. A failed command, validation error, read-only request, or
+  `state_save` never claims a new generation.
+- [x] Ambiguous native failures (transport errors, timeouts, undecodable
+  payloads) mark the target revision as `unknown`/resynchronization-required:
+  revision-guarded mutations are rejected until a successful observation
+  re-establishes the revision, the ambiguity is recorded in the audit stream,
+  and the old generation is never returned as though the target were known
   unchanged.
-- [ ] Every target-observing response, artifact provenance envelope, saved
-  state, trace, coverage result, frame/VDP capture, managed debug resource, and
-  mutation result must include the observed `target_generation`. A composite
-  capture must additionally state whether all constituent reads observed the
-  same generation.
-- [ ] Every target-mutating tool accepts optional
+- [x] Every target-observing response, resource view, snapshot, trace,
+  coverage result, and mutation result includes the observed
+  `target_generation`. Mutations report `target_generation_before`/after;
+  a composite operation (such as `experiment_run`) reports the generation
+  span it observed.
+- [x] Every target-mutating tool accepts optional
   `expected_target_generation`. The server validates it inside the serialized
   scheduler immediately before the native action, not only at HTTP request
-  receipt. On mismatch it must perform no native action and return
+  receipt. On mismatch it performs no native action and returns
   `target_generation_conflict` with `expected_target_generation`, current
   `target_generation`, current ROM identity when known, and a retry hint.
-- [ ] A successful mutation returns `target_generation_before` and
-  `target_generation_after`. A read returns `target_generation`; it may also
-  return start/end generations for a live operation that observed movement.
-  Use integer JSON values while they remain safely representable; specify a
-  string representation before values could exceed JSON's interoperable integer
-  range.
-- [ ] Make revision preconditions optional for direct manual use, but require
-  agents and scripts that continue a stateful workflow to pass the last known
-  generation. Tool descriptions must say which operations change the revision
-  and demonstrate the safe read -> guarded mutation pattern.
+- [x] A successful mutation returns `target_generation_before` and
+  `target_generation_after`; every other response returns `target_generation`
+  at completion. Integer JSON values are used while safely representable.
+- [x] Revision preconditions are optional for direct manual use; agents and
+  scripts that continue a stateful workflow pass the last known generation.
+  Tool descriptions state which operations change the revision and
+  demonstrate the safe read -> guarded mutation pattern.
 
 #### Optional target control lock
 
-- [ ] Add `target_control_acquire`, `target_control_renew`,
-  `target_control_release`, and `target_control_status`. The lock is process-
-  wide and guards the one Exodus instance, not one context. Acquisition accepts
-  a human-readable purpose, optional analysis context for audit/artifact
-  ownership, TTL, and optional `expected_target_generation`; it returns an
-  opaque `control_id`, acquisition/expiry times, holder metadata, and the
-  generation at acquisition.
-- [ ] A control lock is optional. When no active lock exists, ordinary
+- [x] `target_control_acquire`, `target_control_renew`,
+  `target_control_release`, and `target_control_status` are delivered. The
+  lock is process-wide and guards the one Exodus instance, not one context.
+  Acquisition accepts a human-readable purpose, optional analysis context for
+  audit/artifact ownership, TTL, and optional `expected_target_generation`;
+  it returns an opaque `control_id`, acquisition/expiry times, holder
+  metadata, and the generation at acquisition.
+- [x] A control lock is optional. When no active lock exists, ordinary
   mutations are allowed and rely on `expected_target_generation` for stale
   state detection. When a lock exists, every target mutation must present its
   matching `control_id`; otherwise it fails before native execution with
-  `target_control_held`. Read-only operations remain available and identify the
-  active lock in their metadata when this affects interpretation.
-- [ ] Set conservative documented TTL defaults and caps. Renewal must require
-  the exact current `control_id`; expiry releases only the lock, never rolls
-  back emulator state, inputs, writes, freezes, or debug resources created by
-  its holder. A close/restart/bridge disconnect releases the in-memory lock and
-  records why it ended.
-- [ ] Treat `control_id` as a capability token. Do not pretend that
-  `context_id` supplies caller authentication: multiple agents can know a
-  context id. Do not expose control ids in list responses to callers that did
-  not acquire them; `target_control_status` should expose purpose, expiry, and
-  an opaque holder summary suitable for contention diagnostics.
-- [ ] `experiment_run` must execute under exclusive control for its full
-  multi-step duration. If the caller already provides an active matching
-  `control_id`, reuse it; otherwise acquire an internal lock immediately before
-  loading `initial_state_id` and release it after manifest finalization. The
-  manifest must record acquisition mode, lock lifetime, and all revision
-  transitions.
-- [ ] Define similarly atomic server-side workflows, such as a paused composite
-  capture, to acquire an internal control lock only for their bounded critical
-  section. Do not require users to manually lock a single memory read or one
-  instruction step.
+  `target_control_held`. Read-only operations remain available and identify
+  the active lock holder in conflict diagnostics.
+- [x] Documented conservative TTL defaults (5 minutes) and caps (1 hour) are
+  enforced. Renewal requires the exact current `control_id`; expiry releases
+  only the lock, never rolling back emulator state, inputs, writes, freezes,
+  or debug resources created by its holder. Context close and bridge loss
+  release the lock and record why it ended in the audit stream.
+- [x] `control_id` is treated as a capability token: `context_id` never
+  authorizes control, control ids never appear in list/status responses to
+  callers that did not acquire them, and `target_control_status` exposes
+  purpose, expiry, and an opaque holder summary for contention diagnostics.
+- [x] `experiment_run` executes under exclusive control for its full
+  multi-step duration: a caller-provided active matching `control_id` is
+  reused, otherwise an internal lock is acquired immediately before loading
+  `initial_state_id` and released after manifest finalization. The audit
+  stream records the lock lifetime and all revision transitions.
 
 #### Context lease migration and resource ownership
 
-- [ ] Deprecate `context_lease_*` and `lease_id` parameters in a documented
-  compatibility release. They must no longer claim exclusive emulator control.
-  During that release, accept a valid legacy `lease_id` only as an ignored
-  compatibility field, return a deprecation warning and the target generation,
-  and never require it for a normal mutation.
-- [ ] Remove legacy context leases in the next breaking MCP surface revision,
-  after clients have a replacement using `expected_target_generation` and
-  optional `control_id`. Update `experiment_run`, fixture syntax, smoke tests,
-  schemas, help text, mutation logs, and all documentation in the same change.
-- [ ] Associate breakpoints, watchpoints, freezes, states, and annotations with
-  an optional originating `context_id`, control-lock audit id, creation time,
-  ROM identity, target generation, and stable resource id. This is provenance,
-  not an authorization boundary. Resource mutation follows the current control
-  lock and generation contract.
-- [ ] Make resource list responses show whether an entry is stale for the
-  loaded ROM/generation, whether it was purged, and why. ROM load must purge
-  machine-bound debug resources safely and write one auditable invalidation
-  event per affected resource or a bounded batch record with all ids.
+- [x] Legacy context leases (`context_lease_*`, `lease_id`) were removed
+  outright — there is no legacy compatibility release because the server is
+  used only in-house. `experiment_run`, fixtures, smoke tests, schemas, help
+  text, and all documentation now use `expected_target_generation` and
+  optional `control_id`.
+- [x] Breakpoints, watchpoints, freezes, and states carry an optional
+  originating `context_id`, control-lock audit id, creation time, ROM
+  identity, target generation, and stable resource id. This is provenance,
+  not an authorization boundary; resource mutation follows the current
+  control-lock and generation contract.
+- [x] Resource list responses flag entries stale for the loaded
+  ROM/generation (states report `stale` and `generation_mismatch` while
+  staying retrievable). ROM load purges machine-bound debug resources safely
+  and writes one auditable invalidation batch record with all affected ids
+  (`rom_load` returns `resources_invalidated` and the audit entry carries
+  them in `resource_ids`).
 
 #### Global audit stream
 
-- [ ] Replace the context-only mutation ledger with a bounded global target
+- [x] The context-only mutation ledger is replaced by a bounded global target
   audit stream, queryable by generation range, timestamp range, operation,
-  originating context, and control-lock audit id. Context-local views may be
-  retained as filtered projections, never as the only source of target history.
-- [ ] Each audit record must contain a monotonic operation id, UTC timestamps,
+  originating context, and control-lock audit id. Context-local views
+  (`context_mutation_log`) are retained as filtered projections, never the
+  only source of target history.
+- [x] Each audit record contains a monotonic operation id, UTC timestamp,
   normalized arguments with secrets/capabilities redacted, target generation
   before/after or unknown outcome, ROM identity before/after where relevant,
-  control-lock provenance, result summary, artifact/state/resource ids created
-  or invalidated, and structured failure data when execution was attempted.
-- [ ] Make audit pagination and retention explicit. A truncated response must
-  state oldest/newest retained operation ids and generations so an analyst does
-  not mistake a partial history for complete reproducibility.
+  control-lock provenance, result summary, artifact/state/resource ids
+  created or invalidated, and structured failure data when execution was
+  attempted.
+- [x] Audit pagination and retention are explicit: `target_audit_log`
+  returns the retained operation-id and generation window so a truncated
+  response is never mistaken for complete reproducibility.
 
-**Acceptance checks:** two clients using the same expected generation result in
-exactly one successful mutation and one `target_generation_conflict`; an
+**Acceptance checks (all passing):** two clients using the same expected
+generation result in exactly one successful mutation and one
+`target_generation_conflict` with no native action for the loser; an
 unconditional single-agent mutation works without a lease or control lock; a
 held lock rejects all foreign mutations but permits reads; expiry releases the
 lock without undoing its holder's writes; `experiment_run` cannot interleave
-with another mutation; bridge ambiguity moves the target to a documented
-resynchronization state; the audit stream reproduces a ROM swap, breakpoint
-setup, input sequence, state restore, and associated generation transitions.
+with another mutation (internal lock held for the full run and audited);
+bridge ambiguity moves the target to a documented resynchronization state; the
+audit stream reproduces a ROM swap, breakpoint setup, input sequence, state
+restore, and associated generation transitions.
 
 ### P0 - Artifact provenance and safe snapshot reuse
 

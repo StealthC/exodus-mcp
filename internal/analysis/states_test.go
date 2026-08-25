@@ -62,25 +62,23 @@ func TestStateStoreEvictsOldest(t *testing.T) {
 	}
 }
 
-func TestLedgerBoundedAndNewestFirst(t *testing.T) {
-	ledger := newLedger()
-	for i := 0; i < maxLedgerEntriesPerContext+10; i++ {
-		ledger.Record(LedgerEntry{
-			Timestamp: time.Now().UTC().Add(time.Duration(i) * time.Millisecond),
-			Tool:      "memory_write",
-			ContextID: "ctx_a",
-			LeaseID:   "lease_1",
-			Detail:    map[string]any{"index": i},
-		})
+func TestStateStorePreservesProvenance(t *testing.T) {
+	store := newStateStore()
+	snapshot := &Snapshot{
+		ID:               NewSnapshotID(),
+		ContextID:        "ctx_a",
+		Path:             "state.zip",
+		ROMPath:          `F:\roms\kid.bin`,
+		ControlID:        "ctl_1",
+		TargetGeneration: 12,
+		CreatedAt:        time.Now().UTC(),
 	}
-	list := ledger.List("ctx_a")
-	if len(list) != maxLedgerEntriesPerContext {
-		t.Fatalf("expected %d entries, got %d", maxLedgerEntriesPerContext, len(list))
+	store.Create("ctx_a", snapshot)
+	found, err := store.Get("ctx_a", snapshot.ID)
+	if err != nil {
+		t.Fatalf("get: %v", err)
 	}
-	if list[0].Detail["index"] != maxLedgerEntriesPerContext+9 {
-		t.Fatalf("newest entry must come first, got %v", list[0].Detail)
-	}
-	if len(ledger.List("ctx_b")) != 0 {
-		t.Fatal("unknown context must list nothing")
+	if found.ROMPath != snapshot.ROMPath || found.ControlID != "ctl_1" || found.TargetGeneration != 12 {
+		t.Fatalf("provenance lost: %+v", found)
 	}
 }

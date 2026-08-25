@@ -29,15 +29,44 @@ downloads over HTTP.
 An Exodus process represents one mutable emulation state. It cannot safely
 execute parallel frame advances, input changes, or memory writes.
 
-The server will therefore expose **analysis contexts** as explicit handles,
-for example `context_create` returning `ctx_...`. Context-local data includes
+The server therefore exposes **analysis contexts** as explicit handles, for
+example `context_create` returning `ctx_...`. Context-local data includes
 symbols, annotations, artifact references, saved snapshots, and preferences.
-Every emulator operation passes through one serialized scheduler.
+Contexts are namespaces for analysis data only: they are not virtual emulator
+instances and do not authorize exclusive control of the target.
 
-Read-only operations may be queued concurrently but execute serially against a
-consistent emulator point. Mutating operations require an exclusive context
-lease. A future multi-instance manager can provide actual parallelism by
-launching separate Exodus processes, one bridge per instance.
+Concurrency safety comes from a **serialized scheduler**: every
+target-mutating operation passes through one mutex that validates
+preconditions, executes the native action, and advances the process-local
+`target_generation` atomically. Read-only operations run concurrently against
+a consistent emulator point because the native bridge serializes commands.
+
+**Optimistic concurrency.** `target_generation` is a monotonic unsigned token
+initialized when the server starts and advanced exactly once after every
+successful target mutation. Every response reports the generation observed at
+completion; mutating tools accept an optional `expected_target_generation`
+precondition and report before/after values. A mismatch fails with
+`target_generation_conflict` before any native action. When a transport
+failure leaves the outcome of a mutation unprovable, the target moves to an
+`unknown`/resynchronization-required state; guarded mutations wait until a
+successful read-only observation re-establishes the revision (and advances
+it, because the machine may have changed while unknown).
+
+**Optional exclusive control lock.** Workflows that need a multi-call atomic
+span can acquire the single process-wide lock via `target_control_*`. The
+`control_id` is a capability returned only to its acquirer; while the lock is
+active, every target mutation must present it or fails with
+`target_control_held`, and read-only tools stay available. Expiry, context
+close, and bridge loss release the lock and record why in the audit stream.
+
+Every mutation outcome (success, native failure, precondition conflict,
+ambiguous transport failure) and every lock lifecycle event is recorded in a
+bounded **global target audit stream** with monotonic operation ids, target
+generations, ROM identity, and context/control provenance; context-local views
+are filtered projections.
+
+A future multi-instance manager can provide actual parallelism by launching
+separate Exodus processes, one bridge per instance.
 
 These handles are application concepts, not MCP protocol sessions. Modern MCP
 removed protocol-level HTTP sessions in revision `2026-07-28`.
@@ -106,16 +135,17 @@ ends the window when a managed watchpoint's hit counter advances, and returns
 the fired watchpoint ids plus a stop reason, restoring the prior run state.
 
 The Go server owns an artifact store (immutable bytes, SHA-256 descriptors,
-ETag plus byte-range downloads under `/artifacts/{id}`, startup sweeps) and an
-analysis-context registry with an implicit default context. Tools return
+ETag plus byte-range downloads under `/artifacts/{id}`, startup sweeps), an
+analysis-context registry with an implicit default context, the target
+revision/control-lock state, and the bounded global audit stream. Tools return
 bounded summaries plus artifact descriptors; domain failures use MCP
 `isError: true` results rather than JSON-RPC protocol errors.
 
 The Go server also owns the experiment runner. Operator-authored `.py`
 scripts and declarative `.json` fixtures execute as a separate process outside
 the emulator, and every step reaches the emulator only through the same tool
-handlers, lease checks, and artifact store as regular MCP calls — never
-through the native pipe or capability. Script execution is intentionally
-un-sandboxed at the OS level (scripts are trusted operator code); bounds are
-enforced on steps, output, artifacts, and wall-clock time, and each run is
-recorded in a reproducible manifest artifact.
+handlers, scheduler (generation/control-lock preconditions), and artifact
+store as regular MCP calls — never through the native pipe or capability.
+Script execution is intentionally un-sandboxed at the OS level (scripts are
+trusted operator code); bounds are enforced on steps, output, artifacts, and
+wall-clock time, and each run is recorded in a reproducible manifest artifact.

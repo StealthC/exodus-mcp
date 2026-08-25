@@ -9,6 +9,45 @@ and this project will use [Semantic Versioning](https://semver.org/spec/v2.0.0.h
 
 ### Added
 
+- Target revision (optimistic concurrency): a process-local
+  `target_generation` starts at 1, advances exactly once per successful
+  target mutation, and is stamped on every tool response. Every mutating
+  tool (`rom_load`, CPU control and steps, breakpoint/watchpoint
+  create/remove, `memory_write`, `memory_freeze` family, `state_load`,
+  `frame_advance`, `input_set`, trace/coverage captures, `experiment_run`)
+  accepts optional `expected_target_generation` (validated inside the
+  serialized scheduler immediately before the native action) and reports
+  `target_generation_before`/`after`; a mismatch fails with
+  `target_generation_conflict` and no native action. Ambiguous transport
+  failures move the target to an `unknown`/resynchronization-required
+  state; guarded mutations wait until a successful observation
+  re-establishes the revision (and advances it).
+- Optional exclusive control lock: `target_control_acquire`,
+  `target_control_renew`, `target_control_release`, `target_control_status`
+  — one process-wide lock (5 min default TTL, 1 h cap) whose `control_id`
+  is a capability returned only to the acquirer. A held lock rejects
+  foreign mutations with `target_control_held` but never blocks reads;
+  expiry, context close, and bridge loss release the lock and record why.
+- `target_audit_log`: the bounded global target audit stream with
+  monotonic operation ids, UTC timestamps, normalized redacted arguments,
+  target generations before/after or unknown, ROM identity, context and
+  control-lock provenance, outcomes, structured failures, and created or
+  invalidated resource ids — filterable by tool, context, control id,
+  generation range, and time range, with pagination and retained-window
+  metadata on truncated responses. `context_mutation_log` is now a
+  per-context projection of this stream.
+- Resource provenance: breakpoints, watchpoints, freezes, and states record
+  originating context, control-lock audit id, creation time, ROM identity,
+  and target generation. `rom_load` purges machine-bound resources with one
+  audited invalidation batch (`resources_invalidated`); `state_list` flags
+  entries stale for the loaded ROM and generation-mismatched while keeping
+  them retrievable.
+- `experiment_run` executes under exclusive control for its full duration:
+  a caller-provided active `control_id` is reused, otherwise the server
+  acquires an internal lock (audited `experiment_completed` on release)
+  before loading `initial_state_id` and releases it after manifest
+  finalization. Every step's tool call carries the injected context and
+  control id.
 - Symbol-aware disassembly: `m68k_disassemble` and `z80_disassemble` now
   resolve the analysis context's symbols into per-line annotations —
   `symbol` when the instruction address itself has a label, and `targets`
@@ -39,12 +78,14 @@ and this project will use [Semantic Versioning](https://semver.org/spec/v2.0.0.h
   sweep; the default keeps artifacts for the whole server session. Startup
   logging reports the retention policy.
 - `memory_freeze`, `memory_freeze_list`, `memory_freeze_remove`,
-  `memory_freeze_clear`: lease-gated server-managed value freezing.
+  `memory_freeze_clear`: server-managed value freezing with optional
+  generation/control preconditions.
   `memory_freeze` writes the pinned bytes once (like `memory_write`) and then
   re-applies them at ~20 Hz through the serialized bridge queue, undoing the
   program's own updates to the range; re-registering the same space+address
-  updates the pinned bytes, `rom_load` purges the whole set, and both mutating
-  calls are recorded in the mutation ledger. The list tool reports byte
+  updates the pinned bytes, `rom_load` purges the whole set with an audited
+  invalidation batch, and both mutating calls are recorded in the target
+  audit stream. The list tool reports byte
   length, write count, last write time, and the last periodic-write error;
   `memory_freeze_clear` drops every entry at once. Validated by unit tests and
   the live smoke (pinning across a running window, write-count growth,
@@ -52,6 +93,23 @@ and this project will use [Semantic Versioning](https://semver.org/spec/v2.0.0.h
 
 ### Changed
 
+- **Breaking:** context leases are removed outright — `context_lease_*`,
+  `lease_id`, and `requireLease` no longer exist; ordinary mutations need no
+  lease, lock, or generation precondition. There is no legacy compatibility
+  release: the server is used only in-house.
+- `memory_freeze` family is no longer lease-gated; the freeze entries carry
+  provenance and accept the optional concurrency preconditions.
+- `state_save` no longer requires a lease (it does not mutate the target);
+  snapshots carry generation/ROM/control provenance.
+- `context_close` releases any control lock acquired under the context and
+  records the reason; it no longer has lease semantics.
+- `cpu_pause`, `cpu_run`, `m68k_step`, `z80_step`, `cpu_step_over`,
+  `cpu_step_out`, and the trace/coverage captures advance the target
+  generation and accept the optional preconditions.
+- `scripts/live-smoke.sh --full` validates the new contract: read ->
+  guarded mutation, `target_generation_conflict` without native action,
+  control-lock lifecycle with TTL expiry, holder-vs-foreign mutations,
+  reads under lock, experiment internal-lock release, and audit queries.
 - README rewritten: the old copy still described the project as a foundation
   shell that could not read from a running Exodus; it now summarizes the
   63-tool catalog by roadmap phase, the delivered status, configuration, and
@@ -78,6 +136,13 @@ and this project will use [Semantic Versioning](https://semver.org/spec/v2.0.0.h
 - `scripts/live-smoke.sh --full` covers the conditional-breakpoint lifecycle
   (range-condition echo/list/remove) and asserts the plain-breakpoint
   `break_counter` default.
+
+### Removed
+
+- `context_lease_acquire`, `context_lease_renew`, `context_lease_release`,
+  `context_lease_list` tools and the `lease_id` argument everywhere; the
+  per-context `LeaseRegistry` and per-context mutation ledger were replaced
+  by the global target state and audit stream.
 
 ### Fixed
 

@@ -26,16 +26,30 @@ var errFreezeLimit = errors.New("freeze entry limit reached")
 
 // freezeEntry is one server-maintained frozen cell range. The server re-writes
 // data through the bridge at freezeTickInterval while the entry exists, so the
-// emulated program's own updates to the range are continuously undone.
+// emulated program's own updates to the range are continuously undone. The
+// provenance fields describe who created the entry and at which target
+// generation; they are not an authorization boundary.
 type freezeEntry struct {
-	ID          string
-	Space       string
-	Address     uint64
-	Data        []byte
-	CreatedAt   time.Time
-	LastWriteAt time.Time
-	WriteCount  uint64
-	LastError   string
+	ID               string
+	Space            string
+	Address          uint64
+	Data             []byte
+	CreatedAt        time.Time
+	LastWriteAt      time.Time
+	WriteCount       uint64
+	LastError        string
+	ContextID        string
+	ControlID        string
+	TargetGeneration uint64
+	ROMPath          string
+}
+
+// freezeProvenance records who created a freeze entry and when.
+type freezeProvenance struct {
+	ContextID        string
+	ControlID        string
+	TargetGeneration uint64
+	ROMPath          string
 }
 
 // freezeRegistry owns the process-wide freeze set. Entries are machine-level,
@@ -62,30 +76,72 @@ func freezeKey(space string, address uint64) string {
 
 // set registers or replaces the frozen bytes at one space+address. It returns
 // the entry, whether an earlier entry was replaced, and errFreezeLimit when
-// the set is full and the address is not already frozen.
-func (registry *freezeRegistry) set(space string, address uint64, data []byte) (*freezeEntry, bool, error) {
+// the set is full and the address is not already frozen. Replacing an entry
+// refreshes its provenance to the new mutation.
+func (registry *freezeRegistry) set(space string, address uint64, data []byte, provenance freezeProvenance) (*freezeEntry, bool, error) {
 	registry.mu.Lock()
 	defer registry.mu.Unlock()
 	key := freezeKey(space, address)
 	if id := registry.byKey[key]; id != "" {
 		entry := registry.byID[id]
 		entry.Data = append(entry.Data[:0], data...)
+		entry.ContextID = provenance.ContextID
+		entry.ControlID = provenance.ControlID
+		entry.TargetGeneration = provenance.TargetGeneration
+		entry.ROMPath = provenance.ROMPath
 		return entry, true, nil
 	}
 	if len(registry.byID) >= freezeMaxEntries {
 		return nil, false, errFreezeLimit
 	}
 	entry := &freezeEntry{
-		ID:        "frz_" + strconv.FormatInt(time.Now().UnixNano(), 36),
-		Space:     space,
-		Address:   address,
-		Data:      append([]byte{}, data...),
-		CreatedAt: time.Now().UTC(),
+		ID:               "frz_" + strconv.FormatInt(time.Now().UnixNano(), 36),
+		Space:            space,
+		Address:          address,
+		Data:             append([]byte{}, data...),
+		CreatedAt:        time.Now().UTC(),
+		ContextID:        provenance.ContextID,
+		ControlID:        provenance.ControlID,
+		TargetGeneration: provenance.TargetGeneration,
+		ROMPath:          provenance.ROMPath,
 	}
 	registry.byID[entry.ID] = entry
 	registry.byKey[key] = entry.ID
 	registry.order = append(registry.order, entry)
 	return entry, false, nil
+}
+
+// has reports whether an entry with the id exists.
+func (registry *freezeRegistry) has(id string) bool {
+	registry.mu.Lock()
+	defer registry.mu.Unlock()
+	return registry.byID[id] != nil
+}
+
+// getAt returns the entry frozen at one space+address, or nil.
+func (registry *freezeRegistry) getAt(space string, address uint64) *freezeEntry {
+	registry.mu.Lock()
+	defer registry.mu.Unlock()
+	id := registry.byKey[freezeKey(space, address)]
+	if id == "" {
+		return nil
+	}
+	entry := registry.byID[id]
+	copy := *entry
+	copy.Data = append([]byte{}, entry.Data...)
+	return &copy
+}
+
+// ids returns the ids of every registered entry, for audited invalidation
+// batches on rom_load.
+func (registry *freezeRegistry) ids() []string {
+	registry.mu.Lock()
+	defer registry.mu.Unlock()
+	ids := make([]string, 0, len(registry.byID))
+	for id := range registry.byID {
+		ids = append(ids, id)
+	}
+	return ids
 }
 
 // remove deletes one entry by id and reports whether it existed.
@@ -198,39 +254,42 @@ func freezeToolSpecs() []toolSpec {
 	return []toolSpec{
 		{
 			name:        "memory_freeze",
-			description: "Register a cell range that the server re-writes at about 20 Hz, undoing the emulated program's own updates to it. Applies the bytes once immediately (like memory_write), then keeps them pinned while the entry exists. Replacing an entry at the same space+address updates the pinned bytes; rom_load purges the whole set. Requires an exclusive context lease.",
+			description: "Register a cell range that the server re-writes at about 20 Hz, undoing the emulated program's own updates to it. Applies the bytes once immediately (like memory_write), then keeps them pinned while the entry exists. Replacing an entry at the same space+address updates the pinned bytes; rom_load purges the whole set with an audited invalidation. Accepts optional expected_target_generation and control_id.",
 			schema: objectSchema(map[string]any{
-				"context":  contextProperty(),
-				"lease_id": stringProperty("Active lease id from context_lease_acquire."),
-				"space":    stringProperty("Space id from memory_spaces_list, such as m68k-bus."),
-				"address":  addressProperty(),
-				"data":     stringProperty("Bytes to keep in place, base64-encoded (up to 4096 bytes)."),
-			}, []string{"lease_id", "space", "address", "data"}),
+				"context":                    contextProperty(),
+				"space":                      stringProperty("Space id from memory_spaces_list, such as m68k-bus."),
+				"address":                    addressProperty(),
+				"data":                       stringProperty("Bytes to keep in place, base64-encoded (up to 4096 bytes)."),
+				"expected_target_generation": integerProperty("Optional target generation the caller last observed; fails with target_generation_conflict on mismatch.", 1),
+				"control_id":                 stringProperty("Optional control id from target_control_acquire; required while the control lock is active."),
+			}, []string{"space", "address", "data"}),
 			run: runMemoryFreeze,
 		},
 		{
 			name:        "memory_freeze_list",
-			description: "List the cell ranges currently frozen by this server process, with byte lengths, write counts, last write time, and any last error from the periodic re-write.",
+			description: "List the cell ranges currently frozen by this server process, with byte lengths, write counts, last write time, provenance (context, target generation, ROM), and any last error from the periodic re-write.",
 			schema:      objectSchema(map[string]any{}, nil),
 			run:         runMemoryFreezeList,
 		},
 		{
 			name:        "memory_freeze_remove",
-			description: "Remove one frozen cell range so the emulated program can update it again. Requires an exclusive context lease.",
+			description: "Remove one frozen cell range so the emulated program can update it again. Accepts optional expected_target_generation and control_id.",
 			schema: objectSchema(map[string]any{
-				"context":   contextProperty(),
-				"lease_id":  stringProperty("Active lease id from context_lease_acquire."),
-				"freeze_id": stringProperty("Freeze entry id returned by memory_freeze."),
-			}, []string{"lease_id", "freeze_id"}),
+				"context":                    contextProperty(),
+				"freeze_id":                  stringProperty("Freeze entry id returned by memory_freeze."),
+				"expected_target_generation": integerProperty("Optional target generation the caller last observed; fails with target_generation_conflict on mismatch.", 1),
+				"control_id":                 stringProperty("Optional control id from target_control_acquire; required while the control lock is active."),
+			}, []string{"freeze_id"}),
 			run: runMemoryFreezeRemove,
 		},
 		{
 			name:        "memory_freeze_clear",
-			description: "Remove every frozen cell range at once, so the emulated program can update all of them again. Returns how many entries were removed. Requires an exclusive context lease.",
+			description: "Remove every frozen cell range at once, so the emulated program can update all of them again. Returns how many entries were removed. Accepts optional expected_target_generation and control_id.",
 			schema: objectSchema(map[string]any{
-				"context":  contextProperty(),
-				"lease_id": stringProperty("Active lease id from context_lease_acquire."),
-			}, []string{"lease_id"}),
+				"context":                    contextProperty(),
+				"expected_target_generation": integerProperty("Optional target generation the caller last observed; fails with target_generation_conflict on mismatch.", 1),
+				"control_id":                 stringProperty("Optional control id from target_control_acquire; required while the control lock is active."),
+			}, nil),
 			run: runMemoryFreezeClear,
 		},
 	}
@@ -238,10 +297,10 @@ func freezeToolSpecs() []toolSpec {
 
 type memoryFreezeArgs struct {
 	Context string `json:"context"`
-	LeaseID string `json:"lease_id"`
 	Space   string `json:"space"`
 	Address any    `json:"address"`
 	Data    string `json:"data"`
+	guardArgs
 }
 
 func runMemoryFreeze(tc toolContext, args json.RawMessage) map[string]any {
@@ -251,9 +310,6 @@ func runMemoryFreeze(tc toolContext, args json.RawMessage) map[string]any {
 	}
 	context, failure := resolveContext(tc.server, parsed.Context)
 	if failure != nil {
-		return failureResult(failure, tc.modern)
-	}
-	if failure := tc.server.requireLease(context, parsed.LeaseID, "memory_freeze"); failure != nil {
 		return failureResult(failure, tc.modern)
 	}
 	address, failure := parseAddress(parsed.Address)
@@ -273,22 +329,56 @@ func runMemoryFreeze(tc toolContext, args json.RawMessage) map[string]any {
 
 	var entry *freezeEntry
 	var replaced bool
-	_, failure = tc.server.memWriteCommand(tc.ctx, parsed.Space, address, bytes)
+	var freezeID string
+	_, before, after, failure := tc.server.executeMutation(tc.ctx, mutationCall{
+		tool:      "memory_freeze",
+		operation: "mem_write",
+		params: map[string]string{
+			"space":   parsed.Space,
+			"address": strconv.FormatUint(address, 10),
+			"length":  strconv.Itoa(len(bytes)),
+			"data":    parsed.Data,
+		},
+		guard:     parsed.guard(),
+		contextID: context.ID,
+		detail: map[string]any{
+			"space":   parsed.Space,
+			"address": address,
+			"length":  len(bytes),
+			"sha256":  sha256Hex(bytes),
+		},
+		prepare: func() *toolFailure {
+			existing := tc.server.freezes.getAt(parsed.Space, address)
+			if existing == nil && len(tc.server.freezes.list()) >= freezeMaxEntries {
+				return &toolFailure{Code: "freeze_limit", Message: "the freeze set is full (" + strconv.Itoa(freezeMaxEntries) + " entries); remove an entry with memory_freeze_remove first"}
+			}
+			return nil
+		},
+		commit: func() {
+			var err error
+			entry, replaced, err = tc.server.freezes.set(parsed.Space, address, bytes, freezeProvenance{
+				ContextID:        context.ID,
+				ControlID:        parsed.ControlID,
+				TargetGeneration: tc.server.target.Generation(),
+				ROMPath:          tc.server.currentROMPath(),
+			})
+			if err != nil {
+				// The scheduler serializes every mutating tool, so the
+				// prepare check cannot race; treat this as a logic bug.
+				panic(err)
+			}
+			freezeID = entry.ID
+		},
+		resources: func() []string {
+			if freezeID == "" {
+				return nil
+			}
+			return []string{freezeID}
+		},
+	})
 	if failure != nil {
 		return failureResult(failure, tc.modern)
 	}
-	entry, replaced, err = tc.server.freezes.set(parsed.Space, address, bytes)
-	if err != nil {
-		return failureResult(&toolFailure{Code: "freeze_limit", Message: "the freeze set is full (" + strconv.Itoa(freezeMaxEntries) + " entries); remove an entry with memory_freeze_remove first"}, tc.modern)
-	}
-
-	tc.server.recordMutation(context, parsed.LeaseID, "memory_freeze", map[string]any{
-		"space":    parsed.Space,
-		"address":  address,
-		"length":   len(bytes),
-		"sha256":   sha256Hex(bytes),
-		"replaced": replaced,
-	})
 
 	result := map[string]any{
 		"freeze_id":   entry.ID,
@@ -301,19 +391,25 @@ func runMemoryFreeze(tc toolContext, args json.RawMessage) map[string]any {
 		"replaced":    replaced,
 		"rewrite_hz":  1 / freezeTickInterval.Seconds(),
 	}
-	return okResult(result, tc.modern)
+	return okResult(stampGenerations(result, before, after), tc.modern)
 }
 
 func freezeEntryView(entry *freezeEntry) map[string]any {
 	view := map[string]any{
-		"freeze_id":   entry.ID,
-		"space":       entry.Space,
-		"address":     entry.Address,
-		"address_hex": fmt.Sprintf("0x%X", entry.Address),
-		"byte_length": len(entry.Data),
-		"data_sha256": sha256Hex(entry.Data),
-		"created_at":  entry.CreatedAt,
-		"write_count": entry.WriteCount,
+		"freeze_id":         entry.ID,
+		"space":             entry.Space,
+		"address":           entry.Address,
+		"address_hex":       fmt.Sprintf("0x%X", entry.Address),
+		"byte_length":       len(entry.Data),
+		"data_sha256":       sha256Hex(entry.Data),
+		"created_at":        entry.CreatedAt,
+		"write_count":       entry.WriteCount,
+		"context_id":        entry.ContextID,
+		"target_generation": entry.TargetGeneration,
+		"rom_path":          entry.ROMPath,
+	}
+	if entry.ControlID != "" {
+		view["control_id"] = entry.ControlID
 	}
 	if !entry.LastWriteAt.IsZero() {
 		view["last_write_at"] = entry.LastWriteAt
@@ -335,8 +431,8 @@ func runMemoryFreezeList(tc toolContext, _ json.RawMessage) map[string]any {
 
 type memoryFreezeRemoveArgs struct {
 	Context  string `json:"context"`
-	LeaseID  string `json:"lease_id"`
 	FreezeID string `json:"freeze_id"`
+	guardArgs
 }
 
 func runMemoryFreezeRemove(tc toolContext, args json.RawMessage) map[string]any {
@@ -348,21 +444,35 @@ func runMemoryFreezeRemove(tc toolContext, args json.RawMessage) map[string]any 
 	if failure != nil {
 		return failureResult(failure, tc.modern)
 	}
-	if failure := tc.server.requireLease(context, parsed.LeaseID, "memory_freeze_remove"); failure != nil {
+	var removed bool
+	_, before, after, failure := tc.server.executeMutation(tc.ctx, mutationCall{
+		tool:      "memory_freeze_remove",
+		operation: "",
+		guard:     parsed.guard(),
+		contextID: context.ID,
+		detail: map[string]any{
+			"freeze_id": parsed.FreezeID,
+		},
+		prepare: func() *toolFailure {
+			if !tc.server.freezes.has(parsed.FreezeID) {
+				return &toolFailure{Code: "unknown_freeze", Message: "no freeze entry with id " + parsed.FreezeID + "; list entries with memory_freeze_list"}
+			}
+			return nil
+		},
+		commit: func() {
+			removed = tc.server.freezes.remove(parsed.FreezeID)
+		},
+		resources: func() []string { return []string{parsed.FreezeID} },
+	})
+	if failure != nil {
 		return failureResult(failure, tc.modern)
 	}
-	if !tc.server.freezes.remove(parsed.FreezeID) {
-		return failureResult(&toolFailure{Code: "unknown_freeze", Message: "no freeze entry with id " + parsed.FreezeID + "; list entries with memory_freeze_list"}, tc.modern)
-	}
-	tc.server.recordMutation(context, parsed.LeaseID, "memory_freeze_remove", map[string]any{
-		"freeze_id": parsed.FreezeID,
-	})
-	return okResult(map[string]any{"freeze_id": parsed.FreezeID, "removed": true}, tc.modern)
+	return okResult(stampGenerations(map[string]any{"freeze_id": parsed.FreezeID, "removed": removed}, before, after), tc.modern)
 }
 
 type memoryFreezeClearArgs struct {
 	Context string `json:"context"`
-	LeaseID string `json:"lease_id"`
+	guardArgs
 }
 
 func runMemoryFreezeClear(tc toolContext, args json.RawMessage) map[string]any {
@@ -374,12 +484,24 @@ func runMemoryFreezeClear(tc toolContext, args json.RawMessage) map[string]any {
 	if failure != nil {
 		return failureResult(failure, tc.modern)
 	}
-	if failure := tc.server.requireLease(context, parsed.LeaseID, "memory_freeze_clear"); failure != nil {
+	var removedIDs []string
+	_, before, after, failure := tc.server.executeMutation(tc.ctx, mutationCall{
+		tool:      "memory_freeze_clear",
+		operation: "",
+		guard:     parsed.guard(),
+		contextID: context.ID,
+		detail:    map[string]any{},
+		prepare: func() *toolFailure {
+			removedIDs = tc.server.freezes.ids()
+			return nil
+		},
+		commit: func() {
+			tc.server.freezes.purge()
+		},
+		resources: func() []string { return removedIDs },
+	})
+	if failure != nil {
 		return failureResult(failure, tc.modern)
 	}
-	removed := tc.server.freezes.purge()
-	tc.server.recordMutation(context, parsed.LeaseID, "memory_freeze_clear", map[string]any{
-		"removed": removed,
-	})
-	return okResult(map[string]any{"removed": removed, "freezes_total": 0}, tc.modern)
+	return okResult(stampGenerations(map[string]any{"removed": len(removedIDs), "freezes_total": 0}, before, after), tc.modern)
 }

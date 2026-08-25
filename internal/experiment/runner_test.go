@@ -85,7 +85,7 @@ func runRequest(script *Script, executor Executor) RunRequest {
 	return RunRequest{
 		ExperimentID: "exp_test",
 		ContextID:    "ctx_test",
-		LeaseID:      "lease_test",
+		ControlID:    "ctl_test",
 		Script:       script,
 		Arguments:    map[string]any{"frames": 1},
 		Exec:         executor,

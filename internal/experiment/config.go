@@ -5,7 +5,7 @@
 // Scripts (.py) and fixtures (.json) live in an operator-configured scripts
 // directory. The Go server owns the process lifecycle, validates every
 // message, mediates every tool call through an allowlist, injects the
-// experiment's context and lease, and records a reproducible manifest
+// experiment's context and control id, and records a reproducible manifest
 // artifact plus capped diagnostic output. Scripts never see the native pipe,
 // the bridge capability, or the emulator process itself.
 package experiment

@@ -7,14 +7,15 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/StealthC/exodus-mcp/internal/analysis"
 	"github.com/StealthC/exodus-mcp/internal/experiment"
 )
 
 // experimentAllowlist is the bounded tool surface scripts and fixtures may
 // call. Every entry exists today; recursive, control-plane, and
-// context/lease management tools are deliberately absent so a script cannot
-// escalate its mediation windows or leave global execution in an arbitrary
-// state.
+// context/control-lock management tools are deliberately absent so a script
+// cannot escalate its mediation windows or leave global execution in an
+// arbitrary state.
 var experimentAllowlist = map[string]bool{
 	"input_set":            true,
 	"frame_advance":        true,
@@ -42,15 +43,16 @@ func experimentToolSpecs() []toolSpec {
 	return []toolSpec{
 		{
 			name:        "experiment_run",
-			description: "Run an operator-authored experiment script (.py) or declarative fixture (.json) from the configured scripts directory (EXODUS_MCP_SCRIPTS_DIR / --scripts; launcher default: repo scripts/experiments). The server mediates every step against an allowlist, injects this context and its lease, and records a reproducible manifest artifact plus capped script output; scripts never see the native pipe or capability. Requires an exclusive context lease.",
+			description: "Run an operator-authored experiment script (.py) or declarative fixture (.json) from the configured scripts directory (EXODUS_MCP_SCRIPTS_DIR / --scripts; launcher default: repo scripts/experiments). The server mediates every step against an allowlist, injects this context and its control id, and records a reproducible manifest artifact plus capped script output; scripts never see the native pipe or capability. The run executes under exclusive control for its full duration: a caller-provided active control_id is reused, otherwise the server acquires an internal lock and releases it after manifest finalization.",
 			schema: objectSchema(map[string]any{
-				"context":          stringProperty("Analysis context handle that owns the experiment artifacts and mutations."),
-				"lease_id":         stringProperty("Lease id returned by context_lease_acquire; the experiment and every mutating step run under it."),
-				"script":           stringProperty("Script file name inside the configured scripts directory; must end in .py or .json and contain no path separators."),
-				"arguments":        map[string]any{"type": "object", "description": "JSON values passed verbatim to the script through the init message."},
-				"initial_state_id": stringProperty("Optional state id loaded with state_load before the first script step."),
-				"timeout_ms":       integerProperty(fmt.Sprintf("Wall-clock budget for the whole run (default %d, cap %d).", defaultExperimentTimeoutMS, maxExperimentTimeoutMS), 1),
-			}, []string{"context", "lease_id", "script"}),
+				"context":                    stringProperty("Analysis context handle that owns the experiment artifacts and mutations."),
+				"script":                     stringProperty("Script file name inside the configured scripts directory; must end in .py or .json and contain no path separators."),
+				"arguments":                  map[string]any{"type": "object", "description": "JSON values passed verbatim to the script through the init message."},
+				"initial_state_id":           stringProperty("Optional state id loaded with state_load before the first script step."),
+				"timeout_ms":                 integerProperty(fmt.Sprintf("Wall-clock budget for the whole run (default %d, cap %d).", defaultExperimentTimeoutMS, maxExperimentTimeoutMS), 1),
+				"control_id":                 stringProperty("Optional active control id from target_control_acquire to reuse; otherwise the server acquires an internal lock for the run."),
+				"expected_target_generation": integerProperty("Optional target generation the caller last observed; fails with target_generation_conflict on mismatch.", 1),
+			}, []string{"context", "script"}),
 			run: runExperiment,
 		},
 	}
@@ -58,11 +60,11 @@ func experimentToolSpecs() []toolSpec {
 
 type experimentRunArgs struct {
 	Context        string         `json:"context"`
-	LeaseID        string         `json:"lease_id"`
 	Script         string         `json:"script"`
 	Arguments      map[string]any `json:"arguments"`
 	InitialStateID string         `json:"initial_state_id"`
 	TimeoutMS      *int64         `json:"timeout_ms"`
+	guardArgs
 }
 
 func runExperiment(tc toolContext, args json.RawMessage) map[string]any {
@@ -81,9 +83,6 @@ func runExperiment(tc toolContext, args json.RawMessage) map[string]any {
 			Message: "experiment_run is not configured: launch exodus-mcp with --scripts (EXODUS_MCP_SCRIPTS_DIR) and a writable scripts directory",
 		}, tc.modern)
 	}
-	if failure := tc.server.requireLease(context, parsed.LeaseID, "experiment_run"); failure != nil {
-		return failureResult(failure, tc.modern)
-	}
 	timeout := time.Duration(defaultExperimentTimeoutMS) * time.Millisecond
 	if parsed.TimeoutMS != nil {
 		if *parsed.TimeoutMS < 1 {
@@ -97,7 +96,44 @@ func runExperiment(tc toolContext, args json.RawMessage) map[string]any {
 		return failureResult(experimentFailure(err), tc.modern)
 	}
 
-	executor := &experimentExecutor{server: tc.server, contextID: context.ID, leaseID: parsed.LeaseID}
+	// The generation precondition is checked before any lock is taken so a
+	// stale caller never churns the exclusive window.
+	if parsed.ExpectedTargetGeneration != nil {
+		if failure := targetGenerationPrecondition(tc.server, *parsed.ExpectedTargetGeneration); failure != nil {
+			return failureResult(failure, tc.modern)
+		}
+	}
+
+	// Exclusive control for the full run: reuse an active caller lock or
+	// acquire an internal one immediately before loading initial_state_id and
+	// release it after the manifest is finalized.
+	controlID := parsed.ControlID
+	if controlID == "" {
+		ttl := timeout + 60*time.Second
+		if ttl > analysis.MaxControlTTL {
+			ttl = analysis.MaxControlTTL
+		}
+		lock, err := tc.server.controls.Acquire("experiment_run "+script.Name, context.ID, ttl, tc.server.target.Generation())
+		if err != nil {
+			var held *analysis.ControlHeldError
+			if errors.As(err, &held) {
+				return failureResult(controlHeldFailure(held.Lock, tc.server.target.Generation()), tc.modern)
+			}
+			return failureResult(&toolFailure{Code: "invalid_params", Message: err.Error()}, tc.modern)
+		}
+		controlID = lock.ID
+		defer func() {
+			_ = tc.server.controls.Release(controlID, "experiment_completed")
+		}()
+	} else if !tc.server.controls.Valid(controlID) {
+		return failureResult(&toolFailure{
+			Code:    "target_control_held",
+			Message: "the provided control_id does not own the active target control lock; acquire one with target_control_acquire or omit control_id to let the server manage the lock",
+		}, tc.modern)
+	}
+
+	runStartGeneration := tc.server.target.Generation()
+	executor := &experimentExecutor{server: tc.server, contextID: context.ID, controlID: controlID}
 	if parsed.InitialStateID != "" {
 		if _, err := executor.Call(tc.ctx, "state_load", map[string]any{"state_id": parsed.InitialStateID}); err != nil {
 			var toolErr *experiment.ToolError
@@ -113,7 +149,7 @@ func runExperiment(tc toolContext, args json.RawMessage) map[string]any {
 	result, err := runner.Run(tc.ctx, experiment.RunRequest{
 		ExperimentID:   experiment.NewID(),
 		ContextID:      context.ID,
-		LeaseID:        parsed.LeaseID,
+		ControlID:      controlID,
 		Script:         script,
 		Arguments:      parsed.Arguments,
 		InitialStateID: parsed.InitialStateID,
@@ -123,15 +159,30 @@ func runExperiment(tc toolContext, args json.RawMessage) map[string]any {
 	if err != nil {
 		return failureResult(&toolFailure{Code: "experiment_error", Message: err.Error()}, tc.modern)
 	}
-	tc.server.recordMutation(context, parsed.LeaseID, "experiment_run", map[string]any{
-		"experiment_id":    result.ExperimentID,
-		"script":           map[string]any{"name": result.ScriptName, "kind": result.ScriptKind, "sha256": result.ScriptSHA256},
-		"initial_state_id": result.InitialStateID,
-		"final_state_id":   result.FinalStateID,
-		"status":           result.Status,
-		"duration_ms":      result.DurationMS,
-		"steps":            len(result.Steps),
-		"manifest_id":      result.Manifest.ID,
+	outcome := analysis.OutcomeOK
+	if result.Status != experiment.StatusCompleted {
+		outcome = analysis.OutcomeFailed
+	}
+	tc.server.recordAudit(analysis.AuditEntry{
+		Tool:      "experiment_run",
+		ContextID: context.ID,
+		ControlID: controlID,
+		Outcome:   outcome,
+		Detail: map[string]any{
+			"experiment_id":    result.ExperimentID,
+			"script":           map[string]any{"name": result.ScriptName, "kind": result.ScriptKind, "sha256": result.ScriptSHA256},
+			"initial_state_id": result.InitialStateID,
+			"final_state_id":   result.FinalStateID,
+			"status":           result.Status,
+			"duration_ms":      result.DurationMS,
+			"steps":            len(result.Steps),
+			"control_mode":     map[string]any{"internal_lock": parsed.ControlID == "", "reused_caller_lock": parsed.ControlID != ""},
+		},
+		Result: map[string]any{
+			"target_generation_before": runStartGeneration,
+			"target_generation_after":  tc.server.target.Generation(),
+		},
+		ResourceIDs: []string{result.Manifest.ID},
 	})
 
 	artifacts := []map[string]any{artifactDescriptor(tc.server, result.Manifest, context.ID)}
@@ -151,7 +202,7 @@ func runExperiment(tc toolContext, args json.RawMessage) map[string]any {
 		}
 		return failureResult(&toolFailure{Code: "experiment_failed", Message: result.Error.Message, Data: data}, tc.modern)
 	}
-	return okResult(map[string]any{
+	return okResult(stampGenerations(map[string]any{
 		"experiment_id":    result.ExperimentID,
 		"status":           result.Status,
 		"script":           map[string]any{"name": result.ScriptName, "kind": result.ScriptKind, "sha256": result.ScriptSHA256},
@@ -160,7 +211,7 @@ func runExperiment(tc toolContext, args json.RawMessage) map[string]any {
 		"initial_state_id": result.InitialStateID,
 		"final_state_id":   result.FinalStateID,
 		"artifacts":        artifacts,
-	}, tc.modern)
+	}, runStartGeneration, tc.server.target.Generation()), tc.modern)
 }
 
 // experimentFailure maps script resolution errors to stable tool codes.
@@ -193,13 +244,14 @@ func experimentArtifactView(ref experiment.ArtifactRef, server *Server, contextI
 }
 
 // experimentExecutor implements experiment.Executor on top of the real tool
-// registry. Every call injects the experiment's context and lease, so a
-// script can never address another context or bypass the lease guard; the
-// response handed to the script is the structuredContent of the tool result.
+// registry. Every call injects the experiment's context and control id, so a
+// script can never address another context or bypass the control-lock guard;
+// the response handed to the script is the structuredContent of the tool
+// result, stamped with the target generation.
 type experimentExecutor struct {
 	server    *Server
 	contextID string
-	leaseID   string
+	controlID string
 }
 
 func (executor *experimentExecutor) Call(ctx context.Context, tool string, arguments map[string]any) (map[string]any, error) {
@@ -217,12 +269,12 @@ func (executor *experimentExecutor) Call(ctx context.Context, tool string, argum
 		arguments = map[string]any{}
 	}
 	arguments["context"] = executor.contextID
-	arguments["lease_id"] = executor.leaseID
+	arguments["control_id"] = executor.controlID
 	raw, err := json.Marshal(arguments)
 	if err != nil {
 		return nil, &experiment.ToolError{Code: "tool_args_invalid", Message: "encode tool arguments: " + err.Error()}
 	}
-	result := spec.run(toolContext{server: executor.server, ctx: ctx, modern: true}, raw)
+	result := injectTargetGeneration(executor.server, spec.run(toolContext{server: executor.server, ctx: ctx, modern: true}, raw))
 	if failed, _ := result["isError"].(bool); failed {
 		content, _ := result["structuredContent"].(map[string]any)
 		code, _ := content["code"].(string)

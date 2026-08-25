@@ -7,11 +7,13 @@ Mega Drive / Genesis ROM analysis.
 The Go server speaks Streamable HTTP at `/mcp` (normative target MCP
 `2026-07-28`, with a bounded legacy initialization-era layer), and drives a
 single Exodus instance through an authenticated local named pipe into a native
-C++ plugin. Currently **63 analysis tools** cover the phased roadmap from
+C++ plugin. Currently **64 analysis tools** cover the phased roadmap from
 bridge/context foundations through VDP graphics, deterministic controlled
 experimentation, and Phase 5 advanced analysis (ROM header parsing, snapshot
 memory search, watchpoint-triggered tracing, coverage, and scripted
-experiments). See the [feature catalog](docs/FEATURES.md) for the delivered
+experiments), with optimistic concurrency (target generations, optional
+exclusive control lock) and a global target audit stream. See the
+[feature catalog](docs/FEATURES.md) for the delivered
 scope and the [roadmap](docs/ROADMAP.md) for planned work.
 
 ## Goals
@@ -61,19 +63,21 @@ modern and legacy dispatchers. An overview by roadmap phase:
   VSRAM), `vdp_tile_export`, `vdp_plane_export`, `vdp_palette_export`,
   `vdp_sprite_table`, `vdp_pixel_info`, `frame_capture`.
 - **Phase 4 (controlled experimentation):** `rom_load`, CPU pause/run/step/
-  step-over/step-out, MCP-managed breakpoints and watchpoints,
-  lease-gated `memory_write`, `memory_freeze` family (20 Hz server-side value
-  freezing; set/list/remove/clear), `frame_advance`, `input_set`,
-  `state_save`/`state_load`/`state_list`, `context_lease_*`,
-  `context_mutation_log`.
+  step-over/step-out, MCP-managed breakpoints and watchpoints, optimistic
+  concurrency (`target_generation` on every response, optional
+  `expected_target_generation` on mutations), the optional exclusive
+  `target_control_*` lock, `memory_write`, the `memory_freeze` family (20 Hz
+  server-side value freezing; set/list/remove/clear), `frame_advance`,
+  `input_set`, `state_save`/`state_load`/`state_list`,
+  `context_mutation_log`, `target_audit_log`.
 - **Phase 5 (advanced analysis):** `rom_info` (Sega header + checksum),
   `memory_search`, `memory_diff` (cheat-finder snapshot comparison),
   `cpu_trace_capture_watchpoint`, `experiment_run`.
 
 Every tool response is a bounded summary; high-volume output lands in an
 immutable artifact. See [FEATURES.md](docs/FEATURES.md) for the delivered
-catalog and design rules (byte order, address formats, lease requirements),
-and [ROADMAP.md](docs/ROADMAP.md) for planned work.
+catalog and design rules (byte order, address formats, target generations,
+control locks), and [ROADMAP.md](docs/ROADMAP.md) for planned work.
 
 ## Artifact-first output
 
@@ -136,8 +140,9 @@ contract are in [native-plugin](native-plugin/README.md).
 - [x] Authenticated named-pipe bridge with capability-gated plugin access and
       serialized command scheduler.
 - [x] Phases 0-4 complete and live-validated against Kid Chameleon (bridge,
-      memory, CPUs, symbols, VDP/graphics, leases, mutations, states,
-      breakpoints/watchpoints, frames, input).
+      memory, CPUs, symbols, VDP/graphics, optimistic concurrency with target
+      generations and the optional control lock, audit stream, mutations,
+      states, breakpoints/watchpoints, frames, input).
 - [x] Phase 5 core: `rom_info`, `memory_search`, `memory_diff`,
       watchpoint-triggered traces, coverage, `experiment_run`.
 - [ ] Multi-instance orchestration (parallel experiments) — remaining Phase 5

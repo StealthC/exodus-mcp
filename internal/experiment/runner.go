@@ -37,7 +37,7 @@ func (err *ToolError) Error() string { return err.Code + ": " + err.Message }
 
 // Executor mediates one allowlisted tool call for an experiment. The MCP
 // layer implements it by dispatching into the real tool handlers with the
-// experiment's context and lease injected; tests use fakes.
+// experiment's context and control id injected; tests use fakes.
 type Executor interface {
 	Call(ctx context.Context, tool string, arguments map[string]any) (map[string]any, error)
 }
@@ -94,7 +94,7 @@ type Result struct {
 type RunRequest struct {
 	ExperimentID   string
 	ContextID      string
-	LeaseID        string
+	ControlID      string
 	Script         *Script
 	Arguments      map[string]any
 	InitialStateID string

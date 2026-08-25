@@ -42,13 +42,13 @@ func phase1ToolSpecs() []toolSpec {
 		},
 		{
 			name:        "context_close",
-			description: "Close an analysis context. The implicit default context cannot be closed; its artifacts stay retrievable during the session.",
+			description: "Close an analysis context. The implicit default context cannot be closed; its artifacts stay retrievable during the session. Any process-wide control lock acquired under the context is released and the reason is recorded in the audit stream.",
 			schema:      objectSchema(map[string]any{"context_id": stringProperty("Context handle returned by context_create.")}, []string{"context_id"}),
 			run:         runContextClose,
 		},
 		{
 			name:        "context_create",
-			description: "Create an analysis context that scopes symbols, artifacts, and future mutation leases. Contexts are application handles, not MCP sessions.",
+			description: "Create an analysis context that scopes symbols, artifacts, snapshots, and resource provenance. Contexts are application handles, not MCP sessions, and never authorize exclusive emulator control.",
 			schema:      objectSchema(map[string]any{"name": stringProperty("Short human-readable context name (max 100 characters).")}, []string{"name"}),
 			run:         runContextCreate,
 		},
@@ -96,10 +96,12 @@ func phase1ToolSpecs() []toolSpec {
 		},
 		{
 			name:        "rom_load",
-			description: "Replace the current Mega Drive cartridge with a ROM file visible to Windows. This mutates the running target and preserves its prior run state unless run is true.",
+			description: "Replace the current Mega Drive cartridge with a ROM file visible to Windows. This mutates the running target, preserves its prior run state unless run is true, and purges machine-bound debug resources (breakpoints, watchpoints, freezes) with an audited invalidation. Accepts optional expected_target_generation and control_id; a mismatch fails with target_generation_conflict before any native action.",
 			schema: objectSchema(map[string]any{
-				"path": stringProperty("Absolute Windows path to a .bin, .gen, or .md ROM file."),
-				"run":  map[string]any{"type": "boolean", "description": "Run the system after the ROM loads, even if it was paused before."},
+				"path":                       stringProperty("Absolute Windows path to a .bin, .gen, or .md ROM file."),
+				"run":                        map[string]any{"type": "boolean", "description": "Run the system after the ROM loads, even if it was paused before."},
+				"expected_target_generation": integerProperty("Optional target generation the caller last observed; fails with target_generation_conflict on mismatch.", 1),
+				"control_id":                 stringProperty("Optional control id from target_control_acquire; required while the control lock is active."),
 			}, []string{"path"}),
 			run: runROMLoad,
 		},
@@ -118,6 +120,7 @@ func phase1ToolSpecs() []toolSpec {
 type romLoadArgs struct {
 	Path string `json:"path"`
 	Run  bool   `json:"run"`
+	guardArgs
 }
 
 func runROMLoad(tc toolContext, args json.RawMessage) map[string]any {
@@ -129,18 +132,48 @@ func runROMLoad(tc toolContext, args json.RawMessage) map[string]any {
 	if path == "" || strings.ContainsAny(path, "\r\n") {
 		return failureResult(&toolFailure{Code: "invalid_params", Message: "path must be one non-empty Windows file path"}, tc.modern)
 	}
-	payload, failure := tc.server.executeCommand(tc.ctx, "rom_load", map[string]string{"path": path, "run": strconv.FormatBool(parsed.Run)})
+
+	// Machine-bound resources (freezes, managed breakpoints, managed
+	// watchpoints) describe the previous cartridge's address map; the plugin
+	// purges its debug resources natively and the server purges the rest,
+	// collecting one audited invalidation batch for the rom_load record.
+	var invalidated []string
+	payload, before, after, failure := tc.server.executeMutation(tc.ctx, mutationCall{
+		tool:      "rom_load",
+		operation: "rom_load",
+		params:    map[string]string{"path": path, "run": strconv.FormatBool(parsed.Run)},
+		guard:     parsed.guard(),
+		contextID: "",
+		detail: map[string]any{
+			"path": path,
+			"run":  parsed.Run,
+		},
+		romAfter: path,
+		prepare: func() *toolFailure {
+			invalidated = nil
+			for _, id := range tc.server.freezes.ids() {
+				invalidated = append(invalidated, id)
+			}
+			for _, id := range tc.server.debugResourceIDs() {
+				invalidated = append(invalidated, fmt.Sprintf("debug_%d", id))
+			}
+			return nil
+		},
+		commit: func() {
+			server := tc.server
+			server.freezes.purge()
+			server.purgeDebugResources()
+			server.setROMPath(path)
+		},
+		resources: func() []string { return invalidated },
+	})
 	if failure != nil {
 		return failureResult(failure, tc.modern)
 	}
-	// Frozen ranges describe the previous cartridge's address map; writing
-	// them into the new program would corrupt its state, so the whole set is
-	// purged on every successful load (mirroring the plugin-side purge of
-	// breakpoints and watchpoints).
-	if purged := tc.server.freezes.purge(); purged > 0 {
-		payload["freezes_purged"] = purged
+	if len(invalidated) > 0 {
+		payload["resources_invalidated"] = invalidated
 	}
-	return okResult(payload, tc.modern)
+	return okResult(stampGenerations(payload, before, after), tc.modern)
 }
 
 // ----------------------------------------------------------------------------------------------------------------------
@@ -210,6 +243,11 @@ func fetchEmulatorStatus(tc toolContext) (*emulatorStatusData, *toolFailure) {
 	var status emulatorStatusData
 	if err := json.Unmarshal(data, &status); err != nil {
 		return nil, &toolFailure{Code: "bridge_error", Message: "decode emulator_status payload: " + err.Error()}
+	}
+	if status.Rom.Loaded {
+		tc.server.setROMPath(status.Rom.Path)
+	} else {
+		tc.server.setROMPath("")
 	}
 	return &status, nil
 }
@@ -690,6 +728,11 @@ func runContextClose(tc toolContext, args json.RawMessage) map[string]any {
 		}
 		return failureResult(&toolFailure{Code: code, Message: err.Error()}, tc.modern)
 	}
+	// A control lock acquired under this context ends with it; the drop hook
+	// records why.
+	tc.server.controls.DropIf(func(lock *analysis.ControlLock) bool {
+		return lock.ContextID == context.ID
+	}, "context_closed")
 	view := contextView(context)
 	view["closed"] = true
 	return okResult(map[string]any{"context": view}, tc.modern)

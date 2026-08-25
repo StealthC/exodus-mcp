@@ -5,7 +5,7 @@ server, grouped by capability. Planned work is tracked in
 [ROADMAP.md](ROADMAP.md); the [CHANGELOG.md](../CHANGELOG.md) records the
 delivery history.
 
-The MCP server currently exposes **63 analysis tools** spanning the delivered
+The MCP server currently exposes **64 analysis tools** spanning the delivered
 roadmap phases 0-5: bridge and context foundations, memory and artifact
 access, both processors, VDP graphics, deterministic controlled
 experimentation, and advanced analysis. Everything below is covered by unit
@@ -26,9 +26,23 @@ and integration tests and exercised live against a running Exodus instance
 - **Flexible address formats.** Address arguments accept `$`-prefixed
   Motorola hex, `0x` hex, Zilog `h`-suffixed hex, and decimal integers; every
   response echoes the canonical parsed address.
-- **Lease-gated mutation.** All mutating tools require the exclusive lease of
-  their analysis context and return enough metadata to reproduce the action;
-  every mutation is recorded in `context_mutation_log`.
+- **Optimistic concurrency.** Every response carries the process-local
+  `target_generation` observed at response completion; every target mutation
+  reports `target_generation_before`/`after` and accepts an optional
+  `expected_target_generation` precondition, validated inside the serialized
+  scheduler immediately before the native action. A mismatch fails with
+  `target_generation_conflict` and no native action, with the current
+  generation, ROM identity, and a retry hint.
+- **Optional exclusive control lock.** `target_control_acquire`/`renew`/
+  `release`/`status` provide a short-lived process-wide exclusive window
+  (TTL-capped, capability-gated `control_id`) for workflows that need a
+  multi-call atomic span. A held lock rejects foreign mutations with
+  `target_control_held` but never blocks reads; expiry releases only the lock.
+- **Bounded global audit stream.** Every target mutation, precondition
+  conflict, and control-lock lifecycle event lands in `target_audit_log`
+  (monotonic operation ids, target generations, ROM identity, context and
+  control provenance, structured failures); `context_mutation_log` is a
+  per-context projection.
 - **Consistent reads only.** Searches and diffs run over snapshot artifacts
   (never a live racy scan); timed-buffer VDP reads briefly pause a running
   system, restore it afterwards, and report that in the response.
@@ -75,10 +89,12 @@ and integration tests and exercised live against a running Exodus instance
   `decreased`, `changed_by` (signed delta), `equal_to`, and `in_range`;
   bounded inline matches plus a `memory-diff-results` artifact.
 - `memory_freeze`, `memory_freeze_list`, `memory_freeze_remove`,
-  `memory_freeze_clear`: lease-gated server-managed value freezing. A
-  registered range is written once and re-applied at 20 Hz through the
-  serialized bridge queue; the list tool surfaces write counts, last write
-  time, and the last periodic-write error; the set is purged on `rom_load`.
+  `memory_freeze_clear`: server-managed value freezing with optional
+  generation/control preconditions. A registered range is written once and
+  re-applied at 20 Hz through the serialized bridge queue; the list tool
+  surfaces write counts, last write time, provenance (context, target
+  generation, ROM), and the last periodic-write error; the set is purged on
+  `rom_load` with an audited invalidation batch.
 - `artifact_get`, `artifact_preview`: metadata, bounded previews, and range
   retrieval guidance for every produced artifact.
 
@@ -106,7 +122,8 @@ and integration tests and exercised live against a running Exodus instance
   `cpu_watchpoint_remove` — byte ranges with read/write/any access filtering,
   live hit counters, and deterministic hit-and-pause through the Exodus
   debugger path. Breakpoints and watchpoints are purged safely on
-  `rom_load`.
+  `rom_load` with one audited invalidation batch; list views carry creation
+  provenance (context, target generation, ROM) without exposing control ids.
 - `cpu_trace_capture`: artifact-first processor trace window. The trace log
   is routed through a temporary on-disk file, tracing is configured with the
   system stopped, and the prior run state is restored (the reproducible
@@ -158,19 +175,38 @@ and integration tests and exercised live against a running Exodus instance
 
 - `rom_load`: controlled local cartridge replacement that preserves the
   previous running state; MCP-managed breakpoints, watchpoints, and frozen
-  cell ranges are purged before the module unloads.
-- Exclusive context leases: `context_lease_acquire`, `context_lease_renew`,
-  `context_lease_release`, `context_lease_list` — one exclusive lease per
-  context with TTL-based expiry and release-on-close; every Phase 4 mutation
-  tool requires it.
-- `context_mutation_log`: bounded per-context audit trail of every mutation
-  with lease id, echoed arguments, and timestamp.
+  cell ranges are purged before the module unloads, with one audited
+  invalidation batch naming every affected resource.
+- Target revision: a process-local `target_generation` starts at 1, advances
+  exactly once per successful mutation, and is attached to every response,
+  resource, snapshot, and audit record. Ambiguous native failures move the
+  target to an `unknown`/resynchronization-required state; revision-guarded
+  mutations wait until a successful observation re-establishes the revision
+  (and advances it, because the machine may have changed while unknown).
+- Optional exclusive control lock: `target_control_acquire`,
+  `target_control_renew`, `target_control_release`, `target_control_status` —
+  one process-wide lock with TTL-based expiry (5 min default, 1 h cap),
+  `control_id` capability returned only to the acquirer, purpose/expiry holder
+  diagnostics without leaking the id, release on context close or bridge
+  loss, and audit records stating why each lock ended.
+- `target_audit_log`: the bounded global target audit stream — monotonic
+  operation ids, UTC timestamps, normalized redacted arguments, target
+  generations before/after (or unknown), ROM identity, originating context,
+  control-lock provenance, outcome, structured failures, and created or
+  invalidated resource ids, with generation/time/tool/context/control filters,
+  pagination, and retained-window metadata on truncated responses.
+- `context_mutation_log`: the per-context projection of the audit stream
+  (target mutations only; lock lifecycle stays global).
 - `state_save`, `state_load`, `state_list`: context-scoped system snapshots
   through the emulator's native save-state path (ZIP format), each verified
-  with SHA-256 and size.
+  with SHA-256 and size and carrying provenance (context, target generation,
+  ROM, optional control id). `state_save` does not mutate the target;
+  `state_load` does and reports before/after generations. Lists flag entries
+  stale for the loaded ROM and generation-mismatched while preserving them
+  for historical analysis.
 - `frame_advance`: pause, execute exactly N rendered VDP frames, pause —
-  reports the final frame token and times out with a diagnostic when the
-  display is not rendering.
+  reports the final frame token, before/after target generations, and times
+  out with a diagnostic when the display is not rendering.
 - `input_set`: press/release of up, down, left, right, a, b, c, start, x, y,
   z, and mode on a controller by player port, through the controller device
   input path.
@@ -190,10 +226,12 @@ and integration tests and exercised live against a running Exodus instance
   `state_load`, `memory_write`, `memory_read`, `memory_dump`, `memory_search`,
   `frame_capture`, `vdp_status`, `vdp_pixel_info`, `vdp_sprite_table`,
   `m68k_registers`, `z80_registers`, `cpu_coverage_capture`). The server
-  injects the experiment's context and lease, records a reproducible
-  `experiment-manifest` artifact plus capped diagnostic output, and mirrors
-  every mutation in the ledger. Scripts never see the native pipe or
-  capability; trust-in-operator-code applies (no OS sandboxing).
+  injects the experiment's context and control id, runs the whole experiment
+  under exclusive control (reusing a caller-provided active `control_id` or
+  acquiring an internal lock released after manifest finalization), records a
+  reproducible `experiment-manifest` artifact plus capped diagnostic output,
+  and mirrors every step in the audit stream. Scripts never see the native
+  pipe or capability; trust-in-operator-code applies (no OS sandboxing).
 
 ## Operations
 
@@ -203,10 +241,12 @@ and integration tests and exercised live against a running Exodus instance
   `24h`) expires old artifacts on a background sweep; startup logging reports
   the policy.
 - `scripts/live-smoke.sh`: validates a running pair through the MCP endpoint —
-  read-only default checks, `--full` adds the mutating surface (lease
-  lifecycle, memory write with read-back, frame advance, input,
-  save/list/load, breakpoint/watchpoint lifecycles, consecutive paused
-  captures, running-state restoration).
+  read-only default checks, `--full` adds the mutating surface (target
+  generation read → guarded mutation, `target_generation_conflict` without
+  native action, control-lock lifecycle with TTL expiry, memory write with
+  read-back, frame advance, input, save/list/load, breakpoint/watchpoint
+  lifecycles, consecutive paused captures, running-state restoration,
+  experiment internal-lock release, audit stream queries).
 - `scripts/test.sh`: local quality gates (format, vet, race-enabled tests,
   `GOOS=windows` build/vet) plus `--windows-live` named-pipe integration
   against a real pipe.
@@ -237,11 +277,20 @@ reference harness, in addition to unit and integration tests:
   sprite-table chain `[0, 4, 15]` in attract mode; `vdp_pixel_info`
   attribution of border, layer B sky, layer A text/building, and a bottom-row
   sprite.
-- Save/list/load round trip; frame advance and input with a 3-button
-  controller; coverage capture; watchpoint-triggered trace capture; ROM
-  header parsing and checksum validation.
+- Save/list/load round trip with generation/ROM provenance and stale flags;
+  frame advance and input with a 3-button controller; coverage capture;
+  watchpoint-triggered trace capture; ROM header parsing and checksum
+  validation.
+- Optimistic concurrency: two clients sharing one observed generation produce
+  exactly one mutation and one `target_generation_conflict`; an unconditional
+  single-agent mutation needs no lease or lock; a held control lock rejects
+  foreign mutations while reads stay available; TTL expiry releases only the
+  lock; ambiguous transport failures move the target to the documented
+  resynchronization state; the audit stream reproduces ROM swaps,
+  breakpoint/watchpoint/freeze setup and purge, and generation transitions.
 - `experiment_run` fixture path: manifest artifact contents over HTTP plus
-  the frame-capture artifact.
+  the frame-capture artifact, and the internal control lock released with an
+  audited `experiment_completed` reason.
 
 ## Adopted external input
 
@@ -265,7 +314,9 @@ The delivered catalog honors these rules, and any future tool must keep them:
   address.
 - Default responses are summaries; large output is an artifact. Inline raw
   output requires an explicit small limit.
-- Mutating tools require an exclusive analysis-context lease and return enough
-  metadata to reproduce the action.
+- Mutating tools accept optional `expected_target_generation` (read →
+  guarded-mutate pattern) and optional `control_id` (required while the
+  exclusive control lock is active), and return enough metadata to reproduce
+  the action in the global audit stream.
 - System-specific tools use clear prefixes (`m68k_`, `z80_`, `vdp_`) rather
   than pretending that behavior is generic.

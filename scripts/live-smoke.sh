@@ -4,13 +4,14 @@
 # Default checks are strictly read-only: health, discovery, tool catalog,
 # bridge status, and emulator status. --full additionally exercises the
 # mutating CPU-control tools (pause/run, M68K step, breakpoint and watchpoint
-# lifecycle, paused frame-capture determinism), the Phase 4 lease-gated
-# surface (memory write, memory_freeze lifecycle, frame advance, input,
-# snapshot round trip), the
+# lifecycle, paused frame-capture determinism), the optimistic-concurrency
+# surface (target generation read -> guarded mutation, conflict detection,
+# the optional exclusive control lock with TTL expiry), memory write, the
+# memory_freeze lifecycle, frame advance, input, the snapshot round trip, the
 # snapshot comparison surface (memory_search, memory_diff around a rendered
-# frame), and the lease-gated experiment fixture (experiment_run over
-# smoke-input.json with manifest verification), always restoring running state
-# on exit.
+# frame), the experiment fixture (experiment_run over smoke-input.json with
+# manifest and internal-lock verification), and the global audit stream,
+# always restoring running state on exit.
 #
 # Requires: bash, curl, python3. Run against an already-launched pair
 # (./scripts/run-windows.sh); never start a second pair for this script.
@@ -411,75 +412,120 @@ print(s)
 	check "coverage records executed entries" "[ -n \"\$coverage_entries\" ] && [ \"\$coverage_entries\" -ge 1 ]"
 	check "coverage records distinct addresses" "[ -n \"\$coverage_distinct\" ] && [ \"\$coverage_distinct\" -ge 1 ]"
 
-	step "Phase 4 controlled experimentation (lease-gated)"
-	# Purge any lease left by an earlier session: an aborted smoke holds its
-	# lease until TTL expiry, which would block the acquire below. Mirrors
-	# the breakpoint/watchpoint purge above.
-	stale_lease=$(json_get "$(tool_call "context_lease_list")" "parsed.get('leases', [{}])[0].get('lease_id', '')" 2>/dev/null)
-	if [ -n "$stale_lease" ]; then
-		tool_call "context_lease_release" "{\"lease_id\": \"$stale_lease\"}" >/dev/null
-	fi
-	# The system is paused here; every Phase 4 mutation below requires the
-	# exclusive context lease, which the smoke holds from acquire to release.
-	lease=$(tool_call "context_lease_acquire" '{"purpose": "live-smoke phase 4"}' 2>/dev/null || echo "")
-	lease_id=$(json_get "$lease" "parsed.get('lease_id', '')" 2>/dev/null)
-	if [ -z "$lease_id" ]; then
-		check "context lease acquires" false
+	step "Phase 4 controlled experimentation (generation + control lock)"
+	# The system is paused here. Ordinary single-agent mutations need no
+	# lease, no lock, and no generation precondition; stateful callers pass
+	# the last observed target_generation. The smoke reads the generation
+	# from a read-only observation, then exercises conflict detection, the
+	# optional exclusive control lock, and its TTL expiry.
+
+	# Read -> guarded mutation pattern: observe, then mutate with the
+	# observed generation.
+	gen_read=$(tool_call "emulator_status")
+	gen=$(json_get "$gen_read" "parsed.get('target_generation', 0)" 2>/dev/null)
+	check "observation reports a target generation" "[ -n \"\$gen\" ] && [ \"\$gen\" -ge 1 ]"
+
+	# memory_write with read-back through the debugger path, unconditional.
+	probe_byte=$(printf '\x5a' | base64)
+	write_result=$(tool_call "memory_write" "{\"space\": \"m68k-bus\", \"address\": \"0xFF0000\", \"data\": \"$probe_byte\"}")
+	write_code=$(json_get "$write_result" "parsed.get('code', '')" 2>/dev/null)
+	if [ "$write_code" = "write_fault" ]; then
+		echo "SKIP  memory_write echo (write fault on the probe address)"
 	else
-		check "context lease acquires" true
-		listed_leases=$(tool_call "context_lease_list")
-		lease_count=$(json_get "$listed_leases" "len(parsed.get('leases', []))" 2>/dev/null)
-		check "context lease lists exactly one" "[ \"\$lease_count\" = '1' ]"
+		written_len=$(json_get "$write_result" "parsed.get('length', 0)" 2>/dev/null)
+		check "memory_write echoes written length" "[ \"\$written_len\" = '1' ]"
+		before_gen=$(json_get "$write_result" "parsed.get('target_generation_before', 0)" 2>/dev/null)
+		after_gen=$(json_get "$write_result" "parsed.get('target_generation_after', 0)" 2>/dev/null)
+		check "mutation reports before/after generations" "[ -n \"\$before_gen\" ] && [ \"\$after_gen\" = \$((before_gen + 1)) ]"
+		read_result=$(tool_call "memory_read" '{"space": "m68k-bus", "address": "0xFF0000", "length": 1}')
+		read_hex=$(json_get "$read_result" "parsed.get('data_base64', '')" 2>/dev/null)
+		check "memory_write read-back matches" "[ \"\$read_hex\" = \"\$probe_byte\" ]"
 
-		# memory_write with read-back through the debugger path.
-		probe_byte=$(printf '\x5a' | base64)
-		write_result=$(tool_call "memory_write" "{\"lease_id\": \"$lease_id\", \"space\": \"m68k-bus\", \"address\": \"0xFF0000\", \"data\": \"$probe_byte\"}")
-		write_code=$(json_get "$write_result" "parsed.get('code', '')" 2>/dev/null)
-		if [ "$write_code" = "write_fault" ]; then
-			echo "SKIP  memory_write echo (write fault on the probe address)"
+		# A guarded write with the current generation succeeds; the stale
+		# generation fails with target_generation_conflict and no native
+		# action (verified by the audit stream recording only the conflict).
+		current_gen=$(json_get "$read_result" "parsed.get('target_generation', 0)" 2>/dev/null)
+		guarded=$(tool_call "memory_write" "{\"space\": \"m68k-bus\", \"address\": \"0xFF0000\", \"data\": \"$probe_byte\", \"expected_target_generation\": $current_gen}")
+		guarded_code=$(json_get "$guarded" "parsed.get('code', '')" 2>/dev/null)
+		check "guarded write with the current generation succeeds" "[ -z \"\$guarded_code\" ] || [ \"\$guarded_code\" != 'target_generation_conflict' ]"
+		guarded_after=$(json_get "$guarded" "parsed.get('target_generation_after', 0)" 2>/dev/null)
+		stale_gen=$((current_gen - 1))
+		conflict=$(tool_call "memory_write" "{\"space\": \"m68k-bus\", \"address\": \"0xFF0000\", \"data\": \"$probe_byte\", \"expected_target_generation\": $stale_gen}")
+		conflict_code=$(json_get "$conflict" "parsed.get('code', '')" 2>/dev/null)
+		check "stale generation yields target_generation_conflict" "[ \"\$conflict_code\" = 'target_generation_conflict' ]"
+		conflict_expected=$(json_get "$conflict" "parsed.get('expected_target_generation', -1)" 2>/dev/null)
+		conflict_current=$(json_get "$conflict" "parsed.get('target_generation', -1)" 2>/dev/null)
+		check "conflict reports expected and current" "[ \"\$conflict_expected\" = \"\$stale_gen\" ] && [ \"\$conflict_current\" = \"\$guarded_after\" ]"
+
+		# memory_freeze pins a cell while the system runs: the sweeper
+		# must re-apply the bytes (write_count grows) and the value must
+		# still hold after a running window; removing it stops the writes.
+		freeze=$(tool_call "memory_freeze" "{\"space\": \"m68k-bus\", \"address\": \"0xFF0000\", \"data\": \"$probe_byte\"}")
+		freeze_id=$(json_get "$freeze" "parsed.get('freeze_id', '')" 2>/dev/null)
+		if [ -z "$freeze_id" ]; then
+			check "memory_freeze registers a freeze entry" false
 		else
-			written_len=$(json_get "$write_result" "parsed.get('length', 0)" 2>/dev/null)
-			check "memory_write echoes written length" "[ \"\$written_len\" = '1' ]"
-			read_result=$(tool_call "memory_read" '{"space": "m68k-bus", "address": "0xFF0000", "length": 1}')
-			read_hex=$(json_get "$read_result" "parsed.get('data_base64', '')" 2>/dev/null)
-			check "memory_write read-back matches" "[ \"\$read_hex\" = \"\$probe_byte\" ]"
+			check "memory_freeze registers a freeze entry" true
+			tool_call "cpu_run" >/dev/null
+			sleep 1
+			tool_call "cpu_pause" >/dev/null
+			frozen_read=$(tool_call "memory_read" '{"space": "m68k-bus", "address": "0xFF0000", "length": 1}')
+			frozen_hex=$(json_get "$frozen_read" "parsed.get('data_base64', '')" 2>/dev/null)
+			freeze_listed=$(tool_call "memory_freeze_list")
+			freeze_writes=$(json_get "$freeze_listed" "parsed.get('freezes', [{}])[0].get('write_count', 0)" 2>/dev/null)
+			check "memory_freeze sweeper re-applied the cell" "[ -n \"\$freeze_writes\" ] && [ \"\$freeze_writes\" -ge 1 ]"
+			check "memory_freeze keeps the cell pinned while running" "[ \"\$frozen_hex\" = \"\$probe_byte\" ]"
+			freeze_rm=$(tool_call "memory_freeze_remove" "{\"freeze_id\": \"$freeze_id\"}")
+			freeze_rm_flag=$(json_get "$freeze_rm" "str(parsed.get('removed', False)).lower()" 2>/dev/null)
+			check "memory_freeze_remove deletes the entry" "[ \"\$freeze_rm_flag\" = 'true' ]"
 
-			# memory_freeze pins a cell while the system runs: the sweeper
-			# must re-apply the bytes (write_count grows) and the value must
-			# still hold after a running window; removing it stops the writes.
-			freeze=$(tool_call "memory_freeze" "{\"lease_id\": \"$lease_id\", \"space\": \"m68k-bus\", \"address\": \"0xFF0000\", \"data\": \"$probe_byte\"}")
-			freeze_id=$(json_get "$freeze" "parsed.get('freeze_id', '')" 2>/dev/null)
-			if [ -z "$freeze_id" ]; then
-				check "memory_freeze registers a freeze entry" false
-			else
-				check "memory_freeze registers a freeze entry" true
-				tool_call "cpu_run" >/dev/null
-				sleep 1
-				tool_call "cpu_pause" >/dev/null
-				frozen_read=$(tool_call "memory_read" '{"space": "m68k-bus", "address": "0xFF0000", "length": 1}')
-				frozen_hex=$(json_get "$frozen_read" "parsed.get('data_base64', '')" 2>/dev/null)
-				freeze_listed=$(tool_call "memory_freeze_list")
-				freeze_writes=$(json_get "$freeze_listed" "parsed.get('freezes', [{}])[0].get('write_count', 0)" 2>/dev/null)
-				check "memory_freeze sweeper re-applied the cell" "[ -n \"\$freeze_writes\" ] && [ \"\$freeze_writes\" -ge 1 ]"
-				check "memory_freeze keeps the cell pinned while running" "[ \"\$frozen_hex\" = \"\$probe_byte\" ]"
-				freeze_rm=$(tool_call "memory_freeze_remove" "{\"lease_id\": \"$lease_id\", \"freeze_id\": \"$freeze_id\"}")
-				freeze_rm_flag=$(json_get "$freeze_rm" "str(parsed.get('removed', False)).lower()" 2>/dev/null)
-				check "memory_freeze_remove deletes the entry" "[ \"\$freeze_rm_flag\" = 'true' ]"
+			# memory_freeze_clear drops the whole set in one call.
+			tool_call "memory_freeze" "{\"space\": \"m68k-bus\", \"address\": \"0xFF0002\", \"data\": \"$probe_byte\"}" >/dev/null
+			tool_call "memory_freeze" "{\"space\": \"m68k-bus\", \"address\": \"0xFF0004\", \"data\": \"$probe_byte\"}" >/dev/null
+			freeze_clear=$(tool_call "memory_freeze_clear" "{}")
+			freeze_cleared=$(json_get "$freeze_clear" "parsed.get('removed', -1)" 2>/dev/null)
+			check "memory_freeze_clear reports the removed count" "[ \"\$freeze_cleared\" = '2' ]"
+			freeze_after=$(tool_call "memory_freeze_list")
+			freeze_after_total=$(json_get "$freeze_after" "parsed.get('freezes_total', -1)" 2>/dev/null)
+			check "memory_freeze_clear empties the set" "[ \"\$freeze_after_total\" = '0' ]"
+		fi
 
-				# memory_freeze_clear drops the whole set in one call.
-				tool_call "memory_freeze" "{\"lease_id\": \"$lease_id\", \"space\": \"m68k-bus\", \"address\": \"0xFF0002\", \"data\": \"$probe_byte\"}" >/dev/null
-				tool_call "memory_freeze" "{\"lease_id\": \"$lease_id\", \"space\": \"m68k-bus\", \"address\": \"0xFF0004\", \"data\": \"$probe_byte\"}" >/dev/null
-				freeze_clear=$(tool_call "memory_freeze_clear" "{\"lease_id\": \"$lease_id\"}")
-				freeze_cleared=$(json_get "$freeze_clear" "parsed.get('removed', -1)" 2>/dev/null)
-				check "memory_freeze_clear reports the removed count" "[ \"\$freeze_cleared\" = '2' ]"
-				freeze_after=$(tool_call "memory_freeze_list")
-				freeze_after_total=$(json_get "$freeze_after" "parsed.get('freezes_total', -1)" 2>/dev/null)
-				check "memory_freeze_clear empties the set" "[ \"\$freeze_after_total\" = '0' ]"
-			fi
+		# Optional exclusive control lock: foreign mutations are rejected,
+		# reads stay available, the holder passes, expiry releases the lock.
+		lock=$(tool_call "target_control_acquire" '{"purpose": "live-smoke phase 4"}')
+		control_id=$(json_get "$lock" "parsed.get('control_id', '')" 2>/dev/null)
+		if [ -z "$control_id" ]; then
+			check "target_control_acquire returns a control id" false
+		else
+			check "target_control_acquire returns a control id" true
+			status=$(tool_call "target_control_status")
+			status_active=$(json_get "$status" "str(parsed.get('active', False)).lower()" 2>/dev/null)
+			check "target_control_status reports the active lock" "[ \"\$status_active\" = 'true' ]"
+			status_leak=$(json_get "$status" "'control_id' in parsed" 2>/dev/null)
+			check "control status never leaks the control id" "[ \"\$status_leak\" = 'false' ]"
+			held=$(tool_call "memory_write" "{\"space\": \"m68k-bus\", \"address\": \"0xFF0000\", \"data\": \"$probe_byte\"}")
+			held_code=$(json_get "$held" "parsed.get('code', '')" 2>/dev/null)
+			check "foreign mutation is target_control_held" "[ \"\$held_code\" = 'target_control_held' ]"
+			held_read=$(tool_call "memory_read" '{"space": "m68k-bus", "address": "0xFF0000", "length": 1}')
+			check "reads stay available under the lock" "[ -n \"\$(json_get \"\$held_read\" \"parsed.get('data_base64', '')\" 2>/dev/null)\" ]"
+			holder_write=$(tool_call "memory_write" "{\"space\": \"m68k-bus\", \"address\": \"0xFF0000\", \"data\": \"$probe_byte\", \"control_id\": \"$control_id\"}")
+			holder_code=$(json_get "$holder_write" "parsed.get('code', '')" 2>/dev/null)
+			check "holder mutation passes with its control_id" "[ -z \"\$holder_code\" ] || [ \"\$holder_code\" != 'target_control_held' ]"
+			renewed=$(tool_call "target_control_renew" "{\"control_id\": \"$control_id\", \"ttl_ms\": 200}")
+			renew_ok=$(json_get "$renewed" "parsed.get('control_id', '')" 2>/dev/null)
+			check "target_control_renew extends the lock" "[ \"\$renew_ok\" = \"\$control_id\" ]"
+			# Expiry releases only the lock; ordinary mutations resume.
+			sleep 1
+			expired_status=$(tool_call "target_control_status")
+			expired_active=$(json_get "$expired_status" "str(parsed.get('active', False)).lower()" 2>/dev/null)
+			check "lock expires by its TTL" "[ \"\$expired_active\" = 'false' ]"
+			after_expiry=$(tool_call "memory_write" "{\"space\": \"m68k-bus\", \"address\": \"0xFF0000\", \"data\": \"$probe_byte\"}")
+			after_expiry_code=$(json_get "$after_expiry" "parsed.get('code', '')" 2>/dev/null)
+			check "mutation resumes after lock expiry" "[ -z \"\$after_expiry_code\" ] || [ \"\$after_expiry_code\" != 'target_control_held' ]"
 		fi
 
 		# frame_advance: one rendered frame while paused, parked again after.
-		advance=$(tool_call "frame_advance" "{\"lease_id\": \"$lease_id\", \"frames\": 1}")
+		advance=$(tool_call "frame_advance" "{\"frames\": 1}")
 		advance_code=$(json_get "$advance" "parsed.get('code', '')" 2>/dev/null)
 		if [ "$advance_code" = "frame_timeout" ]; then
 			echo "SKIP  frame_advance (display not rendering; game may be at a blank screen)"
@@ -493,7 +539,7 @@ print(s)
 			# stable region at boot, e.g. the Sega splash counters).
 			ram_before=$(tool_call "memory_dump" '{"space": "m68k-bus", "address": "0xFF0000", "length": 65536}')
 			ram_before_id=$(json_get "$ram_before" "parsed.get('artifact', {}).get('id', '')" 2>/dev/null)
-			tool_call "frame_advance" "{\"lease_id\": \"$lease_id\", \"frames\": 1}" >/dev/null
+			tool_call "frame_advance" "{\"frames\": 1}" >/dev/null
 			ram_after=$(tool_call "memory_dump" '{"space": "m68k-bus", "address": "0xFF0000", "length": 65536}')
 			ram_after_id=$(json_get "$ram_after" "parsed.get('artifact', {}).get('id', '')" 2>/dev/null)
 			if [ -z "$ram_before_id" ] || [ -z "$ram_after_id" ]; then
@@ -506,18 +552,18 @@ print(s)
 		fi
 
 		# input_set down/up; a workspace without a controller skips.
-		input_result=$(tool_call "input_set" "{\"lease_id\": \"$lease_id\", \"player\": 1, \"buttons\": [\"a\"], \"state\": \"down\"}")
+		input_result=$(tool_call "input_set" "{\"player\": 1, \"buttons\": [\"a\"], \"state\": \"down\"}")
 		input_code=$(json_get "$input_result" "parsed.get('code', '')" 2>/dev/null)
 		if [ "$input_code" = "controller_not_found" ]; then
 			echo "SKIP  input_set (no controller device in the loaded workspace)"
 		else
 			check "input_set presses a button" "[ -n \"\$input_result\" ]"
-			released=$(tool_call "input_set" "{\"lease_id\": \"$lease_id\", \"player\": 1, \"buttons\": [\"a\"], \"state\": \"up\"}")
+			released=$(tool_call "input_set" "{\"player\": 1, \"buttons\": [\"a\"], \"state\": \"up\"}")
 			check "input_set releases a button" "[ -n \"\$released\" ]"
 		fi
 
 		# state_save -> state_list -> state_load round trip.
-		saved=$(tool_call "state_save" "{\"lease_id\": \"$lease_id\", \"name\": \"smoke\"}")
+		saved=$(tool_call "state_save" "{\"name\": \"smoke\"}")
 		state_id=$(json_get "$saved" "parsed.get('state_id', '')" 2>/dev/null)
 		if [ -z "$state_id" ]; then
 			check "state_save returns a snapshot id" false
@@ -531,7 +577,7 @@ print(s)
 				*" $state_id "*) check "state_list reports the snapshot" true ;;
 				*) check "state_list reports the snapshot" false ;;
 			esac
-			loaded=$(tool_call "state_load" "{\"lease_id\": \"$lease_id\", \"state_id\": \"$state_id\"}")
+			loaded=$(tool_call "state_load" "{\"state_id\": \"$state_id\"}")
 			loaded_flag=$(json_get "$loaded" "str(parsed.get('loaded', False)).lower()" 2>/dev/null)
 			check "state_load restores the snapshot" "[ \"\$loaded_flag\" = 'true' ]"
 		fi
@@ -541,7 +587,9 @@ print(s)
 		# launcher defaults it to <repo>\scripts\experiments). The fixture
 		# presses start, advances three frames, releases, and captures a
 		# frame; it ends with the system parked, matching the surrounding
-		# checks, and the final restore block resumes it when needed.
+		# checks, and the final restore block resumes it when needed. The
+		# run acquires an internal control lock for its full duration and
+		# releases it after the manifest is finalized; no lease is involved.
 		if [ "$input_code" = "controller_not_found" ]; then
 			echo "SKIP  experiment fixture (no controller device in the workspace)"
 		else
@@ -551,7 +599,7 @@ print(s)
 				check "experiment fixture resolves the default context" false
 			else
 				check "experiment fixture resolves the default context" true
-				exp=$(tool_call "experiment_run" "{\"context\": \"$ctx_id\", \"lease_id\": \"$lease_id\", \"script\": \"smoke-input.json\", \"timeout_ms\": 30000}")
+				exp=$(tool_call "experiment_run" "{\"context\": \"$ctx_id\", \"script\": \"smoke-input.json\", \"timeout_ms\": 30000}")
 				exp_code=$(json_get "$exp" "parsed.get('code', '')" 2>/dev/null)
 				exp_status=$(json_get "$exp" "parsed.get('status', '')" 2>/dev/null)
 				if [ "$exp_code" = "experiment_failed" ]; then
@@ -576,6 +624,14 @@ print(s)
 							frame_bytes=$(curl -fsS --max-time 10 "$BASE_URL/artifacts/$frame_id?context=$ctx_id" 2>/dev/null | wc -c)
 						fi
 						check "experiment captured a frame artifact" "[ \"\$frame_bytes\" -gt 0 ]"
+						# The run's internal control lock was released and the
+						# audit stream records the reason.
+						lock_audit=$(tool_call "target_audit_log" "{\"tool\": \"target_control\"}")
+						lock_end_reason=$(json_get "$lock_audit" "' '.join(str(e.get('detail', {}).get('reason', '')) for e in parsed.get('entries', []))" 2>/dev/null)
+						case " $lock_end_reason " in
+							*" experiment_completed "*) check "experiment releases its internal lock" true ;;
+							*) check "experiment releases its internal lock" false ;;
+						esac
 					else
 						check "experiment manifest records completion" false
 						check "experiment manifest lists every step" false
@@ -585,13 +641,12 @@ print(s)
 			fi
 		fi
 
-		mutation_log=$(tool_call "context_mutation_log")
+		mutation_log=$(tool_call "context_mutation_log" '{"limit": 50}')
 		log_count=$(json_get "$mutation_log" "len(parsed.get('entries', []))" 2>/dev/null)
 		check "mutation log records the actions" "[ -n \"\$log_count\" ] && [ \"\$log_count\" -ge 3 ]"
-
-		released=$(tool_call "context_lease_release" "{\"lease_id\": \"$lease_id\"}")
-		released_flag=$(json_get "$released" "str(parsed.get('released', False)).lower()" 2>/dev/null)
-		check "context lease releases" "[ \"\$released_flag\" = 'true' ]"
+		audit_log=$(tool_call "target_audit_log" "{\"limit\": 20}")
+		audit_count=$(json_get "$audit_log" "len(parsed.get('entries', []))" 2>/dev/null)
+		check "target audit stream is queryable" "[ -n \"\$audit_count\" ] && [ \"\$audit_count\" -ge 3 ]"
 	fi
 
 	if [ "$was_running" = "True" ] || [ "$was_running" = "true" ]; then

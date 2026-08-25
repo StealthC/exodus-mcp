@@ -32,25 +32,29 @@ func phase5ToolSpecs() []toolSpec {
 	return []toolSpec{
 		{
 			name:        "cpu_coverage_capture",
-			description: "Run the system for a bounded window and record which code addresses executed into a coverage artifact (distinct addresses, merged ranges, page histogram). Reuses the trace_capture path; the prior run state is restored afterwards.",
+			description: "Run the system for a bounded window and record which code addresses executed into a coverage artifact (distinct addresses, merged ranges, page histogram). Reuses the trace_capture path; the prior run state is restored afterwards. The system runs during the window, so the capture mutates the target and advances the target generation. Accepts optional expected_target_generation and control_id.",
 			schema: objectSchema(map[string]any{
-				"cpu":          enumProperty("Processor to trace.", []string{"m68k", "z80"}),
-				"duration_ms":  integerProperty("Trace window in milliseconds (default 500, cap 5000).", 1),
-				"max_entries":  integerProperty("Maximum trace entries retained (default 10000, cap 10000).", 1),
-				"region_start": addressProperty(),
-				"region_end":   addressProperty(),
-				"context":      stringProperty("Analysis context that will own the coverage artifact."),
+				"cpu":                        enumProperty("Processor to trace.", []string{"m68k", "z80"}),
+				"duration_ms":                integerProperty("Trace window in milliseconds (default 500, cap 5000).", 1),
+				"max_entries":                integerProperty("Maximum trace entries retained (default 10000, cap 10000).", 1),
+				"region_start":               addressProperty(),
+				"region_end":                 addressProperty(),
+				"context":                    stringProperty("Analysis context that will own the coverage artifact."),
+				"expected_target_generation": integerProperty("Optional target generation the caller last observed; fails with target_generation_conflict on mismatch.", 1),
+				"control_id":                 stringProperty("Optional control id from target_control_acquire; required while the control lock is active."),
 			}, []string{"cpu"}),
 			run: runCpuCoverageCapture,
 		},
 		{
 			name:        "cpu_trace_capture_watchpoint",
-			description: "Event-driven trace capture: run the system until a managed watchpoint hits and capture the executed instructions that led up to the hit. The system runs during the window even if it was parked, then the prior run state is restored. The trace artifact is text; the summary reports which watchpoint fired.",
+			description: "Event-driven trace capture: run the system until a managed watchpoint hits and capture the executed instructions that led up to the hit. The system runs during the window even if it was parked, then the prior run state is restored, so the capture mutates the target and advances the target generation. The trace artifact is text; the summary reports which watchpoint fired. Accepts optional expected_target_generation and control_id.",
 			schema: objectSchema(map[string]any{
-				"watchpoint_id": integerProperty("watchpoint id returned by cpu_watchpoint_set.", 1),
-				"max_entries":   integerProperty(fmt.Sprintf("Maximum entries (default %d, cap %d).", defaultTraceEntries, maxTraceEntries), 1),
-				"timeout_ms":    integerProperty("Wait before giving up on the hit (default 5000, cap 30000).", 100),
-				"context":       stringProperty("Analysis context that will own the trace artifact."),
+				"watchpoint_id":              integerProperty("watchpoint id returned by cpu_watchpoint_set.", 1),
+				"max_entries":                integerProperty(fmt.Sprintf("Maximum entries (default %d, cap %d).", defaultTraceEntries, maxTraceEntries), 1),
+				"timeout_ms":                 integerProperty("Wait before giving up on the hit (default 5000, cap 30000).", 100),
+				"context":                    stringProperty("Analysis context that will own the trace artifact."),
+				"expected_target_generation": integerProperty("Optional target generation the caller last observed; fails with target_generation_conflict on mismatch.", 1),
+				"control_id":                 stringProperty("Optional control id from target_control_acquire; required while the control lock is active."),
 			}, []string{"watchpoint_id"}),
 			run: runCpuTraceCaptureWatchpoint,
 		},
@@ -1011,6 +1015,7 @@ type traceCaptureWatchpointArgs struct {
 	MaxEntries   uint64 `json:"max_entries"`
 	TimeoutMs    uint64 `json:"timeout_ms"`
 	Context      string `json:"context"`
+	guardArgs
 }
 
 func runCpuTraceCaptureWatchpoint(tc toolContext, args json.RawMessage) map[string]any {
@@ -1042,7 +1047,18 @@ func runCpuTraceCaptureWatchpoint(tc toolContext, args json.RawMessage) map[stri
 		"max_entries":   strconv.FormatUint(maxEntries, 10),
 		"timeout_ms":    strconv.FormatUint(timeoutMs, 10),
 	}
-	payload, failure := tc.server.executeCommand(tc.ctx, "trace_capture", params)
+	payload, before, after, failure := tc.server.executeMutation(tc.ctx, mutationCall{
+		tool:      "cpu_trace_capture_watchpoint",
+		operation: "trace_capture",
+		params:    params,
+		guard:     parsed.guard(),
+		contextID: context.ID,
+		detail: map[string]any{
+			"watchpoint_id": parsed.WatchpointID,
+			"max_entries":   maxEntries,
+			"timeout_ms":    timeoutMs,
+		},
+	})
 	if failure != nil {
 		return failureResult(failure, tc.modern)
 	}
@@ -1064,7 +1080,8 @@ func runCpuTraceCaptureWatchpoint(tc toolContext, args json.RawMessage) map[stri
 	if value, ok := payload["event_note"].(string); ok {
 		summary["event_note"] = value
 	}
-	return okResult(map[string]any{"summary": summary, "artifact": artifactDesc}, tc.modern)
+	result := map[string]any{"summary": summary, "artifact": artifactDesc}
+	return okResult(stampGenerations(result, before, after), tc.modern)
 }
 
 // traceArtifactFromPayload turns a trace_capture payload into a stored
@@ -1112,6 +1129,7 @@ type coverageCaptureArgs struct {
 	RegionStart any    `json:"region_start"`
 	RegionEnd   any    `json:"region_end"`
 	Context     string `json:"context"`
+	guardArgs
 }
 
 func runCpuCoverageCapture(tc toolContext, args json.RawMessage) map[string]any {
@@ -1166,7 +1184,20 @@ func runCpuCoverageCapture(tc toolContext, args json.RawMessage) map[string]any 
 		// resumes it for the window and restores the prior run state.
 		"force_run": "true",
 	}
-	payload, failure := tc.server.executeCommand(tc.ctx, "trace_capture", params)
+	payload, before, after, failure := tc.server.executeMutation(tc.ctx, mutationCall{
+		tool:      "cpu_coverage_capture",
+		operation: "trace_capture",
+		params:    params,
+		guard:     parsed.guard(),
+		contextID: context.ID,
+		detail: map[string]any{
+			"cpu":          parsed.CPU,
+			"duration_ms":  duration,
+			"max_entries":  maxEntries,
+			"region_start": regionStart,
+			"region_end":   regionEnd,
+		},
+	})
 	if failure != nil {
 		return failureResult(failure, tc.modern)
 	}
@@ -1211,7 +1242,7 @@ func runCpuCoverageCapture(tc toolContext, args json.RawMessage) map[string]any 
 		return failureResult(&toolFailure{Code: "artifact_error", Message: err.Error()}, tc.modern)
 	}
 
-	return okResult(map[string]any{
+	result := map[string]any{
 		"summary": map[string]any{
 			"kind":           "cpu-coverage",
 			"cpu":            parsed.CPU,
@@ -1225,7 +1256,8 @@ func runCpuCoverageCapture(tc toolContext, args json.RawMessage) map[string]any 
 			"sha256":         stored.SHA256,
 		},
 		"artifact": artifactDescriptor(tc.server, stored, context.ID),
-	}, tc.modern)
+	}
+	return okResult(stampGenerations(result, before, after), tc.modern)
 }
 
 // parseTraceAddresses reads the leading hex address of every trace line

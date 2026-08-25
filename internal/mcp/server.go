@@ -59,6 +59,28 @@ type Server struct {
 	contexts *analysis.Registry
 	baseURL  string
 
+	// target is the process-local target revision; controls owns the single
+	// optional exclusive control lock; audit is the bounded global target
+	// audit stream. schedulerMu serializes every target-mutating operation
+	// so precondition validation, native execution, and the generation
+	// advance are atomic.
+	target      *analysis.Target
+	controls    *analysis.ControlRegistry
+	audit       *analysis.AuditLog
+	schedulerMu sync.Mutex
+
+	// romPath is the last known loaded ROM path, refreshed by emulator
+	// status reads and rom_load; "" means unknown.
+	romPathMu sync.Mutex
+	romPath   string
+
+	// debugMu guards the server-side provenance of MCP-managed breakpoints
+	// and watchpoints (the plugin owns the native resources; the server
+	// records who created them and when).
+	debugMu     sync.Mutex
+	breakpoints map[uint64]debugResourceMeta
+	watchpoints map[uint64]debugResourceMeta
+
 	// statesDir anchors context-scoped system snapshots; empty means
 	// os.TempDir()/exodus-mcp/states.
 	statesDir string
@@ -85,14 +107,35 @@ func NewServer(version string, client bridge.Client, store *artifact.Store, cont
 	if baseURL == "" {
 		baseURL = "http://127.0.0.1"
 	}
-	return &Server{
-		version:  version,
-		bridge:   client,
-		store:    store,
-		contexts: contexts,
-		baseURL:  strings.TrimRight(baseURL, "/"),
-		freezes:  newFreezeRegistry(),
+	server := &Server{
+		version:     version,
+		bridge:      client,
+		store:       store,
+		contexts:    contexts,
+		baseURL:     strings.TrimRight(baseURL, "/"),
+		target:      analysis.NewTarget(),
+		controls:    analysis.NewControlRegistry(),
+		audit:       analysis.NewAuditLog(),
+		breakpoints: make(map[uint64]debugResourceMeta),
+		watchpoints: make(map[uint64]debugResourceMeta),
+		freezes:     newFreezeRegistry(),
 	}
+	// Every control-lock end (release, expiry, context close, bridge loss)
+	// lands in the audit stream with the reason it ended.
+	server.controls.SetDropHook(func(lock *analysis.ControlLock, reason string) {
+		server.recordAudit(analysis.AuditEntry{
+			Tool:      "target_control",
+			ContextID: lock.ContextID,
+			ControlID: lock.ID,
+			Outcome:   analysis.OutcomeLockEvent,
+			Detail: map[string]any{
+				"event":   "lock_ended",
+				"reason":  reason,
+				"purpose": lock.Purpose,
+			},
+		})
+	})
+	return server
 }
 
 // Handler returns the local HTTP handler covering /healthz, /mcp, and
@@ -284,17 +327,24 @@ func (server *Server) statusFor(ctx context.Context) (bridge.Status, error) {
 	return status, nil
 }
 
-func (server *Server) executeCommand(ctx context.Context, operation string, params map[string]string) (map[string]any, *toolFailure) {
+// runCommand executes one bridge operation and classifies its failure:
+// provable failures (status, support, or native command errors) carry
+// ambiguous=false; transport or decode failures that cannot prove whether the
+// native action executed carry ambiguous=true.
+func (server *Server) runCommand(ctx context.Context, operation string, params map[string]string) (map[string]any, *toolFailure, bool) {
 	status, err := server.statusFor(ctx)
 	if err != nil {
-		return nil, &toolFailure{Code: "bridge_unavailable", Message: "The Exodus native bridge is unavailable: " + err.Error()}
+		// The bridge is unreachable; any exclusive control window ends with
+		// the connection, and the reason is recorded in the audit stream.
+		server.controls.DropIf(func(*analysis.ControlLock) bool { return true }, "bridge_unavailable")
+		return nil, &toolFailure{Code: "bridge_unavailable", Message: "The Exodus native bridge is unavailable: " + err.Error()}, false
 	}
 	if !status.SupportsOperation(operation) {
 		return nil, &toolFailure{
 			Code:    "unsupported_plugin",
 			Message: "The connected ExodusMcpPlugin does not advertise '" + operation + "'. Update the extension DLL to protocol version 2.",
 			Data:    map[string]any{"supported_operations": status.SupportedOperations},
-		}
+		}, false
 	}
 	callContext, cancel := context.WithTimeout(ctx, commandTimeout(operation))
 	defer cancel()
@@ -302,20 +352,35 @@ func (server *Server) executeCommand(ctx context.Context, operation string, para
 	if err != nil {
 		var commandErr *bridge.CommandError
 		if errors.As(err, &commandErr) {
-			return nil, &toolFailure{Code: commandErr.Code, Message: commandErr.Message}
+			return nil, &toolFailure{Code: commandErr.Code, Message: commandErr.Message}, false
 		}
 		// A transport-class failure means the cached status may describe a
 		// dead or restarted bridge; force the next command to re-probe.
 		server.invalidateStatusCache()
-		return nil, &toolFailure{Code: "bridge_error", Message: err.Error()}
+		return nil, &toolFailure{Code: "bridge_error", Message: err.Error()}, true
 	}
 	var payload map[string]any
 	if len(data) > 0 {
 		if err := json.Unmarshal(data, &payload); err != nil {
-			return nil, &toolFailure{Code: "bridge_error", Message: "decode bridge payload: " + err.Error()}
+			// The command executed; an undecodable response means its outcome
+			// cannot be proven.
+			server.invalidateStatusCache()
+			return nil, &toolFailure{Code: "bridge_error", Message: "decode bridge payload: " + err.Error()}, true
 		}
 	}
-	return payload, nil
+	return payload, nil, false
+}
+
+// executeCommand runs one read-only bridge operation. A successful read
+// re-establishes the target revision after an ambiguous failure window: the
+// generation advances because the machine may have changed while unknown.
+func (server *Server) executeCommand(ctx context.Context, operation string, params map[string]string) (map[string]any, *toolFailure) {
+	payload, failure, _ := server.runCommand(ctx, operation, params)
+	if failure == nil {
+		server.target.ResynchronizeIfUnknown()
+		return payload, nil
+	}
+	return nil, failure
 }
 
 func commandTimeout(operation string) time.Duration {
@@ -329,40 +394,98 @@ func commandTimeout(operation string) time.Duration {
 	}
 }
 
-// requireLease enforces the mutation guard for the Phase 4 tools. Every
-// mutating tool must present the id of the context's active lease; the
-// failure distinguishes "no lease at all" from "wrong lease id".
-func (server *Server) requireLease(context *analysis.Context, leaseID, tool string) *toolFailure {
-	if leaseID == "" {
-		return &toolFailure{
-			Code:    "lease_required",
-			Message: tool + " requires an exclusive context lease; acquire one with context_lease_acquire",
-		}
-	}
-	if server.contexts.Leases.Valid(context.ID, leaseID) {
-		return nil
-	}
-	if server.contexts.Leases.Active(context.ID) == nil {
-		return &toolFailure{
-			Code:    "lease_required",
-			Message: "context " + context.ID + " holds no active lease; acquire one with context_lease_acquire",
-		}
-	}
-	return &toolFailure{
-		Code:    "lease_invalid",
-		Message: "lease " + leaseID + " does not own context " + context.ID,
+// recordAudit appends one entry to the bounded global target audit stream.
+func (server *Server) recordAudit(entry analysis.AuditEntry) {
+	server.audit.Record(entry)
+}
+
+// currentROMPath returns the last known loaded ROM path, or "" when unknown.
+// It is best-effort identity for conflict data, provenance, and staleness.
+func (server *Server) currentROMPath() string {
+	server.romPathMu.Lock()
+	defer server.romPathMu.Unlock()
+	return server.romPath
+}
+
+// setROMPath records the currently loaded ROM path.
+func (server *Server) setROMPath(path string) {
+	server.romPathMu.Lock()
+	defer server.romPathMu.Unlock()
+	server.romPath = path
+}
+
+// debugResourceMeta is the server-side provenance of one MCP-managed
+// breakpoint or watchpoint; the plugin owns the native resource.
+type debugResourceMeta struct {
+	ContextID        string
+	ControlID        string
+	TargetGeneration uint64
+	CreatedAt        time.Time
+	ROMPath          string
+}
+
+func (server *Server) trackDebugResource(kind string, id uint64, meta debugResourceMeta) {
+	server.debugMu.Lock()
+	defer server.debugMu.Unlock()
+	switch kind {
+	case "breakpoint":
+		server.breakpoints[id] = meta
+	case "watchpoint":
+		server.watchpoints[id] = meta
 	}
 }
 
-// recordMutation appends one audited entry to the context's mutation trail.
-func (server *Server) recordMutation(context *analysis.Context, leaseID, tool string, detail map[string]any) {
-	server.contexts.Ledger.Record(analysis.LedgerEntry{
-		Timestamp: time.Now().UTC(),
-		Tool:      tool,
-		ContextID: context.ID,
-		LeaseID:   leaseID,
-		Detail:    detail,
-	})
+func (server *Server) debugResourceMeta(kind string, id uint64) *debugResourceMeta {
+	server.debugMu.Lock()
+	defer server.debugMu.Unlock()
+	var meta debugResourceMeta
+	var present bool
+	switch kind {
+	case "breakpoint":
+		meta, present = server.breakpoints[id]
+	case "watchpoint":
+		meta, present = server.watchpoints[id]
+	}
+	if !present {
+		return nil
+	}
+	copy := meta
+	return &copy
+}
+
+func (server *Server) forgetDebugResource(kind string, id uint64) {
+	server.debugMu.Lock()
+	defer server.debugMu.Unlock()
+	switch kind {
+	case "breakpoint":
+		delete(server.breakpoints, id)
+	case "watchpoint":
+		delete(server.watchpoints, id)
+	}
+}
+
+// debugResourceIDs returns the ids of every tracked resource of both kinds,
+// for the audited invalidation batch on rom_load.
+func (server *Server) debugResourceIDs() []uint64 {
+	server.debugMu.Lock()
+	defer server.debugMu.Unlock()
+	ids := make([]uint64, 0, len(server.breakpoints)+len(server.watchpoints))
+	for id := range server.breakpoints {
+		ids = append(ids, id)
+	}
+	for id := range server.watchpoints {
+		ids = append(ids, id)
+	}
+	return ids
+}
+
+// purgeDebugResources drops the provenance of every managed debug resource,
+// mirroring the plugin-side purge that rom_load performs natively.
+func (server *Server) purgeDebugResources() {
+	server.debugMu.Lock()
+	defer server.debugMu.Unlock()
+	server.breakpoints = make(map[uint64]debugResourceMeta)
+	server.watchpoints = make(map[uint64]debugResourceMeta)
 }
 
 // SetStatesDir overrides the directory that anchors system snapshots.

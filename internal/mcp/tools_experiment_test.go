@@ -45,19 +45,6 @@ func writeExperimentScript(t *testing.T, dir, name, content string) {
 	}
 }
 
-// acquireLease takes the exclusive lease of the default context and returns
-// its id.
-func acquireLease(t *testing.T, server *Server) string {
-	t.Helper()
-	result := postToolCall(t, server, "context_lease_acquire", `{"purpose":"experiment test"}`)
-	content := structured(result)
-	leaseID, _ := content["lease_id"].(string)
-	if leaseID == "" {
-		t.Fatalf("lease acquisition failed: %v", result)
-	}
-	return leaseID
-}
-
 func fixtureBridge() *fakeBridgeClient {
 	client := &fakeBridgeClient{status: newFakeStatus()}
 	client.executeFunc = func(ctx context.Context, method string, params map[string]string) (json.RawMessage, error) {
@@ -102,7 +89,7 @@ func TestExperimentCatalogIncludesTool(t *testing.T) {
 				names = append(names, value.(string))
 			}
 		}
-		if len(names) != 3 || strings.Join(names, ",") != "context,lease_id,script" {
+		if len(names) != 2 || strings.Join(names, ",") != "context,script" {
 			t.Fatalf("experiment_run required = %v", names)
 		}
 	}
@@ -113,35 +100,23 @@ func TestExperimentCatalogIncludesTool(t *testing.T) {
 
 func TestExperimentRunDisabledWithoutRunner(t *testing.T) {
 	result := callTool(t, &fakeBridgeClient{status: newFakeStatus()}, "experiment_run",
-		`{"context":"","lease_id":"lease_x","script":"x.py"}`)
+		`{"context":"","script":"x.py"}`)
 	content := structured(result)
 	if result["isError"] != true || content["code"] != "experiments_disabled" {
 		t.Fatalf("expected experiments_disabled: %v", result)
 	}
 }
 
-func TestExperimentRunRequiresLease(t *testing.T) {
-	client := fixtureBridge()
-	server, _ := newExperimentServer(t, client, t.TempDir())
-	result := postToolCall(t, server, "experiment_run",
-		`{"context":"","lease_id":"","script":"smoke-input.json"}`)
-	content := structured(result)
-	if result["isError"] != true || content["code"] != "lease_required" {
-		t.Fatalf("expected lease_required: %v", result)
-	}
-}
-
 func TestExperimentRunScriptResolutionFailures(t *testing.T) {
 	client := fixtureBridge()
 	server, _ := newExperimentServer(t, client, t.TempDir())
-	leaseID := acquireLease(t, server)
 	for _, call := range []struct{ script, code string }{
 		{"missing.py", "script_not_found"},
 		{"../escape.py", "script_disallowed"},
 		{"notes.txt", "script_disallowed"},
 	} {
 		result := postToolCall(t, server, "experiment_run",
-			fmt.Sprintf(`{"context":"","lease_id":%q,"script":%q}`, leaseID, call.script))
+			fmt.Sprintf(`{"context":"","script":%q}`, call.script))
 		content := structured(result)
 		if result["isError"] != true || content["code"] != call.code {
 			t.Fatalf("%s: expected %s: %v", call.script, call.code, result)
@@ -161,10 +136,10 @@ func TestExperimentRunFixtureCompletesEndToEnd(t *testing.T) {
 		]
 	}`)
 	server, store := newExperimentServer(t, client, scriptsDir)
-	leaseID := acquireLease(t, server)
 
+	before := structured(postToolCall(t, server, "memory_read", `{"space":"m68k-bus","address":0,"length":1}`))["target_generation"].(float64)
 	result := postToolCall(t, server, "experiment_run",
-		fmt.Sprintf(`{"context":"","lease_id":%q,"script":"probe.json","timeout_ms":30000}`, leaseID))
+		`{"context":"","script":"probe.json","timeout_ms":30000}`)
 	if result["isError"] == true {
 		t.Fatalf("experiment failed: %v", result)
 	}
@@ -177,6 +152,11 @@ func TestExperimentRunFixtureCompletesEndToEnd(t *testing.T) {
 	}
 	if content["final_state_id"] == "" || content["final_state_id"] == nil {
 		t.Fatalf("final_state_id missing: %v", content)
+	}
+	// The run is a mutation: the frame_advance step advanced the generation.
+	if content["target_generation_before"] != before || content["target_generation_after"] != before+1 {
+		t.Fatalf("experiment generations wrong: before %v after %v (started at %v)",
+			content["target_generation_before"], content["target_generation_after"], before)
 	}
 	artifacts, _ := content["artifacts"].([]any)
 	if len(artifacts) < 1 {
@@ -231,9 +211,70 @@ func TestExperimentRunFixtureCompletesEndToEnd(t *testing.T) {
 	if !strings.Contains(joined, "mem_read") || !strings.Contains(joined, "frame_advance") || !strings.Contains(joined, "state_save") {
 		t.Fatalf("bridge methods = %v", methods)
 	}
-	// The script-supplied arguments carried the injected context and lease.
+	// The script-supplied arguments carried the injected context and the
+	// internal control id.
 	if !strings.Contains(string(raw), `"context": "`+server.contexts.Default().ID) {
 		t.Fatalf("manifest steps do not echo the injected context: %s", raw)
+	}
+	if !strings.Contains(string(raw), `"control_id": "ctl_`) {
+		t.Fatalf("manifest steps do not echo the injected control id: %s", raw)
+	}
+	// The internal lock was released after the run and the audit records why.
+	if server.controls.Active() != nil {
+		t.Fatal("the internal experiment lock must be released after the run")
+	}
+	audit := structured(postToolCall(t, server, "target_audit_log", `{}`))
+	foundEnd := false
+	for _, entry := range audit["entries"].([]any) {
+		view := entry.(map[string]any)
+		if view["outcome"] == "lock_event" && view["detail"].(map[string]any)["reason"] == "experiment_completed" {
+			foundEnd = true
+		}
+	}
+	if !foundEnd {
+		t.Fatalf("audit stream lacks the experiment_completed lock end: %v", audit["entries"])
+	}
+}
+
+func TestExperimentRunReusesCallerControlLock(t *testing.T) {
+	client := fixtureBridge()
+	scriptsDir := t.TempDir()
+	writeExperimentScript(t, scriptsDir, "read.json", `{
+		"version": 1,
+		"steps": [{"tool": "memory_read", "arguments": {"space": "m68k-ram", "address": 4096, "length": 4}}]
+	}`)
+	server, _ := newExperimentServer(t, client, scriptsDir)
+	lock := structured(postToolCall(t, server, "target_control_acquire", `{"purpose":"manual experiment"}`))
+	controlID := lock["control_id"].(string)
+
+	result := postToolCall(t, server, "experiment_run",
+		`{"context":"","script":"read.json","control_id":"`+controlID+`"}`)
+	if result["isError"] == true {
+		t.Fatalf("experiment with a caller lock must succeed: %v", result)
+	}
+	// The caller keeps ownership: the lock survives the run.
+	if !server.controls.Valid(controlID) {
+		t.Fatal("a reused caller lock must not be released by the run")
+	}
+	postToolCall(t, server, "target_control_release", `{"control_id":"`+controlID+`"}`)
+}
+
+func TestExperimentRunRejectsForeignControlID(t *testing.T) {
+	client := fixtureBridge()
+	scriptsDir := t.TempDir()
+	writeExperimentScript(t, scriptsDir, "read.json", `{
+		"version": 1,
+		"steps": [{"tool": "memory_read", "arguments": {"space": "m68k-ram", "address": 4096, "length": 4}}]
+	}`)
+	server, _ := newExperimentServer(t, client, scriptsDir)
+	result := postToolCall(t, server, "experiment_run",
+		`{"context":"","script":"read.json","control_id":"ctl_wrong"}`)
+	content := structured(result)
+	if result["isError"] != true || content["code"] != "target_control_held" {
+		t.Fatalf("foreign control id must be target_control_held: %v", result)
+	}
+	if len(client.recordedCalls) != 0 {
+		t.Fatalf("rejected run must not reach the bridge: %v", client.recordedCalls)
 	}
 }
 
@@ -245,7 +286,6 @@ func TestExperimentRunInitialStateLoadsBeforeFirstStep(t *testing.T) {
 		"steps": [{"tool": "memory_read", "arguments": {"space": "m68k-ram", "address": 4096, "length": 4}}]
 	}`)
 	server, _ := newExperimentServer(t, client, scriptsDir)
-	leaseID := acquireLease(t, server)
 	contextID := server.contexts.Default().ID
 
 	snapshotPath := filepath.Join(t.TempDir(), "seed.zip")
@@ -263,7 +303,7 @@ func TestExperimentRunInitialStateLoadsBeforeFirstStep(t *testing.T) {
 	})
 
 	result := postToolCall(t, server, "experiment_run",
-		fmt.Sprintf(`{"context":%q,"lease_id":%q,"script":"read.json","initial_state_id":"state_seed"}`, contextID, leaseID))
+		`{"context":"","script":"read.json","initial_state_id":"state_seed"}`)
 	if result["isError"] == true {
 		t.Fatalf("experiment failed: %v", result)
 	}
@@ -284,10 +324,9 @@ func TestExperimentRunRejectsNonAllowedTool(t *testing.T) {
 		"steps": [{"tool": "cpu_run", "arguments": {}}]
 	}`)
 	server, store := newExperimentServer(t, client, scriptsDir)
-	leaseID := acquireLease(t, server)
 
 	result := postToolCall(t, server, "experiment_run",
-		fmt.Sprintf(`{"context":"","lease_id":%q,"script":"escape.json"}`, leaseID))
+		`{"context":"","script":"escape.json"}`)
 	if result["isError"] != true {
 		t.Fatalf("expected failure: %v", result)
 	}
@@ -314,9 +353,8 @@ func TestExperimentRunRejectsNonAllowedTool(t *testing.T) {
 func TestExperimentRunInvalidArguments(t *testing.T) {
 	client := fixtureBridge()
 	server, _ := newExperimentServer(t, client, t.TempDir())
-	leaseID := acquireLease(t, server)
 	result := postToolCall(t, server, "experiment_run",
-		fmt.Sprintf(`{"context":"","lease_id":%q,"script":"x.py","timeout_ms":0}`, leaseID))
+		`{"context":"","script":"x.py","timeout_ms":0}`)
 	content := structured(result)
 	if result["isError"] != true || content["code"] != "invalid_params" {
 		t.Fatalf("expected invalid_params: %v", result)

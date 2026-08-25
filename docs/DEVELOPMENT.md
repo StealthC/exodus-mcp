@@ -153,20 +153,23 @@ Security model: scripts are trusted operator code; the server mediates only
 a minimal environment (`-I`, `PYTHONNOUSERSITE`, `PYTHONDONTWRITEBYTECODE`,
 explicit PATH) — do not place untrusted files in the scripts directory.
 
-Requirements: `experiment_run` needs the exclusive lease of its analysis
-context, like every other mutation entry point. It accepts `context`,
-`lease_id`, `script` (plain `.py`/`.json` file name, no separators),
-`arguments` (opaque JSON passed to the script), `initial_state_id` (loaded
-through `state_load` before the first step), and `timeout_ms`.
+Requirements: `experiment_run` accepts `context`, `script` (plain
+`.py`/`.json` file name, no separators), `arguments` (opaque JSON passed to
+the script), `initial_state_id` (loaded through `state_load` before the first
+step), `timeout_ms`, and the optional concurrency preconditions
+(`expected_target_generation`, `control_id`). The run executes under exclusive
+control for its full duration: a caller-provided active `control_id` is
+reused, otherwise the server acquires an internal lock and releases it after
+manifest finalization (audited as `experiment_completed`).
 
 Allowlist: `input_set`, `frame_advance`, `state_save`, `state_load`,
 `memory_write`, `memory_read`, `memory_dump`, `memory_search`,
 `frame_capture`, `vdp_status`, `vdp_pixel_info`, `vdp_sprite_table`,
 `m68k_registers`, `z80_registers`, `cpu_coverage_capture`. Anything else —
-including `cpu_run`, stepping, breakpoints/watchpoints, context/lease tools,
+including `cpu_run`, stepping, breakpoints/watchpoints, control-lock tools,
 `rom_load`, and recursive `experiment_run` — fails with `tool_not_allowed`.
-The server injects the experiment's `context` and `lease_id` into every call;
-scripts cannot address another context.
+The server injects the experiment's `context` and `control_id` into every
+call; scripts cannot address another context or bypass the lock guard.
 
 Python protocol (bounded JSON lines over stdin/stdout):
 
@@ -183,9 +186,10 @@ Python protocol (bounded JSON lines over stdin/stdout):
 The run always produces an `experiment-manifest` artifact (script digest,
 arguments, per-step results, artifacts, status/error) and, when stderr was
 captured, an `experiment-output` artifact; script-published artifacts are
-stored under the context and their descriptors are replied inline. A
-`context_mutation_log` entry records the whole run alongside the per-step
-mutation entries the individual handlers already log.
+stored under the context and their descriptors are replied inline. The global
+audit stream records the run envelope alongside the per-step mutation entries
+the individual handlers already log; `context_mutation_log` shows the
+projection for the context.
 
 Run `./scripts/live-smoke.sh --full` to validate the fixture path against a
 loaded ROM.

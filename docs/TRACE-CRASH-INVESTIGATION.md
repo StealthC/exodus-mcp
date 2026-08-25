@@ -231,7 +231,8 @@ triggers it — which is why §6 must run first.
 
 Wrap capture in explicit pause/resume (`ISystemExtensionInterface::
 StopSystem`/`RunSystem`). Correctness-first but mutates global run state;
-belongs behind Phase 4 mutation leases.
+belongs behind the target-generation/control-lock contract (an internal
+control lock for the bounded capture window), not the removed context leases.
 
 ### c. Upstream patch (fork commit)
 

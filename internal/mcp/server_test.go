@@ -185,8 +185,7 @@ func TestToolsListDeterministicAndComplete(t *testing.T) {
 	}
 	expected := []string{
 		"artifact_get", "artifact_preview", "bridge_status", "context_close",
-		"context_create", "context_lease_acquire", "context_lease_list",
-		"context_lease_release", "context_lease_renew", "context_list",
+		"context_create", "context_list",
 		"context_mutation_log", "cpu_coverage_capture", "cpu_trace_capture",
 		"cpu_trace_capture_watchpoint",
 		"frame_advance", "input_set",
@@ -195,6 +194,8 @@ func TestToolsListDeterministicAndComplete(t *testing.T) {
 		"rom_info", "rom_load",
 		"state_list", "state_load", "state_save",
 		"symbols_clear", "symbols_list", "symbols_set",
+		"target_audit_log", "target_control_acquire", "target_control_release",
+		"target_control_renew", "target_control_status",
 		"target_info", "z80_disassemble", "z80_read_memory", "z80_registers",
 		"emulator_status",
 	}

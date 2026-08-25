@@ -11,16 +11,20 @@ import (
 
 // Snapshot is one context-scoped system state saved through the emulator.
 // The emulator owns the actual state file; the store keeps the metadata the
-// server needs to list, verify, and reload snapshots.
+// server needs to list, verify, and reload snapshots. The provenance fields
+// (context, control lock, target generation, ROM) describe who and when —
+// they are not an authorization boundary.
 type Snapshot struct {
-	ID        string    `json:"id"`
-	ContextID string    `json:"context_id"`
-	Name      string    `json:"name,omitempty"`
-	Path      string    `json:"path"`
-	SHA256    string    `json:"sha256"`
-	SizeBytes int64     `json:"size_bytes"`
-	CreatedAt time.Time `json:"created_at"`
-	ROMPath   string    `json:"rom_path,omitempty"`
+	ID               string    `json:"id"`
+	ContextID        string    `json:"context_id"`
+	Name             string    `json:"name,omitempty"`
+	Path             string    `json:"path"`
+	SHA256           string    `json:"sha256"`
+	SizeBytes        int64     `json:"size_bytes"`
+	CreatedAt        time.Time `json:"created_at"`
+	ROMPath          string    `json:"rom_path,omitempty"`
+	ControlID        string    `json:"control_id,omitempty"`
+	TargetGeneration uint64    `json:"target_generation"`
 }
 
 const maxSnapshotsPerContext = 32

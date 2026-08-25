@@ -20,12 +20,14 @@ func cpuToolSpecs() []toolSpec {
 	return []toolSpec{
 		{
 			name:        "cpu_trace_capture",
-			description: "Capture a bounded M68K or Z80 execution trace into a text artifact. The capture stops the system, routes the processor trace log through a temporary on-disk file (the in-memory ring accessor is unsafe across the extension boundary), and restores the prior run state. Entries accumulate only while the system runs during the window; a paused system yields none. Tracing with disassembly slows emulation substantially while active.",
+			description: "Capture a bounded M68K or Z80 execution trace into a text artifact. The capture stops the system, routes the processor trace log through a temporary on-disk file (the in-memory ring accessor is unsafe across the extension boundary), and restores the prior run state. The system runs during the window, so the capture mutates the target and advances the target generation. Accepts optional expected_target_generation and control_id.",
 			schema: objectSchema(map[string]any{
-				"cpu":         enumProperty("Processor to trace.", []string{"m68k", "z80"}),
-				"max_entries": integerProperty(fmt.Sprintf("Maximum entries (default %d, cap %d).", defaultTraceEntries, maxTraceEntries), 1),
-				"timeout_ms":  integerProperty("Capture window in milliseconds (default 5000, cap 30000).", 100),
-				"context":     stringProperty("Analysis context that will own the trace artifact."),
+				"cpu":                        enumProperty("Processor to trace.", []string{"m68k", "z80"}),
+				"max_entries":                integerProperty(fmt.Sprintf("Maximum entries (default %d, cap %d).", defaultTraceEntries, maxTraceEntries), 1),
+				"timeout_ms":                 integerProperty("Capture window in milliseconds (default 5000, cap 30000).", 100),
+				"context":                    stringProperty("Analysis context that will own the trace artifact."),
+				"expected_target_generation": integerProperty("Optional target generation the caller last observed; fails with target_generation_conflict on mismatch.", 1),
+				"control_id":                 stringProperty("Optional control id from target_control_acquire; required while the control lock is active."),
 			}, []string{"cpu"}),
 			run: runCpuTraceCapture,
 		},
@@ -395,6 +397,7 @@ type traceCaptureArgs struct {
 	MaxEntries uint64 `json:"max_entries"`
 	TimeoutMs  uint64 `json:"timeout_ms"`
 	Context    string `json:"context"`
+	guardArgs
 }
 
 func runCpuTraceCapture(tc toolContext, args json.RawMessage) map[string]any {
@@ -423,7 +426,18 @@ func runCpuTraceCapture(tc toolContext, args json.RawMessage) map[string]any {
 		"max_entries": strconv.FormatUint(maxEntries, 10),
 		"timeout_ms":  strconv.FormatUint(timeoutMs, 10),
 	}
-	payload, failure := tc.server.executeCommand(tc.ctx, "trace_capture", params)
+	payload, before, after, failure := tc.server.executeMutation(tc.ctx, mutationCall{
+		tool:      "cpu_trace_capture",
+		operation: "trace_capture",
+		params:    params,
+		guard:     parsed.guard(),
+		contextID: context.ID,
+		detail: map[string]any{
+			"cpu":         parsed.CPU,
+			"max_entries": maxEntries,
+			"timeout_ms":  timeoutMs,
+		},
+	})
 	if failure != nil {
 		return failureResult(failure, tc.modern)
 	}
@@ -432,10 +446,11 @@ func runCpuTraceCapture(tc toolContext, args json.RawMessage) map[string]any {
 	if failure != nil {
 		return failureResult(failure, tc.modern)
 	}
-	return okResult(map[string]any{
+	result := map[string]any{
 		"summary":  summary,
 		"artifact": artifactDesc,
-	}, tc.modern)
+	}
+	return okResult(stampGenerations(result, before, after), tc.modern)
 }
 
 // ----------------------------------------------------------------------------------------------------------------------
