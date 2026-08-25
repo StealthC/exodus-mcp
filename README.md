@@ -11,7 +11,8 @@ C++ plugin. Currently **63 analysis tools** cover the phased roadmap from
 bridge/context foundations through VDP graphics, deterministic controlled
 experimentation, and Phase 5 advanced analysis (ROM header parsing, snapshot
 memory search, watchpoint-triggered tracing, coverage, and scripted
-experiments). See the [tool roadmap](docs/ROADMAP.md) for the full scope.
+experiments). See the [feature catalog](docs/FEATURES.md) for the delivered
+scope and the [roadmap](docs/ROADMAP.md) for planned work.
 
 ## Goals
 
@@ -70,8 +71,9 @@ modern and legacy dispatchers. An overview by roadmap phase:
   `cpu_trace_capture_watchpoint`, `experiment_run`.
 
 Every tool response is a bounded summary; high-volume output lands in an
-immutable artifact. See the [tool roadmap](docs/ROADMAP.md) for phase-by-phase
-details and design rules (byte order, address formats, lease requirements).
+immutable artifact. See [FEATURES.md](docs/FEATURES.md) for the delivered
+catalog and design rules (byte order, address formats, lease requirements),
+and [ROADMAP.md](docs/ROADMAP.md) for planned work.
 
 ## Artifact-first output
 
@@ -142,8 +144,8 @@ contract are in [native-plugin](native-plugin/README.md).
       item; audio analysis (Phase 6), advanced debugging (Phase 7), and
       deterministic replay (Phase 8) are planned.
 
-See the phased [tool roadmap](docs/ROADMAP.md) and the
-[changelog](CHANGELOG.md) for the delivery history.
+See the [feature catalog](docs/FEATURES.md), the [roadmap](docs/ROADMAP.md),
+and the [changelog](CHANGELOG.md) for the delivery history.
 
 ## License
 

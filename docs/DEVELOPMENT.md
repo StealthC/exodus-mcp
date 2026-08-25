@@ -204,9 +204,10 @@ Before every commit:
    security, or user-visible functionality changes.
 4. Update the relevant document when changing build, protocol, architecture,
    or deployment assumptions.
-5. Update [Tool roadmap](ROADMAP.md) when a tool is added, deferred, or moves
-   between phases. Add byte-order, address-space, and artifact tests for every
-   tool that reads emulator data.
+5. Update [Features](FEATURES.md) when a tool ships, and
+   [Tool roadmap](ROADMAP.md) when work is planned, deferred, or moves between
+   phases. Add byte-order, address-space, and artifact tests for every tool
+   that reads emulator data.
 
 When releasing a version, move the `Unreleased` entries to a dated
 `[x.y.z]` heading, add its comparison link, create an annotated `vX.Y.Z` tag,

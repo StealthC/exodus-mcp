@@ -25,7 +25,8 @@ Guidance for contributors and coding agents working in this workspace.
   target and bounded legacy policy.
 - [Artifact delivery](docs/ARTIFACTS.md): large-output policy and direct
   retrieval contract.
-- [Tool roadmap](docs/ROADMAP.md): phased functional scope and tool rules.
+- [Features](docs/FEATURES.md): delivered tool catalog, design rules, and validation status.
+- [Tool roadmap](docs/ROADMAP.md): remaining planned phases and deferred work.
 - Write all new documentation, code comments, identifiers, commit messages,
   and user-facing errors in English unless explicitly requested otherwise.
 

@@ -42,6 +42,13 @@ and this project will use [Semantic Versioning](https://semver.org/spec/v2.0.0.h
 - License: `exodus-mcp` is now MIT-licensed (`LICENSE`); the Exodus MIT notice
   remains applicable to the submodule and any redistributed Exodus-derived
   material.
+- `docs/ROADMAP.md` trimmed to planned work only: the open Phase 5 item
+  (multi-instance orchestration), planned Phases 6-8 (audio, advanced
+  debugging, deterministic replay), the deferred fork-side improvements, the
+  operations backlog, and recorded design constraints. A new
+  `docs/FEATURES.md` catalogs the delivered 63-tool feature set by capability
+  with cross-cutting behavior, design rules, and live-validation status;
+  README and contributor docs now point at the delivered/planned split.
 - `docs/ROADMAP.md` marks `memory_diff` complete in Phase 5 and records the
   planned Phase 6 (audio), Phase 7 (advanced debugging), and Phase 8
   (deterministic replay) scope; multi-instance orchestration remains the open
