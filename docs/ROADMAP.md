@@ -283,6 +283,25 @@ demonstration.
 - [ ] Replay: re-execute a recorded sequence from a saved state and verify
   frame-for-frame determinism against the original run.
 
+## Fork-side improvements (deferred)
+
+Work that requires changing emulator core code in the `vendor/exodus` fork
+(the project prefers external extensions; these items are tracked here so
+their scope and rationale stay visible).
+
+- [ ] **Native write interceptor for reactive value freezing**: hook the
+  emulator core's memory write path so cells registered by the server are
+  restored directly at write time, eliminating the ~20 Hz polling re-write of
+  `memory_freeze` (active, fire-and-forget by design today) and keeping the
+  freeze working even when the MCP process is not running. This is the
+  emulator-side equivalent of an internal cheat engine; it requires a fork
+  commit plus a fork rebuild and stays deferred while the server-side polling
+  freeze meets analysis needs.
+- [ ] **Persist input bindings on clean shutdown**: call the system config
+  save in the same shutdown path that writes `settings.xml`, so key bindings
+  survive pair restarts without the manual **File → Save System** action
+  (today Exodus writes `Device.MapInput` only on that explicit menu action).
+
 ## Operations (planned)
 
 - [x] Configurable artifact retention: `--artifact-ttl` /

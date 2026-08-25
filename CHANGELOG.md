@@ -45,7 +45,9 @@ and this project will use [Semantic Versioning](https://semver.org/spec/v2.0.0.h
 - `docs/ROADMAP.md` marks `memory_diff` complete in Phase 5 and records the
   planned Phase 6 (audio), Phase 7 (advanced debugging), and Phase 8
   (deterministic replay) scope; multi-instance orchestration remains the open
-  Phase 5 item.
+  Phase 5 item. A new deferred section tracks fork-side improvements: a native
+  write interceptor for reactive value freezing and persisting input bindings
+  on clean shutdown.
 
 ### Security
 
