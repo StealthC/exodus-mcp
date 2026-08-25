@@ -436,12 +436,14 @@ print(s)
 			completed=$(json_get "$advance" "parsed.get('frames_completed', 0)" 2>/dev/null)
 			check "frame_advance completes one frame" "[ \"\$completed\" = '1' ]"
 
-			# memory_diff around a rendered frame: dump 68K work RAM, advance
-			# one frame, dump again; running game state must move cells.
-			ram_before=$(tool_call "memory_dump" '{"space": "m68k-bus", "address": "0xFF0000", "length": 256}')
+			# memory_diff around a rendered frame: dump all of 68K work RAM,
+			# advance a frame, dump again; running game state must move cells
+			# somewhere in the window (the first 0x100 bytes alone can be a
+			# stable region at boot, e.g. the Sega splash counters).
+			ram_before=$(tool_call "memory_dump" '{"space": "m68k-bus", "address": "0xFF0000", "length": 65536}')
 			ram_before_id=$(json_get "$ram_before" "parsed.get('artifact', {}).get('id', '')" 2>/dev/null)
 			tool_call "frame_advance" "{\"lease_id\": \"$lease_id\", \"frames\": 1}" >/dev/null
-			ram_after=$(tool_call "memory_dump" '{"space": "m68k-bus", "address": "0xFF0000", "length": 256}')
+			ram_after=$(tool_call "memory_dump" '{"space": "m68k-bus", "address": "0xFF0000", "length": 65536}')
 			ram_after_id=$(json_get "$ram_after" "parsed.get('artifact', {}).get('id', '')" 2>/dev/null)
 			if [ -z "$ram_before_id" ] || [ -z "$ram_after_id" ]; then
 				check "memory_diff sees the frame update work RAM" false
