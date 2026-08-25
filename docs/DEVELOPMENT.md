@@ -112,6 +112,70 @@ this RAM address" into a deterministic stop. Watchpoints and breakpoints are
 purged automatically when `rom_load` swaps cartridges, because the processor
 devices that own them are destroyed with the loaded module.
 
+## Experiments (`experiment_run`)
+
+`experiment_run` executes operator-authored automation against the emulator:
+Python 3 scripts (`.py`) for conditional/long-running automation, or
+declarative JSON fixtures (`.json`) for short deterministic sequences. Both
+live in the configured scripts directory and are mediated by the Go server —
+scripts never talk to the native pipe or hold the bridge capability.
+
+Configuration (flag > environment > `.env` > default):
+
+- `--scripts` / `EXODUS_MCP_SCRIPTS_DIR`: allowed scripts root. The launcher
+  defaults it to `<repo>\scripts\experiments` (where `smoke-input.json` and
+  the `title-scan.py` example live); standalone runs default to
+  `%TEMP%\exodus-mcp\scripts`.
+- `--python` / `EXODUS_MCP_PYTHON`: interpreter for `.py` scripts
+  (default `python` on Windows, `python3` elsewhere; resolved through PATH).
+- `--experiment-timeout`: hard per-run cap (default 5 minutes); the tool's
+  `timeout_ms` (default 30000, cap 300000) is clamped to it.
+- `--experiment-max-steps` (default 200) and
+  `--experiment-max-output-bytes` (default 1 MiB) bound step counts, each
+  published artifact, and captured stderr.
+
+Security model: scripts are trusted operator code; the server mediates only
+*emulator access*, not the script itself. Interpreter isolation is limited to
+a minimal environment (`-I`, `PYTHONNOUSERSITE`, `PYTHONDONTWRITEBYTECODE`,
+explicit PATH) — do not place untrusted files in the scripts directory.
+
+Requirements: `experiment_run` needs the exclusive lease of its analysis
+context, like every other mutation entry point. It accepts `context`,
+`lease_id`, `script` (plain `.py`/`.json` file name, no separators),
+`arguments` (opaque JSON passed to the script), `initial_state_id` (loaded
+through `state_load` before the first step), and `timeout_ms`.
+
+Allowlist: `input_set`, `frame_advance`, `state_save`, `state_load`,
+`memory_write`, `memory_read`, `memory_dump`, `memory_search`,
+`frame_capture`, `vdp_status`, `vdp_pixel_info`, `vdp_sprite_table`,
+`m68k_registers`, `z80_registers`, `cpu_coverage_capture`. Anything else —
+including `cpu_run`, stepping, breakpoints/watchpoints, context/lease tools,
+`rom_load`, and recursive `experiment_run` — fails with `tool_not_allowed`.
+The server injects the experiment's `context` and `lease_id` into every call;
+scripts cannot address another context.
+
+Python protocol (bounded JSON lines over stdin/stdout):
+
+1. Server writes `{"type":"init","experiment_id":…,"script":…,
+   "arguments":…,"limits":{…}}` to stdin.
+2. Script writes `{"type":"call","id":…,"tool":…,"arguments":{…}}` (or
+   `{"type":"artifact","id":…,"kind":…,"mime_type":…,"data_base64":…}`, or
+   `{"type":"complete","summary":{…}}`) to stdout — protocol JSON only;
+   diagnostics belong on stderr.
+3. Server replies per message with `{"type":"result","id":…,"ok":true|false,
+   "value":…}` on stdin; tool failures are `ok:false` with a `{code,message}`
+   payload and do not end the run.
+
+The run always produces an `experiment-manifest` artifact (script digest,
+arguments, per-step results, artifacts, status/error) and, when stderr was
+captured, an `experiment-output` artifact; script-published artifacts are
+stored under the context and their descriptors are replied inline. A
+`context_mutation_log` entry records the whole run alongside the per-step
+mutation entries the individual handlers already log.
+
+Run `./scripts/live-smoke.sh --full` to validate the fixture path against a
+loaded ROM.
+
 ## Quality gates
 
 Before every commit:

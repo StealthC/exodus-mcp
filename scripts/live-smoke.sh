@@ -4,8 +4,10 @@
 # Default checks are strictly read-only: health, discovery, tool catalog,
 # bridge status, and emulator status. --full additionally exercises the
 # mutating CPU-control tools (pause/run, M68K step, breakpoint and watchpoint
-# lifecycle, paused frame-capture determinism) and always restores running
-# state on exit.
+# lifecycle, paused frame-capture determinism), the Phase 4 lease-gated
+# surface (memory write, frame advance, input, snapshot round trip), and the
+# lease-gated experiment fixture (experiment_run over smoke-input.json with
+# manifest verification), always restoring running state on exit.
 #
 # Requires: bash, curl, python3. Run against an already-launched pair
 # (./scripts/run-windows.sh); never start a second pair for this script.
@@ -379,6 +381,13 @@ print(s)
 	check "coverage records distinct addresses" "[ -n \"\$coverage_distinct\" ] && [ \"\$coverage_distinct\" -ge 1 ]"
 
 	step "Phase 4 controlled experimentation (lease-gated)"
+	# Purge any lease left by an earlier session: an aborted smoke holds its
+	# lease until TTL expiry, which would block the acquire below. Mirrors
+	# the breakpoint/watchpoint purge above.
+	stale_lease=$(json_get "$(tool_call "context_lease_list")" "parsed.get('leases', [{}])[0].get('lease_id', '')" 2>/dev/null)
+	if [ -n "$stale_lease" ]; then
+		tool_call "context_lease_release" "{\"lease_id\": \"$stale_lease\"}" >/dev/null
+	fi
 	# The system is paused here; every Phase 4 mutation below requires the
 	# exclusive context lease, which the smoke holds from acquire to release.
 	lease=$(tool_call "context_lease_acquire" '{"purpose": "live-smoke phase 4"}' 2>/dev/null || echo "")
@@ -444,6 +453,55 @@ print(s)
 			loaded=$(tool_call "state_load" "{\"lease_id\": \"$lease_id\", \"state_id\": \"$state_id\"}")
 			loaded_flag=$(json_get "$loaded" "str(parsed.get('loaded', False)).lower()" 2>/dev/null)
 			check "state_load restores the snapshot" "[ \"\$loaded_flag\" = 'true' ]"
+		fi
+
+		step "Experiment fixture (allowlisted scripted fixture)"
+		# smoke-input.json lives in the configured scripts directory (the
+		# launcher defaults it to <repo>\scripts\experiments). The fixture
+		# presses start, advances three frames, releases, and captures a
+		# frame; it ends with the system parked, matching the surrounding
+		# checks, and the final restore block resumes it when needed.
+		if [ "$input_code" = "controller_not_found" ]; then
+			echo "SKIP  experiment fixture (no controller device in the workspace)"
+		else
+			ctx_list=$(tool_call "context_list")
+			ctx_id=$(json_get "$ctx_list" "[c['id'] for c in parsed.get('contexts', []) if c.get('default')][0]" 2>/dev/null)
+			if [ -z "$ctx_id" ]; then
+				check "experiment fixture resolves the default context" false
+			else
+				check "experiment fixture resolves the default context" true
+				exp=$(tool_call "experiment_run" "{\"context\": \"$ctx_id\", \"lease_id\": \"$lease_id\", \"script\": \"smoke-input.json\", \"timeout_ms\": 30000}")
+				exp_code=$(json_get "$exp" "parsed.get('code', '')" 2>/dev/null)
+				exp_status=$(json_get "$exp" "parsed.get('status', '')" 2>/dev/null)
+				if [ "$exp_code" = "experiment_failed" ]; then
+					check "experiment fixture completes" false
+				else
+					check "experiment fixture completes" "[ \"\$exp_status\" = 'completed' ]"
+					exp_steps=$(json_get "$exp" "parsed.get('completed_steps', -1)" 2>/dev/null)
+					check "experiment fixture ran all steps" "[ \"\$exp_steps\" = '5' ]"
+					manifest_id=$(json_get "$exp" "[a['id'] for a in parsed.get('artifacts', []) if a.get('kind') == 'experiment-manifest'][0]" 2>/dev/null)
+					if [ -n "$manifest_id" ]; then
+						manifest_data=$(curl -fsS --max-time 10 "$BASE_URL/artifacts/$manifest_id?context=$ctx_id" 2>/dev/null || echo "")
+						manifest_status=$(json_get "$manifest_data" "parsed.get('status', '')" 2>/dev/null)
+						manifest_steps=$(json_get "$manifest_data" "len(parsed.get('steps', []))" 2>/dev/null)
+						check "experiment manifest records completion" "[ \"\$manifest_status\" = 'completed' ]"
+						check "experiment manifest lists every step" "[ \"\$manifest_steps\" = '5' ]"
+						# The frame_capture step's PNG lives in the context artifact
+						# store; its descriptor is echoed in the manifest step
+						# value, so verify the artifact id and its bytes there.
+						frame_id=$(json_get "$manifest_data" "[s['value']['artifact']['id'] for s in parsed.get('steps', []) if 'artifact' in s.get('value', {})][0]" 2>/dev/null)
+						frame_bytes=0
+						if [ -n "$frame_id" ]; then
+							frame_bytes=$(curl -fsS --max-time 10 "$BASE_URL/artifacts/$frame_id?context=$ctx_id" 2>/dev/null | wc -c)
+						fi
+						check "experiment captured a frame artifact" "[ \"\$frame_bytes\" -gt 0 ]"
+					else
+						check "experiment manifest records completion" false
+						check "experiment manifest lists every step" false
+						check "experiment captured a frame artifact" false
+					fi
+				fi
+			fi
 		fi
 
 		mutation_log=$(tool_call "context_mutation_log")

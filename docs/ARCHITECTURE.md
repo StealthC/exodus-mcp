@@ -110,3 +110,12 @@ ETag plus byte-range downloads under `/artifacts/{id}`, startup sweeps) and an
 analysis-context registry with an implicit default context. Tools return
 bounded summaries plus artifact descriptors; domain failures use MCP
 `isError: true` results rather than JSON-RPC protocol errors.
+
+The Go server also owns the experiment runner. Operator-authored `.py`
+scripts and declarative `.json` fixtures execute as a separate process outside
+the emulator, and every step reaches the emulator only through the same tool
+handlers, lease checks, and artifact store as regular MCP calls — never
+through the native pipe or capability. Script execution is intentionally
+un-sandboxed at the OS level (scripts are trusted operator code); bounds are
+enforced on steps, output, artifacts, and wall-clock time, and each run is
+recorded in a reproducible manifest artifact.

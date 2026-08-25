@@ -9,6 +9,40 @@ and this project will use [Semantic Versioning](https://semver.org/spec/v2.0.0.h
 
 ### Added
 
+- `experiment_run`: runs operator-authored experiment scripts (`*.py`) or
+  declarative fixtures (`*.json`) from the configured scripts directory
+  (`EXODUS_MCP_SCRIPTS_DIR` / `--scripts`; the launcher defaults it to
+  `<repo>\scripts\experiments`). The Go server mediates every step against
+  an allowlist (`input_set`, `frame_advance`, `state_save`, `state_load`,
+  `memory_write`, `memory_read`, `memory_dump`, `memory_search`,
+  `frame_capture`, `vdp_status`, `vdp_pixel_info`, `vdp_sprite_table`,
+  `m68k_registers`, `z80_registers`, `cpu_coverage_capture`), injects the
+  experiment's context and lease, and records a reproducible
+  `experiment-manifest` artifact plus capped diagnostic output.
+  Python scripts use a bounded JSON-lines duplex (stdin/stdout) documented in
+  `docs/DEVELOPMENT.md`; fixtures are plain versioned step lists. Optional
+  `initial_state_id` loads a snapshot before the first step. Scripts never
+  see the native pipe or capability; recursion, `rom_load`, global CPU
+  control, and context/lease tools are not allowlisted. New flags:
+  `--scripts`, `--python`, `--experiment-timeout`, `--experiment-max-steps`,
+  `--experiment-max-output-bytes` (defaults 200 steps, 1 MiB output).
+- `scripts/experiments/smoke-input.json` (lease-gated input/frame/capture
+  fixture) and `scripts/experiments/title-scan.py` (documented Python
+  example). `scripts/live-smoke.sh --full` now validates the fixture path:
+  manifest artifact contents over HTTP and the frame-capture artifact, and
+  purges leftover session leases before acquiring its own (mirroring the
+  existing breakpoint/watchpoint purge).
+- New artifact kinds `experiment-manifest` and `experiment-output`, plus
+  script-published artifacts (e.g. `experiment-observations`) with validated
+  MIME types and per-artifact byte caps.
+
+### Changed
+
+- `tools/list` and `tools/call` dispatch through a shared registry lookup;
+  `experiment_run` steps execute the exact same handlers as MCP clients.
+
+### Added
+
 - Context lease tools: `context_lease_acquire`, `context_lease_renew`,
   `context_lease_release`, and `context_lease_list`. One exclusive lease per
   analysis context with TTL-based expiry and release-on-close; every Phase 4

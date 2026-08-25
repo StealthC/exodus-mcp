@@ -37,7 +37,16 @@ type toolSpec struct {
 	run         func(tc toolContext, args json.RawMessage) map[string]any
 }
 
-var toolRegistry = buildToolRegistry()
+// toolRegistry is the deterministic alphabetical catalog shared by the
+// modern and legacy dispatchers. It is filled in init() because experiment
+// tool handlers dispatch back through lookupTool at runtime; a declaration-
+// time initializer would create an initialization cycle between the registry
+// and the experiment executor.
+var toolRegistry []toolSpec
+
+func init() {
+	toolRegistry = buildToolRegistry()
+}
 
 func buildToolRegistry() []toolSpec {
 	specs := append(phase1ToolSpecs(), cpuToolSpecs()...)
@@ -46,8 +55,21 @@ func buildToolRegistry() []toolSpec {
 	specs = append(specs, leaseToolSpecs()...)
 	specs = append(specs, phase4ToolSpecs()...)
 	specs = append(specs, phase5ToolSpecs()...)
+	specs = append(specs, experimentToolSpecs()...)
 	sort.Slice(specs, func(i, j int) bool { return specs[i].name < specs[j].name })
 	return specs
+}
+
+// lookupTool returns the registered spec of one tool, or nil. Experiment
+// scripts dispatch through the same registry so their steps run through the
+// exact handlers the MCP clients call.
+func lookupTool(name string) *toolSpec {
+	for index := range toolRegistry {
+		if toolRegistry[index].name == name {
+			return &toolRegistry[index]
+		}
+	}
+	return nil
 }
 
 // toolSchemas renders deterministic tool descriptors shared by both eras.
@@ -71,16 +93,14 @@ func (server *Server) callTool(ctx context.Context, params json.RawMessage, mode
 	if err := json.Unmarshal(params, &call); err != nil || call.Name == "" {
 		return errorResult("invalid_params", "tools/call requires a tool name", modern)
 	}
-	for _, spec := range toolRegistry {
-		if spec.name != call.Name {
-			continue
-		}
-		if len(call.Arguments) == 0 {
-			call.Arguments = json.RawMessage("{}")
-		}
-		return spec.run(toolContext{server: server, ctx: ctx, modern: modern}, call.Arguments)
+	spec := lookupTool(call.Name)
+	if spec == nil {
+		return errorResult("unknown_tool", "Unknown tool: "+call.Name, modern)
 	}
-	return errorResult("unknown_tool", "Unknown tool: "+call.Name, modern)
+	if len(call.Arguments) == 0 {
+		call.Arguments = json.RawMessage("{}")
+	}
+	return spec.run(toolContext{server: server, ctx: ctx, modern: modern}, call.Arguments)
 }
 
 // ----------------------------------------------------------------------------------------------------------------------

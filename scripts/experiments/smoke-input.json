@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "name": "live-smoke input fixture",
+  "steps": [
+    {"tool": "input_set", "arguments": {"player": 1, "buttons": ["start"], "state": "down"}},
+    {"tool": "frame_advance", "arguments": {"frames": 2}},
+    {"tool": "input_set", "arguments": {"player": 1, "buttons": ["start"], "state": "up"}},
+    {"tool": "frame_advance", "arguments": {"frames": 1}},
+    {"tool": "frame_capture", "arguments": {}}
+  ]
+}

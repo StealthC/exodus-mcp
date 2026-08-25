@@ -14,6 +14,11 @@ rem                             absolute path (default: Exodus.exe)
 for /f %%i in ("%~dp0..\..") do set "ROOT=%%~fi\"
 call "%ROOT%scripts\internal\common.bat"
 
+rem Experiment scripts and fixtures live in the repo by default so the
+rem launcher ships a usable allowlisted set; override with --scripts or
+rem EXODUS_MCP_SCRIPTS_DIR (flag > environment > .env > default).
+if not defined EXODUS_MCP_SCRIPTS_DIR set "EXODUS_MCP_SCRIPTS_DIR=%ROOT%scripts\experiments"
+
 if not exist "%ROOT%bin\exodus-mcp.exe" (
     echo ERROR: bin\exodus-mcp.exe not found. Run scripts\build-windows.sh first.
     exit /b 1

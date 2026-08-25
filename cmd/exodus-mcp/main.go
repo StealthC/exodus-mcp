@@ -18,6 +18,7 @@ import (
 	"github.com/StealthC/exodus-mcp/internal/analysis"
 	"github.com/StealthC/exodus-mcp/internal/artifact"
 	"github.com/StealthC/exodus-mcp/internal/bridge"
+	"github.com/StealthC/exodus-mcp/internal/experiment"
 	"github.com/StealthC/exodus-mcp/internal/mcp"
 )
 
@@ -44,6 +45,12 @@ func main() {
 	defaultStatesDir := filepath.Join(os.TempDir(), "exodus-mcp", "states")
 	statesDir := flag.String("states", envOrDefault("EXODUS_MCP_STATES_DIR", defaultStatesDir), "directory anchoring context-scoped system snapshots")
 	baseURL := flag.String("base-url", "", "external base URL advertised in artifact links; defaults to the listen address's loopback port")
+	defaultScriptsDir := filepath.Join(os.TempDir(), "exodus-mcp", "scripts")
+	scriptsDir := flag.String("scripts", envOrDefault("EXODUS_MCP_SCRIPTS_DIR", defaultScriptsDir), "directory containing allowed experiment scripts (.py) and fixtures (.json)")
+	pythonCmd := flag.String("python", os.Getenv("EXODUS_MCP_PYTHON"), "Python 3 interpreter used for .py experiment scripts")
+	experimentTimeout := flag.Duration("experiment-timeout", experiment.MaxTimeout, "hard wall-clock cap for one experiment_run (per-run timeout_ms is clamped to it)")
+	experimentMaxSteps := flag.Int("experiment-max-steps", experiment.DefaultMaxSteps, "maximum tool steps in one experiment run")
+	experimentMaxOutputBytes := flag.Int64("experiment-max-output-bytes", experiment.DefaultMaxOutputBytes, "maximum script-published artifact size and captured stderr per experiment run")
 	var exodusArguments stringList
 	flag.Var(&exodusArguments, "exodus-arg", "argument passed to Exodus; repeat for multiple arguments")
 	showVersion := flag.Bool("version", false, "print version and exit")
@@ -84,6 +91,18 @@ func main() {
 	client := bridge.NewNamedPipeClient(*pipeName, *pipeCapability)
 	mcpServer := mcp.NewServer(version, client, store, analysis.NewRegistry(), *baseURL)
 	mcpServer.SetStatesDir(*statesDir)
+	experimentRunner, err := experiment.NewRunner(experiment.Config{
+		ScriptsDir:      *scriptsDir,
+		PythonCmd:       *pythonCmd,
+		MaxTimeout:      *experimentTimeout,
+		MaxSteps:        *experimentMaxSteps,
+		MaxOutputBytes:  *experimentMaxOutputBytes,
+		ArtifactBaseURL: *baseURL,
+	}, store)
+	if err != nil {
+		log.Fatal(err)
+	}
+	mcpServer.SetExperimentRunner(experimentRunner)
 	server := &http.Server{
 		Addr:    *listen,
 		Handler: mcpServer.Handler(),
@@ -92,6 +111,7 @@ func main() {
 	log.Printf("exodus-mcp listening on http://%s/mcp", *listen)
 	log.Printf("artifact store at %s", store.Dir())
 	log.Printf("state snapshots at %s", *statesDir)
+	log.Printf("experiment scripts at %s", *scriptsDir)
 	if exodusDone == nil {
 		log.Fatal(server.Serve(listener))
 	}

@@ -18,6 +18,7 @@ import (
 	"github.com/StealthC/exodus-mcp/internal/analysis"
 	"github.com/StealthC/exodus-mcp/internal/artifact"
 	"github.com/StealthC/exodus-mcp/internal/bridge"
+	"github.com/StealthC/exodus-mcp/internal/experiment"
 )
 
 const (
@@ -61,6 +62,10 @@ type Server struct {
 	// statesDir anchors context-scoped system snapshots; empty means
 	// os.TempDir()/exodus-mcp/states.
 	statesDir string
+
+	// experiments runs operator-authored scripts and fixtures; nil means the
+	// experiment_run tool is disabled.
+	experiments *experiment.Runner
 
 	statusMu      sync.Mutex
 	statusExpires time.Time
@@ -358,6 +363,12 @@ func (server *Server) recordMutation(context *analysis.Context, leaseID, tool st
 // SetStatesDir overrides the directory that anchors system snapshots.
 func (server *Server) SetStatesDir(dir string) {
 	server.statesDir = dir
+}
+
+// SetExperimentRunner installs the experiment runner backing experiment_run;
+// leaving it unset keeps the tool disabled with experiments_disabled.
+func (server *Server) SetExperimentRunner(runner *experiment.Runner) {
+	server.experiments = runner
 }
 
 // StatesDir returns the directory anchoring context-scoped system snapshots.

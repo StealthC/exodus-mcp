@@ -128,6 +128,9 @@ cleanup will prevent unbounded disk growth.
 | `cpu-trace` | `cpu_trace_capture`, `cpu_trace_capture_watchpoint` | `text/plain; charset=utf-8` | Executed instruction trace lines |
 | `cpu-coverage` | `cpu_coverage_capture` | `application/json` | Executed addresses, merged ranges, page histogram |
 | `rom-header` | `rom_info` | `application/octet-stream` | 256-byte cartridge header region at cart offset 0x100 |
+| `experiment-manifest` | `experiment_run` | `application/json` | Reproducible run metadata: script name/kind/SHA-256, arguments, per-step results (capped), artifacts produced, status and error |
+| `experiment-output` | `experiment_run` | `text/plain; charset=utf-8` | Capped, sanitized script stderr for diagnostics |
+| script-defined (`experiment-observations`, …) | `experiment_run` script `artifact` message | script-declared (validated) | Bounded derived bytes published by the script, one artifact per message |
 
 ## Testing requirements
 

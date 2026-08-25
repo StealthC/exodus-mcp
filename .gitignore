@@ -11,3 +11,8 @@
 
 # Exodus runtime artifact created when it runs with this repo as cwd.
 /settings.xml
+
+# Microsoft Store Python installer side effects (created when the WindowsApps
+# `python` alias stub runs with this repo as cwd).
+/Python/
+python_install_*.log

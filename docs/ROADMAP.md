@@ -209,7 +209,19 @@ not manually decode opaque dumps in its prompt.
   (documented in `docs/SEGA-HEADER.md`), with a header-region artifact and a
   reference memory map. `target_info.rom` now summarizes the loaded
   cartridge instead of reporting that parsing is pending.
-- Optional external scripting with strict allowlists and artifact-first output.
+- [x] External scripting with strict allowlists and artifact-first output.
+  `experiment_run` executes operator-authored Python 3 scripts (`.py`) or
+  declarative fixtures (`.json`) from the configured scripts directory
+  (`EXODUS_MCP_SCRIPTS_DIR` / `--scripts`; the launcher defaults it to the
+  repo's `scripts/experiments`). Scripts talk to the Go server over a bounded
+  JSON-lines duplex (stdin/stdout) and may call only an allowlisted subset of
+  existing tools; the server injects the experiment's context and lease,
+  records a reproducible `experiment-manifest` artifact plus capped
+  diagnostic output, and mirrors every mutation in the context ledger.
+  Scripts never see the native pipe or capability. The requirement is
+  trust-in-operator-code, not OS sandboxing: interpreters run with a minimal
+  environment, but arbitrary Python (including subprocesses) is not
+  contained.
 - Multi-instance orchestration for real parallel experiments.
 
 ## Adopted external input
