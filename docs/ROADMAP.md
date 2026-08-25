@@ -28,15 +28,9 @@ structured outputs, mirroring the Phase 3 VDP surface.
 
 **Outcome:** agents reason about execution flow, not just single instructions.
 
-Delivered (see [FEATURES.md](FEATURES.md)): symbol-aware disassembly
-(`m68k_disassemble` / `z80_disassemble` resolve context symbols into per-line
-`symbol` and `targets` annotations), and conditional execution breakpoints
-through the emulator's native surface — location conditions (`greater`,
-`less`, `range` with exclusive bounds) plus hit counters and break-on-Nth-hit
-(`break_on_counter` / `break_counter`; ignored hits never pause the system;
-`cpu_breakpoint_list` reports the native `hit_count`).
-
-Remaining:
+Delivered 2026-08-25 (see [FEATURES.md](FEATURES.md)): symbol-aware
+disassembly and conditional execution breakpoints (location conditions,
+native hit counters, break-on-Nth-hit). Remaining:
 
 - [ ] Register-based breakpoint conditions: evaluate conditions such as
   "D0 == $1234" or "A7 >= $FF0000" on a breakpoint hit. `IBreakpoint` has no

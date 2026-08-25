@@ -218,7 +218,14 @@ and integration tests and exercised live against a running Exodus instance
 All delivered phases are validated live against Kid Chameleon on the
 reference harness, in addition to unit and integration tests:
 
-- Pause/run, M68K/Z80 single-instruction steps, and the breakpoint lifecycle.
+- Pause/run, M68K/Z80 single-instruction steps, and the breakpoint lifecycle,
+  including the conditional-breakpoint surface validated live against the
+  rebuilt plugin: location-condition echo and list agreement, break-on-Nth-hit
+  counters, validation errors, and the plain-breakpoint `break_counter`
+  default (covered by `live-smoke.sh --full`).
+- Symbol-aware disassembly is covered by dedicated unit tests for both CPUs:
+  exact and bus-masked matches, `$`/`0x`/`h`-suffixed operand literal
+  extraction, displacement-placeholder rejection, and cross-space isolation.
 - Watchpoint lifecycle: hit pauses the system at the offending instruction
   with rollback confirmed, all address formats and access modes, exact error
   codes, removal, and purge-on-ROM-swap.

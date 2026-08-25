@@ -34,16 +34,6 @@ and this project will use [Semantic Versioning](https://semver.org/spec/v2.0.0.h
   (never a live racy scan). Returns bounded inline matches (address, before,
   after, delta) plus a full-results artifact (kind `memory-diff-results`).
 
-### Fixed
-
-- `cpu_breakpoint_set` echoed `break_counter: 0` instead of the documented
-  default `1` when `break_on_counter` was false: the plugin's `ParseUnsigned`
-  zeroes its output on an absent parameter, and the default restore only ran
-  on the break-on-counter path. The default is now restored in every path,
-  `cpu_breakpoint_list` reports the effective default (`1`) when the feature
-  is off so set/list echoes agree, and a malformed `break_counter` is
-  rejected instead of silently treated as absent. Caught by the direct
-  post-rebuild HTTP validation; the live smoke now asserts the default.
 - Artifact retention: `--artifact-ttl` / `EXODUS_MCP_ARTIFACT_TTL` (a Go
   duration such as `24h`) expires artifacts older than the TTL on a background
   sweep; the default keeps artifacts for the whole server session. Startup
@@ -69,19 +59,36 @@ and this project will use [Semantic Versioning](https://semver.org/spec/v2.0.0.h
 - License: `exodus-mcp` is now MIT-licensed (`LICENSE`); the Exodus MIT notice
   remains applicable to the submodule and any redistributed Exodus-derived
   material.
-- `docs/ROADMAP.md` trimmed to planned work only: the open Phase 5 item
+- `docs/ROADMAP.md` tracks only remaining work: the open Phase 5 item
   (multi-instance orchestration), planned Phases 6-8 (audio, advanced
   debugging, deterministic replay), the deferred fork-side improvements, the
-  operations backlog, and recorded design constraints. A new
-  `docs/FEATURES.md` catalogs the delivered 63-tool feature set by capability
-  with cross-cutting behavior, design rules, and live-validation status;
-  README and contributor docs now point at the delivered/planned split.
-- `docs/ROADMAP.md` marks `memory_diff` complete in Phase 5 and records the
-  planned Phase 6 (audio), Phase 7 (advanced debugging), and Phase 8
-  (deterministic replay) scope; multi-instance orchestration remains the open
-  Phase 5 item. A new deferred section tracks fork-side improvements: a native
-  write interceptor for reactive value freezing and persisting input bindings
-  on clean shutdown.
+  operations backlog, and recorded design constraints. Phase 7 records what
+  shipped this cycle (symbol-aware disassembly; conditional execution
+  breakpoints with native hit counters, location conditions, and
+  break-on-Nth-hit) and what remains (register-based conditions, M68K
+  backtrace, state diff). A new `docs/FEATURES.md` catalogs the delivered
+  63-tool feature set by capability with cross-cutting behavior, design
+  rules, and live-validation status; README, AGENTS, and DEVELOPMENT point
+  at the delivered/planned split.
+- `AGENTS.md` documents the verified WSL self-service build/run/validate
+  loop (`stop-windows.sh` → `build-windows.sh` → `run-windows.sh` →
+  healthz version stamp → `live-smoke.sh --full` → `test.sh --windows-live`)
+  and the `_meta` requirement for the modern dispatcher on raw HTTP, so
+  pair lifecycle and plugin-side validation no longer require the user.
+- `scripts/live-smoke.sh --full` covers the conditional-breakpoint lifecycle
+  (range-condition echo/list/remove) and asserts the plain-breakpoint
+  `break_counter` default.
+
+### Fixed
+
+- `cpu_breakpoint_set` echoed `break_counter: 0` instead of the documented
+  default `1` when `break_on_counter` was false: the plugin's `ParseUnsigned`
+  zeroes its output on an absent parameter, and the default restore only ran
+  on the break-on-counter path. The default is now restored in every path,
+  `cpu_breakpoint_list` reports the effective default (`1`) when the feature
+  is off so set/list echoes agree, and a malformed `break_counter` is
+  rejected instead of silently treated as absent. Caught by the direct
+  post-rebuild HTTP validation; the live smoke now asserts the default.
 
 ### Security
 
