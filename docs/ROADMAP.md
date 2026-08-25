@@ -24,17 +24,28 @@ structured outputs, mirroring the Phase 3 VDP surface.
 - [ ] Active-note decode: from the recorded or live FM/PSG state, report the
   notes playing per channel (analogy to `vdp_sprite_table`).
 
-## Phase 7 — Advanced debugging (planned)
+## Phase 7 — Advanced debugging (partially delivered)
 
 **Outcome:** agents reason about execution flow, not just single instructions.
 
-- [ ] Conditional execution breakpoints with register-based conditions and
-  hit counters (execution breakpoints currently lack the counters that
-  watchpoints have).
+Delivered (see [FEATURES.md](FEATURES.md)): symbol-aware disassembly
+(`m68k_disassemble` / `z80_disassemble` resolve context symbols into per-line
+`symbol` and `targets` annotations), and conditional execution breakpoints
+through the emulator's native surface — location conditions (`greater`,
+`less`, `range` with exclusive bounds) plus hit counters and break-on-Nth-hit
+(`break_on_counter` / `break_counter`; ignored hits never pause the system;
+`cpu_breakpoint_list` reports the native `hit_count`).
+
+Remaining:
+
+- [ ] Register-based breakpoint conditions: evaluate conditions such as
+  "D0 == $1234" or "A7 >= $FF0000" on a breakpoint hit. `IBreakpoint` has no
+  register condition, so this needs either a fork-side extension of the
+  breakpoint interface or a server-side post-hit evaluation loop (read
+  registers after the pause, resume when the condition is false) with the
+  race and pause/resume cost that implies.
 - [ ] M68K backtrace: walk the stack (A7 + frame linkage) with symbol support
   from `symbols_set`; heuristics documented and flagged as such.
-- [ ] Symbol-aware disassembly: resolve symbol names in `m68k_disassemble` /
-  `z80_disassemble` output.
 - [ ] State diff: compare two `state_save` snapshots (registers, memory, VDP)
   into a structured differences report.
 

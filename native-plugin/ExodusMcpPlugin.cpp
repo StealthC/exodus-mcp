@@ -2030,6 +2030,26 @@ bool ExodusMcpPlugin::BuildCPUControlData(const BridgeRequest& request, std::str
 }
 
 //----------------------------------------------------------------------------------------------------------------------
+// Maps an IBreakpoint location condition to the wire-name used by the MCP
+// tools. Keep in sync with the enum order in IBreakpoint.h.
+//----------------------------------------------------------------------------------------------------------------------
+static const char* BreakpointConditionName(IBreakpoint::Condition condition)
+{
+	switch (condition)
+	{
+	case IBreakpoint::Condition::Greater:
+		return "greater";
+	case IBreakpoint::Condition::Less:
+		return "less";
+	case IBreakpoint::Condition::GreaterAndLess:
+		return "range";
+	case IBreakpoint::Condition::Equal:
+	default:
+		return "equal";
+	}
+}
+
+//----------------------------------------------------------------------------------------------------------------------
 bool ExodusMcpPlugin::BuildBreakpointSetData(const BridgeRequest& request, std::string& data, std::string& errorCode, std::string& errorMessage)
 {
 	const std::string cpu = ParamValue(request.params, "cpu");
@@ -2049,6 +2069,80 @@ bool ExodusMcpPlugin::BuildBreakpointSetData(const BridgeRequest& request, std::
 		return false;
 	}
 
+	// Optional location condition: equal (default), greater, less, or a range
+	// with exclusive bounds (data1 < location < data2). The server validates
+	// the same contract; the plugin re-checks so other clients over the wire
+	// protocol get the same errors.
+	IBreakpoint::Condition condition = IBreakpoint::Condition::Equal;
+	const std::string conditionName = ParamValue(request.params, "condition");
+	if (conditionName == "greater")
+	{
+		condition = IBreakpoint::Condition::Greater;
+	}
+	else if (conditionName == "less")
+	{
+		condition = IBreakpoint::Condition::Less;
+	}
+	else if (conditionName == "range")
+	{
+		condition = IBreakpoint::Condition::GreaterAndLess;
+	}
+	else if (!conditionName.empty() && conditionName != "equal")
+	{
+		errorCode = "invalid_params";
+		errorMessage = "condition must be equal, greater, less, or range";
+		return false;
+	}
+	unsigned long long rangeEnd = 0;
+	const bool hasRangeEnd = ParseUnsigned(ParamValue(request.params, "range_end"), rangeEnd);
+	if (condition == IBreakpoint::Condition::GreaterAndLess)
+	{
+		if (!hasRangeEnd)
+		{
+			errorCode = "invalid_params";
+			errorMessage = "condition=range requires range_end";
+			return false;
+		}
+		if (rangeEnd <= address)
+		{
+			errorCode = "invalid_params";
+			errorMessage = "range_end must be above address (range bounds are exclusive)";
+			return false;
+		}
+	}
+	else if (hasRangeEnd)
+	{
+		errorCode = "invalid_params";
+		errorMessage = "range_end applies only to condition=range";
+		return false;
+	}
+
+	// Optional break-on-counter: pause only on every Nth hit instead of every
+	// hit. The emulator core evaluates the live hit counter at break time, so
+	// ignored hits never pause the system.
+	const bool breakOnCounter = ParamValue(request.params, "break_on_counter") == "true";
+	unsigned long long breakCounter = 1;
+	const bool hasBreakCounter = ParseUnsigned(ParamValue(request.params, "break_counter"), breakCounter);
+	if (breakOnCounter)
+	{
+		if (hasBreakCounter && breakCounter == 0)
+		{
+			errorCode = "invalid_params";
+			errorMessage = "break_counter must be at least 1";
+			return false;
+		}
+		if (!hasBreakCounter)
+		{
+			breakCounter = 1;
+		}
+	}
+	else if (hasBreakCounter)
+	{
+		errorCode = "invalid_params";
+		errorMessage = "break_counter applies only when break_on_counter is true";
+		return false;
+	}
+
 	IBreakpoint* breakpoint = processor->CreateBreakpoint();
 	if (breakpoint == 0 || !processor->LockBreakpoint(breakpoint))
 	{
@@ -2059,9 +2153,18 @@ bool ExodusMcpPlugin::BuildBreakpointSetData(const BridgeRequest& request, std::
 	breakpoint->SetEnabled(true);
 	breakpoint->SetLogEvent(false);
 	breakpoint->SetBreakEvent(true);
-	breakpoint->SetLocationCondition(IBreakpoint::Condition::Equal);
+	breakpoint->SetLocationCondition(condition);
 	breakpoint->SetLocationConditionData1((unsigned int)address);
 	breakpoint->SetLocationMask(processor->GetAddressBusMask());
+	if (condition == IBreakpoint::Condition::GreaterAndLess)
+	{
+		breakpoint->SetLocationConditionData2((unsigned int)rangeEnd);
+	}
+	breakpoint->SetBreakOnCounter(breakOnCounter);
+	if (breakOnCounter)
+	{
+		breakpoint->SetBreakCounter((unsigned int)breakCounter);
+	}
 	const unsigned long long breakpointID = _nextBreakpointID++;
 	breakpoint->SetName(L"MCP breakpoint " + std::to_wstring(breakpointID));
 	processor->UnlockBreakpoint(breakpoint);
@@ -2077,6 +2180,14 @@ bool ExodusMcpPlugin::BuildBreakpointSetData(const BridgeRequest& request, std::
 	AppendJsonStringAscii(data, cpu);
 	data += ",\"address\":";
 	AppendNumber(data, address);
+	data += ",\"condition\":";
+	AppendJsonStringAscii(data, BreakpointConditionName(condition));
+	data += ",\"range_end\":";
+	AppendNumber(data, condition == IBreakpoint::Condition::GreaterAndLess ? rangeEnd : 0);
+	data += ",\"break_on_counter\":";
+	data += breakOnCounter ? "true" : "false";
+	data += ",\"break_counter\":";
+	AppendNumber(data, breakCounter);
 	data += "}";
 	return true;
 }
@@ -2104,6 +2215,14 @@ bool ExodusMcpPlugin::BuildBreakpointListData(const BridgeRequest&, std::string&
 		AppendJsonStringAscii(data, managed.cpu);
 		data += ",\"address\":";
 		AppendNumber(data, managed.breakpoint->GetLocationConditionData1());
+		data += ",\"condition\":";
+		AppendJsonStringAscii(data, BreakpointConditionName(managed.breakpoint->GetLocationCondition()));
+		data += ",\"range_end\":";
+		AppendNumber(data, managed.breakpoint->GetLocationConditionData2());
+		data += ",\"break_on_counter\":";
+		data += managed.breakpoint->GetBreakOnCounter() ? "true" : "false";
+		data += ",\"break_counter\":";
+		AppendNumber(data, managed.breakpoint->GetBreakCounter());
 		data += ",\"enabled\":";
 		data += managed.breakpoint->GetEnabled() ? "true" : "false";
 		data += ",\"hit_count\":";

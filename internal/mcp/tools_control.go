@@ -25,14 +25,18 @@ func controlToolSpecs() []toolSpec {
 		},
 		{
 			name:        "cpu_breakpoint_set",
-			description: "Create an enabled exact-address execution breakpoint owned by this MCP process.",
+			description: "Create an enabled exact-address execution breakpoint owned by this MCP process. Optional `condition` filters by the processor's program counter (greater/less boundaries, inclusive-free range), and `break_on_counter` pauses only on every Nth hit; `breakpoint_list` reports the native hit counter.",
 			schema: objectSchema(map[string]any{
-				"cpu":     enumProperty("Processor to break.", []string{"m68k", "z80"}),
-				"address": addressProperty(),
+				"cpu":              enumProperty("Processor to break.", []string{"m68k", "z80"}),
+				"address":          addressProperty(),
+				"condition":        enumProperty("Location condition. equal breaks at exactly `address`; greater/less break above/below it; range breaks inside `address` (exclusive lower bound) and `range_end` (exclusive upper bound).", []string{"equal", "greater", "less", "range"}),
+				"range_end":        addressProperty(),
+				"break_on_counter": booleanProperty("Only pause on every Nth hit instead of every hit; N comes from break_counter."),
+				"break_counter":    integerProperty("Break every Nth hit when break_on_counter is true (default 1).", 1),
 			}, []string{"cpu", "address"}),
 			run: runBreakpointSet,
 		},
-		{name: "cpu_breakpoint_list", description: "List execution breakpoints created through this MCP process.", schema: objectSchema(map[string]any{}, nil), run: runBreakpointList},
+		{name: "cpu_breakpoint_list", description: "List execution breakpoints created through this MCP process, including enabled state, condition, break-on-counter settings, and native hit counters.", schema: objectSchema(map[string]any{}, nil), run: runBreakpointList},
 		{
 			name:        "cpu_breakpoint_remove",
 			description: "Remove one execution breakpoint created through this MCP process.",
@@ -93,8 +97,12 @@ func makeRunCPUControlFromArgs(action string) func(toolContext, json.RawMessage)
 }
 
 type breakpointSetArgs struct {
-	CPU     string `json:"cpu"`
-	Address any    `json:"address"`
+	CPU            string  `json:"cpu"`
+	Address        any     `json:"address"`
+	Condition      string  `json:"condition"`
+	RangeEnd       any     `json:"range_end"`
+	BreakOnCounter bool    `json:"break_on_counter"`
+	BreakCounter   *uint64 `json:"break_counter"`
 }
 
 func runBreakpointSet(tc toolContext, args json.RawMessage) map[string]any {
@@ -106,7 +114,51 @@ func runBreakpointSet(tc toolContext, args json.RawMessage) map[string]any {
 	if failure != nil {
 		return failureResult(failure, tc.modern)
 	}
-	payload, failure := tc.server.executeCommand(tc.ctx, "breakpoint_set", map[string]string{"cpu": parsed.CPU, "address": strconv.FormatUint(address, 10)})
+	condition := parsed.Condition
+	switch condition {
+	case "", "equal", "greater", "less", "range":
+	default:
+		return failureResult(&toolFailure{Code: "invalid_params", Message: "condition must be equal, greater, less, or range"}, tc.modern)
+	}
+	var rangeEnd uint64
+	if parsed.RangeEnd != nil {
+		if condition != "range" {
+			return failureResult(&toolFailure{Code: "invalid_params", Message: "range_end applies only to condition=range"}, tc.modern)
+		}
+		if rangeEnd, failure = parseAddress(parsed.RangeEnd); failure != nil {
+			return failureResult(failure, tc.modern)
+		}
+		if rangeEnd <= address {
+			return failureResult(&toolFailure{Code: "invalid_params", Message: "range_end must be above address (range bounds are exclusive)"}, tc.modern)
+		}
+	} else if condition == "range" {
+		return failureResult(&toolFailure{Code: "invalid_params", Message: "condition=range requires range_end"}, tc.modern)
+	}
+	breakCounter := uint64(1)
+	if parsed.BreakCounter != nil {
+		if !parsed.BreakOnCounter {
+			return failureResult(&toolFailure{Code: "invalid_params", Message: "break_counter applies only when break_on_counter is true"}, tc.modern)
+		}
+		if *parsed.BreakCounter == 0 {
+			return failureResult(&toolFailure{Code: "invalid_params", Message: "break_counter must be at least 1"}, tc.modern)
+		}
+		breakCounter = *parsed.BreakCounter
+	}
+	params := map[string]string{
+		"cpu":     parsed.CPU,
+		"address": strconv.FormatUint(address, 10),
+	}
+	if condition != "" {
+		params["condition"] = condition
+	}
+	if condition == "range" {
+		params["range_end"] = strconv.FormatUint(rangeEnd, 10)
+	}
+	if parsed.BreakOnCounter {
+		params["break_on_counter"] = "true"
+		params["break_counter"] = strconv.FormatUint(breakCounter, 10)
+	}
+	payload, failure := tc.server.executeCommand(tc.ctx, "breakpoint_set", params)
 	if failure != nil {
 		return failureResult(failure, tc.modern)
 	}

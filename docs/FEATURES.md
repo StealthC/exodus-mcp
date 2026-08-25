@@ -87,11 +87,21 @@ and integration tests and exercised live against a running Exodus instance
 - M68K: `m68k_registers`, `m68k_read_memory`, `m68k_disassemble`,
   `m68k_step` (single-instruction step).
 - Z80: `z80_registers`, `z80_read_memory`, `z80_disassemble`, `z80_step`.
+- Symbol-aware disassembly: `m68k_disassemble` and `z80_disassemble`
+  annotate every line whose instruction address or operand literal resolves
+  against the analysis context's symbols — per-line `symbol` (own address)
+  plus `targets` (operand literals that matched), with a documented
+  `annotation_method` (24-bit 68K / 16-bit Z80 bus mask). Symbols from other
+  address spaces never annotate.
 - Deterministic processor control: `cpu_pause`, `cpu_run`, `cpu_step_over`,
   `cpu_step_out` — with live running-state reporting.
 - Execution breakpoints: `cpu_breakpoint_set`, `cpu_breakpoint_list`,
-  `cpu_breakpoint_remove` — MCP-managed exact-address breakpoints that pause
-  the selected processor.
+  `cpu_breakpoint_remove` — MCP-managed breakpoints that pause the selected
+  processor. `cpu_breakpoint_set` accepts optional conditions: `condition`
+  `greater`/`less`/`range` filters by the program counter (range bounds are
+  exclusive), and `break_on_counter` pauses only on every Nth native hit
+  (ignored hits never stop the system). `cpu_breakpoint_list` reports
+  `enabled`, the condition fields, and the native `hit_count`.
 - Watchpoints: `cpu_watchpoint_set`, `cpu_watchpoint_list`,
   `cpu_watchpoint_remove` — byte ranges with read/write/any access filtering,
   live hit counters, and deterministic hit-and-pause through the Exodus

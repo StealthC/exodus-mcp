@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"strconv"
 
+	"github.com/StealthC/exodus-mcp/internal/analysis"
 	"github.com/StealthC/exodus-mcp/internal/symbols"
 )
 
@@ -30,7 +31,7 @@ func cpuToolSpecs() []toolSpec {
 		},
 		{
 			name:        "m68k_disassemble",
-			description: "Disassemble M68K instructions from a start address (default: current PC) via linear sweep. Not execution-verified; bytes are echoed for interpretation.",
+			description: "Disassemble M68K instructions from a start address (default: current PC) via linear sweep. Not execution-verified; bytes are echoed for interpretation. Context symbols are resolved into per-line `symbol` and `targets` annotations.",
 			schema: objectSchema(map[string]any{
 				"address": addressProperty(),
 				"count":   integerProperty(fmt.Sprintf("Instruction count between 1 and %d (default %d).", maxDisassemblyCount, defaultDisassemblyCount), 1),
@@ -90,7 +91,7 @@ func cpuToolSpecs() []toolSpec {
 		},
 		{
 			name:        "z80_disassemble",
-			description: "Disassemble Z80 instructions from a start address (default: current PC) via linear sweep. Not execution-verified; bytes are echoed for interpretation.",
+			description: "Disassemble Z80 instructions from a start address (default: current PC) via linear sweep. Not execution-verified; bytes are echoed for interpretation. Context symbols are resolved into per-line `symbol` and `targets` annotations.",
 			schema: objectSchema(map[string]any{
 				"address": addressProperty(),
 				"count":   integerProperty(fmt.Sprintf("Instruction count between 1 and %d (default %d).", maxDisassemblyCount, defaultDisassemblyCount), 1),
@@ -148,7 +149,8 @@ func makeRunDisassembly(cpu string) func(toolContext, json.RawMessage) map[strin
 		if failure != nil {
 			return failureResult(failure, tc.modern)
 		}
-		if _, failure = resolveContext(tc.server, parsed.Context); failure != nil {
+		context, failure := resolveContext(tc.server, parsed.Context)
+		if failure != nil {
 			return failureResult(failure, tc.modern)
 		}
 		count := parsed.Count
@@ -173,8 +175,196 @@ func makeRunDisassembly(cpu string) func(toolContext, json.RawMessage) map[strin
 		if failure != nil {
 			return failureResult(failure, tc.modern)
 		}
+		if annotated, ok := annotateDisassemblySymbols(context, cpu, payload); ok {
+			payload = annotated
+		}
 		return okResult(payload, tc.modern)
 	}
+}
+
+// ----------------------------------------------------------------------------------------------------------------------
+// Symbol-aware disassembly
+// ----------------------------------------------------------------------------------------------------------------------
+
+// disasmLine mirrors the plugin's linear-sweep line entry. comment is omitted
+// by the plugin when the opcode carries none.
+type disasmLine struct {
+	Address  uint64 `json:"address"`
+	Length   uint64 `json:"length"`
+	Bytes    string `json:"bytes"`
+	Mnemonic string `json:"mnemonic"`
+	Operands string `json:"operands"`
+	Comment  string `json:"comment,omitempty"`
+}
+
+// symbolTarget records one operand literal that resolved to a context symbol.
+type symbolTarget struct {
+	Name       string `json:"name"`
+	Address    uint64 `json:"address"`
+	AddressHex string `json:"address_hex"`
+}
+
+// disasmSymbolMask returns the bus mask applied when matching symbols to
+// disassembly addresses for the Mega Drive baseline: 24-bit for the 68K bus
+// and 16-bit for the Z80 bus. Matching through the mask keeps the annotation
+// exact inside the real addressable bus while tolerating wider user-supplied
+// addresses (for example 0x00FF0000 vs 0xFF0000).
+func disasmSymbolMask(cpu string) uint64 {
+	if cpu == "m68k" {
+		return 0x00FFFFFF
+	}
+	return 0x0000FFFF
+}
+
+// disasmSpaceID is the address space whose symbols apply to a CPU's
+// disassembly. Symbols declared with a differing space id belong to another
+// bus and are ignored, matching the memory_spaces_list contract.
+func disasmSpaceID(cpu string) string {
+	if cpu == "m68k" {
+		return "m68k-bus"
+	}
+	return "z80-bus"
+}
+
+// operandHexLiterals extracts address-like literals from a disassembly
+// operand string: $-prefixed Motorola hex, 0x-prefixed hex, and Zilog
+// h-suffixed hex runs (1-4 digits). Bare digit runs are not matched because
+// register names and displacement placeholders such as "d16(An)" or "(HL)"
+// are also composed of hex-looking characters.
+func operandHexLiterals(operands string) []uint64 {
+	literals := make([]uint64, 0, 2)
+	for index := 0; index < len(operands); {
+		ch := operands[index]
+		if ch == '$' || (ch == '0' && index+1 < len(operands) && (operands[index+1] == 'x' || operands[index+1] == 'X')) {
+			start := index + 1
+			if ch == '0' {
+				start = index + 2
+			}
+			end := start
+			for end < len(operands) && isHexDigit(operands[end]) {
+				end++
+			}
+			if end > start {
+				if value, ok := parseHexRun(operands[start:end]); ok {
+					literals = append(literals, value)
+				}
+				index = end
+				continue
+			}
+			index++
+			continue
+		}
+		if isHexDigit(ch) {
+			start := index
+			for index < len(operands) && isHexDigit(operands[index]) {
+				index++
+			}
+			run := operands[start:index]
+			if len(run) <= 4 && index < len(operands) && (operands[index] == 'h' || operands[index] == 'H') &&
+				(start == 0 || !isHexDigit(operands[start-1])) {
+				if value, ok := parseHexRun(run); ok {
+					literals = append(literals, value)
+				}
+				index++ // consume the h suffix
+				continue
+			}
+			continue
+		}
+		index++
+	}
+	return literals
+}
+
+func isHexDigit(ch byte) bool {
+	return ('0' <= ch && ch <= '9') || ('a' <= ch && ch <= 'f') || ('A' <= ch && ch <= 'F')
+}
+
+// parseHexRun converts a bare hex digit run to an address.
+func parseHexRun(run string) (uint64, bool) {
+	value, err := strconv.ParseUint(run, 16, 64)
+	return value, err == nil
+}
+
+// annotateDisassemblySymbols resolves context symbols against instruction
+// addresses and operand literals of a disasm bridge payload. The response
+// gains a per-line `symbol` (the line's own address) and `targets` (operand
+// literals that resolved), plus top-level `symbols_annotated` and
+// `annotation_method` fields. Annotation is best-effort: an unparseable
+// payload is passed through unchanged.
+func annotateDisassemblySymbols(context *analysis.Context, cpu string, payload map[string]any) (map[string]any, bool) {
+	encoded, err := json.Marshal(payload)
+	if err != nil {
+		return payload, false
+	}
+	var decoded struct {
+		CPU               string       `json:"cpu"`
+		StartAddress      uint64       `json:"start_address"`
+		RequestedCount    uint64       `json:"requested_count"`
+		DisassemblyMethod string       `json:"disassembly_method"`
+		Lines             []disasmLine `json:"lines"`
+	}
+	if err := json.Unmarshal(encoded, &decoded); err != nil || decoded.Lines == nil {
+		return payload, false
+	}
+	mask := disasmSymbolMask(cpu)
+	spaceID := disasmSpaceID(cpu)
+	byAddress := make(map[uint64]string)
+	for _, symbol := range context.Symbols.List("") {
+		if symbol.SpaceID != "" && symbol.SpaceID != spaceID {
+			continue
+		}
+		address := symbol.Address & mask
+		if _, exists := byAddress[address]; !exists {
+			byAddress[address] = symbol.Name
+		}
+	}
+	if len(byAddress) == 0 {
+		return payload, false
+	}
+
+	annotated := make([]map[string]any, 0, len(decoded.Lines))
+	applied := false
+	for _, line := range decoded.Lines {
+		entry := map[string]any{
+			"address":  line.Address,
+			"length":   line.Length,
+			"bytes":    line.Bytes,
+			"mnemonic": line.Mnemonic,
+			"operands": line.Operands,
+		}
+		if line.Comment != "" {
+			entry["comment"] = line.Comment
+		}
+		if name, exists := byAddress[line.Address&mask]; exists {
+			entry["symbol"] = name
+			applied = true
+		}
+		var targets []symbolTarget
+		for _, literal := range operandHexLiterals(line.Operands) {
+			masked := literal & mask
+			if name, exists := byAddress[masked]; exists {
+				targets = append(targets, symbolTarget{Name: name, Address: masked, AddressHex: fmt.Sprintf("0x%X", masked)})
+			}
+		}
+		if len(targets) > 0 {
+			entry["targets"] = targets
+			applied = true
+		}
+		annotated = append(annotated, entry)
+	}
+
+	bitWidth := 24
+	if cpu == "z80" {
+		bitWidth = 16
+	}
+	payload["cpu"] = decoded.CPU
+	payload["start_address"] = decoded.StartAddress
+	payload["requested_count"] = decoded.RequestedCount
+	payload["disassembly_method"] = decoded.DisassemblyMethod
+	payload["symbols_annotated"] = applied
+	payload["annotation_method"] = fmt.Sprintf("context symbols resolved against instruction addresses and operand literals, %d-bit bus mask", bitWidth)
+	payload["lines"] = annotated
+	return payload, true
 }
 
 // ----------------------------------------------------------------------------------------------------------------------

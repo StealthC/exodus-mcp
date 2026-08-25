@@ -181,6 +181,21 @@ if [ "$FULL" = 1 ]; then
 		check "breakpoint set returns an id" false
 	fi
 
+	bp_cond=$(tool_call "cpu_breakpoint_set" '{"cpu": "m68k", "address": "0x00000200", "condition": "range", "range_end": "0x00000220", "break_on_counter": true, "break_counter": 2}')
+	bp_cond_id=$(json_get "$bp_cond" "parsed.get('breakpoint_id')" 2>/dev/null)
+	if [ -n "$bp_cond_id" ]; then
+		cond_name=$(json_get "$bp_cond" "parsed.get('condition')" 2>/dev/null)
+		check "conditional breakpoint echoes condition" "[ \"\$cond_name\" = 'range' ]"
+		bp_list=$(tool_call "cpu_breakpoint_list")
+		list_cond=$(json_get "$bp_list" "' '.join(str(i.get('condition')) for i in parsed.get('breakpoints', []) if i.get('breakpoint_id') == $bp_cond_id)" 2>/dev/null)
+		check "conditional breakpoint listed with condition" "[ \"\$list_cond\" = 'range' ]"
+		bp_cond_rm=$(tool_call "cpu_breakpoint_remove" "{\"breakpoint_id\": $bp_cond_id}")
+		check "conditional breakpoint removed cleanly" \
+			"[ \"\$(json_get \"\$bp_cond_rm\" \"str(parsed.get('removed', False)).lower()\" 2>/dev/null)\" = 'true' ]"
+	else
+		check "conditional breakpoint set returns an id" false
+	fi
+
 	wp=$(tool_call "cpu_watchpoint_set" '{"cpu": "m68k", "address": "0xFF0000", "length": 1}')
 	wp_id=$(json_get "$wp" "parsed.get('watchpoint_id')" 2>/dev/null)
 	if [ -n "$wp_id" ]; then

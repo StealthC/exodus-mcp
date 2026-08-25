@@ -9,6 +9,22 @@ and this project will use [Semantic Versioning](https://semver.org/spec/v2.0.0.h
 
 ### Added
 
+- Symbol-aware disassembly: `m68k_disassemble` and `z80_disassemble` now
+  resolve the analysis context's symbols into per-line annotations —
+  `symbol` when the instruction address itself has a label, and `targets`
+  when an operand literal (`$`-Motorola, `0x`, or Zilog `h`-suffixed hex)
+  matches one, using the 24-bit 68K / 16-bit Z80 bus mask. Symbols declared
+  for another address space never annotate; a payload without matching
+  symbols passes through unchanged (`symbols_annotated` and
+  `annotation_method` are added when any annotation applies).
+- Conditional execution breakpoints: `cpu_breakpoint_set` accepts optional
+  `condition` (`greater`, `less`, `range` with exclusive `range_end` bound),
+  `break_on_counter`, and `break_counter` (break on every Nth hit; ignored
+  hits never pause the system, evaluated natively by the emulator core).
+  `cpu_breakpoint_list` now reports `condition`, `range_end`,
+  `break_on_counter`, `break_counter`, and the native `hit_count`.
+  Validation is enforced identically server-side and in the plugin; plain
+  calls keep their exact historical wire shape.
 - `memory_diff`: cheat-finder comparison between two consistent memory
   snapshots per cell (byte/word/long with explicit byte order, big-endian
   default, and aligned scanning by default). Modes: `changed`, `unchanged`,
