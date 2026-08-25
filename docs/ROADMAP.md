@@ -196,6 +196,15 @@ not manually decode opaque dumps in its prompt.
 - [x] `memory_search`: byte-pattern search over a consistent dump-artifact or
   internal `memory-snapshot` instead of a live racy scan; bounded inline
   matches plus a full-results artifact.
+- [x] `memory_diff`: cheat-finder comparison between two consistent memory
+  snapshots. Cell widths byte/word/long with explicit byte order (big-endian
+  default) and aligned scanning by default; modes `changed`, `unchanged`,
+  `increased`, `decreased`, `changed_by` (signed delta), `equal_to`, and
+  `in_range` support the classic refine-a-candidate workflow (dump before an
+  action, compare after, filter by value/delta until one address remains).
+  Without an `snapshot_after_id` the tool reads the range fresh into a
+  snapshot, mirroring the `memory_search` consistency contract. Bounded
+  inline matches plus a `memory-diff-results` artifact.
 - [x] Event-driven trace capture triggered by watchpoints (the trace crash is
   resolved, so the capture path is available again). The `trace_capture`
   bridge op accepts an optional `watchpoint_id`: the system runs toward the
@@ -223,6 +232,53 @@ not manually decode opaque dumps in its prompt.
   environment, but arbitrary Python (including subprocesses) is not
   contained.
 - Multi-instance orchestration for real parallel experiments.
+
+## Phase 6 — Audio analysis (planned)
+
+**Outcome:** an agent can inspect the Mega Drive sound hardware through
+structured outputs, mirroring the Phase 3 VDP surface.
+
+- [ ] `sound_status`: decoded YM2612 and PSG register state (channels,
+  frequency/pitch, envelopes, volumes, panning, DAC), honoring the existing
+  byte-order and device-specific interpretation rules.
+- [ ] `audio_capture`: sample a bounded window of the mixed stereo output into
+  a WAV artifact (artifact-first, like `frame_capture`).
+- [ ] Active-note decode: from the recorded or live FM/PSG state, report the
+  notes playing per channel (analogy to `vdp_sprite_table`).
+
+## Phase 7 — Advanced debugging (planned)
+
+**Outcome:** agents reason about execution flow, not just single instructions.
+
+- [ ] Conditional execution breakpoints with register-based conditions and
+  hit counters (execution breakpoints currently lack the counters that
+  watchpoints have).
+- [ ] M68K backtrace: walk the stack (A7 + frame linkage) with symbol support
+  from `symbols_set`; heuristics documented and flagged as such.
+- [ ] Symbol-aware disassembly: resolve symbol names in `m68k_disassemble` /
+  `z80_disassemble` output.
+- [ ] State diff: compare two `state_save` snapshots (registers, memory, VDP)
+  into a structured differences report.
+
+## Phase 8 — Deterministic replay (planned)
+
+**Outcome:** reproducible frame-by-frame input sequences for testing and
+demonstration.
+
+- [ ] Input recording: capture a `frame_advance`-stepped sequence of
+  `input_set` events into an artifact.
+- [ ] Replay: re-execute a recorded sequence from a saved state and verify
+  frame-for-frame determinism against the original run.
+
+## Operations (planned)
+
+- [x] Configurable artifact retention: `--artifact-ttl` /
+  `EXODUS_MCP_ARTIFACT_TTL` (a Go duration such as `24h`) expires artifacts
+  older than the TTL on a background sweep; unset keeps artifacts for the
+  server session.
+- [ ] `/metrics` endpoint with per-tool call counts, error rates, and artifact
+  counts for operators.
+- [ ] Release automation matching the v0.1.0 changelog cut.
 
 ## Adopted external input
 

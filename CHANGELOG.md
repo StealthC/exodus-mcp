@@ -9,6 +9,41 @@ and this project will use [Semantic Versioning](https://semver.org/spec/v2.0.0.h
 
 ### Added
 
+- `memory_diff`: cheat-finder comparison between two consistent memory
+  snapshots per cell (byte/word/long with explicit byte order, big-endian
+  default, and aligned scanning by default). Modes: `changed`, `unchanged`,
+  `increased`, `decreased`, `changed_by` (signed delta), `equal_to`, and
+  `in_range`. `snapshot_before_id` is required; `snapshot_after_id` is
+  optional — without it the before range is read fresh into a snapshot
+  (never a live racy scan). Returns bounded inline matches (address, before,
+  after, delta) plus a full-results artifact (kind `memory-diff-results`).
+- Artifact retention: `--artifact-ttl` / `EXODUS_MCP_ARTIFACT_TTL` (a Go
+  duration such as `24h`) expires artifacts older than the TTL on a background
+  sweep; the default keeps artifacts for the whole server session. Startup
+  logging reports the retention policy.
+
+### Changed
+
+- README rewritten: the old copy still described the project as a foundation
+  shell that could not read from a running Exodus; it now summarizes the
+  58-tool catalog by roadmap phase, the delivered status, configuration, and
+  the MIT license.
+- License: `exodus-mcp` is now MIT-licensed (`LICENSE`); the Exodus MIT notice
+  remains applicable to the submodule and any redistributed Exodus-derived
+  material.
+- `docs/ROADMAP.md` marks `memory_diff` complete in Phase 5 and records the
+  planned Phase 6 (audio), Phase 7 (advanced debugging), and Phase 8
+  (deterministic replay) scope; multi-instance orchestration remains the open
+  Phase 5 item.
+
+### Security
+
+- Nothing yet.
+
+## [0.1.0] - 2026-08-25
+
+### Added
+
 - `experiment_run`: runs operator-authored experiment scripts (`*.py`) or
   declarative fixtures (`*.json`) from the configured scripts directory
   (`EXODUS_MCP_SCRIPTS_DIR` / `--scripts`; the launcher defaults it to
@@ -366,4 +401,5 @@ and this project will use [Semantic Versioning](https://semver.org/spec/v2.0.0.h
 
 - Nothing yet.
 
-[Unreleased]: https://github.com/StealthC/exodus-mcp/compare/v0.0.0...HEAD
+[Unreleased]: https://github.com/StealthC/exodus-mcp/compare/v0.1.0...HEAD
+[0.1.0]: https://github.com/StealthC/exodus-mcp/releases/tag/v0.1.0

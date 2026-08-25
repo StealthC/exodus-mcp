@@ -1,12 +1,17 @@
 # Exodus MCP
 
-Exodus MCP is a local, native bridge that will expose the [Exodus Emulation
+Exodus MCP is a local, native bridge that exposes the [Exodus Emulation
 Platform](https://github.com/StealthC/Exodus) to MCP clients for Sega
 Mega Drive / Genesis ROM analysis.
 
-The project is in its foundation phase. The Go command implements the initial
-`/mcp` transport shell and reports the native bridge state honestly. It does
-not yet read from a running Exodus process.
+The Go server speaks Streamable HTTP at `/mcp` (normative target MCP
+`2026-07-28`, with a bounded legacy initialization-era layer), and drives a
+single Exodus instance through an authenticated local named pipe into a native
+C++ plugin. Currently **58 analysis tools** cover the phased roadmap from
+bridge/context foundations through VDP graphics, deterministic controlled
+experimentation, and Phase 5 advanced analysis (ROM header parsing, snapshot
+memory search, watchpoint-triggered tracing, coverage, and scripted
+experiments). See the [tool roadmap](docs/ROADMAP.md) for the full scope.
 
 ## Goals
 
@@ -18,7 +23,8 @@ not yet read from a running Exodus process.
   serializing access to the single emulator instance.
 - Keep large binaries, traces, screenshots, and structured analysis results
   outside the model context by making artifacts directly retrievable.
-- Offer an optional scripting layer later, outside the emulator process.
+- Offer an optional scripting layer outside the emulator process
+  (`experiment_run` with strict allowlists).
 
 ## Architecture
 
@@ -27,7 +33,7 @@ MCP client (OpenCode, other hosts)
         │ Streamable HTTP / JSON-RPC 2.0
         ▼
 exodus-mcp server (Go)
-        │ authenticated local IPC
+        │ authenticated local IPC (named pipe + capability)
         ▼
 ExodusMcpPlugin.dll (C++)
         │ serialized emulator operations
@@ -35,27 +41,55 @@ ExodusMcpPlugin.dll (C++)
 Exodus process and Mega Drive modules
 ```
 
-The server will follow MCP `2026-07-28` as its normative protocol target. It
-will implement a deliberately bounded dual-era compatibility layer for clients
-that still use an initialization-based revision. Details are in
+Details are in [Architecture](docs/ARCHITECTURE.md) and
 [MCP compatibility](docs/MCP-COMPATIBILITY.md).
+
+## Tool catalog
+
+The catalog is a deterministic, alphabetically ordered registry shared by the
+modern and legacy dispatchers. An overview by roadmap phase:
+
+- **Phase 0-1 (bridge & memory):** `bridge_status`, `emulator_status`,
+  `target_info`, analysis contexts (`context_create`/`list`/`close`),
+  `memory_spaces_list`, `memory_read`, `memory_dump`, `artifact_get`,
+  `artifact_preview`.
+- **Phase 2 (processors):** `m68k_registers`/`z80_registers`, per-CPU
+  disassembly and memory reads, `symbols_set`/`list`/`clear`,
+  `cpu_trace_capture`, `cpu_coverage_capture`.
+- **Phase 3 (VDP & graphics):** `vdp_status`, `vdp_memory_read` (VRAM/CRAM/
+  VSRAM), `vdp_tile_export`, `vdp_plane_export`, `vdp_palette_export`,
+  `vdp_sprite_table`, `vdp_pixel_info`, `frame_capture`.
+- **Phase 4 (controlled experimentation):** `rom_load`, CPU pause/run/step/
+  step-over/step-out, MCP-managed breakpoints and watchpoints,
+  lease-gated `memory_write`, `frame_advance`, `input_set`,
+  `state_save`/`state_load`/`state_list`, `context_lease_*`,
+  `context_mutation_log`.
+- **Phase 5 (advanced analysis):** `rom_info` (Sega header + checksum),
+  `memory_search`, `memory_diff` (cheat-finder snapshot comparison),
+  `cpu_trace_capture_watchpoint`, `experiment_run`.
+
+Every tool response is a bounded summary; high-volume output lands in an
+immutable artifact. See the [tool roadmap](docs/ROADMAP.md) for phase-by-phase
+details and design rules (byte order, address formats, lease requirements).
 
 ## Artifact-first output
 
 ROMs, memory dumps, disassemblies, traces, and screenshots can be much larger
-than an agent's useful context window. Tools will therefore return a compact,
-sanitized summary by default and place the full output in an immutable artifact.
-The result will include the artifact's size, hash, MIME type, direct local URL,
-and MCP resource URI. Scripts can download and process the raw data directly;
-an agent can request a small preview, a range, or a parsed/sanitized derivative
-when it actually needs content in context.
+than an agent's useful context window. Tools therefore return a compact,
+sanitized summary by default and place the full output in an immutable
+artifact. The result includes the artifact's size, hash, MIME type, direct
+local URL, and MCP resource URI. Scripts can download and process the raw data
+directly; an agent can request a small preview, a range, or a parsed/sanitized
+derivative when it actually needs content in context.
 
-See [Artifact delivery](docs/ARTIFACTS.md) for the contract.
+See [Artifact delivery](docs/ARTIFACTS.md) for the contract. Artifacts are
+normally kept for the server session; a retention TTL (`--artifact-ttl` /
+`EXODUS_MCP_ARTIFACT_TTL`, e.g. `24h`) enables background expiry.
 
 ## Data interpretation
 
-Every multi-byte value reported by a tool will identify its byte order and
-address space. The initial Mega Drive baseline is M68K `big-endian` and Z80
+Every multi-byte value reported by a tool identifies its byte order and
+address space. The Mega Drive baseline is M68K `big-endian` and Z80
 `little-endian`; raw byte ranges retain address order and are not implicitly
 decoded. VDP data is reported with device-specific interpretation metadata.
 
@@ -63,43 +97,55 @@ decoded. VDP data is reported with device-specific interpretation metadata.
 
 ```text
 cmd/exodus-mcp/       Go server entry point
-native-plugin/        future C++ Exodus extension
+internal/             Go packages (mcp dispatcher, bridge client, analysis,
+                      artifact store, experiment runner, symbols)
+native-plugin/        C++ Exodus extension (ExodusMcpPlugin.dll)
 docs/                 architecture, build, protocol, and CI documents
+scripts/              WSL build/run wrappers, live smoke, experiment fixtures
 vendor/exodus/        pinned StealthC/Exodus Git submodule
 ```
 
 ## Development quick start
 
 ```bash
-go test ./...
-go run ./cmd/exodus-mcp
+go test ./...                # unit and integration tests
+./scripts/test.sh            # local quality gates (fmt, vet, race, Windows build)
 curl http://127.0.0.1:8767/healthz
 ```
 
+Under WSL, build the pair with `./scripts/build-windows.sh` and launch it with
+`./scripts/run-windows.sh` (background it; the launcher does not return until
+the pair closes). Configuration lives in `.env` (copy from `.env.example`;
+required: `EXODUS_MCP_EXODUS_DIR`). Validate a running pair with
+`./scripts/live-smoke.sh --full`.
+
 See [Development](docs/DEVELOPMENT.md) for the local workflow and
-[Building Exodus](docs/BUILD.md) for the emulator build procedure.
-Client setup for OpenCode, Codex CLI, and Claude Code is in
+[Building Exodus](docs/BUILD.md) for the emulator build procedure. Client setup
+for OpenCode, Codex CLI, and Claude Code is in
 [MCP clients](docs/CLIENTS.md). The native extension source and its named-pipe
 contract are in [native-plugin](native-plugin/README.md).
 
 ## Status
 
-- [x] Exodus fork pinned as a submodule.
-- [x] Reproducible Exodus build documentation and CI baseline.
-- [x] Go module, formatting rules, modern MCP transport shell, legacy
-  initialization compatibility, and transport tests.
-- [x] Native extension source, lifecycle status, and authenticated named-pipe
-  contract.
-- [x] Go named-pipe client and live `bridge_status` reporting.
-- [x] Server-owned capability generation and optional Exodus launcher.
-- [ ] Extension deployment verification and serialized command scheduler.
-- [ ] Native extension discovery, authenticated IPC, and read-only live data.
-- [ ] Legacy-client compatibility tests with OpenCode.
+- [x] Exodus fork pinned as a submodule; reproducible build and CI baseline.
+- [x] Modern `2026-07-28` MCP transport (Streamable HTTP) plus bounded legacy
+      initialization compatibility; validated by transport tests.
+- [x] Authenticated named-pipe bridge with capability-gated plugin access and
+      serialized command scheduler.
+- [x] Phases 0-4 complete and live-validated against Kid Chameleon (bridge,
+      memory, CPUs, symbols, VDP/graphics, leases, mutations, states,
+      breakpoints/watchpoints, frames, input).
+- [x] Phase 5 core: `rom_info`, `memory_search`, `memory_diff`,
+      watchpoint-triggered traces, coverage, `experiment_run`.
+- [ ] Multi-instance orchestration (parallel experiments) — remaining Phase 5
+      item; audio analysis (Phase 6), advanced debugging (Phase 7), and
+      deterministic replay (Phase 8) are planned.
 
-See the phased [tool roadmap](docs/ROADMAP.md).
+See the phased [tool roadmap](docs/ROADMAP.md) and the
+[changelog](CHANGELOG.md) for the delivery history.
 
 ## License
 
-The license for `exodus-mcp` has not been selected yet. Exodus itself is
-MIT-licensed; its license notice remains applicable to the submodule and any
-redistributed Exodus-derived material.
+`exodus-mcp` is MIT-licensed (see [LICENSE](LICENSE)). Exodus itself is
+MIT-licensed; its notice remains applicable to the submodule and any
+redistributed Exodus-derived material (see `vendor/exodus/License.txt`).
