@@ -77,7 +77,7 @@ func phase1ToolSpecs() []toolSpec {
 		},
 		{
 			name:        "memory_read",
-			description: fmt.Sprintf("Read at most %d bytes inline with explicit byte-order metadata and effective-address echo. Larger ranges must use memory_dump.", inlineReadCapBytes),
+			description: fmt.Sprintf("Read at most %d bytes inline with explicit byte-order metadata, effective-address echo, and whether the read temporarily paused a running system (system_paused_during_read). Larger ranges must use memory_dump.", inlineReadCapBytes),
 			schema: objectSchema(map[string]any{
 				"space":          stringProperty("Address space id from memory_spaces_list."),
 				"address":        addressProperty(),
@@ -90,7 +90,7 @@ func phase1ToolSpecs() []toolSpec {
 		},
 		{
 			name:        "memory_spaces_list",
-			description: "Enumerate readable address spaces with owner device, size, entry width, permissions, and declared byte order for the loaded target.",
+			description: "Enumerate readable address spaces with owner device, size, entry width, permissions, declared byte order, and the processor bus mapping (bus, bus_base, bus_offset) for the loaded target. bus_address = bus_base + bus_offset + space_relative_address; spaces that are not linearly mapped on a CPU bus (VDP buffers) explain why in bus_mapping_note.",
 			schema:      objectSchema(map[string]any{}, nil),
 			run:         runMemorySpacesList,
 		},
@@ -319,7 +319,7 @@ func targetInfoROM(tc toolContext) map[string]any {
 		"identified": false,
 		"note":       "No Mega Drive cartridge header at 0x100; load a ROM with rom_load, then use rom_info for the full parse.",
 	}
-	header, _, _, failure := readBridgeBytes(tc, "m68k-bus", 0x100, 0x100)
+	header, _, _, _, failure := readBridgeBytes(tc, "m68k-bus", 0x100, 0x100)
 	if failure != nil {
 		fallback["note"] = "Header read unavailable (" + failure.Message + "); use rom_info once a cartridge is loaded."
 		return fallback
@@ -355,6 +355,7 @@ func runMemorySpacesList(tc toolContext, _ json.RawMessage) map[string]any {
 	for _, entry := range spaces {
 		if space, ok := entry.(map[string]any); ok {
 			space["permissions"] = []string{"read"}
+			annotateSpaceBusMapping(space)
 		}
 	}
 	return okResult(map[string]any{
@@ -365,6 +366,7 @@ func runMemorySpacesList(tc toolContext, _ json.RawMessage) map[string]any {
 			"vdp":  "device-specific; reported per space until verified",
 			"raw":  "raw bytes preserve address order and are never silently decoded",
 		},
+		"bus_address_formula": "bus_address = bus_base + bus_offset + space_relative_address",
 	}, tc.modern)
 }
 
@@ -403,11 +405,12 @@ func readMemory(tc toolContext, spaceID string, address uint64, length uint64, r
 	}
 	payload, failure := tc.server.executeCommand(tc.ctx, "mem_read", params)
 	if failure != nil {
-		return failureResult(failure, tc.modern)
+		return failureResult(annotateSpaceRangeFailure(tc, failure, spaceID), tc.modern)
 	}
 	rawDataBase64, _ := payload["data"].(string)
 	byteOrder, _ := payload["byte_order"].(string)
 	effective, _ := payload["effective_address"].(float64)
+	pausedDuringRead, _ := payload["system_paused_during_read"].(bool)
 
 	raw, err := base64.StdEncoding.DecodeString(rawDataBase64)
 	if err != nil {
@@ -415,13 +418,14 @@ func readMemory(tc toolContext, spaceID string, address uint64, length uint64, r
 	}
 
 	value := map[string]any{
-		"space_id":          spaceID,
-		"address":           address,
-		"effective_address": uint64(effective),
-		"length":            len(raw),
-		"byte_order":        byteOrder,
-		"consistency":       payload["consistency"],
-		"representation":    representation,
+		"space_id":                  spaceID,
+		"address":                   address,
+		"effective_address":         uint64(effective),
+		"length":                    len(raw),
+		"byte_order":                byteOrder,
+		"consistency":               payload["consistency"],
+		"system_paused_during_read": pausedDuringRead,
+		"representation":            representation,
 	}
 	switch representation {
 	case "hexdump":
@@ -578,7 +582,7 @@ func runMemoryDump(tc toolContext, args json.RawMessage) map[string]any {
 	}
 	payload, failure := tc.server.executeCommand(tc.ctx, "mem_read", params)
 	if failure != nil {
-		return failureResult(failure, tc.modern)
+		return failureResult(annotateSpaceRangeFailure(tc, failure, parsed.Space), tc.modern)
 	}
 	rawDataBase64, _ := payload["data"].(string)
 	raw, err := base64.StdEncoding.DecodeString(rawDataBase64)
@@ -596,16 +600,20 @@ func runMemoryDump(tc toolContext, args json.RawMessage) map[string]any {
 	}
 	byteOrder, _ := payload["byte_order"].(string)
 	consistency, _ := payload["consistency"].(string)
+	effective, _ := payload["effective_address"].(float64)
+	pausedDuringRead, _ := payload["system_paused_during_read"].(bool)
 	return okResult(map[string]any{
 		"summary": map[string]any{
-			"kind":          "memory-dump",
-			"address_space": parsed.Space,
-			"start_address": address,
-			"byte_length":   len(raw),
-			"byte_order":    byteOrder,
-			"consistency":   consistency,
-			"preview_hex":   artifact.HexDump(raw[:previewLength], int64(address)),
-			"sha256":        stored.SHA256,
+			"kind":                      "memory-dump",
+			"address_space":             parsed.Space,
+			"start_address":             address,
+			"effective_address":         uint64(effective),
+			"byte_length":               len(raw),
+			"byte_order":                byteOrder,
+			"consistency":               consistency,
+			"system_paused_during_read": pausedDuringRead,
+			"preview_hex":               artifact.HexDump(raw[:previewLength], int64(uint64(effective))),
+			"sha256":                    stored.SHA256,
 		},
 		"artifact": artifactDescriptor(tc.server, stored, context.ID),
 	}, tc.modern)

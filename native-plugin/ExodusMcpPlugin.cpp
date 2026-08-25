@@ -161,6 +161,16 @@ std::string NumberToStringHex(unsigned long long value)
 	return buffer;
 }
 
+// HexPadded renders value as zero-padded uppercase hex with at least the
+// given digit width, prefixed with 0x. Canonical address rendering pads to
+// the natural bus width (6 digits for the 24-bit 68K bus, 4 for the Z80).
+std::string HexPadded(unsigned long long value, unsigned int width)
+{
+	char buffer[32] = {0};
+	sprintf_s(buffer, sizeof(buffer), "%0*llX", (int)width, value);
+	return "0x" + std::string(buffer);
+}
+
 std::string ParamValue(const std::map<std::string, std::string>& params, const char* key)
 {
 	std::map<std::string, std::string>::const_iterator found = params.find(key);
@@ -1169,7 +1179,7 @@ std::string ExodusMcpPlugin::BuildVdpStatusData()
 		return "{\"vdp_found\":false}";
 	}
 
-	std::string data = "{\"vdp_found\":true,\"registers\":[";
+	std::string data = "{\"vdp_found\":true,\"system_paused_during_read\":false,\"registers\":[";
 	bool first = true;
 	for (unsigned int location = 0; location < IS315_5313::RegisterCount; ++location)
 	{
@@ -1587,7 +1597,8 @@ bool ExodusMcpPlugin::BuildMemoryReadData(const BridgeRequest& request, std::str
 	if (requestedAddress >= space->sizeBytes || length > space->sizeBytes - requestedAddress)
 	{
 		errorCode = "out_of_range";
-		errorMessage = "Requested range exceeds space size of " + NumberToString(space->sizeBytes) + " bytes";
+		errorMessage = "Requested range exceeds space " + space->id + " size of " + NumberToString(space->sizeBytes) + " bytes; space spans " +
+			HexPadded(0, 6) + "-" + (space->sizeBytes > 0 ? HexPadded(space->sizeBytes - 1, 6) : "unknown");
 		return false;
 	}
 
@@ -1662,7 +1673,9 @@ bool ExodusMcpPlugin::BuildMemoryReadData(const BridgeRequest& request, std::str
 	AppendNumber(data, length);
 	data += ",\"byte_order\":";
 	AppendJsonStringAscii(data, space->byteOrder);
-	data += ",\"encoding\":\"base64\",\"consistency\":\"live\",\"data\":\"";
+	data += ",\"encoding\":\"base64\",\"consistency\":\"live\",\"system_paused_during_read\":";
+	data += pauseForRead ? "true" : "false";
+	data += ",\"data\":\"";
 	data += Base64Encode(bytes.empty() ? 0 : &bytes[0], bytes.size());
 	data += "\"}";
 	return true;
@@ -1714,7 +1727,7 @@ bool ExodusMcpPlugin::BuildRegistersData(const BridgeRequest& request, std::stri
 
 	data = "{\"cpu\":";
 	AppendJsonStringAscii(data, cpu);
-	data += ",\"byte_order\":\"not-applicable\",\"register_note\":\"Values are plain host integers; byte order is not applicable.\",\"registers\":{";
+	data += ",\"byte_order\":\"not-applicable\",\"register_note\":\"Values are plain host integers; byte order is not applicable.\",\"system_paused_during_read\":false,\"registers\":{";
 
 	if (_stricmp(cpu.c_str(), "m68k") == 0)
 	{
@@ -1944,7 +1957,7 @@ bool ExodusMcpPlugin::BuildDisassemblyData(const BridgeRequest& request, std::st
 	AppendNumber(data, livePc);
 	data += ",\"requested_count\":";
 	AppendNumber(data, count);
-	data += ",\"disassembly_method\":\"linear sweep from the start address; not execution-verified\",\"lines\":[";
+	data += ",\"disassembly_method\":\"linear sweep from the start address; not execution-verified\",\"system_paused_during_read\":false,\"lines\":[";
 	data += lines;
 	data += "]}";
 	return true;
@@ -3104,7 +3117,8 @@ bool ExodusMcpPlugin::BuildMemoryWriteData(const BridgeRequest& request, std::st
 	if (requestedAddress >= space->sizeBytes || length > space->sizeBytes - requestedAddress)
 	{
 		errorCode = "out_of_range";
-		errorMessage = "Requested range exceeds space size of " + NumberToString(space->sizeBytes) + " bytes";
+		errorMessage = "Requested range exceeds space " + space->id + " size of " + NumberToString(space->sizeBytes) + " bytes; space spans " +
+			HexPadded(0, 6) + "-" + (space->sizeBytes > 0 ? HexPadded(space->sizeBytes - 1, 6) : "unknown");
 		return false;
 	}
 

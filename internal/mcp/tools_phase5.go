@@ -60,7 +60,7 @@ func phase5ToolSpecs() []toolSpec {
 		},
 		{
 			name:        "memory_search",
-			description: "Search a consistent snapshot for a raw byte pattern. Without snapshot_id the tool dumps the range into a snapshot artifact first (never a live racy scan); with snapshot_id it searches that artifact without any new read. Returns bounded inline matches plus a full-results artifact.",
+			description: "Search a consistent snapshot for a raw byte pattern. Without snapshot_id the tool dumps the range into a snapshot artifact first (never a live racy scan); with snapshot_id it searches that artifact without any new read. Reports whether the snapshot read paused a running system (system_paused_during_read). Returns bounded inline matches plus a full-results artifact.",
 			schema: objectSchema(map[string]any{
 				"space":         stringProperty("Address space id from memory_spaces_list; defines the address domain of the matches."),
 				"pattern":       stringProperty("Byte pattern as hex with optional spaces, e.g. \"4A 42 41\" or \"4a4241\"."),
@@ -106,11 +106,12 @@ func phase5ToolSpecs() []toolSpec {
 // ----------------------------------------------------------------------------------------------------------------------
 
 // readBridgeBytes executes mem_read and returns the decoded bytes, the
-// space's declared byte order, and the effective address. Reads are capped at
-// dumpCapBytes, matching memory_dump.
-func readBridgeBytes(tc toolContext, space string, address, length uint64) ([]byte, string, uint64, *toolFailure) {
+// space's declared byte order, the effective address, and whether the read
+// temporarily paused a running system. Reads are capped at dumpCapBytes,
+// matching memory_dump.
+func readBridgeBytes(tc toolContext, space string, address, length uint64) ([]byte, string, uint64, bool, *toolFailure) {
 	if length < 1 || length > dumpCapBytes {
-		return nil, "", 0, &toolFailure{
+		return nil, "", 0, false, &toolFailure{
 			Code:    "length_out_of_range",
 			Message: fmt.Sprintf("length must be between 1 and %d bytes.", dumpCapBytes),
 		}
@@ -122,16 +123,17 @@ func readBridgeBytes(tc toolContext, space string, address, length uint64) ([]by
 	}
 	payload, failure := tc.server.executeCommand(tc.ctx, "mem_read", params)
 	if failure != nil {
-		return nil, "", 0, failure
+		return nil, "", 0, false, annotateSpaceRangeFailure(tc, failure, space)
 	}
 	rawDataBase64, _ := payload["data"].(string)
 	raw, err := base64.StdEncoding.DecodeString(rawDataBase64)
 	if err != nil {
-		return nil, "", 0, &toolFailure{Code: "bridge_error", Message: "decode base64 memory payload: " + err.Error()}
+		return nil, "", 0, false, &toolFailure{Code: "bridge_error", Message: "decode base64 memory payload: " + err.Error()}
 	}
 	byteOrder, _ := payload["byte_order"].(string)
 	effective, _ := payload["effective_address"].(float64)
-	return raw, byteOrder, uint64(effective), nil
+	pausedDuringRead, _ := payload["system_paused_during_read"].(bool)
+	return raw, byteOrder, uint64(effective), pausedDuringRead, nil
 }
 
 // ----------------------------------------------------------------------------------------------------------------------
@@ -186,6 +188,10 @@ func runMemorySearch(tc toolContext, args json.RawMessage) map[string]any {
 
 	var snapshotBytes []byte
 	var snapshot = make(map[string]any)
+	// The flag reports whether the snapshot's own (live) read paused the
+	// system; reusing an existing snapshot performs no read at all.
+	pausedDuringReadResult := false
+	snapshotReadOrigin := "snapshot artifact reused; no new read performed, so system_paused_during_read is false"
 	if parsed.SnapshotID != "" {
 		meta, err := tc.server.store.Metadata(parsed.SnapshotID, context.ID)
 		if err != nil {
@@ -219,7 +225,7 @@ func runMemorySearch(tc toolContext, args json.RawMessage) map[string]any {
 				Message: fmt.Sprintf("length must be between 1 and %d bytes.", dumpCapBytes),
 			}, tc.modern)
 		}
-		raw, _, _, failure := readBridgeBytes(tc, parsed.Space, startAddress, length)
+		raw, _, _, pausedDuringRead, failure := readBridgeBytes(tc, parsed.Space, startAddress, length)
 		if failure != nil {
 			return failureResult(failure, tc.modern)
 		}
@@ -229,6 +235,8 @@ func runMemorySearch(tc toolContext, args json.RawMessage) map[string]any {
 			return failureResult(&toolFailure{Code: "artifact_error", Message: err.Error()}, tc.modern)
 		}
 		snapshot = artifactDescriptor(tc.server, stored, context.ID)
+		pausedDuringReadResult = pausedDuringRead
+		snapshotReadOrigin = "live read; system_paused_during_read reports whether the snapshot read temporarily paused a running system"
 	}
 
 	matches, total, inlineTruncated, artifactTruncated := findPatternMatches(snapshotBytes, pattern, startAddress, maxMatches)
@@ -259,17 +267,19 @@ func runMemorySearch(tc toolContext, args json.RawMessage) map[string]any {
 
 	return okResult(map[string]any{
 		"summary": map[string]any{
-			"kind":                   "memory-search",
-			"address_space":          parsed.Space,
-			"pattern_hex":            patternHex,
-			"pattern_length_bytes":   len(pattern),
-			"interpretation":         "matches are byte addresses; raw pattern bytes preserve address order and are never decoded",
-			"searched_start_address": startAddress,
-			"searched_byte_length":   len(snapshotBytes),
-			"matches_total":          total,
-			"inline_matches_shown":   len(matches.Inline),
-			"matches_truncated":      inlineTruncated,
-			"snapshot":               snapshot,
+			"kind":                      "memory-search",
+			"address_space":             parsed.Space,
+			"pattern_hex":               patternHex,
+			"pattern_length_bytes":      len(pattern),
+			"interpretation":            "matches are byte addresses; raw pattern bytes preserve address order and are never decoded",
+			"searched_start_address":    startAddress,
+			"searched_byte_length":      len(snapshotBytes),
+			"matches_total":             total,
+			"inline_matches_shown":      len(matches.Inline),
+			"matches_truncated":         inlineTruncated,
+			"system_paused_during_read": pausedDuringReadResult,
+			"snapshot_read_note":        snapshotReadOrigin,
+			"snapshot":                  snapshot,
 		},
 		"matches":  matches.Inline,
 		"artifact": artifactDescriptor(tc.server, storedResults, context.ID),
@@ -499,7 +509,7 @@ func runMemoryDiff(tc toolContext, args json.RawMessage) map[string]any {
 		if parsed.Space == "" {
 			return errorResult("invalid_params", "space is required when snapshot_after_id is omitted", tc.modern)
 		}
-		raw, _, _, failure := readBridgeBytes(tc, parsed.Space, startAddress, uint64(len(beforeBytes)))
+		raw, _, _, _, failure := readBridgeBytes(tc, parsed.Space, startAddress, uint64(len(beforeBytes)))
 		if failure != nil {
 			return failureResult(failure, tc.modern)
 		}
@@ -886,7 +896,7 @@ var mdBusMap = []map[string]any{
 // emulator_status (0 when unknown), used to clamp the checksum range; contextID
 // scopes the header artifact.
 func mdROMInfo(tc toolContext, contextID string, romSizeBytes uint64) (map[string]any, *toolFailure) {
-	header, byteOrder, effective, failure := readBridgeBytes(tc, "m68k-bus", 0x100, 0x100)
+	header, byteOrder, effective, _, failure := readBridgeBytes(tc, "m68k-bus", 0x100, 0x100)
 	if failure != nil {
 		return nil, failure
 	}
@@ -912,7 +922,7 @@ func mdROMInfo(tc toolContext, contextID string, romSizeBytes uint64) (map[strin
 	computed := uint16(0)
 	checksumRange := map[string]any{"start_address": readStart, "end_address": uint64(0x1FF)}
 	if bodyEnd > readStart {
-		body, _, _, failure := readBridgeBytes(tc, "m68k-bus", readStart, bodyEnd-readStart)
+		body, _, _, _, failure := readBridgeBytes(tc, "m68k-bus", readStart, bodyEnd-readStart)
 		if failure != nil {
 			return nil, failure
 		}
