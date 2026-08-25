@@ -11,6 +11,436 @@ complete.
 
 - [ ] Multi-instance orchestration for real parallel experiments.
 
+## Correctness and reverse-engineering interoperability backlog
+
+This backlog records corrections and extensions identified by reviewing the
+already delivered MCP surface from the perspective of Mega Drive game reverse
+engineering. It is intentionally separate from the numbered feature phases
+below: these items repair contracts or make existing dynamic evidence useful
+outside the current Exodus process. Do not mark an item complete merely because
+a similar low-level bridge operation already exists.
+
+### P0 - Target revision, optional control lock, and mutation audit
+
+**Problem:** an Exodus process has exactly one mutable emulated machine: one
+loaded ROM, CPU/VDP/RAM state, input state, and debugger configuration. The
+native bridge already serializes individual commands, so context leases do not
+provide meaningful per-context isolation. They add friction to ordinary
+single-agent work while still failing to express the real risk: a second client
+can change the machine between two dependent calls made by the first client.
+
+**Decision:** contexts are namespaces for analysis data only (artifacts,
+symbols, annotations, and saved-state ownership). They are not virtual emulator
+instances and do not authorize exclusive control of the target. Replace
+mandatory context leases with optimistic concurrency through a monotonically
+increasing target revision, plus an optional short-lived control lock for the
+rare workflows that require a multi-call exclusive window.
+
+#### Target revision contract
+
+- [ ] Introduce a process-local unsigned `target_generation`, initialized when
+  the bridge attaches to a target and never reused during that server process.
+  It identifies the complete observable machine and debugger configuration, not
+  an analysis context. The value is an opaque concurrency token; clients must
+  compare it for equality and must not infer ordering across server restarts.
+- [ ] Advance `target_generation` exactly once after every successful operation
+  that can affect a later observation or behavior. The initial set includes
+  `rom_load`, `state_load`, `memory_write`, `memory_freeze` create/replace/
+  remove/clear, `input_set`, `frame_advance`, CPU run/pause/step actions,
+  breakpoint create/remove, and watchpoint create/remove. A failed command,
+  validation error, timed-out command whose mutation outcome is unknown, and a
+  read-only request must not claim a successful new generation.
+- [ ] Define the outcome of ambiguous native failures before implementation. If
+  the bridge cannot prove whether a mutation reached Exodus, mark the target
+  revision as `unknown`/resynchronization-required, reject revision-guarded
+  mutations until status is re-established, and record the ambiguity in the
+  audit log. Never return the old generation as though the target were known
+  unchanged.
+- [ ] Every target-observing response, artifact provenance envelope, saved
+  state, trace, coverage result, frame/VDP capture, managed debug resource, and
+  mutation result must include the observed `target_generation`. A composite
+  capture must additionally state whether all constituent reads observed the
+  same generation.
+- [ ] Every target-mutating tool accepts optional
+  `expected_target_generation`. The server validates it inside the serialized
+  scheduler immediately before the native action, not only at HTTP request
+  receipt. On mismatch it must perform no native action and return
+  `target_generation_conflict` with `expected_target_generation`, current
+  `target_generation`, current ROM identity when known, and a retry hint.
+- [ ] A successful mutation returns `target_generation_before` and
+  `target_generation_after`. A read returns `target_generation`; it may also
+  return start/end generations for a live operation that observed movement.
+  Use integer JSON values while they remain safely representable; specify a
+  string representation before values could exceed JSON's interoperable integer
+  range.
+- [ ] Make revision preconditions optional for direct manual use, but require
+  agents and scripts that continue a stateful workflow to pass the last known
+  generation. Tool descriptions must say which operations change the revision
+  and demonstrate the safe read -> guarded mutation pattern.
+
+#### Optional target control lock
+
+- [ ] Add `target_control_acquire`, `target_control_renew`,
+  `target_control_release`, and `target_control_status`. The lock is process-
+  wide and guards the one Exodus instance, not one context. Acquisition accepts
+  a human-readable purpose, optional analysis context for audit/artifact
+  ownership, TTL, and optional `expected_target_generation`; it returns an
+  opaque `control_id`, acquisition/expiry times, holder metadata, and the
+  generation at acquisition.
+- [ ] A control lock is optional. When no active lock exists, ordinary
+  mutations are allowed and rely on `expected_target_generation` for stale
+  state detection. When a lock exists, every target mutation must present its
+  matching `control_id`; otherwise it fails before native execution with
+  `target_control_held`. Read-only operations remain available and identify the
+  active lock in their metadata when this affects interpretation.
+- [ ] Set conservative documented TTL defaults and caps. Renewal must require
+  the exact current `control_id`; expiry releases only the lock, never rolls
+  back emulator state, inputs, writes, freezes, or debug resources created by
+  its holder. A close/restart/bridge disconnect releases the in-memory lock and
+  records why it ended.
+- [ ] Treat `control_id` as a capability token. Do not pretend that
+  `context_id` supplies caller authentication: multiple agents can know a
+  context id. Do not expose control ids in list responses to callers that did
+  not acquire them; `target_control_status` should expose purpose, expiry, and
+  an opaque holder summary suitable for contention diagnostics.
+- [ ] `experiment_run` must execute under exclusive control for its full
+  multi-step duration. If the caller already provides an active matching
+  `control_id`, reuse it; otherwise acquire an internal lock immediately before
+  loading `initial_state_id` and release it after manifest finalization. The
+  manifest must record acquisition mode, lock lifetime, and all revision
+  transitions.
+- [ ] Define similarly atomic server-side workflows, such as a paused composite
+  capture, to acquire an internal control lock only for their bounded critical
+  section. Do not require users to manually lock a single memory read or one
+  instruction step.
+
+#### Context lease migration and resource ownership
+
+- [ ] Deprecate `context_lease_*` and `lease_id` parameters in a documented
+  compatibility release. They must no longer claim exclusive emulator control.
+  During that release, accept a valid legacy `lease_id` only as an ignored
+  compatibility field, return a deprecation warning and the target generation,
+  and never require it for a normal mutation.
+- [ ] Remove legacy context leases in the next breaking MCP surface revision,
+  after clients have a replacement using `expected_target_generation` and
+  optional `control_id`. Update `experiment_run`, fixture syntax, smoke tests,
+  schemas, help text, mutation logs, and all documentation in the same change.
+- [ ] Associate breakpoints, watchpoints, freezes, states, and annotations with
+  an optional originating `context_id`, control-lock audit id, creation time,
+  ROM identity, target generation, and stable resource id. This is provenance,
+  not an authorization boundary. Resource mutation follows the current control
+  lock and generation contract.
+- [ ] Make resource list responses show whether an entry is stale for the
+  loaded ROM/generation, whether it was purged, and why. ROM load must purge
+  machine-bound debug resources safely and write one auditable invalidation
+  event per affected resource or a bounded batch record with all ids.
+
+#### Global audit stream
+
+- [ ] Replace the context-only mutation ledger with a bounded global target
+  audit stream, queryable by generation range, timestamp range, operation,
+  originating context, and control-lock audit id. Context-local views may be
+  retained as filtered projections, never as the only source of target history.
+- [ ] Each audit record must contain a monotonic operation id, UTC timestamps,
+  normalized arguments with secrets/capabilities redacted, target generation
+  before/after or unknown outcome, ROM identity before/after where relevant,
+  control-lock provenance, result summary, artifact/state/resource ids created
+  or invalidated, and structured failure data when execution was attempted.
+- [ ] Make audit pagination and retention explicit. A truncated response must
+  state oldest/newest retained operation ids and generations so an analyst does
+  not mistake a partial history for complete reproducibility.
+
+**Acceptance checks:** two clients using the same expected generation result in
+exactly one successful mutation and one `target_generation_conflict`; an
+unconditional single-agent mutation works without a lease or control lock; a
+held lock rejects all foreign mutations but permits reads; expiry releases the
+lock without undoing its holder's writes; `experiment_run` cannot interleave
+with another mutation; bridge ambiguity moves the target to a documented
+resynchronization state; the audit stream reproduces a ROM swap, breakpoint
+setup, input sequence, state restore, and associated generation transitions.
+
+### P0 - Artifact provenance and safe snapshot reuse
+
+**Problem:** `memory_dump` stores raw bytes but its artifact metadata does not
+preserve the address domain and capture facts required to interpret it later.
+`memory_search` and `memory_diff` can reuse a dump, yet accept caller-supplied
+`space` and `start_address`; a valid dump captured from `0xFF0000` can be
+reported later as if it began at `0x000000`. Two same-size snapshots from
+different spaces or ROMs can also be compared without an explicit rejection.
+
+- [ ] Define a versioned artifact provenance envelope for every artifact whose
+  bytes have an address, time, target, or decoding interpretation. Preserve
+  the original bytes unchanged; store the envelope as immutable artifact
+  metadata or as a linked JSON manifest with its own descriptor.
+- [ ] For memory dumps and snapshots, record at minimum: `artifact_schema`,
+  `kind`, `address_space`, requested and effective start addresses in decimal
+  and canonical hex, byte length, raw-byte ordering, declared byte order,
+  device/owner, target generation, ROM SHA-256, frame token if available,
+  CPU run state, capture timestamp, and consistency mode.
+- [ ] Make `memory_search` derive `space`, start address, length, and byte
+  ordering from `snapshot_id`. Parameters that duplicate provenance must be
+  absent or treated as assertions and rejected on mismatch. Search results
+  must include the source snapshot descriptor and its captured address range.
+- [ ] Make `memory_diff` require compatible provenance by default: same
+  address space, same effective range, same byte length, and same ROM identity.
+  If comparing intentionally different ranges is useful, require an explicit
+  `allow_incompatible_provenance: true` and return a prominent warning with
+  both source manifests. Never fabricate a common address origin.
+- [ ] Extend provenance to traces, coverage, frames, VDP exports, save states,
+  and experiment manifests. A later agent must be able to determine which ROM,
+  target generation, state, and emulator instant produced any artifact without
+  retaining the original MCP response in its chat history.
+- [ ] Add `artifact_describe` or extend `artifact_get` so it returns the full
+  typed provenance envelope, not only generic file metadata and a download
+  URL. Keep `artifact_preview` bounded and byte-oriented.
+
+**Acceptance checks:** a RAM dump starting at `0xFF0000` produces search and
+diff addresses in that range without caller restatement; comparing M68K RAM to
+Z80 RAM fails by default; artifact provenance survives an unrelated subsequent
+ROM load; tests cover legacy artifacts with an explicit `provenance_unknown`
+state rather than invented metadata.
+
+### P0 - Honest capture consistency
+
+**Problem:** an immutable artifact is not automatically a temporally atomic
+snapshot of a running emulator. Current RAM reads report bridge-level `live`
+consistency, while larger VDP exports may compose multiple reads and already
+report that they are not coherent. Reverse engineering needs to know whether a
+value, register set, VDP table, and frame describe the same emulated instant.
+
+- [ ] Standardize a `capture_consistency` object for every state-observing
+  tool. It must distinguish `live`, `paused`, `atomic`, `state_restored`, and
+  `composite_non_atomic`; state whether execution was paused by the tool,
+  whether it was resumed afterwards, and the observed initial/final frame
+  tokens and run states.
+- [ ] Add a bounded paused memory snapshot operation. It accepts one or more
+  named ranges, pauses once if necessary, reads them all while paused, restores
+  the original run state, and returns a manifest linking all produced raw
+  artifacts to one capture id. It must not call the current per-range live read
+  loop and call the result atomic.
+- [ ] Add an optional capture guard to individual memory, register, VDP, and
+  frame tools where the native implementation can provide it. Default behavior
+  must remain explicit and safe for compatibility: do not silently turn a
+  `live` call into a pause that changes timing-sensitive software.
+- [ ] Record a stable capture id and target generation in all outputs from a
+  composite capture. Reject mixing artifacts from separate captures in tools
+  that claim a coherent cross-domain conclusion.
+- [ ] Document the operational costs: a paused capture can perturb real-time
+  behavior, while a live capture can be internally inconsistent. Agents must
+  be able to choose based on this metadata rather than infer it from a tool
+  name such as "snapshot".
+
+**Acceptance checks:** a composite capture from a running ROM reports exactly
+one pause/resume cycle and matching capture ids; a deliberately changing RAM
+counter demonstrates the difference between `live` and paused captures; VDP
+exports never claim coherence when VRAM and CRAM came from different frames.
+
+### P1 - Schema and response contract hardening
+
+**Problem:** address schemas currently advertise strings even though handlers
+also accept JSON integers. Unknown JSON properties are generally ignored by Go
+argument decoding, so spelling errors may be silently lost. Output address
+format and artifact descriptions also vary between tools. These issues make
+agent orchestration and generated clients unnecessarily unreliable.
+
+- [ ] Define one reusable address schema using `oneOf` for non-negative JSON
+  integer and supported string notation (`0x`, Motorola `$`, Zilog `h`, or
+  decimal). Apply it to every address argument, including nested structures.
+- [ ] Require strict decoding of tool arguments. Reject unknown properties with
+  `invalid_params`, identify the full JSON path, and retain deliberate
+  forward-compatible extension points only where documented.
+- [ ] Normalize address-bearing outputs to include numeric `address`, canonical
+  uppercase `address_hex`, `address_space`, effective address where translation
+  occurred, and address-bus width/mask when relevant. Do not use strings in one
+  response and numbers in an equivalent response without stating why.
+- [ ] Give every tool output a stable schema version or documented result type.
+  Preserve the bounded human-readable `content` field, but make
+  `structuredContent` the authoritative machine contract.
+- [ ] Normalize artifact descriptors across all producers, including a single
+  `artifacts` field for multi-artifact results, MIME type, size, SHA-256,
+  provenance reference, resource URI, and direct retrieval URL.
+- [ ] Audit descriptions and schemas against actual behavior. In particular,
+  `memory_spaces_list` must report real readable and writable capabilities
+  instead of unconditionally overwriting permissions with `read` while the
+  server exposes `memory_write` for some spaces.
+
+**Acceptance checks:** schema fixtures validate every accepted address form and
+reject a typo such as `adress`; generated JSON-schema clients can call all
+address tools; tool golden tests verify canonical address and artifact shapes;
+space capabilities accurately distinguish ROM, RAM, timed VDP buffers, and
+unsupported writes.
+
+### P1 - Structured trace, coverage, and control-flow evidence
+
+**Problem:** `cpu_trace_capture` stores plain text. Coverage extracts the first
+hexadecimal token of each line and merges numerically consecutive instruction
+start addresses, which does not represent contiguous 68000 instructions with
+variable lengths and does not convey control-flow edges.
+
+- [ ] Keep the existing text trace as a human-readable rendering, but add a
+  versioned JSONL artifact with one event per executed instruction. Required
+  fields are CPU, address space, PC in numeric and hex form, opcode bytes,
+  instruction length, mnemonic/operands where available, cycle position,
+  target generation, capture id, and frame token where available.
+- [ ] Include typed control-flow facts where available: fallthrough address,
+  resolved branch/call target, branch-taken state, call/return classification,
+  exception/interrupt marker, and confidence. Unknown data must be omitted or
+  marked unknown, never inferred from disassembly text.
+- [ ] Replace byte-adjacent coverage ranges with instruction-aware blocks.
+  A block must contain executed instruction starts, first and last instruction
+  addresses, count of executions, and observed outgoing edges. Do not claim
+  that a gap between `0x100` and `0x104` means different code merely because
+  instruction starts are not byte-adjacent.
+- [ ] Add optional filters to trace and coverage capture: address range,
+  include/exclude ROM or RAM, frame window, instruction count, and whether to
+  retain repeated events. All filters must be represented in provenance.
+- [ ] Store coverage in a versioned neutral artifact: executed address set,
+  execution counts, basic blocks, edges, capture conditions, ROM identity, and
+  address-space requirements.
+- [ ] Include truncation facts separately for source trace events, decoded
+  events, unique addresses, blocks, and edges. A trace ring/timeout limit must
+  never be reported as complete coverage.
+
+**Acceptance checks:** synthetic 68K variable-length instructions form one
+correct block; a conditional branch produces two distinct observed edges across
+captures; Z80 and M68K artifacts retain their own address spaces; the artifact
+contains enough typed data for an agent to relate coverage to a static listing
+without parsing text.
+
+### P1 - Forensic breakpoint and watchpoint events
+
+**Problem:** managed watchpoints expose hit counters and pause execution, but
+the evidence required to explain a hit is absent from the public result. An
+analyst must capture a separate trace and manually infer the access that caused
+it. Breakpoint and watchpoint ownership also lacks context provenance.
+
+- [ ] Emit a structured event artifact whenever a managed breakpoint or
+  watchpoint stops execution, with optional bounded inline latest-event
+  summary. Events must include managed resource id, owner context, CPU,
+  triggering PC, address space, watched effective address, access direction,
+  requested range, hit count, target generation, frame token, and timestamp.
+- [ ] When the debugger API provides it, include access width, value before,
+  value after, transferred value, and decoded instruction bytes. Clearly mark
+  fields unavailable from the native API rather than presenting zero as data.
+- [ ] Let `cpu_trace_capture_watchpoint` link its trace artifact to the exact
+  stop event and include the event descriptor in the summary. The result must
+  distinguish timeout, a different managed resource firing, and the requested
+  watchpoint firing.
+- [ ] Add bounded event history with pagination and artifact spillover. History
+  must preserve counter gaps caused by sampling/truncation and identify any
+  dropped records.
+- [ ] Apply the target-generation, optional control-lock, and provenance rules
+  above to all debug resources and events.
+
+**Acceptance checks:** a known RAM write yields its PC, write direction,
+effective address, target generation, and linked trace; a read watchpoint is
+not mislabeled as write; timeout produces no synthetic event; event ownership
+is enforced across contexts.
+
+### P1 - Atomic VDP capture and frame render manifest
+
+**Problem:** the existing VDP tools are individually valuable, but a frame PNG,
+VDP registers, CRAM, VSRAM, VRAM, sprite table, and plane export can originate
+from different emulated moments. `vdp_pixel_info` explains a single coordinate
+but cannot answer which layers, tiles, and sprites contributed to a whole
+frame.
+
+- [ ] Add one bounded VDP capture operation that acquires the capture guard
+once, obtains status/registers, frame buffer, CRAM, VSRAM, selected VRAM ranges,
+sprite table, and scroll data, then restores prior run state. Return a capture
+manifest plus linked raw and derived artifacts sharing one capture id.
+- [ ] Allow callers to select expensive components and impose documented caps.
+  Default output remains artifact-first; a small summary must state exactly
+  which components were included, omitted, truncated, or unavailable.
+- [ ] Add a render manifest artifact for one completed frame. It should contain
+  display geometry, plane/window configuration, scroll bases and decoded
+  offsets, palette state, sprite link-chain/display order, visible sprite cell
+  bounds, tile/name-table references, priority data, and the assumptions or
+  limitations of the renderer.
+- [ ] Preserve VDP-specific semantics in every decoded field: VRAM byte order,
+  CRAM packing, tile pixel order, name-entry bits, coordinate domains, border
+  treatment, interlace behavior, shadow/highlight state, and any unsupported
+  mode. Never flatten these into generic CPU-memory values.
+- [ ] Make `vdp_plane_export`, `vdp_tile_export`, `vdp_sprite_table`, and
+  `vdp_pixel_info` optionally consume a compatible VDP capture manifest rather
+  than performing a new live read. This makes repeated inspection deterministic
+  and avoids pausing the game repeatedly.
+
+**Acceptance checks:** all artifacts from one VDP capture share a capture id
+and frame token; a running title screen does not produce a falsely coherent
+plane/frame pair; a render manifest identifies the sprite chain and name-table
+entries validated against `vdp_pixel_info`; capture reuse makes two derived
+exports byte-identical.
+
+### P2 - Mega Drive map, ROM identity, and practical memory operations
+
+- [ ] Publish a structured operational Mega Drive memory map that combines the
+  reference bus map with the live target. Each region must state CPU-visible
+  range, mirrors/mask, backing device, read/write capability, timing caveats,
+  byte order, and I/O semantics. This is distinct from the generic
+  `memory_spaces_list` inventory and must not imply that all reference regions
+  exist on every loaded system.
+- [ ] Introduce one shared `rom_identity` object: SHA-256 of the loaded ROM
+  file when available, file and padded mapping sizes, header serial/title,
+  Sega checksum status, mapped image base, and target generation. Attach it to
+  all ROM-derived artifacts, states, symbols, annotations, and exports.
+- [ ] Make incomplete checksum computation unambiguous. `rom_info` currently
+  caps a body read at the generic dump cap; its result must expose
+  `checksum_complete`, bytes covered, expected full range, cap reason, and
+  must not describe a partial comparison as full header-checksum validation.
+- [ ] Add hex input (`data_hex`) as a mutually exclusive alternative to base64
+  for `memory_write` and `memory_freeze`. Normalize both to raw address-order
+  bytes, echo bounded uppercase hexadecimal, effective address, write result,
+  and optional read-back verification.
+- [ ] Extend raw pattern search with explicitly documented wildcard/mask
+  patterns and optional alignment, while retaining the current exact-byte mode
+  unchanged. Result artifacts must serialize the parsed pattern and masks, not
+  only the source text, so a search is reproducible.
+
+**Acceptance checks:** the map marks VDP timed buffers as not directly writable;
+a larger-than-cap ROM reports incomplete checksum coverage; equivalent hex and
+base64 writes produce the same audit hash; a masked signature search is
+reproducible from its result artifact.
+
+### P2 - Evidence annotations and analyst hypotheses
+
+- [ ] Add context-scoped annotations for addresses and ranges. An annotation
+  must support title, text, tags, category, author/source, confidence,
+  creation/update timestamps, address space, address/range, ROM identity, and
+  links to artifacts, states, captures, trace events, symbols, and managed
+  debug resources.
+- [ ] Distinguish observations from hypotheses. For example, an annotation may
+  claim that `0xFF1234` is a life counter, but its evidence should link the
+  memory-diff artifact and watchpoint event that support that claim. Do not
+  promote an annotation to a symbol automatically.
+- [ ] Provide bounded list/filter/search/export operations and a versioned
+  annotation artifact format. Include conflict handling when importing
+  annotations created by another analyst.
+- [ ] Invalidate or prominently flag annotations whose ROM identity or target
+  generation no longer matches the loaded target. Preserve them for historical
+  analysis rather than deleting them on ROM load.
+
+**Acceptance checks:** an annotation can link a diff, state, watchpoint event,
+and symbol; it is exported with complete provenance; a different ROM produces
+a mismatch warning; pagination never silently omits historical annotations.
+
+### Cross-cutting delivery rules for this backlog
+
+- [ ] Every new artifact schema needs a documented version, JSON fixtures,
+  provenance validation, bounded previews, and backwards behavior for legacy
+  artifacts that lack metadata.
+- [ ] Every target-mutating operation needs unit coverage for generation
+  preconditions, control-lock ownership and expiry, audit logging, ROM-change
+  invalidation, and failure without partial mutation.
+- [ ] Every capture feature needs a live Windows integration test that proves
+  run-state restoration, capture consistency metadata, target-generation
+  propagation, and bounded artifact behavior using a real Exodus instance.
+- [ ] Every structured artifact needs fixture-based schema and round-trip tests
+  that verify address spaces, ROM identity, provenance, and truncation facts.
+- [ ] Tool descriptions must identify when an output is direct observation,
+  derived decoding, heuristic inference, incomplete due to a cap, or an
+  analyst-provided hypothesis.
+
 ## Phase 6 — Audio analysis (planned)
 
 **Outcome:** an agent can inspect the Mega Drive sound hardware through
@@ -84,7 +514,8 @@ their scope and rationale stay visible).
 - New tools must follow the [tool design rules](FEATURES.md#tool-design-rules).
 - Deliberately rejected architecture alternatives, kept as policy: an HTTP
   listener inside the emulator process, unauthenticated transport, floating
-  upstream CI references, and lease-free mutation tools such as free-form
-  memory writes (from the August 2026 review of the independent
-  `sadnescity/exodus-mcp-extension` project; adoptions from that review are
-  delivered and listed in [FEATURES.md](FEATURES.md#adopted-external-input)).
+  upstream CI references, and unconditional mutation interfaces that provide
+  neither a target-generation precondition nor an optional exclusive control
+  mechanism (from the August 2026 review of the independent
+  `sadnescity/exodus-mcp-extension`; adoptions from that review are delivered
+  and listed in [FEATURES.md](FEATURES.md#adopted-external-input)).
