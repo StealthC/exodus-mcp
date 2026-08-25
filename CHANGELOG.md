@@ -33,6 +33,17 @@ and this project will use [Semantic Versioning](https://semver.org/spec/v2.0.0.h
   optional — without it the before range is read fresh into a snapshot
   (never a live racy scan). Returns bounded inline matches (address, before,
   after, delta) plus a full-results artifact (kind `memory-diff-results`).
+
+### Fixed
+
+- `cpu_breakpoint_set` echoed `break_counter: 0` instead of the documented
+  default `1` when `break_on_counter` was false: the plugin's `ParseUnsigned`
+  zeroes its output on an absent parameter, and the default restore only ran
+  on the break-on-counter path. The default is now restored in every path,
+  `cpu_breakpoint_list` reports the effective default (`1`) when the feature
+  is off so set/list echoes agree, and a malformed `break_counter` is
+  rejected instead of silently treated as absent. Caught by the direct
+  post-rebuild HTTP validation; the live smoke now asserts the default.
 - Artifact retention: `--artifact-ttl` / `EXODUS_MCP_ARTIFACT_TTL` (a Go
   duration such as `24h`) expires artifacts older than the TTL on a background
   sweep; the default keeps artifacts for the whole server session. Startup

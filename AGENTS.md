@@ -70,52 +70,84 @@ Guidance for contributors and coding agents working in this workspace.
 
 ## WSL environment
 
-- Under WSL, use `./scripts/build-windows.sh` to build the pair (native
-  plugin + Go server) and `./scripts/run-windows.sh` to launch it. Do not run
-  `exodus-mcp.exe` or Exodus directly from the Linux shell. For fork-side
-  experiments, `./scripts/build-fork.sh` rebuilds the submodule's emulator
-  and installs the exe into the configured test install; close the running
-  emulator first (Windows locks the exe image).
+You can and should build, run, and validate the full Windows pair from WSL
+yourself — the wrappers call Windows through interop. The complete loop below
+was executed and verified against a real Windows install on 2026-08-25
+(plugin C++ changes included); use it instead of asking the user to run
+things. Do not run `exodus-mcp.exe` or Exodus directly from the Linux shell;
+always go through the wrappers.
+
 - Configuration lives in `.env` (copy from `.env.example`; required:
   `EXODUS_MCP_EXODUS_DIR`). Precedence is flag > environment > `.env` >
   default everywhere. The wrappers publish `EXODUS_MCP_*` variables to
   Windows processes via `WSLENV`; without that plumbing Windows children
   silently never see WSL-side overrides.
-- Starting, stopping, and restarting the pair is routine agent work and does
-  not need per-restart user approval. The supported lifecycle is:
-  - Check first whether a pair is already running (`tasklist.exe` for
-    `Exodus.nightly.exe` and `exodus-mcp.exe`, plus port `127.0.0.1:8767`).
-    Never start a second instance: only one process can bind the port, and
-    each Exodus child pairs with one generated capability.
-  - Stop a running pair before installing a new build with
-    `scripts/stop-windows.sh`, which first asks Exodus to close gracefully
-    (WM_CLOSE) so it can persist `settings.xml`, then force-kills after a
-    grace period (fallback: `taskkill /F /IM Exodus.nightly.exe /IM
-    exodus-mcp.exe`). Windows locks loaded images, so the plugin DLL cannot be
-    copied while Exodus runs, and a stale pair keeps serving old code.
-  - Exodus configuration persistence follows the emulator's own design: the
-    `settings.xml` prefs are written only on a clean shutdown, and the key
-    bindings (`Device.MapInput` in the default system module XML) are written
-    only by the manual **File → Save System** action. A forced kill loses any
-    in-session changes; prefer the graceful stop above instead of raw
-    `taskkill /F` whenever a clean exit matters.
-  - Launch `run-windows.sh` **in the background** — the launcher does not
-    return until the pair is closed, so a foreground invocation blocks the
-    shell (redirect its output to `tmp/run-windows.log`). Then check health
-    from a separate foreground command: poll
-    `curl -s http://127.0.0.1:8767/healthz` until it answers, and inspect
-    `tmp/run-windows.log` for startup errors. Only proceed with tool calls
-    once the health endpoint responds. The launcher reserves the port before
-    starting Exodus and terminates its child when the MCP server exits; its
-    log reports child exit codes such as `0xc0000005`.
-  - Load test ROMs through `rom_load` instead of asking for manual UI steps.
-- Download artifacts and write scratch files into the workspace `tmp/`
-  directory (`<repo>/tmp`), not the system temp path; the user inspects that
-  directory visually. It is gitignored, so leftovers never reach commits.
-- Validation does not require the harness MCP connection: `live-smoke.sh`
-  and raw HTTP calls against `http://127.0.0.1:8767/mcp` exercise every tool
-  without the cached catalog. Prefer this path for build/test loops so a
-  stale harness catalog never blocks verification.
+
+### Self-service build/run/validate loop
+
+1. **Check what is running** before anything: `tasklist.exe | grep -iE
+   "exodus"` plus `curl -s http://127.0.0.1:8767/healthz`.
+   - The health response includes the build version (e.g.
+     `v0.1.0-6-gcadc8a1`, stamped from `git describe`), so you can confirm
+     which build is live before and after a rebuild.
+   - Never start a second pair: only one process can bind the port, and each
+     Exodus child pairs with one generated capability.
+2. **Stop a running pair before building**: `./scripts/stop-windows.sh`.
+   - It asks Exodus to close gracefully (WM_CLOSE) so it can persist
+     `settings.xml`, then force-kills after a grace period (`--grace-seconds`
+     tunes it; `taskkill /F /IM ...` is the manual fallback). Windows locks
+     loaded images, so the plugin DLL can only be replaced while Exodus is
+     stopped.
+   - `settings.xml` is written only on clean shutdown; key bindings
+     (`Device.MapInput`) only via **File → Save System**. Prefer the graceful
+     stop instead of raw `taskkill /F` whenever a clean exit matters.
+3. **Build**: `./scripts/build-windows.sh` (default `Release | x64`; pass
+   `--config Debug` for Debug-CRT work). One command compiles the native
+   plugin (`native-plugin/ExodusMcpPlugin.cpp` → `ExodusMcpPlugin.dll`),
+   installs it into the test install (`EXODUS_MCP_EXODUS_DIR`), and builds
+   `bin/exodus-mcp.exe`. Run it in the **foreground** when the build result is
+   needed to continue — do not background it and poll with `sleep`.
+   The final line prints the installed version, e.g. `bin\exodus-mcp.exe
+   (version v0.1.0-6-gcadc8a1)`. For fork-side emulator changes use
+   `./scripts/build-fork.sh` instead (same stop-first rule).
+4. **Run**: `./scripts/run-windows.sh` **in the background** — the launcher
+   does not return until the pair is closed, so a foreground invocation
+   blocks the shell. Redirect its output to `tmp/run-windows.log`. Then poll
+   `curl -s http://127.0.0.1:8767/healthz` from a separate foreground command
+   until it answers `"ok"` (a plain `for` loop with a bounded retry count is
+   fine; the pipe can lag the HTTP gate by tens of seconds on Debug builds),
+   and inspect `tmp/run-windows.log` for startup errors before driving tools.
+   The log also reports child exit codes such as `0xc0000005`.
+5. **Validate**: `./scripts/live-smoke.sh --full` against the running pair.
+   - `--full` loads a test ROM itself through `rom_load` (default
+     `F:\projects\kid\rom\kid.bin`; override with `EXODUS_MCP_SMOKE_ROM`),
+     so no manual UI steps are needed, and covers pause/run, steps,
+     breakpoint/watchpoint lifecycles, conditional breakpoints, paused frame
+     determinism, VDP reads/exports, trace/coverage, rom_info, memory
+     search/diff, leases, memory write/freeze, frame advance, input,
+     save/load states, and the experiment fixture.
+   - Read-only default checks (health, discovery, catalog, bridge, emulator
+     status) run without a ROM.
+   - Integration suites: `./scripts/test.sh` (Linux gates) and
+     `./scripts/test.sh --windows-live` (named-pipe integration suite against
+     a real Windows pipe through interop; it does not start Exodus).
+   - Expect the full loop to take a few minutes; the MSVC build alone is
+     roughly two. This loop is the standard gate for plugin-side changes —
+     it is what caught, for example, a `break_counter` echo regression in the
+     conditional-breakpoint work (2026-08-25).
+
+### Direct HTTP validation (bypassing the harness)
+
+- Raw HTTP against `http://127.0.0.1:8767/mcp` exercises every tool without
+  the cached MCP catalog; prefer it for build/test loops so a stale harness
+  catalog never blocks verification.
+- For the **modern** dispatcher (the one that returns `structuredContent`),
+  the call params must carry
+  `"_meta": {"io.modelcontextprotocol/protocolVersion": "2026-07-28"}`
+  (plus headers `MCP-Protocol-Version: 2026-07-28`, `Mcp-Method:
+  tools/call`, `Mcp-Name: <tool>`). Without `_meta` the request silently
+  falls back to the legacy dispatcher, which returns only the text `content`
+  field.
 - The harness caches the MCP tool catalog per session. Newly added or changed
   tools stay invisible or stale inside the running harness session even after
   a successful rebuild, reinstall, and pair restart. Whenever the work needs
@@ -123,8 +155,9 @@ Guidance for contributors and coding agents working in this workspace.
   the user to reload the connection (`/mcp`, then disable and re-enable the
   `exodus` server) and wait for their confirmation before calling those tools
   through the harness or subagents; keep validating over raw HTTP meanwhile.
-- `./scripts/test.sh --windows-live` runs the named-pipe integration suite
-  against a real Windows pipe through interop; it does not start Exodus.
+- Download artifacts and write scratch files into the workspace `tmp/`
+  directory (`<repo>/tmp`), not the system temp path; the user inspects that
+  directory visually. It is gitignored, so leftovers never reach commits.
 
 ## Git and upstream discipline
 

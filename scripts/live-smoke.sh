@@ -174,6 +174,8 @@ if [ "$FULL" = 1 ]; then
 	bp_id=$(json_get "$bp" "parsed.get('breakpoint_id')" 2>/dev/null)
 	if [ -n "$bp_id" ]; then
 		check "breakpoint set returns an id" true
+		bp_counter=$(json_get "$bp" "parsed.get('break_counter')" 2>/dev/null)
+		check "plain breakpoint defaults break_counter to 1" "[ \"\$bp_counter\" = '1' ]"
 		bp_rm=$(tool_call "cpu_breakpoint_remove" "{\"breakpoint_id\": $bp_id}")
 		check "breakpoint removed cleanly" \
 			"[ \"\$(json_get \"\$bp_rm\" \"str(parsed.get('removed', False)).lower()\" 2>/dev/null)\" = 'true' ]"

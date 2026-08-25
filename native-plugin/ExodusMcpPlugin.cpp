@@ -2119,10 +2119,23 @@ bool ExodusMcpPlugin::BuildBreakpointSetData(const BridgeRequest& request, std::
 
 	// Optional break-on-counter: pause only on every Nth hit instead of every
 	// hit. The emulator core evaluates the live hit counter at break time, so
-	// ignored hits never pause the system.
+	// ignored hits never pause the system. ParseUnsigned zeroes its output on
+	// failure, so the default must be restored explicitly whenever the
+	// parameter is absent.
 	const bool breakOnCounter = ParamValue(request.params, "break_on_counter") == "true";
 	unsigned long long breakCounter = 1;
-	const bool hasBreakCounter = ParseUnsigned(ParamValue(request.params, "break_counter"), breakCounter);
+	bool hasBreakCounter = false;
+	const std::string breakCounterParam = ParamValue(request.params, "break_counter");
+	if (!breakCounterParam.empty())
+	{
+		if (!ParseUnsigned(breakCounterParam, breakCounter))
+		{
+			errorCode = "invalid_params";
+			errorMessage = "break_counter must be an unsigned integer";
+			return false;
+		}
+		hasBreakCounter = true;
+	}
 	if (breakOnCounter)
 	{
 		if (hasBreakCounter && breakCounter == 0)
@@ -2222,7 +2235,9 @@ bool ExodusMcpPlugin::BuildBreakpointListData(const BridgeRequest&, std::string&
 		data += ",\"break_on_counter\":";
 		data += managed.breakpoint->GetBreakOnCounter() ? "true" : "false";
 		data += ",\"break_counter\":";
-		AppendNumber(data, managed.breakpoint->GetBreakCounter());
+		// Report the effective default (1) when the feature is off; the core
+		// stores 0 for that state, which would contradict the set echo.
+		AppendNumber(data, managed.breakpoint->GetBreakOnCounter() ? managed.breakpoint->GetBreakCounter() : 1);
 		data += ",\"enabled\":";
 		data += managed.breakpoint->GetEnabled() ? "true" : "false";
 		data += ",\"hit_count\":";
