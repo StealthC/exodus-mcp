@@ -21,21 +21,23 @@ and this project will use [Semantic Versioning](https://semver.org/spec/v2.0.0.h
   duration such as `24h`) expires artifacts older than the TTL on a background
   sweep; the default keeps artifacts for the whole server session. Startup
   logging reports the retention policy.
-- `memory_freeze`, `memory_freeze_list`, `memory_freeze_remove`: lease-gated
-  server-managed value freezing. `memory_freeze` writes the pinned bytes once
-  (like `memory_write`) and then re-applies them at ~20 Hz through the
-  serialized bridge queue, undoing the program's own updates to the range;
-  re-registering the same space+address updates the pinned bytes, `rom_load`
-  purges the whole set, and both mutating calls are recorded in the mutation
-  ledger. The list tool reports byte length, write count, last write time, and
-  the last periodic-write error. Validated by unit tests and the live smoke
-  (pinning across a running window, write-count growth, removal).
+- `memory_freeze`, `memory_freeze_list`, `memory_freeze_remove`,
+  `memory_freeze_clear`: lease-gated server-managed value freezing.
+  `memory_freeze` writes the pinned bytes once (like `memory_write`) and then
+  re-applies them at ~20 Hz through the serialized bridge queue, undoing the
+  program's own updates to the range; re-registering the same space+address
+  updates the pinned bytes, `rom_load` purges the whole set, and both mutating
+  calls are recorded in the mutation ledger. The list tool reports byte
+  length, write count, last write time, and the last periodic-write error;
+  `memory_freeze_clear` drops every entry at once. Validated by unit tests and
+  the live smoke (pinning across a running window, write-count growth,
+  per-entry removal, bulk clear).
 
 ### Changed
 
 - README rewritten: the old copy still described the project as a foundation
   shell that could not read from a running Exodus; it now summarizes the
-  62-tool catalog by roadmap phase, the delivered status, configuration, and
+  63-tool catalog by roadmap phase, the delivered status, configuration, and
   the MIT license.
 - License: `exodus-mcp` is now MIT-licensed (`LICENSE`); the Exodus MIT notice
   remains applicable to the submodule and any redistributed Exodus-derived

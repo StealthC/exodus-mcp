@@ -207,3 +207,57 @@ func TestMemoryFreezeLimit(t *testing.T) {
 		t.Fatalf("expected freeze_limit, got %v", over)
 	}
 }
+
+func TestMemoryFreezeClear(t *testing.T) {
+	client := freezeWriteClient()
+	server := newTestServer(t, client)
+	lease := structured(postToolCall(t, server, "context_lease_acquire", `{"purpose":"freeze clear"}`))
+	leaseID := lease["lease_id"].(string)
+
+	// Clear without a lease is rejected.
+	noLease := structured(postToolCall(t, server, "memory_freeze_clear", `{}`))
+	if noLease["code"] != "lease_required" {
+		t.Fatalf("clear without lease must fail: %v", noLease)
+	}
+
+	for index := 0; index < 3; index++ {
+		result := structured(postToolCall(t, server, "memory_freeze", fmt.Sprintf(`{"lease_id":%q,"space":"m68k-bus","address":%d,"data":%q}`, leaseID, index*2, freezeData(0x05))))
+		if result["code"] != nil {
+			t.Fatalf("entry %d failed: %v", index, result)
+		}
+	}
+	listed := structured(postToolCall(t, server, "memory_freeze_list", `{}`))
+	if listed["freezes_total"] != float64(3) {
+		t.Fatalf("expected 3 entries before clear: %v", listed)
+	}
+
+	cleared := structured(postToolCall(t, server, "memory_freeze_clear", fmt.Sprintf(`{"lease_id":%q}`, leaseID)))
+	if cleared["removed"] != float64(3) || cleared["freezes_total"] != float64(0) {
+		t.Fatalf("clear result wrong: %v", cleared)
+	}
+	listed = structured(postToolCall(t, server, "memory_freeze_list", `{}`))
+	if listed["freezes_total"] != float64(0) {
+		t.Fatalf("list must be empty after clear: %v", listed)
+	}
+	before := countCalls(client, "mem_write")
+	server.applyFreezes()
+	if after := countCalls(client, "mem_write"); after != before {
+		t.Fatalf("cleared freezes must not write again (%d -> %d)", before, after)
+	}
+
+	// Clearing an already-empty set is a harmless no-op reporting zero.
+	clearedAgain := structured(postToolCall(t, server, "memory_freeze_clear", fmt.Sprintf(`{"lease_id":%q}`, leaseID)))
+	if clearedAgain["removed"] != float64(0) {
+		t.Fatalf("second clear must report zero: %v", clearedAgain)
+	}
+
+	log := structured(postToolCall(t, server, "context_mutation_log", `{}`))
+	entries := log["entries"].([]any)
+	tools := map[string]bool{}
+	for _, e := range entries {
+		tools[e.(map[string]any)["tool"].(string)] = true
+	}
+	if !tools["memory_freeze_clear"] {
+		t.Fatalf("mutation log missing memory_freeze_clear: %v", entries)
+	}
+}

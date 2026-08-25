@@ -7,7 +7,7 @@ Mega Drive / Genesis ROM analysis.
 The Go server speaks Streamable HTTP at `/mcp` (normative target MCP
 `2026-07-28`, with a bounded legacy initialization-era layer), and drives a
 single Exodus instance through an authenticated local named pipe into a native
-C++ plugin. Currently **62 analysis tools** cover the phased roadmap from
+C++ plugin. Currently **63 analysis tools** cover the phased roadmap from
 bridge/context foundations through VDP graphics, deterministic controlled
 experimentation, and Phase 5 advanced analysis (ROM header parsing, snapshot
 memory search, watchpoint-triggered tracing, coverage, and scripted
@@ -61,9 +61,10 @@ modern and legacy dispatchers. An overview by roadmap phase:
   `vdp_sprite_table`, `vdp_pixel_info`, `frame_capture`.
 - **Phase 4 (controlled experimentation):** `rom_load`, CPU pause/run/step/
   step-over/step-out, MCP-managed breakpoints and watchpoints,
-  lease-gated `memory_write`, `memory_freeze` (20 Hz server-side value
-  freezing), `frame_advance`, `input_set`, `state_save`/`state_load`/
-  `state_list`, `context_lease_*`, `context_mutation_log`.
+  lease-gated `memory_write`, `memory_freeze` family (20 Hz server-side value
+  freezing; set/list/remove/clear), `frame_advance`, `input_set`,
+  `state_save`/`state_load`/`state_list`, `context_lease_*`,
+  `context_mutation_log`.
 - **Phase 5 (advanced analysis):** `rom_info` (Sega header + checksum),
   `memory_search`, `memory_diff` (cheat-finder snapshot comparison),
   `cpu_trace_capture_watchpoint`, `experiment_run`.

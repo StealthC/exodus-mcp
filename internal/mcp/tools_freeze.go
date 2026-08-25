@@ -224,6 +224,15 @@ func freezeToolSpecs() []toolSpec {
 			}, []string{"lease_id", "freeze_id"}),
 			run: runMemoryFreezeRemove,
 		},
+		{
+			name:        "memory_freeze_clear",
+			description: "Remove every frozen cell range at once, so the emulated program can update all of them again. Returns how many entries were removed. Requires an exclusive context lease.",
+			schema: objectSchema(map[string]any{
+				"context":  contextProperty(),
+				"lease_id": stringProperty("Active lease id from context_lease_acquire."),
+			}, []string{"lease_id"}),
+			run: runMemoryFreezeClear,
+		},
 	}
 }
 
@@ -349,4 +358,28 @@ func runMemoryFreezeRemove(tc toolContext, args json.RawMessage) map[string]any 
 		"freeze_id": parsed.FreezeID,
 	})
 	return okResult(map[string]any{"freeze_id": parsed.FreezeID, "removed": true}, tc.modern)
+}
+
+type memoryFreezeClearArgs struct {
+	Context string `json:"context"`
+	LeaseID string `json:"lease_id"`
+}
+
+func runMemoryFreezeClear(tc toolContext, args json.RawMessage) map[string]any {
+	parsed, failure := decodeArgs[memoryFreezeClearArgs](args)
+	if failure != nil {
+		return failureResult(failure, tc.modern)
+	}
+	context, failure := resolveContext(tc.server, parsed.Context)
+	if failure != nil {
+		return failureResult(failure, tc.modern)
+	}
+	if failure := tc.server.requireLease(context, parsed.LeaseID, "memory_freeze_clear"); failure != nil {
+		return failureResult(failure, tc.modern)
+	}
+	removed := tc.server.freezes.purge()
+	tc.server.recordMutation(context, parsed.LeaseID, "memory_freeze_clear", map[string]any{
+		"removed": removed,
+	})
+	return okResult(map[string]any{"removed": removed, "freezes_total": 0}, tc.modern)
 }

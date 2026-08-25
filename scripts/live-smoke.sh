@@ -448,6 +448,16 @@ print(s)
 				freeze_rm=$(tool_call "memory_freeze_remove" "{\"lease_id\": \"$lease_id\", \"freeze_id\": \"$freeze_id\"}")
 				freeze_rm_flag=$(json_get "$freeze_rm" "str(parsed.get('removed', False)).lower()" 2>/dev/null)
 				check "memory_freeze_remove deletes the entry" "[ \"\$freeze_rm_flag\" = 'true' ]"
+
+				# memory_freeze_clear drops the whole set in one call.
+				tool_call "memory_freeze" "{\"lease_id\": \"$lease_id\", \"space\": \"m68k-bus\", \"address\": \"0xFF0002\", \"data\": \"$probe_byte\"}" >/dev/null
+				tool_call "memory_freeze" "{\"lease_id\": \"$lease_id\", \"space\": \"m68k-bus\", \"address\": \"0xFF0004\", \"data\": \"$probe_byte\"}" >/dev/null
+				freeze_clear=$(tool_call "memory_freeze_clear" "{\"lease_id\": \"$lease_id\"}")
+				freeze_cleared=$(json_get "$freeze_clear" "parsed.get('removed', -1)" 2>/dev/null)
+				check "memory_freeze_clear reports the removed count" "[ \"\$freeze_cleared\" = '2' ]"
+				freeze_after=$(tool_call "memory_freeze_list")
+				freeze_after_total=$(json_get "$freeze_after" "parsed.get('freezes_total', -1)" 2>/dev/null)
+				check "memory_freeze_clear empties the set" "[ \"\$freeze_after_total\" = '0' ]"
 			fi
 		fi
 

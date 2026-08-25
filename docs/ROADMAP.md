@@ -184,17 +184,19 @@ not manually decode opaque dumps in its prompt.
   entry. Value-freeze facilities remain deferred as optional. Validated live
   against Kid Chameleon: bus write with read-back, unaligned word-boundary
   writes, Z80 RAM, and error codes.
-- [x] `memory_freeze`, `memory_freeze_list`, `memory_freeze_remove`:
+- [x] `memory_freeze`, `memory_freeze_list`, `memory_freeze_remove`,
+  `memory_freeze_clear`:
   lease-gated server-managed value freezing. A registered cell range is
   written once immediately and then re-applied at 20 Hz by the Go server
   through the serialized bridge queue, continuously undoing the program's own
   updates (replacing the entry at the same space+address updates the pinned
   bytes; the set is purged on `rom_load` so stale ranges never reach a new
   cartridge's address map). `memory_freeze_list` surfaces write counts, last
-  write time, and the last periodic-write error; both mutating calls are
-  recorded in the mutation ledger. Validated live against Kid Chameleon:
-  lifecycle with running-window pinning, write-count growth, removal, and
-  smoke coverage.
+  write time, and the last periodic-write error; `memory_freeze_remove` stops
+  one entry and `memory_freeze_clear` drops the whole set; the mutating calls
+  are recorded in the mutation ledger. Validated live against Kid Chameleon:
+  lifecycle with running-window pinning, write-count growth, per-entry
+  removal, bulk clear, and smoke coverage.
 
 ## Phase 5 — Advanced analysis
 
