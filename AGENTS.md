@@ -86,10 +86,18 @@ Guidance for contributors and coding agents working in this workspace.
     `Exodus.nightly.exe` and `exodus-mcp.exe`, plus port `127.0.0.1:8767`).
     Never start a second instance: only one process can bind the port, and
     each Exodus child pairs with one generated capability.
-  - Stop a running pair before installing a new build
-    (`taskkill /F /IM Exodus.nightly.exe /IM exodus-mcp.exe`): Windows locks
-    loaded images, so the plugin DLL cannot be copied while Exodus runs, and
-    a stale pair keeps serving old code.
+  - Stop a running pair before installing a new build with
+    `scripts/stop-windows.sh`, which first asks Exodus to close gracefully
+    (WM_CLOSE) so it can persist `settings.xml`, then force-kills after a
+    grace period (fallback: `taskkill /F /IM Exodus.nightly.exe /IM
+    exodus-mcp.exe`). Windows locks loaded images, so the plugin DLL cannot be
+    copied while Exodus runs, and a stale pair keeps serving old code.
+  - Exodus configuration persistence follows the emulator's own design: the
+    `settings.xml` prefs are written only on a clean shutdown, and the key
+    bindings (`Device.MapInput` in the default system module XML) are written
+    only by the manual **File → Save System** action. A forced kill loses any
+    in-session changes; prefer the graceful stop above instead of raw
+    `taskkill /F` whenever a clean exit matters.
   - Launch `run-windows.sh` **in the background** — the launcher does not
     return until the pair is closed, so a foreground invocation blocks the
     shell (redirect its output to `tmp/run-windows.log`). Then check health

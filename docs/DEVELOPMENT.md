@@ -62,6 +62,20 @@ The launcher reserves the HTTP port before it starts Exodus. A busy port fails
 without opening Exodus; if the server stops after the child starts, it
 terminates that child rather than leaving an orphaned emulator process.
 
+Stopping the pair from WSL: prefer `./scripts/stop-windows.sh`, which posts
+WM_CLOSE to the emulator window and waits a grace period before forcing a
+kill. This matters because Exodus persists its configuration only during a
+clean shutdown: the `settings.xml` preferences are written by
+`DestroySystemInterfaceThread` (the WM_CLOSE path), and key bindings
+(`Device.MapInput` entries in the default system module XML, e.g.
+`Modules\MegaDriveTestSystemNoBios.xml`) are written only by the manual
+**File → Save System** menu action. A forced kill (raw `taskkill /F`) loses
+any in-session UI changes, so rebinds made while the pair is managed by MCP
+"revert" on the next launch unless they were saved with **File → Save
+System** in the same install tree the launcher uses (its working directory is
+the Exodus install root, so both manual and MCP-driven sessions resolve the
+same `settings.xml` and `Modules\` folder).
+
 ## Windows server used from WSL
 
 Keep the MCP server bound to `127.0.0.1`. In the default WSL2 NAT mode, WSL
