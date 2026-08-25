@@ -5,9 +5,11 @@
 # bridge status, and emulator status. --full additionally exercises the
 # mutating CPU-control tools (pause/run, M68K step, breakpoint and watchpoint
 # lifecycle, paused frame-capture determinism), the Phase 4 lease-gated
-# surface (memory write, frame advance, input, snapshot round trip), and the
-# lease-gated experiment fixture (experiment_run over smoke-input.json with
-# manifest verification), always restoring running state on exit.
+# surface (memory write, frame advance, input, snapshot round trip), the
+# snapshot comparison surface (memory_search, memory_diff around a rendered
+# frame), and the lease-gated experiment fixture (experiment_run over
+# smoke-input.json with manifest verification), always restoring running state
+# on exit.
 #
 # Requires: bash, curl, python3. Run against an already-launched pair
 # (./scripts/run-windows.sh); never start a second pair for this script.
@@ -346,6 +348,17 @@ print(s)
 		check "memory_search honors a snapshot artifact" false
 	fi
 
+	# memory_diff against the same ROM snapshot: a fresh read of ROM cannot
+	# differ from the dump, and the header byte 0x53 lives at 0x101.
+	diff_rom=$(tool_call "memory_diff" "{\"snapshot_before_id\": \"$snap_id\", \"mode\": \"changed\", \"space\": \"m68k-bus\", \"start_address\": \"0x100\"}")
+	diff_cells=$(json_get "$diff_rom" "parsed.get('summary', {}).get('range', {}).get('cells_scanned', 0)" 2>/dev/null)
+	check "memory_diff scans the snapshot range" "[ \"\$diff_cells\" = '512' ]"
+	diff_changed=$(json_get "$diff_rom" "parsed.get('summary', {}).get('matches_total', -1)" 2>/dev/null)
+	check "memory_diff sees no change inside ROM" "[ \"\$diff_changed\" = '0' ]"
+	diff_byte=$(tool_call "memory_diff" "{\"snapshot_before_id\": \"$snap_id\", \"mode\": \"equal_to\", \"value\": 83, \"space\": \"m68k-bus\", \"start_address\": \"0x100\"}")
+	diff_equal=$(json_get "$diff_byte" "parsed.get('summary', {}).get('matches_total', 0)" 2>/dev/null)
+	check "memory_diff equal_to finds the header byte" "[ -n \"\$diff_equal\" ] && [ \"\$diff_equal\" -ge 1 ]"
+
 	step "Event-driven trace capture (watchpoint)"
 	# A fresh cartridge state keeps the trigger deterministic: repeated
 	# hit-and-rollback cycles can wedge the running game into a spin loop that
@@ -422,6 +435,21 @@ print(s)
 		else
 			completed=$(json_get "$advance" "parsed.get('frames_completed', 0)" 2>/dev/null)
 			check "frame_advance completes one frame" "[ \"\$completed\" = '1' ]"
+
+			# memory_diff around a rendered frame: dump 68K work RAM, advance
+			# one frame, dump again; running game state must move cells.
+			ram_before=$(tool_call "memory_dump" '{"space": "m68k-bus", "address": "0xFF0000", "length": 256}')
+			ram_before_id=$(json_get "$ram_before" "parsed.get('artifact', {}).get('id', '')" 2>/dev/null)
+			tool_call "frame_advance" "{\"lease_id\": \"$lease_id\", \"frames\": 1}" >/dev/null
+			ram_after=$(tool_call "memory_dump" '{"space": "m68k-bus", "address": "0xFF0000", "length": 256}')
+			ram_after_id=$(json_get "$ram_after" "parsed.get('artifact', {}).get('id', '')" 2>/dev/null)
+			if [ -z "$ram_before_id" ] || [ -z "$ram_after_id" ]; then
+				check "memory_diff sees the frame update work RAM" false
+			else
+				ram_diff=$(tool_call "memory_diff" "{\"snapshot_before_id\": \"$ram_before_id\", \"snapshot_after_id\": \"$ram_after_id\", \"mode\": \"changed\", \"width\": \"word\", \"start_address\": \"0xFF0000\"}")
+				ram_diff_total=$(json_get "$ram_diff" "parsed.get('summary', {}).get('matches_total', -1)" 2>/dev/null)
+				check "memory_diff sees the frame update work RAM" "[ -n \"\$ram_diff_total\" ] && [ \"\$ram_diff_total\" -ge 1 ]"
+			fi
 		fi
 
 		# input_set down/up; a workspace without a controller skips.

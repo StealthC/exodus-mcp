@@ -69,6 +69,26 @@ func phase5ToolSpecs() []toolSpec {
 			run: runMemorySearch,
 		},
 		{
+			name:        "memory_diff",
+			description: "Compare two consistent memory snapshots cell-by-cell and report cells matching a comparison mode. Without snapshot_after_id the region is read fresh into a snapshot first (never a live racy scan). Modes: changed, unchanged, increased, decreased, changed_by (signed delta), equal_to (after value), in_range (after value bounds). Width byte/word/long with explicit byte order (default big-endian) and aligned scanning by default. Returns bounded inline matches plus a full-results artifact.",
+			schema: objectSchema(map[string]any{
+				"snapshot_before_id": stringProperty("id of a memory-dump or memory-snapshot artifact representing the earlier state."),
+				"snapshot_after_id":  stringProperty("optional id of a memory-dump or memory-snapshot artifact representing the later state; when omitted, the before range is read fresh into a snapshot before comparing."),
+				"space":              stringProperty("Address space id from memory_spaces_list; required when snapshot_after_id is omitted."),
+				"mode":               enumProperty("Comparison mode.", []string{"changed", "unchanged", "increased", "decreased", "changed_by", "equal_to", "in_range"}),
+				"width":              enumProperty("Cell width. Default byte; word/long cells honor byte_order.", []string{"byte", "word", "long"}),
+				"byte_order":         enumProperty("Byte order for word/long cells. Default big-endian (M68K domain); use little-endian for Z80 RAM cells.", []string{"big-endian", "little-endian"}),
+				"value":              integerProperty("Value for equal_to (unsigned, must fit the width) or the signed delta for changed_by.", 0),
+				"min_value":          integerProperty("Lower bound for in_range.", 0),
+				"max_value":          integerProperty("Upper bound for in_range.", 0),
+				"start_address":      addressProperty(),
+				"max_matches":        integerProperty(fmt.Sprintf("Maximum inline matches (default %d, cap %d).", defaultSearchMaxMatches, maxSearchMaxMatches), 1),
+				"allow_misaligned":   booleanProperty("Scan every cell offset instead of aligning to the cell width in the address domain."),
+				"context":            contextProperty(),
+			}, []string{"snapshot_before_id", "mode"}),
+			run: runMemoryDiff,
+		},
+		{
 			name:        "rom_info",
 			description: "Parse the Mega Drive cartridge header at 0x100 (system type, copyright, titles, serial, checksum, I/O support, ROM/RAM/SRAM windows, region) and validate the header checksum against the computed Sega sum over the ROM body. Also reports the declared and reference memory mapping. Attaches a header-region hexdump artifact.",
 			schema:      objectSchema(map[string]any{"context": contextProperty()}, nil),
@@ -308,6 +328,366 @@ func parseHexPattern(raw string) ([]byte, *toolFailure) {
 		return nil, &toolFailure{Code: "invalid_params", Message: "pattern contains non-hex characters: " + err.Error()}
 	}
 	return decoded, nil
+}
+
+// ----------------------------------------------------------------------------------------------------------------------
+// memory_diff — cheat-finder snapshot comparison
+// ----------------------------------------------------------------------------------------------------------------------
+
+type memoryDiffArgs struct {
+	SnapshotBeforeID string  `json:"snapshot_before_id"`
+	SnapshotAfterID  string  `json:"snapshot_after_id"`
+	Space            string  `json:"space"`
+	Mode             string  `json:"mode"`
+	Width            string  `json:"width"`
+	ByteOrder        string  `json:"byte_order"`
+	Value            *int64  `json:"value"`
+	MinValue         *uint64 `json:"min_value"`
+	MaxValue         *uint64 `json:"max_value"`
+	StartAddress     any     `json:"start_address"`
+	MaxMatches       uint64  `json:"max_matches"`
+	AllowMisaligned  bool    `json:"allow_misaligned"`
+	Context          string  `json:"context"`
+}
+
+// diffWidths maps the width argument to its byte size.
+var diffWidths = map[string]int{
+	"byte": 1,
+	"word": 2,
+	"long": 4,
+}
+
+// maxCellValue returns the largest representable unsigned value for a width.
+func maxCellValue(width int) uint64 {
+	switch width {
+	case 2:
+		return 0xFFFF
+	case 4:
+		return 0xFFFFFFFF
+	default:
+		return 0xFF
+	}
+}
+
+// loadDiffSnapshot resolves one memory snapshot artifact and returns its raw
+// bytes, its descriptor, and the space used for a fresh read when needed.
+func loadDiffSnapshot(tc toolContext, contextID, id string) ([]byte, map[string]any, *toolFailure) {
+	meta, err := tc.server.store.Metadata(id, contextID)
+	if err != nil {
+		return nil, nil, &toolFailure{Code: "unknown_artifact", Message: err.Error()}
+	}
+	if meta.Kind != "memory-dump" && meta.Kind != "memory-snapshot" {
+		return nil, nil, &toolFailure{
+			Code:    "invalid_params",
+			Message: "snapshot ids must reference memory-dump or memory-snapshot artifacts; got kind " + meta.Kind,
+		}
+	}
+	data, _, err := tc.server.store.Bytes(id, contextID)
+	if err != nil {
+		return nil, nil, &toolFailure{Code: "artifact_error", Message: err.Error()}
+	}
+	return data, artifactDescriptor(tc.server, meta, contextID), nil
+}
+
+func runMemoryDiff(tc toolContext, args json.RawMessage) map[string]any {
+	parsed, failure := decodeArgs[memoryDiffArgs](args)
+	if failure != nil {
+		return failureResult(failure, tc.modern)
+	}
+	if parsed.SnapshotBeforeID == "" {
+		return errorResult("invalid_params", "snapshot_before_id is required", tc.modern)
+	}
+	if parsed.Mode == "" {
+		return errorResult("invalid_params", "mode is required", tc.modern)
+	}
+	switch parsed.Mode {
+	case "changed", "unchanged", "increased", "decreased", "changed_by", "equal_to", "in_range":
+	default:
+		return errorResult("invalid_params", "mode must be one of changed, unchanged, increased, decreased, changed_by, equal_to, in_range", tc.modern)
+	}
+	width := 1
+	widthName := "byte"
+	if parsed.Width != "" {
+		resolved, supported := diffWidths[parsed.Width]
+		if !supported {
+			return errorResult("invalid_params", "width must be byte, word, or long", tc.modern)
+		}
+		width = resolved
+		widthName = parsed.Width
+	}
+	byteOrder := parsed.ByteOrder
+	if byteOrder == "" {
+		byteOrder = "big-endian"
+	}
+	if byteOrder != "big-endian" && byteOrder != "little-endian" {
+		return errorResult("invalid_params", "byte_order must be big-endian or little-endian", tc.modern)
+	}
+	cellMax := maxCellValue(width)
+	switch parsed.Mode {
+	case "equal_to":
+		if parsed.Value == nil {
+			return errorResult("invalid_params", "equal_to requires value", tc.modern)
+		}
+		if *parsed.Value < 0 || uint64(*parsed.Value) > cellMax {
+			return errorResult("invalid_params", fmt.Sprintf("value %d is outside the representable range 0..%d for width %s", *parsed.Value, cellMax, widthName), tc.modern)
+		}
+	case "changed_by":
+		if parsed.Value == nil {
+			return errorResult("invalid_params", "changed_by requires value (the signed delta)", tc.modern)
+		}
+	case "in_range":
+		if parsed.MinValue == nil || parsed.MaxValue == nil {
+			return errorResult("invalid_params", "in_range requires min_value and max_value", tc.modern)
+		}
+		if *parsed.MinValue > *parsed.MaxValue {
+			return errorResult("invalid_params", "min_value must not exceed max_value", tc.modern)
+		}
+		if *parsed.MinValue > cellMax {
+			return errorResult("invalid_params", fmt.Sprintf("min_value %d is outside the representable range 0..%d for width %s", *parsed.MinValue, cellMax, widthName), tc.modern)
+		}
+	}
+
+	context, failure := resolveContext(tc.server, parsed.Context)
+	if failure != nil {
+		return failureResult(failure, tc.modern)
+	}
+	startAddress := uint64(0)
+	if parsed.StartAddress != nil {
+		startAddress, failure = parseAddress(parsed.StartAddress)
+		if failure != nil {
+			return failureResult(failure, tc.modern)
+		}
+	}
+	maxMatches := parsed.MaxMatches
+	if maxMatches == 0 {
+		maxMatches = defaultSearchMaxMatches
+	}
+	if maxMatches > maxSearchMaxMatches {
+		return failureResult(&toolFailure{
+			Code:    "invalid_params",
+			Message: fmt.Sprintf("max_matches is capped at %d inline matches.", maxSearchMaxMatches),
+		}, tc.modern)
+	}
+
+	beforeBytes, beforeSnapshot, failure := loadDiffSnapshot(tc, context.ID, parsed.SnapshotBeforeID)
+	if failure != nil {
+		return failureResult(failure, tc.modern)
+	}
+	if len(beforeBytes) == 0 {
+		return failureResult(&toolFailure{Code: "invalid_params", Message: "the before snapshot is empty; nothing to compare."}, tc.modern)
+	}
+
+	var afterBytes []byte
+	var afterSnapshot map[string]any
+	freshAfterRead := false
+	if parsed.SnapshotAfterID != "" {
+		afterBytes, afterSnapshot, failure = loadDiffSnapshot(tc, context.ID, parsed.SnapshotAfterID)
+		if failure != nil {
+			return failureResult(failure, tc.modern)
+		}
+		if len(afterBytes) != len(beforeBytes) {
+			return failureResult(&toolFailure{
+				Code:    "invalid_params",
+				Message: fmt.Sprintf("snapshot lengths differ: before %d bytes, after %d bytes; both snapshots must cover the same range", len(beforeBytes), len(afterBytes)),
+			}, tc.modern)
+		}
+	} else {
+		if parsed.Space == "" {
+			return errorResult("invalid_params", "space is required when snapshot_after_id is omitted", tc.modern)
+		}
+		raw, _, _, failure := readBridgeBytes(tc, parsed.Space, startAddress, uint64(len(beforeBytes)))
+		if failure != nil {
+			return failureResult(failure, tc.modern)
+		}
+		afterBytes = raw
+		stored, err := tc.server.store.Put(context.ID, "memory-snapshot", "application/octet-stream", raw)
+		if err != nil {
+			return failureResult(&toolFailure{Code: "artifact_error", Message: err.Error()}, tc.modern)
+		}
+		afterSnapshot = artifactDescriptor(tc.server, stored, context.ID)
+		freshAfterRead = true
+	}
+
+	// Alignment policy: by default the scan is aligned to the cell width in
+	// the address domain, so a word scan of a big-endian 68K range starts at
+	// an even address; misaligned cells are skipped. allow_misaligned
+	// opts into scanning every cell offset.
+	firstCell := uint64(0)
+	alignment := "aligned-to-width"
+	if parsed.AllowMisaligned {
+		alignment = "misaligned-scan"
+	} else if startAddress%uint64(width) != 0 {
+		firstCell = uint64(width) - startAddress%uint64(width)
+	}
+
+	matches := []map[string]any{}
+	records := []map[string]any{}
+	var total uint64
+	littleEndian := byteOrder == "little-endian"
+	// Aligned scans advance one cell per step; a misaligned scan advances one
+	// byte so every byte offset is visited as a cell.
+	stride := uint64(width)
+	if parsed.AllowMisaligned {
+		stride = 1
+	}
+	for offset := firstCell; offset+uint64(width) <= uint64(len(beforeBytes)); offset += stride {
+		beforeValue := decodeCell(beforeBytes, offset, width, littleEndian)
+		afterValue := decodeCell(afterBytes, offset, width, littleEndian)
+		matched := false
+		switch parsed.Mode {
+		case "changed":
+			matched = beforeValue != afterValue
+		case "unchanged":
+			matched = beforeValue == afterValue
+		case "increased":
+			matched = afterValue > beforeValue
+		case "decreased":
+			matched = afterValue < beforeValue
+		case "changed_by":
+			matched = int64(afterValue)-int64(beforeValue) == *parsed.Value
+		case "equal_to":
+			matched = afterValue == uint64(*parsed.Value)
+		case "in_range":
+			matched = afterValue >= *parsed.MinValue && afterValue <= *parsed.MaxValue
+		}
+		if !matched {
+			continue
+		}
+		total++
+		address := startAddress + offset
+		delta := int64(afterValue) - int64(beforeValue)
+		if uint64(len(records)) < maxSearchArtifactMatches {
+			records = append(records, map[string]any{
+				"address": address,
+				"offset":  offset,
+				"before":  beforeValue,
+				"after":   afterValue,
+				"delta":   delta,
+			})
+		}
+		if uint64(len(matches)) < maxMatches {
+			matches = append(matches, map[string]any{
+				"address":     address,
+				"address_hex": fmt.Sprintf("0x%X", address),
+				"offset":      offset,
+				"before":      beforeValue,
+				"after":       afterValue,
+				"delta":       delta,
+			})
+		}
+	}
+
+	cellsScanned := uint64(0)
+	trailingBytes := uint64(0)
+	if parsed.AllowMisaligned {
+		if uint64(len(beforeBytes)) >= uint64(width) {
+			cellsScanned = 1 + uint64(len(beforeBytes)) - uint64(width)
+		}
+	} else {
+		if uint64(len(beforeBytes)) > firstCell {
+			cellsScanned = (uint64(len(beforeBytes)) - firstCell) / uint64(width)
+		}
+		trailingBytes = uint64(len(beforeBytes)) - firstCell - cellsScanned*uint64(width)
+	}
+	inlineTruncated := uint64(len(matches)) < total
+	artifactTruncated := uint64(len(records)) < total
+
+	rangeInfo := map[string]any{
+		"start_address":          startAddress,
+		"byte_length":            len(beforeBytes),
+		"width_bytes":            width,
+		"cells_scanned":          cellsScanned,
+		"first_cell_offset":      firstCell,
+		"trailing_bytes_ignored": trailingBytes,
+	}
+	document := map[string]any{
+		"kind":             "memory-diff-results",
+		"mode":             parsed.Mode,
+		"width":            widthName,
+		"width_bytes":      width,
+		"byte_order":       byteOrder,
+		"alignment":        alignment,
+		"interpretation":   fmt.Sprintf("cells are compared at %d-byte granularity in address order; the %s representation is applied per cell and %s is the alignment policy", width, byteOrder, alignment),
+		"range":            rangeInfo,
+		"before_snapshot":  beforeSnapshot,
+		"after_snapshot":   afterSnapshot,
+		"fresh_after_read": freshAfterRead,
+		"matches_total":    total,
+		"truncated":        artifactTruncated,
+		"matches":          records,
+	}
+	if parsed.Mode == "equal_to" {
+		document["value"] = *parsed.Value
+	}
+	if parsed.Mode == "changed_by" {
+		document["delta"] = *parsed.Value
+	}
+	if parsed.Mode == "in_range" {
+		document["min_value"] = *parsed.MinValue
+		document["max_value"] = *parsed.MaxValue
+	}
+	documentBytes, err := json.Marshal(document)
+	if err != nil {
+		return failureResult(&toolFailure{Code: "artifact_error", Message: err.Error()}, tc.modern)
+	}
+	storedResults, err := tc.server.store.Put(context.ID, "memory-diff-results", "application/json", documentBytes)
+	if err != nil {
+		return failureResult(&toolFailure{Code: "artifact_error", Message: err.Error()}, tc.modern)
+	}
+
+	summary := map[string]any{
+		"kind":                 "memory-diff",
+		"mode":                 parsed.Mode,
+		"width":                widthName,
+		"width_bytes":          width,
+		"byte_order":           byteOrder,
+		"alignment":            alignment,
+		"interpretation":       fmt.Sprintf("cells are compared at %d-byte granularity in address order; the %s representation is applied per cell and %s is the alignment policy", width, byteOrder, alignment),
+		"range":                rangeInfo,
+		"before_snapshot":      beforeSnapshot,
+		"after_snapshot":       afterSnapshot,
+		"fresh_after_read":     freshAfterRead,
+		"matches_total":        total,
+		"inline_matches_shown": len(matches),
+		"matches_truncated":    inlineTruncated,
+		"sha256":               storedResults.SHA256,
+	}
+	if parsed.Mode == "equal_to" {
+		summary["value"] = *parsed.Value
+	}
+	if parsed.Mode == "changed_by" {
+		summary["delta"] = *parsed.Value
+	}
+	if parsed.Mode == "in_range" {
+		summary["min_value"] = *parsed.MinValue
+		summary["max_value"] = *parsed.MaxValue
+	}
+	return okResult(map[string]any{
+		"summary":  summary,
+		"matches":  matches,
+		"artifact": artifactDescriptor(tc.server, storedResults, context.ID),
+	}, tc.modern)
+}
+
+// decodeCell reads one cell of the given width from data at offset using the
+// declared byte order. Offsets are byte offsets within the snapshot; the
+// snapshot preserves address order, so the byte order only affects how the
+// cell's bytes are combined into a numeric value.
+func decodeCell(data []byte, offset uint64, width int, littleEndian bool) uint64 {
+	switch width {
+	case 2:
+		if littleEndian {
+			return uint64(binary.LittleEndian.Uint16(data[offset : offset+2]))
+		}
+		return uint64(binary.BigEndian.Uint16(data[offset : offset+2]))
+	case 4:
+		if littleEndian {
+			return uint64(binary.LittleEndian.Uint32(data[offset : offset+4]))
+		}
+		return uint64(binary.BigEndian.Uint32(data[offset : offset+4]))
+	default:
+		return uint64(data[offset])
+	}
 }
 
 // ----------------------------------------------------------------------------------------------------------------------
