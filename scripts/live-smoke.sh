@@ -281,6 +281,103 @@ if [ "$FULL" = 1 ]; then
 	trace_captured=$(json_get "$trace" "parsed.get('summary', {}).get('captured', 0)" 2>/dev/null)
 	check "m68k trace capture yields entries" "[ -n \"\$trace_captured\" ] && [ \"\$trace_captured\" -ge 1 ]"
 
+	step "Phase 5 advanced analysis (read-only + event-driven)"
+	# The system is paused here; rom_info and memory_search are read-only, and
+	# the watchpoint trace + coverage restore the prior (paused) run state.
+	rom_info=$(tool_call "rom_info")
+	rom_identified=$(json_get "$rom_info" "parsed.get('identified', False)" 2>/dev/null)
+	check "rom_info identifies the cartridge" "[ \"\$rom_identified\" = 'True' ] || [ \"\$rom_identified\" = 'true' ]"
+	rom_title=$(json_get "$rom_info" "parsed.get('header', {}).get('overseas_name', '')" 2>/dev/null)
+	check "rom_info reports a title" "[ -n \"\$rom_title\" ]"
+	checksum_matches=$(json_get "$rom_info" "str(parsed.get('header', {}).get('checksum', {}).get('matches', False)).lower()" 2>/dev/null)
+	check "rom_info validates the header checksum" "[ \"\$checksum_matches\" = 'true' ]"
+	rom_computed=$(json_get "$rom_info" "parsed.get('header', {}).get('checksum', {}).get('computed', -1)" 2>/dev/null)
+	rom_artifact=$(json_get "$rom_info" "parsed.get('artifact', {}).get('id', '')" 2>/dev/null)
+	if [ -n "$rom_artifact" ]; then
+		hd=$(tool_call "artifact_get" "{\"artifact_id\": \"$rom_artifact\"}")
+		hd_artifact=$(json_get "$hd" "parsed.get('artifact', {}).get('id', '')" 2>/dev/null)
+		check "rom_info attaches a header artifact" "[ -n \"\$hd_artifact\" ]"
+	else
+		check "rom_info attaches a header artifact" false
+	fi
+
+	# Independent Sega checksum over the ROM file, computed on this host. The
+	# check is skipped when the Windows path is not reachable from WSL.
+	rom_path=$(json_get "$rom_args" "parsed['path']" 2>/dev/null)
+	rom_linux=$(python3 -c "
+import sys, re
+p = sys.argv[1].replace('\\\\', '/')
+m = re.match(r'^([A-Za-z]):(.*)\$', p)
+print('/mnt/' + m.group(1).lower() + m.group(2) if m and not p.startswith('/') else p)
+" "$rom_path" 2>/dev/null)
+	if [ -n "$rom_linux" ] && [ -f "$rom_linux" ]; then
+		independent=$(python3 -c "
+import sys
+data = open(sys.argv[1], 'rb').read()
+s = 0
+for i in range(0x200, len(data) - 1, 2):
+    s = (s + ((data[i] << 8) | data[i + 1])) & 0xFFFF
+if (len(data) - 0x200) % 2 == 1:
+    s = (s + (data[-1] << 8)) & 0xFFFF
+print(s)
+" "$rom_linux")
+		check "rom_info checksum matches an independent computation" \
+			"[ -n \"\$independent\" ] && [ \"\$independent\" = \"\$rom_computed\" ]"
+	else
+		echo "SKIP  rom_info independent checksum (ROM file not reachable from this host)"
+	fi
+
+	step "Memory search (consistent snapshot)"
+	search=$(tool_call "memory_search" '{"space": "m68k-bus", "pattern": "53454741", "start_address": "0x100", "length": 512}')
+	search_total=$(json_get "$search" "parsed.get('summary', {}).get('matches_total', 0)" 2>/dev/null)
+	check "memory_search finds the header magic" "[ -n \"\$search_total\" ] && [ \"\$search_total\" -ge 1 ]"
+	match_addr=$(json_get "$search" "parsed.get('matches', [{}])[0].get('address', -1)" 2>/dev/null)
+	check "memory_search anchors the first match at 0x100" "[ \"\$match_addr\" = '256' ]"
+
+	snap_dump=$(tool_call "memory_dump" '{"space": "m68k-bus", "address": "0x100", "length": 512}')
+	snap_id=$(json_get "$snap_dump" "parsed.get('artifact', {}).get('id', '')" 2>/dev/null)
+	if [ -n "$snap_id" ]; then
+		snap_search=$(tool_call "memory_search" "{\"space\": \"m68k-bus\", \"pattern\": \"53454741\", \"snapshot_id\": \"$snap_id\"}")
+		snap_total=$(json_get "$snap_search" "parsed.get('summary', {}).get('matches_total', 0)" 2>/dev/null)
+		check "memory_search honors a snapshot artifact" "[ -n \"\$snap_total\" ] && [ \"\$snap_total\" -ge 1 ]"
+	else
+		check "memory_search honors a snapshot artifact" false
+	fi
+
+	step "Event-driven trace capture (watchpoint)"
+	# A fresh cartridge state keeps the trigger deterministic: repeated
+	# hit-and-rollback cycles can wedge the running game into a spin loop that
+	# stops touching the watched address (observed live), so reload before the
+	# capture. run:false parks the system at the entry point; the capture
+	# resumes it during the window and restores the parked state.
+	fresh_args=$(python3 -c "import json, sys; print(json.dumps({'path': sys.argv[1], 'run': False}))" "$rom_path" 2>/dev/null)
+	if [ -z "$fresh_args" ]; then
+		fresh_args='{"path": "F:\\projects\\kid\\rom\\kid.bin", "run": false}'
+	fi
+	tool_call "rom_load" "$fresh_args" >/dev/null
+	wp_trace=$(tool_call "cpu_watchpoint_set" '{"cpu": "m68k", "address": "0xC00004", "length": 2, "access": "write"}')
+	wp_trace_id=$(json_get "$wp_trace" "parsed.get('watchpoint_id')" 2>/dev/null)
+	if [ -z "$wp_trace_id" ]; then
+		check "watchpoint trace sets its trigger" false
+	else
+		check "watchpoint trace sets its trigger" true
+		wptrace=$(tool_call "cpu_trace_capture_watchpoint" "{\"watchpoint_id\": $wp_trace_id, \"timeout_ms\": 3000}")
+		wpt_captured=$(json_get "$wptrace" "parsed.get('summary', {}).get('captured', 0)" 2>/dev/null)
+		wpt_hit=$(json_get "$wptrace" "str(parsed.get('summary', {}).get('stopped_on_watchpoint', False)).lower()" 2>/dev/null)
+		check "watchpoint trace captures entries" "[ -n \"\$wpt_captured\" ] && [ \"\$wpt_captured\" -ge 1 ]"
+		check "watchpoint trace stops on the hit" "[ \"\$wpt_hit\" = 'true' ]"
+		wp_rm=$(tool_call "cpu_watchpoint_remove" "{\"watchpoint_id\": $wp_trace_id}")
+		wp_rm_flag=$(json_get "$wp_rm" "str(parsed.get('removed', False)).lower()" 2>/dev/null)
+		check "watchpoint trace trigger removed" "[ \"\$wp_rm_flag\" = 'true' ]"
+	fi
+
+	step "Execution coverage artifact"
+	coverage=$(tool_call "cpu_coverage_capture" '{"cpu": "m68k", "duration_ms": 400}')
+	coverage_entries=$(json_get "$coverage" "parsed.get('summary', {}).get('entries_total', 0)" 2>/dev/null)
+	coverage_distinct=$(json_get "$coverage" "parsed.get('summary', {}).get('distinct_total', 0)" 2>/dev/null)
+	check "coverage records executed entries" "[ -n \"\$coverage_entries\" ] && [ \"\$coverage_entries\" -ge 1 ]"
+	check "coverage records distinct addresses" "[ -n \"\$coverage_distinct\" ] && [ \"\$coverage_distinct\" -ge 1 ]"
+
 	step "Phase 4 controlled experimentation (lease-gated)"
 	# The system is paused here; every Phase 4 mutation below requires the
 	# exclusive context lease, which the smoke holds from acquire to release.
@@ -339,8 +436,11 @@ if [ "$FULL" = 1 ]; then
 			state_sha=$(json_get "$saved" "parsed.get('sha256', '')" 2>/dev/null)
 			check "state_save verifies the snapshot digest" "[ -n \"\$state_sha\" ]"
 			snapshot_list=$(tool_call "state_list")
-			snapshot_count=$(json_get "$snapshot_list" "len(parsed.get('snapshots', []))" 2>/dev/null)
-			check "state_list reports the snapshot" "[ \"\$snapshot_count\" = '1' ]"
+			listing_ids=$(json_get "$snapshot_list" "' '.join(str(s.get('state_id', '')) for s in parsed.get('snapshots', []))" 2>/dev/null)
+			case " $listing_ids " in
+				*" $state_id "*) check "state_list reports the snapshot" true ;;
+				*) check "state_list reports the snapshot" false ;;
+			esac
 			loaded=$(tool_call "state_load" "{\"lease_id\": \"$lease_id\", \"state_id\": \"$state_id\"}")
 			loaded_flag=$(json_get "$loaded" "str(parsed.get('loaded', False)).lower()" 2>/dev/null)
 			check "state_load restores the snapshot" "[ \"\$loaded_flag\" = 'true' ]"

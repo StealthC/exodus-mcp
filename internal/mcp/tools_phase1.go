@@ -177,10 +177,18 @@ type deviceInfo struct {
 	Memory       bool   `json:"memory"`
 }
 
+type emulatorStatusRom struct {
+	Loaded          bool   `json:"loaded"`
+	SizeBytes       uint64 `json:"size_bytes"`
+	PaddedSizeBytes uint64 `json:"padded_size_bytes"`
+	Path            string `json:"path"`
+}
+
 type emulatorStatusData struct {
-	SystemRunning bool         `json:"system_running"`
-	Modules       []moduleInfo `json:"modules"`
-	Devices       []deviceInfo `json:"devices"`
+	SystemRunning bool              `json:"system_running"`
+	Modules       []moduleInfo      `json:"modules"`
+	Devices       []deviceInfo      `json:"devices"`
+	Rom           emulatorStatusRom `json:"rom"`
 }
 
 func fetchEmulatorStatus(tc toolContext) (*emulatorStatusData, *toolFailure) {
@@ -210,6 +218,7 @@ func runEmulatorStatus(tc toolContext, _ json.RawMessage) map[string]any {
 		"system_running": status.SystemRunning,
 		"modules":        modules,
 		"devices":        devices,
+		"rom":            status.Rom,
 		"consistency":    "live",
 	}, tc.modern)
 }
@@ -253,11 +262,40 @@ func runTargetInfo(tc toolContext, _ json.RawMessage) map[string]any {
 			"assumed":  true,
 			"note":     "The baseline is derived from the Mega Drive modules shipped with Exodus; explicit target detection is planned.",
 		},
-		"rom": map[string]any{
-			"identified": false,
-			"note":       "ROM/header parsing is planned for the advanced analysis phase.",
-		},
+		"rom": targetInfoROM(tc),
 	}, tc.modern)
+}
+
+// targetInfoROM fills the rom summary from a light header read. Any read or
+// decode failure keeps target_info usable and honest by reporting no cartridge
+// identified; the full parse lives in rom_info.
+func targetInfoROM(tc toolContext) map[string]any {
+	fallback := map[string]any{
+		"identified": false,
+		"note":       "No Mega Drive cartridge header at 0x100; load a ROM with rom_load, then use rom_info for the full parse.",
+	}
+	header, _, _, failure := readBridgeBytes(tc, "m68k-bus", 0x100, 0x100)
+	if failure != nil {
+		fallback["note"] = "Header read unavailable (" + failure.Message + "); use rom_info once a cartridge is loaded."
+		return fallback
+	}
+	parsed, failure := decodeMDHeader(header)
+	if failure != nil {
+		fallback["note"] = failure.Message
+		return fallback
+	}
+	title := parsed.Overseas
+	if title == "" {
+		title = parsed.Domestic
+	}
+	return map[string]any{
+		"identified":  true,
+		"system_type": parsed.SystemType,
+		"title":       title,
+		"serial":      parsed.Serial,
+		"region":      parsed.Region,
+		"note":        "Header summary; the full parsed header, checksum, and mapping are available through rom_info.",
+	}
 }
 
 // ----------------------------------------------------------------------------------------------------------------------

@@ -134,6 +134,13 @@ private:
 	std::wstring _capability;
 	unsigned int _loadedModuleCount;
 	bool _bridgeEnabled;
+	// The most recent ROM loaded through the bridge (rom_load). emulator_status
+	// reports these so server-side tools can bound reads (header parsing,
+	// checksums) without mirroring Exodus's own module introspection.
+	bool _romLoaded;
+	std::wstring _romPath;
+	unsigned long long _romSizeBytes;
+	unsigned long long _romPaddedSizeBytes;
 	unsigned long long _nextBreakpointID;
 	std::map<unsigned long long, ManagedBreakpoint> _managedBreakpoints;
 	unsigned long long _nextWatchpointID;

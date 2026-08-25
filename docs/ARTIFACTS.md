@@ -118,6 +118,17 @@ cleanup will prevent unbounded disk growth.
 - A script may process artifacts directly, but its output returns through the
   same bounded summary/artifact policy.
 
+## Recognized artifact kinds
+
+| Kind | Producer | MIME | Contents |
+| --- | --- | --- | --- |
+| `memory-dump` | `memory_dump` | `application/octet-stream` | Raw memory range bytes |
+| `memory-snapshot` | `memory_search` (internal) | `application/octet-stream` | Consistent raw snapshot of the searched range |
+| `memory-search-results` | `memory_search` | `application/json` | Space, pattern, byte-order note, searched range, match addresses |
+| `cpu-trace` | `cpu_trace_capture`, `cpu_trace_capture_watchpoint` | `text/plain; charset=utf-8` | Executed instruction trace lines |
+| `cpu-coverage` | `cpu_coverage_capture` | `application/json` | Executed addresses, merged ranges, page histogram |
+| `rom-header` | `rom_info` | `application/octet-stream` | 256-byte cartridge header region at cart offset 0x100 |
+
 ## Testing requirements
 
 Artifact tests must cover: stable ID lookup, authentication, unknown IDs,

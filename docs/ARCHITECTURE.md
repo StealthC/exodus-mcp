@@ -98,6 +98,13 @@ paths as the built-in Exodus debug windows (`IMemory::ReadMemoryEntry`,
 and the trace ring buffer). No memory mutation, frame advance, ROM loading,
 input injection, or scripting is implemented.
 
+`emulator_status` reports the ROM loaded through `rom_load` (path, file size,
+padded mapping size) so server-side tools can bound header and checksum reads
+across the pipe. `trace_capture` accepts an optional `watchpoint_id`: in that
+event-driven mode the plugin resumes the system (even from a paused state),
+ends the window when a managed watchpoint's hit counter advances, and returns
+the fired watchpoint ids plus a stop reason, restoring the prior run state.
+
 The Go server owns an artifact store (immutable bytes, SHA-256 descriptors,
 ETag plus byte-range downloads under `/artifacts/{id}`, startup sweeps) and an
 analysis-context registry with an implicit default context. Tools return

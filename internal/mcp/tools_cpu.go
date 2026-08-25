@@ -238,34 +238,13 @@ func runCpuTraceCapture(tc toolContext, args json.RawMessage) map[string]any {
 		return failureResult(failure, tc.modern)
 	}
 
-	traceText, _ := payload["trace_text"].(string)
-	stored, err := tc.server.store.Put(context.ID, "cpu-trace", "text/plain; charset=utf-8", []byte(traceText))
-	if err != nil {
-		return failureResult(&toolFailure{Code: "artifact_error", Message: err.Error()}, tc.modern)
+	summary, artifactDesc, failure := traceArtifactFromPayload(tc, context, payload)
+	if failure != nil {
+		return failureResult(failure, tc.modern)
 	}
-	delete(payload, "trace_text")
-	captured, _ := payload["captured"].(float64)
-	timedOut, _ := payload["timed_out"].(bool)
-	cpu, _ := payload["cpu"].(string)
-	sample, _ := payload["sample"].([]any)
-	captureChannel, _ := payload["capture_channel"].(string)
-
-	summary := map[string]any{
-		"kind":          "cpu-trace",
-		"cpu":           cpu,
-		"captured":      int(captured),
-		"timed_out":     timedOut,
-		"sampling_note": "Sampling follows live emulation only; a paused system yields few or no entries.",
-		"sample":        sample,
-		"sha256":        stored.SHA256,
-	}
-	if captureChannel != "" {
-		summary["capture_channel"] = captureChannel
-	}
-
 	return okResult(map[string]any{
 		"summary":  summary,
-		"artifact": artifactDescriptor(tc.server, stored, context.ID),
+		"artifact": artifactDesc,
 	}, tc.modern)
 }
 

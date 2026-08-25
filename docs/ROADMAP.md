@@ -187,13 +187,28 @@ not manually decode opaque dumps in its prompt.
 
 ## Phase 5 — Advanced analysis
 
-- Code/data logging and coverage artifacts.
-- `memory_search`: byte-pattern search over a consistent dump-artifact
-  snapshot instead of a live racy scan; bounded inline matches plus a
-  full-results artifact.
-- Event-driven trace capture triggered by watchpoints (the trace crash is
-  resolved, so the capture path is available again).
-- ROM/header parsing, checksums, mapping, and cartridge metadata.
+- [x] Code/data logging and coverage artifacts. `cpu_coverage_capture`
+  turns a bounded execution window into a coverage artifact: distinct
+  executed addresses, merged consecutive-address spans, and a page
+  histogram with the top pages inline. Server-side on the proven
+  trace-capture path; a byte-order note states the address domain.
+  Data-logging watchpoint modes remain deferred.
+- [x] `memory_search`: byte-pattern search over a consistent dump-artifact or
+  internal `memory-snapshot` instead of a live racy scan; bounded inline
+  matches plus a full-results artifact.
+- [x] Event-driven trace capture triggered by watchpoints (the trace crash is
+  resolved, so the capture path is available again). The `trace_capture`
+  bridge op accepts an optional `watchpoint_id`: the system runs toward the
+  managed watchpoint (even from a paused state), the window ends when the
+  watchpoint fires, and the response reports the fired watchpoint ids and
+  stop reason. New tool `cpu_trace_capture_watchpoint`.
+- [x] ROM/header parsing, checksums, mapping, and cartridge metadata.
+  `rom_info` parses the 256-byte Sega header (system type, copyright, both
+  titles, serial/product/version, I/O support, ROM/RAM/backup-RAM windows,
+  region) and validates the header checksum against the computed Sega sum
+  (documented in `docs/SEGA-HEADER.md`), with a header-region artifact and a
+  reference memory map. `target_info.rom` now summarizes the loaded
+  cartridge instead of reporting that parsing is pending.
 - Optional external scripting with strict allowlists and artifact-first output.
 - Multi-instance orchestration for real parallel experiments.
 

@@ -39,6 +39,40 @@ and this project will use [Semantic Versioning](https://semver.org/spec/v2.0.0.h
 - `scripts/live-smoke.sh --full` now exercises the Phase 4 surface: lease
   lifecycle, memory write with read-back, frame advance, input press and
   release, save/list/load round trip, and the mutation log.
+- `memory_search`: raw byte-pattern search over a consistent snapshot. It
+  either dumps a `memory-snapshot` artifact for the range (never a live racy
+  scan) or searches an existing `memory-dump`/`memory-snapshot` artifact by
+  id without any new read. Returns bounded inline matches plus a
+  full-results artifact (kind `memory-search-results`).
+- `rom_info`: parses the Sega Mega Drive cartridge header at 0x100 (system
+  type, copyright, domestic/overseas titles, serial/product/version,
+  I/O-support codes, ROM/RAM/backup-RAM windows, region), validates the
+  stored header checksum against the computed Sega sum, and reports the
+  declared plus reference 68K memory mapping. Attaches a header-region
+  artifact. `target_info.rom` now summarizes the loaded cartridge.
+- `cpu_trace_capture_watchpoint`: event-driven trace capture. The
+  `trace_capture` bridge op accepts an optional `watchpoint_id`; the system
+  runs toward the managed watchpoint (even from a paused state), the window
+  ends when it fires, and the response reports the fired watchpoint ids plus
+  the stop reason. New tool wires it up.
+- `cpu_coverage_capture`: execution coverage artifact built from a bounded
+  trace window — distinct executed addresses, merged consecutive-address
+  spans, and a page histogram (kind `cpu-coverage`).
+- Plugin: `emulator_status` now reports the ROM loaded through `rom_load`
+  (path, file size, padded mapping size) so server-side tools can bound
+  header and checksum reads; `rom_load` echoes the same sizes.
+- `docs/SEGA-HEADER.md`: Mega Drive cartridge header reference with data
+  tables, the checksum algorithm, region/product decoding, and the source
+  documents used to derive the parser.
+
+### Changed
+
+- The `trace_capture` bridge op gains an optional `watchpoint_id` parameter
+  (event-driven mode). Plain captures keep their shape; watchpoint mode
+  forces the run during the window and restores the prior run state,
+  matching the established trace-capture contract.
+- `cpu_trace_capture` now surfaces the plugin's mode-specific sampling note
+  verbatim instead of hardcoding one server-side string.
 
 ### Changed
 

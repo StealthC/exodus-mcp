@@ -199,7 +199,7 @@ bool IsSupportedROMPath(const std::wstring& path)
 	return (_wcsicmp(suffix, L".bin") == 0) || (_wcsicmp(suffix, L".gen") == 0) || (_wcsicmp(suffix, L".md") == 0);
 }
 
-bool CreateROMModule(const std::wstring& romPath, std::wstring& modulePath)
+bool CreateROMModule(const std::wstring& romPath, std::wstring& modulePath, unsigned long long& romSizeOut, unsigned int& paddedSizeOut)
 {
 	if (!IsSupportedROMPath(romPath))
 	{
@@ -220,6 +220,8 @@ bool CreateROMModule(const std::wstring& romPath, std::wstring& modulePath)
 	{
 		paddedSize <<= 1;
 	}
+	romSizeOut = romSize;
+	paddedSizeOut = paddedSize;
 
 	wchar_t tempPath[MAX_PATH] = {};
 	const DWORD tempPathLength = GetTempPathW(MAX_PATH, tempPath);
@@ -267,6 +269,7 @@ ExodusMcpPlugin::ExodusMcpPlugin(const std::wstring& implementationName, const s
 	_pipeThread(0),
 	_loadedModuleCount(0),
 	_bridgeEnabled(false),
+	_romLoaded(false),
 	_nextBreakpointID(1),
 	_nextWatchpointID(1),
 	_pixelInfoEnableFrameToken(0)
@@ -956,7 +959,15 @@ std::string ExodusMcpPlugin::BuildEmulatorStatusData()
 		data += memoryDevice ? "true" : "false";
 		data += "}";
 	}
-	data += "]}";
+	data += "],\"rom\":{\"loaded\":";
+	data += _romLoaded ? "true" : "false";
+	data += ",\"size_bytes\":";
+	AppendNumber(data, _romSizeBytes);
+	data += ",\"padded_size_bytes\":";
+	AppendNumber(data, _romPaddedSizeBytes);
+	data += ",\"path\":";
+	AppendJsonString(data, _romPath);
+	data += "}}";
 	return data;
 }
 
@@ -2292,7 +2303,9 @@ bool ExodusMcpPlugin::BuildROMLoadData(const BridgeRequest& request, std::string
 	}
 
 	std::wstring modulePath;
-	if (!CreateROMModule(romPath, modulePath))
+	unsigned long long romSize = 0;
+	unsigned int romPaddedSize = 0;
+	if (!CreateROMModule(romPath, modulePath, romSize, romPaddedSize))
 	{
 		errorCode = "rom_load_failed";
 		errorMessage = "ROM path must name an existing file no larger than 16 MiB";
@@ -2332,10 +2345,19 @@ bool ExodusMcpPlugin::BuildROMLoadData(const BridgeRequest& request, std::string
 		system.RunSystem();
 	}
 
+	_romLoaded = true;
+	_romPath = romPath;
+	_romSizeBytes = romSize;
+	_romPaddedSizeBytes = romPaddedSize;
+
 	data = "{\"loaded\":true,\"path\":";
 	AppendJsonString(data, romPath);
 	data += ",\"module_path\":";
 	AppendJsonString(data, modulePath);
+	data += ",\"size_bytes\":";
+	AppendNumber(data, romSize);
+	data += ",\"padded_size_bytes\":";
+	AppendNumber(data, romPaddedSize);
 	data += ",\"system_running\":";
 	data += runAfterLoad ? "true" : "false";
 	data += "}";
@@ -2377,20 +2399,57 @@ bool ExodusMcpPlugin::BuildTraceCaptureData(const BridgeRequest& request, std::s
 //----------------------------------------------------------------------------------------------------------------------
 bool ExodusMcpPlugin::TraceCaptureInner(const BridgeRequest& request, std::string& data, std::string& errorCode, std::string& errorMessage)
 {
-	const std::string cpu = ParamValue(request.params, "cpu");
-	bool validName = false;
-	IProcessor* processor = FindProcessor(cpu, validName);
-	if (!validName)
+	std::string cpu = ParamValue(request.params, "cpu");
+
+	// Event-driven mode: an optional watchpoint_id turns the managed
+	// watchpoint into the capture stop condition. The processor and cpu are
+	// taken from that watchpoint (the request cpu may stay empty and is only
+	// validated, when present, against the watchpoint's cpu).
+	unsigned long long watchpointID = 0;
+	const bool watchpointMode = ParseUnsigned(ParamValue(request.params, "watchpoint_id"), watchpointID);
+	ManagedWatchpoint* triggerWatchpoint = 0;
+	IProcessor* processor = 0;
+	if (watchpointMode)
 	{
-		errorCode = "invalid_params";
-		errorMessage = "cpu must be m68k or z80";
-		return false;
+		std::map<unsigned long long, ManagedWatchpoint>::iterator found = _managedWatchpoints.find(watchpointID);
+		if (found == _managedWatchpoints.end())
+		{
+			errorCode = "invalid_params";
+			errorMessage = "unknown watchpoint_id " + NumberToString(watchpointID) + ": list managed watchpoints with watchpoint_list";
+			return false;
+		}
+		triggerWatchpoint = &found->second;
+		processor = triggerWatchpoint->processor;
+		if (processor == 0)
+		{
+			errorCode = "watchpoint_error";
+			errorMessage = "the watchpoint no longer references a live processor";
+			return false;
+		}
+		if (!cpu.empty() && _stricmp(cpu.c_str(), triggerWatchpoint->cpu.c_str()) != 0)
+		{
+			errorCode = "invalid_params";
+			errorMessage = "watchpoint_id " + NumberToString(watchpointID) + " watches cpu " + triggerWatchpoint->cpu + ", not " + cpu;
+			return false;
+		}
+		cpu = triggerWatchpoint->cpu;
 	}
-	if (processor == 0)
+	else
 	{
-		errorCode = "cpu_not_found";
-		errorMessage = "No " + cpu + " processor is present in the loaded target";
-		return false;
+		bool validName = false;
+		processor = FindProcessor(cpu, validName);
+		if (!validName)
+		{
+			errorCode = "invalid_params";
+			errorMessage = "cpu must be m68k or z80";
+			return false;
+		}
+		if (processor == 0)
+		{
+			errorCode = "cpu_not_found";
+			errorMessage = "No " + cpu + " processor is present in the loaded target";
+			return false;
+		}
 	}
 
 	unsigned long long maxEntries = kDefaultTraceEntries;
@@ -2414,6 +2473,11 @@ bool ExodusMcpPlugin::TraceCaptureInner(const BridgeRequest& request, std::strin
 		timeoutMs = kMaxTraceTimeoutMs;
 	}
 
+	// force_run makes plain captures resume a parked system for the window
+	// (coverage-style tools need entries even when the system was paused).
+	// Prior run state is restored at the end.
+	const bool forceRun = ParamValue(request.params, "force_run") == "true";
+
 	IProcessor& target = *processor;
 
 	// The whole configuration sequence runs with the system stopped: the CPU
@@ -2422,6 +2486,23 @@ bool ExodusMcpPlugin::TraceCaptureInner(const BridgeRequest& request, std::strin
 	// the system runs. Run state is captured first and restored at the end.
 	const bool wasRunning = GetSystemInterface().SystemRunning();
 	GetSystemInterface().StopSystem();
+
+	// Baseline hit counters for the whole managed set: the event-driven
+	// response reports every watchpoint that fired during the window, not
+	// just the requested trigger.
+	std::map<unsigned long long, unsigned long long> baselineHits;
+	if (watchpointMode)
+	{
+		for (std::map<unsigned long long, ManagedWatchpoint>::const_iterator i = _managedWatchpoints.begin(); i != _managedWatchpoints.end(); ++i)
+		{
+			IWatchpoint* watchpoint = i->second.watchpoint;
+			if (i->second.processor != 0 && i->second.processor->LockWatchpoint(watchpoint))
+			{
+				baselineHits[i->first] = watchpoint->GetHitCounter();
+				i->second.processor->UnlockWatchpoint(watchpoint);
+			}
+		}
+	}
 
 	const bool priorEnabled = target.GetTraceEnabled();
 	const bool priorDisassemble = target.GetTraceDisassemble();
@@ -2456,7 +2537,28 @@ bool ExodusMcpPlugin::TraceCaptureInner(const BridgeRequest& request, std::strin
 	target.SetTraceDisassemble(true);
 	target.SetTraceEnabled(true);
 
-	if (wasRunning)
+	// Event-driven mode: keep the trigger watchpoint disarmed during a short
+	// warm-up. A resumed system can sit exactly on the watched instruction
+	// after a rollback pause, so an instant first hit would otherwise end the
+	// capture before any trace entry is committed. The trigger is re-armed
+	// between two stopped states (see the capture phases below); the prior
+	// enabled state is restored at the end.
+	bool priorTriggerEnabled = true;
+	if (watchpointMode && triggerWatchpoint != 0 && triggerWatchpoint->processor != 0 &&
+		triggerWatchpoint->processor->LockWatchpoint(triggerWatchpoint->watchpoint))
+	{
+		priorTriggerEnabled = triggerWatchpoint->watchpoint->GetEnabled();
+		triggerWatchpoint->watchpoint->SetEnabled(false);
+		triggerWatchpoint->processor->UnlockWatchpoint(triggerWatchpoint->watchpoint);
+	}
+
+	// Event-driven mode always resumes the system for the capture window even
+	// when it was parked: the contract is "run until the watchpoint fires".
+	// force_run does the same for plain captures (coverage). Plain mode keeps
+	// its established behavior otherwise (entries only accumulate while the
+	// system happens to be running). Prior run state is restored at the end
+	// in every mode.
+	if (wasRunning || watchpointMode || forceRun)
 	{
 		GetSystemInterface().RunSystem();
 	}
@@ -2464,7 +2566,50 @@ bool ExodusMcpPlugin::TraceCaptureInner(const BridgeRequest& request, std::strin
 	const DWORD startTime = GetTickCount();
 	bool timedOut = false;
 	bool stopped = false;
-	while (true)
+	bool pausedDuringWindow = false;
+	const unsigned long long warmUpMs = watchpointMode ? ((timeoutMs < 150) ? timeoutMs : 150) : 0;
+	unsigned long long lastRunCheck = 0;
+	const unsigned long long runCheckInterval = 50;
+
+	// Capture phase one (event-driven only): accumulate trace entries with
+	// the trigger disarmed. Sensing stops only on the bridge stop event or
+	// the warm-up bound; the overall timeout still covers the whole window.
+	if (warmUpMs > 0)
+	{
+		while (true)
+		{
+			if ((GetTickCount() - startTime) >= warmUpMs)
+			{
+				break;
+			}
+			if (WaitForSingleObject(_stopEvent, 10) == WAIT_OBJECT_0)
+			{
+				stopped = true;
+				break;
+			}
+		}
+	}
+
+	// Re-arm the trigger between stopped states: every watchpoint API call
+	// takes the debug mutex, and those getters have been observed to starve
+	// while the CPU worker runs (see TRACE-CRASH-INVESTIGATION.md). With the
+	// system parked the lock is uncontended, so the arming is deterministic.
+	if (!stopped && watchpointMode)
+	{
+		GetSystemInterface().StopSystem();
+		if (triggerWatchpoint != 0 && triggerWatchpoint->processor != 0 &&
+			triggerWatchpoint->processor->LockWatchpoint(triggerWatchpoint->watchpoint))
+		{
+			triggerWatchpoint->watchpoint->SetEnabled(true);
+			triggerWatchpoint->processor->UnlockWatchpoint(triggerWatchpoint->watchpoint);
+		}
+		GetSystemInterface().RunSystem();
+	}
+
+	// Capture phase two: sense the trigger. SystemRunning is cheap; the 50 ms
+	// cadence plus a 30 ms post-arm grace keeps the poll from tripping on the
+	// worker spin-up after RunSystem.
+	while (!stopped && !timedOut)
 	{
 		if ((GetTickCount() - startTime) >= timeoutMs)
 		{
@@ -2476,6 +2621,19 @@ bool ExodusMcpPlugin::TraceCaptureInner(const BridgeRequest& request, std::strin
 			stopped = true;
 			break;
 		}
+		if (watchpointMode)
+		{
+			const unsigned long long elapsed = GetTickCount() - startTime;
+			if ((elapsed - lastRunCheck) >= runCheckInterval && (elapsed - warmUpMs) >= 30)
+			{
+				lastRunCheck = elapsed;
+				if (!GetSystemInterface().SystemRunning())
+				{
+					pausedDuringWindow = true;
+					break;
+				}
+			}
+		}
 	}
 
 	GetSystemInterface().StopSystem();
@@ -2484,6 +2642,12 @@ bool ExodusMcpPlugin::TraceCaptureInner(const BridgeRequest& request, std::strin
 	// Disabling the file log closes the stream, flushing any pending entries
 	// the worker had queued for the next commit.
 	target.SetTraceFileLoggingEnabled(priorToFile);
+	if (watchpointMode && triggerWatchpoint != 0 && triggerWatchpoint->processor != 0 &&
+		triggerWatchpoint->processor->LockWatchpoint(triggerWatchpoint->watchpoint))
+	{
+		triggerWatchpoint->watchpoint->SetEnabled(priorTriggerEnabled);
+		triggerWatchpoint->processor->UnlockWatchpoint(triggerWatchpoint->watchpoint);
+	}
 
 	// Parse the trace file: the worker writes one ASCII line per entry as
 	// 0xADDR(hex) \t opcode \t args \t ;comment \t cycle(decimal) \t time.
@@ -2565,6 +2729,41 @@ bool ExodusMcpPlugin::TraceCaptureInner(const BridgeRequest& request, std::strin
 		return false;
 	}
 
+	// Event-driven mode: report every managed watchpoint whose hit counter
+	// advanced during the capture window. Computed while the system is still
+	// parked, before the pending restore below re-enters the run state.
+	std::vector<unsigned long long> watchpointIDsHit;
+	// A hit is authoritative from the counter: a watchpoint that fired always
+	// pauses the system, so hit counters are the ground truth either way.
+	if (watchpointMode)
+	{
+		for (std::map<unsigned long long, ManagedWatchpoint>::const_iterator i = _managedWatchpoints.begin(); i != _managedWatchpoints.end(); ++i)
+		{
+			unsigned long long current = 0;
+			if (i->second.processor != 0 && i->second.processor->LockWatchpoint(i->second.watchpoint))
+			{
+				current = i->second.watchpoint->GetHitCounter();
+				i->second.processor->UnlockWatchpoint(i->second.watchpoint);
+			}
+			unsigned long long baseline = 0;
+			std::map<unsigned long long, unsigned long long>::const_iterator foundBaseline = baselineHits.find(i->first);
+			if (foundBaseline != baselineHits.end())
+			{
+				baseline = foundBaseline->second;
+			}
+			if (current > baseline)
+			{
+				watchpointIDsHit.push_back(i->first);
+			}
+		}
+	}
+	const char* stopReason = "timeout";
+	if (watchpointMode && pausedDuringWindow)
+	{
+		stopReason = watchpointIDsHit.empty() ? "pause" : "watchpoint_hit";
+	}
+	const bool stoppedOnWatchpoint = !watchpointIDsHit.empty();
+
 	const size_t ringTotal = entryAddresses.size();
 	// Keep an empty capture file around for inspection; a non-empty one has
 	// already been consumed and is deleted.
@@ -2630,7 +2829,42 @@ bool ExodusMcpPlugin::TraceCaptureInner(const BridgeRequest& request, std::strin
 	data += ",\"duration_ms\":";
 	AppendNumber(data, GetTickCount() - startTime);
 	data += ",\"capture_channel\":\"trace-file\",";
-	data += "\"sampling_note\":\"Entries accumulate only while the system is running; a paused system yields none. The capture routes the processor trace log through a temporary on-disk file, because unpacking the marshaled in-memory ring across the extension boundary is unsafe for this plugin.\",\"sample\":[";
+	if (watchpointMode)
+	{
+		data += "\"watchpoint_mode\":true,\"watchpoint_id\":";
+		AppendNumber(data, watchpointID);
+		data += ",\"stopped_on_watchpoint\":";
+		data += stoppedOnWatchpoint ? "true" : "false";
+		data += ",\"stop_reason\":";
+		AppendJsonStringAscii(data, stopReason);
+		data += ",\"watchpoint_ids_hit\":[";
+		bool firstHit = true;
+		for (size_t i = 0; i < watchpointIDsHit.size(); ++i)
+		{
+			if (!firstHit)
+			{
+				data += ",";
+			}
+			firstHit = false;
+			AppendNumber(data, watchpointIDsHit[i]);
+		}
+		data += "],";
+		data += "\"event_note\":\"Event-driven capture: the system ran during the window even if it was parked; the trigger watchpoint stayed disarmed through a short warm-up so an instant resume hit cannot truncate the window; the capture stopped on the watchpoint hit (or timeout), and the prior run state was restored.\",";
+	}
+	data += "\"sampling_note\":\"";
+	if (watchpointMode)
+	{
+		data += "The capture runs the system toward the watchpoint, so entries reflect the instructions that led up to the hit. ";
+	}
+	else if (forceRun)
+	{
+		data += "The capture ran the system during the window even if it was parked; the prior run state was restored afterwards. ";
+	}
+	else
+	{
+		data += "Entries accumulate only while the system is running; a paused system yields none. ";
+	}
+	data += "The capture routes the processor trace log through a temporary on-disk file, because unpacking the marshaled in-memory ring across the extension boundary is unsafe for this plugin.\",\"sample\":[";
 	data += sampleLines;
 	data += "],\"trace_text\":";
 	AppendJsonStringAscii(data, traceText);
