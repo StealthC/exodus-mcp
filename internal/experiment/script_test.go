@@ -29,8 +29,15 @@ func TestResolveAndReadPythonAndJSON(t *testing.T) {
 	if script.Kind != "python" || script.Name != "scan.py" || script.SHA256 == "" {
 		t.Fatalf("python script metadata wrong: %+v", script)
 	}
-	if script.Path != filepath.Join(root, "scan.py") {
-		t.Fatalf("path = %q", script.Path)
+	// ResolveAndRead reports the canonicalized absolute path; on Windows
+	// EvalSymlinks normalizes drive-letter and component case, so compare
+	// canonical to canonical instead of against the raw joined path.
+	wantPath, err := filepath.EvalSymlinks(filepath.Join(root, "scan.py"))
+	if err != nil {
+		t.Fatalf("resolve expected path: %v", err)
+	}
+	if script.Path != wantPath {
+		t.Fatalf("path = %q, want %q", script.Path, wantPath)
 	}
 	fixture, err := ResolveAndRead(root, "fixture.json")
 	if err != nil {

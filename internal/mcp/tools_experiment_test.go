@@ -70,7 +70,13 @@ func fixtureBridge() *fakeBridgeClient {
 			if err := os.WriteFile(params["path"], []byte("snapshot-bytes"), 0o600); err != nil {
 				return nil, err
 			}
-			return json.RawMessage(`{"path":"` + params["path"] + `"}`), nil
+			// Marshal the path so backslashes in Windows paths are escaped
+			// (a raw interpolated "C:\Users\..." breaks JSON with \U).
+			encoded, err := json.Marshal(map[string]string{"path": params["path"]})
+			if err != nil {
+				return nil, err
+			}
+			return json.RawMessage(encoded), nil
 		case "state_load":
 			return json.RawMessage(`{"loaded":true}`), nil
 		}
