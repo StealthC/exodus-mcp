@@ -3,6 +3,7 @@ package artifact
 import (
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -10,6 +11,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 func newTestStore(t *testing.T) *Store {
@@ -85,6 +87,47 @@ func TestSanitizeTextReplacesControlBytes(t *testing.T) {
 	sanitized := sanitizeText([]byte{'a', 0x01, 'b', 0xFF, 'c'})
 	if strings.ContainsAny(sanitized, "\x01") {
 		t.Fatalf("control byte leaked: %q", sanitized)
+	}
+}
+
+func TestExpireOlderThanRemovesOnlyExpired(t *testing.T) {
+	store := newTestStore(t)
+	fresh, err := store.Put("ctx_a", "memory-dump", "application/octet-stream", []byte("fresh"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	stale, err := store.Put("ctx_a", "memory-dump", "application/octet-stream", []byte("stale"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Backdate one artifact past the TTL; the other stays current.
+	store.mu.Lock()
+	backdated := store.artifacts[stale.ID]
+	backdated.CreatedAt = time.Now().UTC().Add(-2 * time.Hour)
+	store.artifacts[stale.ID] = backdated
+	store.mu.Unlock()
+
+	removed, err := store.ExpireOlderThan(time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if removed != 1 {
+		t.Fatalf("ExpireOlderThan removed %d, want 1", removed)
+	}
+	if _, _, err := store.Bytes(stale.ID, "ctx_a"); err == nil {
+		t.Fatal("expired artifact must no longer resolve")
+	}
+	if _, err := os.Stat(store.path(stale.ID)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("expired artifact file must be deleted, stat err = %v", err)
+	}
+	if _, _, err := store.Bytes(fresh.ID, "ctx_a"); err != nil {
+		t.Fatalf("fresh artifact must survive: %v", err)
+	}
+
+	// A non-positive TTL disables expiry entirely.
+	removed, err = store.ExpireOlderThan(0)
+	if err != nil || removed != 0 {
+		t.Fatalf("disabled expiry must be a no-op: removed=%d err=%v", removed, err)
 	}
 }
 

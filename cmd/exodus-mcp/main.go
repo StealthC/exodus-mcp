@@ -42,6 +42,7 @@ func main() {
 	exodusExecutable := flag.String("exodus", "", "launch Exodus with a generated bridge pipe and capability")
 	defaultArtifactDir := filepath.Join(os.TempDir(), "exodus-mcp", "artifacts")
 	artifactDir := flag.String("artifacts", envOrDefault("EXODUS_MCP_ARTIFACTS", defaultArtifactDir), "directory for immutable tool artifacts")
+	artifactTTL := flag.Duration("artifact-ttl", envDurationOrDefault("EXODUS_MCP_ARTIFACT_TTL", 0), "retention lifetime for tool artifacts (0 disables background expiry; e.g. 24h)")
 	defaultStatesDir := filepath.Join(os.TempDir(), "exodus-mcp", "states")
 	statesDir := flag.String("states", envOrDefault("EXODUS_MCP_STATES_DIR", defaultStatesDir), "directory anchoring context-scoped system snapshots")
 	baseURL := flag.String("base-url", "", "external base URL advertised in artifact links; defaults to the listen address's loopback port")
@@ -64,6 +65,9 @@ func main() {
 	store, err := artifact.NewStore(*artifactDir)
 	if err != nil {
 		log.Fatal(err)
+	}
+	if *artifactTTL > 0 {
+		runArtifactSweeper(store, *artifactTTL)
 	}
 	listener, err := net.Listen("tcp", *listen)
 	if err != nil {
@@ -110,6 +114,11 @@ func main() {
 
 	log.Printf("exodus-mcp listening on http://%s/mcp", *listen)
 	log.Printf("artifact store at %s", store.Dir())
+	if *artifactTTL > 0 {
+		log.Printf("artifact retention: %s (expiry sweep active)", *artifactTTL)
+	} else {
+		log.Printf("artifact retention: unlimited (set --artifact-ttl / EXODUS_MCP_ARTIFACT_TTL to enable expiry)")
+	}
 	log.Printf("state snapshots at %s", *statesDir)
 	log.Printf("experiment scripts at %s", *scriptsDir)
 	if exodusDone == nil {
@@ -149,6 +158,47 @@ func envOrDefault(key, fallback string) string {
 		return value
 	}
 	return fallback
+}
+
+// envDurationOrDefault resolves a duration configuration value the same way,
+// logging and ignoring an unparsable value instead of failing the launch.
+func envDurationOrDefault(key string, fallback time.Duration) time.Duration {
+	if raw := os.Getenv(key); raw != "" {
+		if parsed, err := time.ParseDuration(raw); err == nil {
+			return parsed
+		}
+		log.Printf("ignoring invalid %s=%q (want a duration such as 24h)", key, raw)
+	}
+	return fallback
+}
+
+// runArtifactSweeper expires artifacts older than the configured TTL on a
+// background ticker. The interval sits between one minute and one hour and is
+// half the TTL, so a fresh artifact can be deleted at most one interval after
+// it passes the cutoff. The goroutine dies with the process; the store is
+// otherwise only touched under its own lock.
+func runArtifactSweeper(store *artifact.Store, ttl time.Duration) {
+	interval := ttl / 2
+	if interval < time.Minute {
+		interval = time.Minute
+	}
+	if interval > time.Hour {
+		interval = time.Hour
+	}
+	go func() {
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+		for range ticker.C {
+			removed, err := store.ExpireOlderThan(ttl)
+			if err != nil {
+				log.Printf("artifact sweep: %v", err)
+				continue
+			}
+			if removed > 0 {
+				log.Printf("artifact sweep: removed %d expired artifact(s)", removed)
+			}
+		}
+	}()
 }
 
 func waitForProcess(wait func() error) <-chan error {

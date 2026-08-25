@@ -70,6 +70,32 @@ func NewStore(dir string) (*Store, error) {
 // Dir reports the backing directory.
 func (store *Store) Dir() string { return store.dir }
 
+// ExpireOlderThan removes artifacts created before the given age, deleting
+// their backing files, and returns how many were removed. A non-positive TTL
+// disables expiry and never removes anything. Unknown-file removal errors are
+// surfaced so an operator can notice a broken store, but the sweep continues
+// reporting the count of artifacts removed so far this pass.
+func (store *Store) ExpireOlderThan(ttl time.Duration) (int, error) {
+	if ttl <= 0 {
+		return 0, nil
+	}
+	cutoff := time.Now().UTC().Add(-ttl)
+	store.mu.Lock()
+	defer store.mu.Unlock()
+	removed := 0
+	for id, artifact := range store.artifacts {
+		if artifact.CreatedAt.After(cutoff) {
+			continue
+		}
+		if err := os.Remove(store.path(id)); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return removed, fmt.Errorf("remove expired artifact: %w", err)
+		}
+		delete(store.artifacts, id)
+		removed++
+	}
+	return removed, nil
+}
+
 // Put writes one immutable artifact and returns its descriptor.
 func (store *Store) Put(contextID, kind, mimeType string, data []byte) (Artifact, error) {
 	id, err := newID()
