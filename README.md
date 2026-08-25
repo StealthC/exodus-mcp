@@ -7,7 +7,7 @@ Mega Drive / Genesis ROM analysis.
 The Go server speaks Streamable HTTP at `/mcp` (normative target MCP
 `2026-07-28`, with a bounded legacy initialization-era layer), and drives a
 single Exodus instance through an authenticated local named pipe into a native
-C++ plugin. Currently **58 analysis tools** cover the phased roadmap from
+C++ plugin. Currently **59 analysis tools** cover the phased roadmap from
 bridge/context foundations through VDP graphics, deterministic controlled
 experimentation, and Phase 5 advanced analysis (ROM header parsing, snapshot
 memory search, watchpoint-triggered tracing, coverage, and scripted

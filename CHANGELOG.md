@@ -26,7 +26,7 @@ and this project will use [Semantic Versioning](https://semver.org/spec/v2.0.0.h
 
 - README rewritten: the old copy still described the project as a foundation
   shell that could not read from a running Exodus; it now summarizes the
-  58-tool catalog by roadmap phase, the delivered status, configuration, and
+  59-tool catalog by roadmap phase, the delivered status, configuration, and
   the MIT license.
 - License: `exodus-mcp` is now MIT-licensed (`LICENSE`); the Exodus MIT notice
   remains applicable to the submodule and any redistributed Exodus-derived
