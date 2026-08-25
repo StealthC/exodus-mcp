@@ -133,6 +133,13 @@ func runROMLoad(tc toolContext, args json.RawMessage) map[string]any {
 	if failure != nil {
 		return failureResult(failure, tc.modern)
 	}
+	// Frozen ranges describe the previous cartridge's address map; writing
+	// them into the new program would corrupt its state, so the whole set is
+	// purged on every successful load (mirroring the plugin-side purge of
+	// breakpoints and watchpoints).
+	if purged := tc.server.freezes.purge(); purged > 0 {
+		payload["freezes_purged"] = purged
+	}
 	return okResult(payload, tc.modern)
 }
 

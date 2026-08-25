@@ -5,7 +5,8 @@
 # bridge status, and emulator status. --full additionally exercises the
 # mutating CPU-control tools (pause/run, M68K step, breakpoint and watchpoint
 # lifecycle, paused frame-capture determinism), the Phase 4 lease-gated
-# surface (memory write, frame advance, input, snapshot round trip), the
+# surface (memory write, memory_freeze lifecycle, frame advance, input,
+# snapshot round trip), the
 # snapshot comparison surface (memory_search, memory_diff around a rendered
 # frame), and the lease-gated experiment fixture (experiment_run over
 # smoke-input.json with manifest verification), always restoring running state
@@ -425,6 +426,29 @@ print(s)
 			read_result=$(tool_call "memory_read" '{"space": "m68k-bus", "address": "0xFF0000", "length": 1}')
 			read_hex=$(json_get "$read_result" "parsed.get('data_base64', '')" 2>/dev/null)
 			check "memory_write read-back matches" "[ \"\$read_hex\" = \"\$probe_byte\" ]"
+
+			# memory_freeze pins a cell while the system runs: the sweeper
+			# must re-apply the bytes (write_count grows) and the value must
+			# still hold after a running window; removing it stops the writes.
+			freeze=$(tool_call "memory_freeze" "{\"lease_id\": \"$lease_id\", \"space\": \"m68k-bus\", \"address\": \"0xFF0000\", \"data\": \"$probe_byte\"}")
+			freeze_id=$(json_get "$freeze" "parsed.get('freeze_id', '')" 2>/dev/null)
+			if [ -z "$freeze_id" ]; then
+				check "memory_freeze registers a freeze entry" false
+			else
+				check "memory_freeze registers a freeze entry" true
+				tool_call "cpu_run" >/dev/null
+				sleep 1
+				tool_call "cpu_pause" >/dev/null
+				frozen_read=$(tool_call "memory_read" '{"space": "m68k-bus", "address": "0xFF0000", "length": 1}')
+				frozen_hex=$(json_get "$frozen_read" "parsed.get('data_base64', '')" 2>/dev/null)
+				freeze_listed=$(tool_call "memory_freeze_list")
+				freeze_writes=$(json_get "$freeze_listed" "parsed.get('freezes', [{}])[0].get('write_count', 0)" 2>/dev/null)
+				check "memory_freeze sweeper re-applied the cell" "[ -n \"\$freeze_writes\" ] && [ \"\$freeze_writes\" -ge 1 ]"
+				check "memory_freeze keeps the cell pinned while running" "[ \"\$frozen_hex\" = \"\$probe_byte\" ]"
+				freeze_rm=$(tool_call "memory_freeze_remove" "{\"lease_id\": \"$lease_id\", \"freeze_id\": \"$freeze_id\"}")
+				freeze_rm_flag=$(json_get "$freeze_rm" "str(parsed.get('removed', False)).lower()" 2>/dev/null)
+				check "memory_freeze_remove deletes the entry" "[ \"\$freeze_rm_flag\" = 'true' ]"
+			fi
 		fi
 
 		# frame_advance: one rendered frame while paused, parked again after.

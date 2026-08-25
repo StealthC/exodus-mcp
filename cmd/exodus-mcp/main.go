@@ -95,6 +95,7 @@ func main() {
 	client := bridge.NewNamedPipeClient(*pipeName, *pipeCapability)
 	mcpServer := mcp.NewServer(version, client, store, analysis.NewRegistry(), *baseURL)
 	mcpServer.SetStatesDir(*statesDir)
+	mcpServer.StartFreezeSweeper()
 	experimentRunner, err := experiment.NewRunner(experiment.Config{
 		ScriptsDir:      *scriptsDir,
 		PythonCmd:       *pythonCmd,

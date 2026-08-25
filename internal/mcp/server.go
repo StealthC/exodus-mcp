@@ -67,6 +67,10 @@ type Server struct {
 	// experiment_run tool is disabled.
 	experiments *experiment.Runner
 
+	// freezes is the process-wide set of server-maintained frozen cell ranges;
+	// nil only before NewServer finishes construction.
+	freezes *freezeRegistry
+
 	statusMu      sync.Mutex
 	statusExpires time.Time
 	statusCache   bridge.Status
@@ -87,6 +91,7 @@ func NewServer(version string, client bridge.Client, store *artifact.Store, cont
 		store:    store,
 		contexts: contexts,
 		baseURL:  strings.TrimRight(baseURL, "/"),
+		freezes:  newFreezeRegistry(),
 	}
 }
 
