@@ -147,6 +147,9 @@ func runFrameAdvance(tc toolContext, args json.RawMessage) map[string]any {
 	if failure != nil {
 		return failureResult(failure, tc.modern)
 	}
+	// frame_advance always ends paused; attribute the state to MCP so
+	// emulator_status can report pause_source.
+	recordStateFromPayload(tc.server, payload, false)
 	return okResult(stampGenerations(payload, before, after), tc.modern)
 }
 
@@ -406,6 +409,9 @@ func runStateLoad(tc toolContext, args json.RawMessage) map[string]any {
 		return failureResult(failure, tc.modern)
 	}
 
+	// state_load restores the saved run state; attribute the echoed state to
+	// MCP so emulator_status derives the pause source.
+	recordStateFromPayload(tc.server, payload, false)
 	result := map[string]any{"state_id": snapshot.ID, "sha256": snapshot.SHA256}
 	for key, value := range payload {
 		result[key] = value

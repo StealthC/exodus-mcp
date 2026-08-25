@@ -93,6 +93,10 @@ type Server struct {
 	// nil only before NewServer finishes construction.
 	freezes *freezeRegistry
 
+	// runState attributes the emulator run state to MCP actions or external
+	// actors and records externally observed transitions in the audit stream.
+	runState *runStateTracker
+
 	statusMu      sync.Mutex
 	statusExpires time.Time
 	statusCache   bridge.Status
@@ -119,6 +123,7 @@ func NewServer(version string, client bridge.Client, store *artifact.Store, cont
 		breakpoints: make(map[uint64]debugResourceMeta),
 		watchpoints: make(map[uint64]debugResourceMeta),
 		freezes:     newFreezeRegistry(),
+		runState:    &runStateTracker{},
 	}
 	// Every control-lock end (release, expiry, context close, bridge loss)
 	// lands in the audit stream with the reason it ended.

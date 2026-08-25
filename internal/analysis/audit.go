@@ -13,6 +13,7 @@ const (
 	OutcomeHeld      = "control_held" // control-lock precondition mismatch, no native action
 	OutcomeAmbiguous = "ambiguous"    // transport failure; mutation outcome unknown
 	OutcomeLockEvent = "lock_event"   // control lock lifecycle, not a target operation
+	OutcomeObserved  = "observed"     // passive observation (run_state_change), no target action
 )
 
 // AuditFailure captures structured failure data for one attempted operation.

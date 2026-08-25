@@ -8,19 +8,19 @@ import (
 
 func controlToolSpecs() []toolSpec {
 	return []toolSpec{
-		{name: "cpu_pause", description: "Pause the emulated system. Mutates the target: advances the target generation. Accepts optional expected_target_generation and control_id.", schema: controlGuardSchema(), run: makeRunCPUControl("cpu_pause", "", "pause")},
-		{name: "cpu_run", description: "Run the emulated system. Mutates the target: advances the target generation. Accepts optional expected_target_generation and control_id.", schema: controlGuardSchema(), run: makeRunCPUControl("cpu_run", "", "run")},
-		{name: "m68k_step", description: "Pause and execute exactly one M68000 instruction. Mutates the target: advances the target generation. Accepts optional expected_target_generation and control_id.", schema: controlGuardSchema(), run: makeRunCPUControl("m68k_step", "m68k", "step")},
-		{name: "z80_step", description: "Pause and execute exactly one Z80 instruction. Mutates the target: advances the target generation. Accepts optional expected_target_generation and control_id.", schema: controlGuardSchema(), run: makeRunCPUControl("z80_step", "z80", "step")},
+		{name: "cpu_pause", description: "Pause the emulated system. Mutates the target: advances the target generation, and emulator_status reports pause_source \"mcp\" until an external actor changes the state. Accepts optional expected_target_generation and control_id.", schema: controlGuardSchema(), run: makeRunCPUControl("cpu_pause", "", "pause")},
+		{name: "cpu_run", description: "Run the emulated system. Mutates the target: advances the target generation, and emulator_status reports pause_source \"mcp\" until an external actor changes the state. UI-initiated transitions are audited as run_state_change events and never advance the generation. Accepts optional expected_target_generation and control_id.", schema: controlGuardSchema(), run: makeRunCPUControl("cpu_run", "", "run")},
+		{name: "m68k_step", description: "Pause and execute exactly one M68000 instruction. Mutates the target: advances the target generation, and the system ends paused (pause_source \"mcp\"). Accepts optional expected_target_generation and control_id.", schema: controlGuardSchema(), run: makeRunCPUControl("m68k_step", "m68k", "step")},
+		{name: "z80_step", description: "Pause and execute exactly one Z80 instruction. Mutates the target: advances the target generation, and the system ends paused (pause_source \"mcp\"). Accepts optional expected_target_generation and control_id.", schema: controlGuardSchema(), run: makeRunCPUControl("z80_step", "z80", "step")},
 		{
 			name:        "cpu_step_over",
-			description: "Run the selected processor until Exodus completes the current instruction without entering a call. Mutates the target: advances the target generation. Accepts optional expected_target_generation and control_id.",
+			description: "Run the selected processor until Exodus completes the current instruction without entering a call. Mutates the target: advances the target generation, and the system is typically paused again (pause_source \"mcp\"). Accepts optional expected_target_generation and control_id.",
 			schema:      stepGuardSchema(),
 			run:         makeRunCPUControlFromArgs("cpu_step_over", "step_over"),
 		},
 		{
 			name:        "cpu_step_out",
-			description: "Run the selected processor until Exodus returns from the current call frame. Mutates the target: advances the target generation. Accepts optional expected_target_generation and control_id.",
+			description: "Run the selected processor until Exodus returns from the current call frame. Mutates the target: advances the target generation, and the system is typically paused again (pause_source \"mcp\"). Accepts optional expected_target_generation and control_id.",
 			schema:      stepGuardSchema(),
 			run:         makeRunCPUControlFromArgs("cpu_step_out", "step_out"),
 		},
@@ -118,8 +118,24 @@ func makeRunCPUControl(tool, cpu, action string) func(toolContext, json.RawMessa
 		if failure != nil {
 			return failureResult(failure, tc.modern)
 		}
+		// cpu_pause/cpu_run end in a deterministic state; steps echo the live
+		// state. The tracker attributes the new state to MCP so subsequent
+		// emulator_status calls can report pause_source.
+		recordStateFromPayload(tc.server, payload, action == "run")
 		return okResult(stampGenerations(payload, before, after), tc.modern)
 	}
+}
+
+// recordStateFromPayload feeds the run-state tracker after a successful CPU
+// control mutation. The plugin echoes the live system_running when the action
+// can race with an async internal break (step_over/step_out), so the payload
+// value wins over the action's expected end state.
+func recordStateFromPayload(server *Server, payload map[string]any, fallback bool) {
+	if value, ok := payload["system_running"].(bool); ok {
+		server.runState.setByMCP(value)
+		return
+	}
+	server.runState.setByMCP(fallback)
 }
 
 type cpuControlGuardArgs struct {
@@ -147,6 +163,7 @@ func makeRunCPUControlFromArgs(tool, action string) func(toolContext, json.RawMe
 		if failure != nil {
 			return failureResult(failure, tc.modern)
 		}
+		recordStateFromPayload(tc.server, payload, false)
 		return okResult(stampGenerations(payload, before, after), tc.modern)
 	}
 }

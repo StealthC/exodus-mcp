@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/StealthC/exodus-mcp/internal/analysis"
 	"github.com/StealthC/exodus-mcp/internal/artifact"
@@ -60,13 +61,13 @@ func phase1ToolSpecs() []toolSpec {
 		},
 		{
 			name:        "emulator_status",
-			description: "Report running state plus loaded modules and devices from the connected Exodus instance.",
+			description: "Report running state plus loaded modules and devices from the connected Exodus instance, with run-state observability: who paused or ran the system (pause_source: mcp, ui_or_external, breakpoint_or_watchpoint, or unknown) and when the run state last changed (last_run_state_change UTC). Externally observed transitions (UI pauses, other bridge clients, native stops) are recorded in the audit stream as run_state_change events and never advance target_generation: the generation advances only on successful MCP mutations.",
 			schema:      objectSchema(map[string]any{}, nil),
 			run:         runEmulatorStatus,
 		},
 		{
 			name:        "memory_dump",
-			description: "Dump up to 8 MiB of memory into an immutable artifact. Returns a compact summary plus descriptor; raw bytes stay out of model context.",
+			description: "Dump up to 8 MiB of memory into an immutable artifact. Returns a compact summary (address space, effective address, byte length, byte order, capture consistency, and whether the read temporarily paused a running system) plus descriptor; raw bytes stay out of model context.",
 			schema: objectSchema(map[string]any{
 				"space":   stringProperty("Address space id from memory_spaces_list."),
 				"address": addressProperty(),
@@ -173,6 +174,9 @@ func runROMLoad(tc toolContext, args json.RawMessage) map[string]any {
 	if len(invalidated) > 0 {
 		payload["resources_invalidated"] = invalidated
 	}
+	// rom_load restarts the system in the requested run state; attribute the
+	// echoed state to MCP so emulator_status derives the pause source.
+	recordStateFromPayload(tc.server, payload, false)
 	return okResult(stampGenerations(payload, before, after), tc.modern)
 }
 
@@ -229,6 +233,7 @@ type emulatorStatusData struct {
 	Modules       []moduleInfo      `json:"modules"`
 	Devices       []deviceInfo      `json:"devices"`
 	Rom           emulatorStatusRom `json:"rom"`
+	StopReason    string            `json:"stop_reason,omitempty"`
 }
 
 func fetchEmulatorStatus(tc toolContext) (*emulatorStatusData, *toolFailure) {
@@ -249,7 +254,24 @@ func fetchEmulatorStatus(tc toolContext) (*emulatorStatusData, *toolFailure) {
 	} else {
 		tc.server.setROMPath("")
 	}
+	// Every passive read of the run state feeds the run-state observation
+	// tracker: externally observed transitions land in the audit stream as
+	// run_state_change events and never advance target_generation.
+	tc.server.runState.observe(tc.server, status.SystemRunning, nil)
 	return &status, nil
+}
+
+// runStateView renders the attribution and transition metadata of a freshly
+// observed run state. A native stop reason reported by the plugin (when it
+// exposes one) takes precedence over the derived source.
+func runStateView(server *Server, status *emulatorStatusData) (string, string, time.Time, bool) {
+	source, note := server.runState.view(status.SystemRunning)
+	if !status.SystemRunning && status.StopReason != "" {
+		source = "breakpoint_or_watchpoint"
+		note = "The plugin reported a native stop reason: " + status.StopReason
+	}
+	lastChange, known := server.runState.lastKnownChange()
+	return source, note, lastChange, known
 }
 
 func runEmulatorStatus(tc toolContext, _ json.RawMessage) map[string]any {
@@ -259,13 +281,25 @@ func runEmulatorStatus(tc toolContext, _ json.RawMessage) map[string]any {
 	}
 	modules := status.Modules
 	devices := status.Devices
-	return okResult(map[string]any{
+	pauseSource, pauseNote, lastChange, changeKnown := runStateView(tc.server, status)
+	result := map[string]any{
 		"system_running": status.SystemRunning,
+		"pause_source":   pauseSource,
 		"modules":        modules,
 		"devices":        devices,
 		"rom":            status.Rom,
 		"consistency":    "live",
-	}, tc.modern)
+	}
+	if !changeKnown {
+		// The first observation anchors the timestamp; there is no verified
+		// transition to report yet.
+		result["last_run_state_change"] = tc.server.runState.firstObservedAt()
+		result["run_state_note"] = "First observation; the timestamp marks this observation, not a verified transition."
+	} else {
+		result["last_run_state_change"] = lastChange
+	}
+	result["pause_source_note"] = pauseNote
+	return okResult(result, tc.modern)
 }
 
 func runTargetInfo(tc toolContext, _ json.RawMessage) map[string]any {

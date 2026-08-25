@@ -17,7 +17,7 @@ func targetToolSpecs() []toolSpec {
 	return []toolSpec{
 		{
 			name:        "target_audit_log",
-			description: "Query the bounded global target audit stream, newest first. Every target mutation (successful or failed), generation/control precondition conflict, and control-lock lifecycle event is recorded with target generations, ROM identity, originating context, and control-lock provenance. Filter by operation, context, control id, generation range, or time range; a truncated response reports the retained window.",
+			description: "Query the bounded global target audit stream, newest first. Every target mutation (successful or failed), generation/control precondition conflict, control-lock lifecycle event, and externally observed run-state transition (run_state_change, UI-initiated pauses with the observed generation and frame token when available) is recorded with target generations, ROM identity, originating context, and control-lock provenance. Filter by operation, context, control id, generation range, or time range; a truncated response reports the retained window.",
 			schema: objectSchema(map[string]any{
 				"context":        contextProperty(),
 				"tool":           stringProperty("Filter by tool name, e.g. memory_write or rom_load."),
