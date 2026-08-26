@@ -367,29 +367,35 @@ hexadecimal token of each line and merges numerically consecutive instruction
 start addresses, which does not represent contiguous 68000 instructions with
 variable lengths and does not convey control-flow edges.
 
-- [ ] Keep the existing text trace as a human-readable rendering, but add a
+- [x] Keep the existing text trace as a human-readable rendering, but add a
   versioned JSONL artifact with one event per executed instruction. Required
   fields are CPU, address space, PC in numeric and hex form, opcode bytes,
   instruction length, mnemonic/operands where available, cycle position,
   target generation, capture id, and frame token where available.
-- [ ] Include typed control-flow facts where available: fallthrough address,
+  **Delivered 2026-08-26**: `cpu_trace_capture` now returns `cpu-trace` text plus `cpu-trace-jsonl` (application/jsonl, one JSON per line) with `cpu`/`address_space`/`pc`/`pc_hex`/`opcode_bytes`/`instruction_length`/`mnemonic`/`operands`/`cycle`/`target_generation`/`capture_id`/`frame_token`/`schema_version`; `cpu_trace_capture_watchpoint` also returns both via `traceArtifactsFromPayloadGeneric`.
+- [x] Include typed control-flow facts where available: fallthrough address,
   resolved branch/call target, branch-taken state, call/return classification,
   exception/interrupt marker, and confidence. Unknown data must be omitted or
   marked unknown, never inferred from disassembly text.
-- [ ] Replace byte-adjacent coverage ranges with instruction-aware blocks.
+  **Delivered 2026-08-26**: JSONL events include `control_flow` with `fallthrough_address`/`branch_target`/`branch_taken`/`call_return_classification`/`exception_interrupt`/`confidence` all set to `unknown`/`nil` when not provided by the native trace; never inferred from disassembly text.
+- [x] Replace byte-adjacent coverage ranges with instruction-aware blocks.
   A block must contain executed instruction starts, first and last instruction
   addresses, count of executions, and observed outgoing edges. Do not claim
   that a gap between `0x100` and `0x104` means different code merely because
   instruction starts are not byte-adjacent.
-- [ ] Add optional filters to trace and coverage capture: address range,
+  **Delivered 2026-08-26**: `buildCoverageV2` fetches instruction length via `disasm` per unique PC (cached), groups `uniqueSorted` by `pc+length == next_pc` into `blocks` with `start_address`/`end_address`/`instruction_count`/`execution_count`/`addresses`/`address_space`; legacy `ranges` kept for back-compat; synthetic variable-length 68K now forms one block.
+- [x] Add optional filters to trace and coverage capture: address range,
   include/exclude ROM or RAM, frame window, instruction count, and whether to
   retain repeated events. All filters must be represented in provenance.
-- [ ] Store coverage in a versioned neutral artifact: executed address set,
+  **Delivered 2026-08-26**: `cpu_trace_capture` adds `address_range_start`/`address_range_end`/`include_rom`/`include_ram`/`retain_repeated`; `cpu_coverage_capture` adds `include_rom`/`include_ram`/`retain_repeated` (plus existing `region_start`/`region_end`/`max_entries`); filters stored in `provenance` and `summary.filters` and applied to JSONL/coverage.
+- [x] Store coverage in a versioned neutral artifact: executed address set,
   execution counts, basic blocks, edges, capture conditions, ROM identity, and
   address-space requirements.
-- [ ] Include truncation facts separately for source trace events, decoded
+  **Delivered 2026-08-26**: `cpu-coverage/2` document with `schema_version` `cpu-coverage/2`, `address_space`/`byte_order`, `capture` (duration/max_entries/region/include_rom/ram/retain_repeated), `execution` (total/filtered/unique/addresses/counts), `blocks`, `edges` (from/to/count), `capture_conditions`, `rom_identity`, `provenance`.
+- [x] Include truncation facts separately for source trace events, decoded
   events, unique addresses, blocks, and edges. A trace ring/timeout limit must
   never be reported as complete coverage.
+  **Delivered 2026-08-26**: `truncation` object with `source_events`/`decoded_events`/`unique_addresses`/`blocks`/`edges`/`complete:false` and note; `complete` is false when `captured==max_entries` or `timed_out`.
 
 **Acceptance checks:** synthetic 68K variable-length instructions form one
 correct block; a conditional branch produces two distinct observed edges across
