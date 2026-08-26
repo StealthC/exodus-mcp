@@ -1480,7 +1480,74 @@ func runCpuTraceCaptureWatchpoint(tc toolContext, args json.RawMessage) map[stri
 	if value, ok := payload["event_note"].(string); ok {
 		summary["event_note"] = value
 	}
+	// Emit structured watchpoint event when the requested watchpoint fired; distinguish timeout / different resource.
+	var eventDesc map[string]any
+	var eventID uint64
+	stoppedOnWatchpoint, _ := payload["stopped_on_watchpoint"].(bool)
+	watchpointIDsHit, _ := payload["watchpoint_ids_hit"].([]any)
+	hitRequested := false
+	for _, idVal := range watchpointIDsHit {
+		if idNum, ok := idVal.(float64); ok && uint64(idNum) == parsed.WatchpointID {
+			hitRequested = true
+			break
+		}
+	}
+	if stoppedOnWatchpoint && hitRequested {
+		// Fetch triggering PC via regs_get
+		pc := fetchCPUCurrentPC(tc, payload["cpu"].(string))
+		meta := tc.server.debugResourceMeta("watchpoint", parsed.WatchpointID)
+		contextID := context.ID
+		if meta != nil {
+			contextID = meta.ContextID
+		}
+		// Fetch watchpoint details for access direction and range
+		watchpointInfo := fetchWatchpointInfo(tc, parsed.WatchpointID)
+		access := "write"
+		watchedAddr := uint64(0)
+		watchedLen := uint64(1)
+		if watchpointInfo != nil {
+			if a, ok := watchpointInfo["access"].(string); ok {
+				access = a
+			}
+			if addr, ok := watchpointInfo["address"].(float64); ok {
+				watchedAddr = uint64(addr)
+			}
+			if length, ok := watchpointInfo["length"].(float64); ok {
+				watchedLen = uint64(length)
+			}
+		}
+		event := debugEvent{
+			ResourceKind:     "watchpoint",
+			ResourceID:       parsed.WatchpointID,
+			ContextID:        contextID,
+			CPU:              payload["cpu"].(string),
+			TriggeringPC:     pc,
+			AddressSpace:     payload["cpu"].(string) + "-bus",
+			WatchedAddress:   watchedAddr,
+			AccessDirection:  access,
+			RequestedLength:  watchedLen,
+			HitCount:         fetchWatchpointHitCount(tc, parsed.WatchpointID),
+			TargetGeneration: after,
+			FrameToken:       currentFrameToken(tc),
+		}
+		eventID = tc.server.pushDebugEvent(event)
+		eventDesc = debugEventDescriptor(tc.server, event, contextID, captureIDFromPayload(payload))
+		summary["event_id"] = eventID
+		summary["event"] = eventDesc
+		// Link trace to event
+		summary["linked_trace_capture_id"] = captureIDFromPayload(payload)
+	} else if stoppedOnWatchpoint && !hitRequested && len(watchpointIDsHit) > 0 {
+		summary["event_note"] = "A different managed watchpoint fired; the requested watchpoint did not."
+		summary["different_watchpoint_hit"] = true
+	} else if !stoppedOnWatchpoint {
+		summary["event_note"] = "Timeout: no watchpoint fired within the window; no synthetic event was created."
+		summary["timeout_without_hit"] = true
+	}
 	result := map[string]any{"summary": summary, "artifact": artifactDesc, "jsonl_artifact": jsonlDesc, "artifacts": []map[string]any{artifactDesc, jsonlDesc}}
+	if eventDesc != nil {
+		result["event"] = eventDesc
+		result["artifacts"] = []map[string]any{artifactDesc, jsonlDesc, eventDesc}
+	}
 	return okResult(stampGenerations(result, before, after), tc.modern)
 }
 
@@ -1605,6 +1672,119 @@ func traceArtifactsFromPayloadGeneric(tc toolContext, context *analysis.Context,
 	summary["filters"] = filters
 	delete(payload, "trace_text")
 	return summary, artifactDescriptor(tc.server, storedText, context.ID), artifactDescriptor(tc.server, storedJSONL, context.ID), nil
+}
+
+func fetchCPUCurrentPC(tc toolContext, cpu string) uint64 {
+	payload, failure := tc.server.executeCommand(tc.ctx, "regs_get", map[string]string{"cpu": cpu})
+	if failure != nil {
+		return 0
+	}
+	// Try m68k pc, then z80 pc
+	if regs, ok := payload["registers"].(map[string]any); ok {
+		if pc, ok := regs["pc"].(float64); ok {
+			return uint64(pc)
+		}
+		if pc, ok := regs["PC"].(float64); ok {
+			return uint64(pc)
+		}
+	}
+	// Fallback: try direct pc field
+	if pc, ok := payload["pc"].(float64); ok {
+		return uint64(pc)
+	}
+	return 0
+}
+
+func fetchWatchpointInfo(tc toolContext, watchpointID uint64) map[string]any {
+	payload, failure := tc.server.executeCommand(tc.ctx, "watchpoint_list", nil)
+	if failure != nil {
+		return nil
+	}
+	list, _ := payload["watchpoints"].([]any)
+	for _, entry := range list {
+		if m, ok := entry.(map[string]any); ok {
+			if id, ok := m["watchpoint_id"].(float64); ok && uint64(id) == watchpointID {
+				return m
+			}
+		}
+	}
+	return nil
+}
+
+func fetchWatchpointHitCount(tc toolContext, watchpointID uint64) uint64 {
+	info := fetchWatchpointInfo(tc, watchpointID)
+	if info == nil {
+		return 0
+	}
+	if cnt, ok := info["hit_count"].(float64); ok {
+		return uint64(cnt)
+	}
+	if cnt, ok := info["hit_counter"].(float64); ok {
+		return uint64(cnt)
+	}
+	return 0
+}
+
+func debugEventDescriptor(server *Server, event debugEvent, contextID, captureID string) map[string]any {
+	provenance := genericProvenance(server, "debug-event", time.Now().UTC())
+	provenance.CaptureID = captureID
+	provenance.AddressSpace = event.AddressSpace
+	provenance.Device = event.CPU
+	provenance.StartAddress = &event.WatchedAddress
+	provenance.EffectiveAddress = &event.WatchedAddress
+	provenance.StartAddressHex = canonicalHex(event.WatchedAddress)
+	provenance.EffectiveAddressHex = canonicalHex(event.WatchedAddress)
+	length := event.RequestedLength
+	provenance.ByteLength = &length
+	provenance.CaptureConsistency = &artifact.CaptureConsistency{State: "live", Note: "Watchpoint event captured upon hit; system was paused by the watchpoint."}
+	if event.FrameToken != nil {
+		provenance.FrameToken = event.FrameToken
+	}
+	eventData := map[string]any{
+		"kind":               "watchpoint-event",
+		"event_id":           event.ID,
+		"resource_kind":      event.ResourceKind,
+		"resource_id":        event.ResourceID,
+		"context_id":         event.ContextID,
+		"cpu":                event.CPU,
+		"triggering_pc":      event.TriggeringPC,
+		"triggering_pc_hex":  canonicalHex(event.TriggeringPC),
+		"address_space":      event.AddressSpace,
+		"watched_address":    event.WatchedAddress,
+		"watched_address_hex": canonicalHex(event.WatchedAddress),
+		"access_direction":   event.AccessDirection,
+		"requested_length":   event.RequestedLength,
+		"hit_count":          event.HitCount,
+		"target_generation":  event.TargetGeneration,
+		"timestamp":          event.Timestamp,
+		"schema_version":     "debug-event/1",
+	}
+	if event.FrameToken != nil {
+		eventData["frame_token"] = *event.FrameToken
+	}
+	// Access width/value fields are not available from the native API; mark unknown.
+	eventData["access_width"] = nil
+	eventData["value_before"] = nil
+	eventData["value_after"] = nil
+	eventData["transferred_value"] = nil
+	eventData["decoded_instruction_bytes"] = nil
+	eventData["note"] = "Access width/value fields are not exposed by the native API and are marked unknown."
+	// Store as artifact
+	// Use a temporary context for storage; the event's context is used for provenance but storage is per requesting context
+	stored, _ := server.store.PutWithProvenance(contextID, "debug-event", "application/json", mustMarshal(eventData), provenance)
+	return artifactDescriptor(server, stored, contextID)
+}
+
+func mustMarshal(v any) []byte {
+	b, _ := json.Marshal(v)
+	return b
+}
+
+func captureIDFromPayload(payload map[string]any) string {
+	if id, ok := payload["capture_id"].(string); ok && id != "" {
+		return id
+	}
+	return newCaptureID()
 }
 
 // ----------------------------------------------------------------------------------------------------------------------

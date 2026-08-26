@@ -86,6 +86,11 @@ type Server struct {
 	breakpoints map[uint64]debugResourceMeta
 	watchpoints map[uint64]debugResourceMeta
 
+	// debugEvents is the bounded history of breakpoint/watchpoint stop events.
+	debugEventsMu sync.Mutex
+	debugEvents   []debugEvent
+	nextEventID   uint64
+
 	// statesDir anchors context-scoped system snapshots; empty means
 	// os.TempDir()/exodus-mcp/states.
 	statesDir string
@@ -435,6 +440,25 @@ type debugResourceMeta struct {
 	ROMPath          string
 }
 
+// debugEvent is one structured breakpoint/watchpoint stop event.
+type debugEvent struct {
+	ID               uint64
+	ResourceKind     string
+	ResourceID       uint64
+	ContextID        string
+	CPU              string
+	TriggeringPC     uint64
+	AddressSpace     string
+	WatchedAddress   uint64
+	AccessDirection  string
+	RequestedLength  uint64
+	HitCount         uint64
+	TargetGeneration uint64
+	FrameToken       *uint64
+	Timestamp        time.Time
+	ControlFlow      map[string]any // placeholder for future
+}
+
 func (server *Server) trackDebugResource(kind string, id uint64, meta debugResourceMeta) {
 	server.debugMu.Lock()
 	defer server.debugMu.Unlock()
@@ -497,6 +521,57 @@ func (server *Server) purgeDebugResources() {
 	defer server.debugMu.Unlock()
 	server.breakpoints = make(map[uint64]debugResourceMeta)
 	server.watchpoints = make(map[uint64]debugResourceMeta)
+}
+
+const maxDebugEvents = 100
+
+func (server *Server) pushDebugEvent(event debugEvent) uint64 {
+	server.debugEventsMu.Lock()
+	defer server.debugEventsMu.Unlock()
+	server.nextEventID++
+	event.ID = server.nextEventID
+	event.Timestamp = time.Now().UTC()
+	server.debugEvents = append(server.debugEvents, event)
+	if len(server.debugEvents) > maxDebugEvents {
+		// Keep the most recent
+		server.debugEvents = server.debugEvents[len(server.debugEvents)-maxDebugEvents:]
+	}
+	return event.ID
+}
+
+func (server *Server) listDebugEvents(offset, limit int) ([]debugEvent, int, bool) {
+	server.debugEventsMu.Lock()
+	defer server.debugEventsMu.Unlock()
+	total := len(server.debugEvents)
+	if offset < 0 {
+		offset = 0
+	}
+	if offset > total {
+		offset = total
+	}
+	if limit <= 0 || limit > total-offset {
+		limit = total - offset
+	}
+	end := offset + limit
+	if end > total {
+		end = total
+	}
+	out := make([]debugEvent, end-offset)
+	copy(out, server.debugEvents[offset:end])
+	truncated := end < total
+	return out, total, truncated
+}
+
+func (server *Server) debugEventByID(id uint64) *debugEvent {
+	server.debugEventsMu.Lock()
+	defer server.debugEventsMu.Unlock()
+	for i := range server.debugEvents {
+		if server.debugEvents[i].ID == id {
+			copy := server.debugEvents[i]
+			return &copy
+		}
+	}
+	return nil
 }
 
 // SetStatesDir overrides the directory that anchors system snapshots.

@@ -658,6 +658,12 @@ func TestCpuTraceCaptureWatchpointPassesParams(t *testing.T) {
 			addr, _ := strconv.ParseUint(params["address"], 10, 64)
 			return json.RawMessage(fmt.Sprintf(`{"cpu":"m68k","start_address":%d,"requested_count":1,"lines":[{"address":%d,"length":2,"bytes":"4E71","mnemonic":"nop","operands":""}]}`, addr, addr)), nil
 		}
+		if method == "regs_get" {
+			return json.RawMessage(`{"cpu":"m68k","registers":{"pc":8192},"flags":{}}`), nil
+		}
+		if method == "watchpoint_list" {
+			return json.RawMessage(`{"watchpoints":[{"watchpoint_id":3,"cpu":"m68k","address":8192,"length":4,"access":"write","hit_count":5}]}`), nil
+		}
 		if method != "trace_capture" {
 			t.Fatalf("method = %s", method)
 		}

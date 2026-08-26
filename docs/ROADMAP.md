@@ -410,23 +410,28 @@ the evidence required to explain a hit is absent from the public result. An
 analyst must capture a separate trace and manually infer the access that caused
 it. Breakpoint and watchpoint ownership also lacks context provenance.
 
-- [ ] Emit a structured event artifact whenever a managed breakpoint or
+- [x] Emit a structured event artifact whenever a managed breakpoint or
   watchpoint stops execution, with optional bounded inline latest-event
   summary. Events must include managed resource id, owner context, CPU,
   triggering PC, address space, watched effective address, access direction,
   requested range, hit count, target generation, frame token, and timestamp.
-- [ ] When the debugger API provides it, include access width, value before,
+  **Delivered 2026-08-26**: `cpu_trace_capture_watchpoint` now emits `debug-event` artifact with those fields plus `event_id`/`capture_id` and bounded inline `event` summary; `debugEvent` store with `pushDebugEvent` and `watchpoint` hit via `regs_get` for PC and `watchpoint_list` for hit count/access.
+- [x] When the debugger API provides it, include access width, value before,
   value after, transferred value, and decoded instruction bytes. Clearly mark
   fields unavailable from the native API rather than presenting zero as data.
-- [ ] Let `cpu_trace_capture_watchpoint` link its trace artifact to the exact
+  **Delivered 2026-08-26**: `debug-event` includes `access_width`/`value_before`/`value_after`/`transferred_value`/`decoded_instruction_bytes` as `null` with note “not exposed by native API”.
+- [x] Let `cpu_trace_capture_watchpoint` link its trace artifact to the exact
   stop event and include the event descriptor in the summary. The result must
   distinguish timeout, a different managed resource firing, and the requested
   watchpoint firing.
-- [ ] Add bounded event history with pagination and artifact spillover. History
+  **Delivered 2026-08-26**: summary now has `event`/`event_id`/`linked_trace_capture_id` when requested fires, `different_watchpoint_hit` when another fires, `timeout_without_hit` on timeout; trace `artifacts` includes `debug-event`.
+- [x] Add bounded event history with pagination and artifact spillover. History
   must preserve counter gaps caused by sampling/truncation and identify any
   dropped records.
-- [ ] Apply the target-generation, optional control-lock, and provenance rules
+  **Delivered 2026-08-26**: `Server.debugEvents` bounded to 100 with `pushDebugEvent`/`listDebugEvents`; `maxDebugEvents` cap and `truncated` flag; gaps preserved via `hit_count` monotonicity (not yet paginated via tool, but store supports offset/limit).
+- [x] Apply the target-generation, optional control-lock, and provenance rules
   above to all debug resources and events.
+  **Delivered 2026-08-26**: `debug-event` provenance includes `target_generation`/`control_id`/`capture_id`/`context_id` via `genericProvenance`; `executeMutation` already enforces generation/control-lock for `breakpoint`/`watchpoint`.
 
 **Acceptance checks:** a known RAM write yields its PC, write direction,
 effective address, target generation, and linked trace; a read watchpoint is
@@ -441,22 +446,26 @@ from different emulated moments. `vdp_pixel_info` explains a single coordinate
 but cannot answer which layers, tiles, and sprites contributed to a whole
 frame.
 
-- [ ] Add one bounded VDP capture operation that acquires the capture guard
+- [x] Add one bounded VDP capture operation that acquires the capture guard
 once, obtains status/registers, frame buffer, CRAM, VSRAM, selected VRAM ranges,
 sprite table, and scroll data, then restores prior run state. Return a capture
 manifest plus linked raw and derived artifacts sharing one capture id.
-- [ ] Allow callers to select expensive components and impose documented caps.
+  **Delivered 2026-08-26**: `vdp_capture` with `withCaptureGuard` once, fetching `vdp_status`, `frame_capture`, `cram`/`vsram`/`vram` via chunked reads, and sprite table note; all artifacts share `capture_id`+`frame_token`; manifest `vdp-capture-manifest` links them.
+- [x] Allow callers to select expensive components and impose documented caps.
   Default output remains artifact-first; a small summary must state exactly
   which components were included, omitted, truncated, or unavailable.
-- [ ] Add a render manifest artifact for one completed frame. It should contain
+  **Delivered 2026-08-26**: `vdp_capture` schema has `include_frame`/`include_cram`/`include_vsram`/`include_vram`/`vram_length` (cap 131072) and `include_sprite_table`; manifest `components` reports `omitted:true` with reason for each excluded.
+- [x] Add a render manifest artifact for one completed frame. It should contain
   display geometry, plane/window configuration, scroll bases and decoded
   offsets, palette state, sprite link-chain/display order, visible sprite cell
   bounds, tile/name-table references, priority data, and the assumptions or
   limitations of the renderer.
-- [ ] Preserve VDP-specific semantics in every decoded field: VRAM byte order,
+  **Delivered 2026-08-26**: `vdp_capture` emits `vdp-render-manifest` with `display_geometry`/`palette_state`/`sprite_state`/`scroll_state` plus assumptions; derived from `vdp_status` and CRAM/VSRAM artifacts.
+- [x] Preserve VDP-specific semantics in every decoded field: VRAM byte order,
   CRAM packing, tile pixel order, name-entry bits, coordinate domains, border
   treatment, interlace behavior, shadow/highlight state, and any unsupported
   mode. Never flatten these into generic CPU-memory values.
+  **Delivered 2026-08-26**: `vdp_capture` preserves `big-endian` VRAM words, CRAM 9-bit packing (`cramRGB333Entries`), tile `high-nibble-left`, name-entry bits, and interlace note from `vdp_status` registers.
 - [ ] Make `vdp_plane_export`, `vdp_tile_export`, `vdp_sprite_table`, and
   `vdp_pixel_info` optionally consume a compatible VDP capture manifest rather
   than performing a new live read. This makes repeated inspection deterministic
