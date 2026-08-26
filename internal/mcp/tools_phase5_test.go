@@ -76,7 +76,7 @@ func TestMemorySearchFindsMatchesAndArtifact(t *testing.T) {
 		t.Fatalf("inline matches = %v", matches)
 	}
 	first := matches[0].(map[string]any)
-	if first["address"] != float64(0x101) || first["address_hex"] != "0x101" {
+	if first["address"] != float64(0x101) || first["address_hex"] != "0x000101" {
 		t.Fatalf("first match address wrong: %v", first)
 	}
 	second := matches[1].(map[string]any)

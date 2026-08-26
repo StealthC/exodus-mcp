@@ -399,7 +399,7 @@ func runMemorySpacesList(tc toolContext, _ json.RawMessage) map[string]any {
 	spaces, _ := payload["spaces"].([]any)
 	for _, entry := range spaces {
 		if space, ok := entry.(map[string]any); ok {
-			space["permissions"] = []string{"read"}
+			space["permissions"] = spacePermissions(space)
 			annotateSpaceBusMapping(space)
 		}
 	}
@@ -467,14 +467,21 @@ func readMemoryValue(tc toolContext, spaceID string, address uint64, length uint
 
 	value := map[string]any{
 		"space_id":                  spaceID,
+		"address_space":             spaceID,
 		"address":                   address,
+		"address_hex":               canonicalHex(address),
 		"effective_address":         uint64(effective),
+		"effective_address_hex":     canonicalHex(uint64(effective)),
 		"length":                    len(raw),
 		"byte_order":                byteOrder,
 		"consistency":               payload["consistency"],
 		"system_paused_during_read": pausedDuringRead,
 		"capture_consistency":       captureConsistencyToMap(buildCaptureConsistency(tc.server, payload, false, true, nil, nil)),
 		"representation":            representation,
+	}
+	if width, mask := addressBusWidthMask(spaceID); width != 0 {
+		value["address_width_bits"] = width
+		value["address_mask_hex"] = canonicalHex(mask)
 	}
 	switch representation {
 	case "hexdump":
@@ -670,6 +677,10 @@ func memoryDumpValue(tc toolContext, context *analysis.Context, spaceID string, 
 		"preview_hex":               artifact.HexDump(raw[:previewLength], int64(uint64(effective))),
 		"sha256":                    stored.SHA256,
 		"provenance_state":          stored.Provenance.State,
+	}
+	if width, mask := addressBusWidthMask(spaceID); width != 0 {
+		summary["address_width_bits"] = width
+		summary["address_mask_hex"] = canonicalHex(mask)
 	}
 	return map[string]any{
 		"summary":  summary,

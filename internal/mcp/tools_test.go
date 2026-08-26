@@ -926,7 +926,7 @@ func TestSymbolsLifecycle(t *testing.T) {
 	listResult := postToolCall(t, server, "symbols_list", "{}")
 	symbolsList := structured(listResult)["symbols"].([]any)
 	first := symbolsList[0].(map[string]any)
-	if first["name"] != "lives" || first["address_hex"] != "0x1092" {
+	if first["name"] != "lives" || first["address_hex"] != "0x001092" {
 		t.Fatalf("symbol ordering/format wrong: %v", first)
 	}
 

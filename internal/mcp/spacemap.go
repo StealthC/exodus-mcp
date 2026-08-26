@@ -134,6 +134,37 @@ func findSpaceSizeBytes(payload map[string]any, spaceID string) uint64 {
 	return 0
 }
 
+// addressBusWidthMask returns the bus width and mask for spaces that are
+// directly mapped on a CPU bus. Unknown or timed-buffer spaces return 0.
+func addressBusWidthMask(spaceID string) (int, uint64) {
+	switch spaceID {
+	case "m68k-bus", "mem-rom", "mem-ram", "mem-boot-rom":
+		return 24, 0xFFFFFF
+	case "z80-bus", "mem-z80-ram":
+		return 16, 0xFFFF
+	default:
+		return 0, 0
+	}
+}
+
+// spacePermissions reports the readable and writable capabilities of a space
+// as understood by the server's memory_write path. Timed-buffer VDP spaces
+// and ROM are read-only; all other bus and memory spaces are read+write
+// through the debugger path (writes to ROM are discarded by the bus but the
+// debugger path exists, so ROM is reported read-only to reflect hardware).
+func spacePermissions(space map[string]any) []string {
+	id, _ := space["id"].(string)
+	kind, _ := space["kind"].(string)
+	if kind == "timed-buffer" || strings.HasPrefix(id, "mem-vdp-") {
+		return []string{"read"}
+	}
+	switch id {
+	case "mem-rom", "mem-boot-rom":
+		return []string{"read"}
+	}
+	return []string{"read", "write"}
+}
+
 // annotateSpaceRangeFailure enriches an out_of_range failure with the valid
 // canonical hex range of the target space. It queries the live catalog on
 // the error path (rare) and leaves the failure untouched when the plugin

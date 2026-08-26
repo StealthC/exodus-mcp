@@ -442,7 +442,7 @@ func findPatternMatches(data, pattern []byte, startAddress uint64, inlineLimit u
 		if uint64(len(result.Inline)) < inlineLimit {
 			result.Inline = append(result.Inline, map[string]any{
 				"address":     address,
-				"address_hex": fmt.Sprintf("0x%X", address),
+				"address_hex": canonicalHex(address),
 				"offset":      uint64(index),
 			})
 		}
@@ -866,7 +866,7 @@ func runMemoryDiff(tc toolContext, args json.RawMessage) map[string]any {
 		if uint64(len(matches)) < maxMatches {
 			matches = append(matches, map[string]any{
 				"address":     address,
-				"address_hex": fmt.Sprintf("0x%X", address),
+				"address_hex": canonicalHex(address),
 				"offset":      offset,
 				"before":      beforeValue,
 				"after":       afterValue,

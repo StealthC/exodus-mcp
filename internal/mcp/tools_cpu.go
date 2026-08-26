@@ -78,7 +78,8 @@ func cpuToolSpecs() []toolSpec {
 					"type":        "array",
 					"description": "Symbols to upsert.",
 					"items": map[string]any{
-						"type": "object",
+						"type":                 "object",
+						"additionalProperties": false,
 						"properties": map[string]any{
 							"name":     stringProperty("Symbol label."),
 							"space_id": stringProperty("Address space id from memory_spaces_list."),
@@ -181,8 +182,40 @@ func makeRunDisassembly(cpu string) func(toolContext, json.RawMessage) map[strin
 		}
 		if annotated, ok := annotateDisassemblySymbols(context, cpu, payload); ok {
 			payload = annotated
+		} else {
+			normalizeDisassemblyPayload(payload, cpu)
 		}
 		return okResult(payload, tc.modern)
+	}
+}
+
+func normalizeDisassemblyPayload(payload map[string]any, cpu string) {
+	spaceID := disasmSpaceID(cpu)
+	mask := disasmSymbolMask(cpu)
+	width := 24
+	if cpu == "z80" {
+		width = 16
+	}
+	if start, ok := payload["start_address"].(float64); ok {
+		payload["start_address_hex"] = canonicalHex(uint64(start))
+		payload["address_space"] = spaceID
+		payload["address_width_bits"] = width
+		payload["address_mask_hex"] = canonicalHex(mask)
+	} else if start, ok := payload["start_address"].(int); ok {
+		payload["start_address_hex"] = canonicalHex(uint64(start))
+		payload["address_space"] = spaceID
+		payload["address_width_bits"] = width
+		payload["address_mask_hex"] = canonicalHex(mask)
+	}
+	if lines, ok := payload["lines"].([]any); ok {
+		for _, lineEntry := range lines {
+			if line, ok := lineEntry.(map[string]any); ok {
+				if addr, ok := line["address"].(float64); ok {
+					line["address_hex"] = canonicalHex(uint64(addr))
+					line["address_space"] = spaceID
+				}
+			}
+		}
 	}
 }
 
@@ -330,11 +363,13 @@ func annotateDisassemblySymbols(context *analysis.Context, cpu string, payload m
 	applied := false
 	for _, line := range decoded.Lines {
 		entry := map[string]any{
-			"address":  line.Address,
-			"length":   line.Length,
-			"bytes":    line.Bytes,
-			"mnemonic": line.Mnemonic,
-			"operands": line.Operands,
+			"address":       line.Address,
+			"address_hex":   canonicalHex(line.Address),
+			"address_space": spaceID,
+			"length":        line.Length,
+			"bytes":         line.Bytes,
+			"mnemonic":      line.Mnemonic,
+			"operands":      line.Operands,
 		}
 		if line.Comment != "" {
 			entry["comment"] = line.Comment
@@ -347,7 +382,7 @@ func annotateDisassemblySymbols(context *analysis.Context, cpu string, payload m
 		for _, literal := range operandHexLiterals(line.Operands) {
 			masked := literal & mask
 			if name, exists := byAddress[masked]; exists {
-				targets = append(targets, symbolTarget{Name: name, Address: masked, AddressHex: fmt.Sprintf("0x%X", masked)})
+				targets = append(targets, symbolTarget{Name: name, Address: masked, AddressHex: canonicalHex(masked)})
 			}
 		}
 		if len(targets) > 0 {
@@ -363,6 +398,10 @@ func annotateDisassemblySymbols(context *analysis.Context, cpu string, payload m
 	}
 	payload["cpu"] = decoded.CPU
 	payload["start_address"] = decoded.StartAddress
+	payload["start_address_hex"] = canonicalHex(decoded.StartAddress)
+	payload["address_space"] = spaceID
+	payload["address_width_bits"] = bitWidth
+	payload["address_mask_hex"] = canonicalHex(mask)
 	payload["requested_count"] = decoded.RequestedCount
 	payload["disassembly_method"] = decoded.DisassemblyMethod
 	payload["symbols_annotated"] = applied
@@ -529,12 +568,18 @@ func runSymbolsList(tc toolContext, args json.RawMessage) map[string]any {
 	symbols := context.Symbols.List(parsed.Filter)
 	views := make([]map[string]any, 0, len(symbols))
 	for _, symbol := range symbols {
-		views = append(views, map[string]any{
-			"name":        symbol.Name,
-			"space_id":    symbol.SpaceID,
-			"address":     symbol.Address,
-			"address_hex": fmt.Sprintf("0x%X", symbol.Address),
-		})
+		view := map[string]any{
+			"name":         symbol.Name,
+			"space_id":     symbol.SpaceID,
+			"address":      symbol.Address,
+			"address_hex":  canonicalHex(symbol.Address),
+			"address_space": symbol.SpaceID,
+		}
+		if width, mask := addressBusWidthMask(symbol.SpaceID); width != 0 {
+			view["address_width_bits"] = width
+			view["address_mask_hex"] = canonicalHex(mask)
+		}
+		views = append(views, view)
 	}
 	return okResult(map[string]any{"symbols": views, "count": len(views)}, tc.modern)
 }

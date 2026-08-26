@@ -49,7 +49,8 @@ func memorySnapshotCaptureSpec() toolSpec {
 				"type":        "array",
 				"description": fmt.Sprintf("Named ranges to capture (1-%d, total bytes capped at %d).", captureMaxRanges, dumpCapBytes),
 				"items": map[string]any{
-					"type": "object",
+					"type":                 "object",
+					"additionalProperties": false,
 					"properties": map[string]any{
 						"name":    stringProperty(fmt.Sprintf("Unique range label (max %d characters, letters/digits/_/-).", captureMaxRangeNameLen)),
 						"address": addressProperty(),
@@ -267,13 +268,15 @@ func runMemorySnapshotCapture(tc toolContext, args json.RawMessage) map[string]a
 			return failureResult(&toolFailure{Code: "artifact_error", Message: err.Error()}, tc.modern)
 		}
 		readRanges = append(readRanges, map[string]any{
-			"name":              entry.Name,
-			"space":             space,
-			"address":           entry.Address,
-			"address_hex":       canonicalHex(entry.Address),
-			"effective_address": uint64(rawEffectiveAddress(payload)),
-			"byte_length":       len(raw),
-			"artifact":          artifactDescriptor(tc.server, stored, context.ID),
+			"name":                  entry.Name,
+			"space":                 space,
+			"address_space":         space,
+			"address":               entry.Address,
+			"address_hex":           canonicalHex(entry.Address),
+			"effective_address":     uint64(rawEffectiveAddress(payload)),
+			"effective_address_hex": canonicalHex(uint64(rawEffectiveAddress(payload))),
+			"byte_length":           len(raw),
+			"artifact":              artifactDescriptor(tc.server, stored, context.ID),
 		})
 	}
 

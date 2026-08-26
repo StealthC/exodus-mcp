@@ -316,6 +316,19 @@ func runMemoryWrite(tc toolContext, args json.RawMessage) map[string]any {
 	if failure != nil {
 		return failureResult(failure, tc.modern)
 	}
+	payload["address"] = address
+	payload["address_hex"] = canonicalHex(address)
+	payload["address_space"] = parsed.Space
+	if effective, ok := payload["effective_address"].(float64); ok {
+		payload["effective_address_hex"] = canonicalHex(uint64(effective))
+	} else {
+		payload["effective_address"] = address
+		payload["effective_address_hex"] = canonicalHex(address)
+	}
+	if width, mask := addressBusWidthMask(parsed.Space); width != 0 {
+		payload["address_width_bits"] = width
+		payload["address_mask_hex"] = canonicalHex(mask)
+	}
 	payload["data_hex_echo"] = hexEcho(bytes, 256)
 	if parsed.VerifyReadback {
 		payload["readback"] = verifyWriteReadback(tc, parsed.Space, address, bytes)

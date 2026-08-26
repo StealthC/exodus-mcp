@@ -1,11 +1,14 @@
 package mcp
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
+	"reflect"
 	"sort"
 	"strconv"
+	"strings"
 
 	"github.com/StealthC/exodus-mcp/internal/analysis"
 	"github.com/StealthC/exodus-mcp/internal/artifact"
@@ -102,9 +105,47 @@ func (server *Server) callTool(ctx context.Context, params json.RawMessage, mode
 		call.Arguments = json.RawMessage("{}")
 	}
 	result := spec.run(toolContext{server: server, ctx: ctx, modern: modern}, call.Arguments)
+	result = injectResultType(result, call.Name)
 	// Every result carries the target generation observed at response
 	// completion; mutations additionally report before/after.
 	return injectTargetGeneration(server, result)
+}
+
+func injectResultType(result map[string]any, toolName string) map[string]any {
+	if result == nil {
+		return result
+	}
+	if isError, ok := result["isError"].(bool); ok && isError {
+		return result
+	}
+	if structured, ok := result["structuredContent"].(map[string]any); ok {
+		if _, exists := structured["result_type"]; !exists {
+			structured["result_type"] = toolName
+		}
+		if _, exists := structured["schema_version"]; !exists {
+			structured["schema_version"] = "1"
+		}
+		return result
+	}
+	// Legacy: patch the content text.
+	content, ok := result["content"].([]map[string]string)
+	if !ok || len(content) == 0 {
+		return result
+	}
+	var value map[string]any
+	if err := json.Unmarshal([]byte(content[0]["text"]), &value); err != nil {
+		return result
+	}
+	if _, exists := value["result_type"]; !exists {
+		value["result_type"] = toolName
+	}
+	if _, exists := value["schema_version"]; !exists {
+		value["schema_version"] = "1"
+	}
+	if encoded, err := json.Marshal(value); err == nil {
+		content[0]["text"] = string(encoded)
+	}
+	return result
 }
 
 // ----------------------------------------------------------------------------------------------------------------------
@@ -150,7 +191,7 @@ func failureResult(failure *toolFailure, modern bool) map[string]any {
 // Schema helpers
 // ----------------------------------------------------------------------------------------------------------------------
 func objectSchema(properties map[string]any, required []string) map[string]any {
-	schema := map[string]any{"type": "object", "properties": properties}
+	schema := map[string]any{"type": "object", "properties": properties, "additionalProperties": false}
 	if len(required) > 0 {
 		schema["required"] = required
 	}
@@ -178,13 +219,20 @@ func booleanProperty(description string) map[string]any {
 }
 
 func addressProperty() map[string]any {
-	return stringProperty("Address as an integer, 0x hex, $ Motorola hex, or h-suffixed Zilog hex.")
+	return map[string]any{
+		"description": "Address as an integer, 0x hex, $ Motorola hex, or h-suffixed Zilog hex.",
+		"oneOf": []map[string]any{
+			{"type": "integer", "minimum": 0},
+			{"type": "string", "pattern": "^(\\$[0-9a-fA-F]+|[0-9a-fA-F]+[hH]|0[xX][0-9a-fA-F]+|[0-9]+)$"},
+		},
+	}
 }
 
 func decodeSchemaProperty() map[string]any {
 	return map[string]any{
-		"type":        "object",
-		"description": "Optional decoded-value view. Multi-byte types require a byte order that matches the space declaration.",
+		"type":                 "object",
+		"description":          "Optional decoded-value view. Multi-byte types require a byte order that matches the space declaration.",
+		"additionalProperties": false,
 		"properties": map[string]any{
 			"type":       enumProperty("Value type to decode.", []string{"u8", "u16", "u32", "i16", "i32"}),
 			"byte_order": enumProperty("Byte order for multi-byte types.", []string{"big-endian", "little-endian"}),
@@ -209,10 +257,128 @@ func captureModeProperty() map[string]any {
 // ----------------------------------------------------------------------------------------------------------------------
 func decodeArgs[T any](args json.RawMessage) (*T, *toolFailure) {
 	var parsed T
+	if len(args) == 0 {
+		args = json.RawMessage("{}")
+	}
+	if failure := strictValidateArgs(args, reflect.TypeOf(&parsed).Elem(), "$"); failure != nil {
+		return nil, failure
+	}
 	if err := json.Unmarshal(args, &parsed); err != nil {
 		return nil, &toolFailure{Code: "invalid_params", Message: "invalid arguments: " + err.Error()}
 	}
 	return &parsed, nil
+}
+
+func isGloballyAllowedField(key string) bool {
+	switch key {
+	case "context", "control_id", "expected_target_generation":
+		return true
+	default:
+		return false
+	}
+}
+
+// strictValidateArgs rejects unknown JSON properties with a full JSON path such as $.ranges[0].address.
+// Map types (e.g. experiment arguments) are treated as open extension points and their inner keys are not validated.
+func strictValidateArgs(raw json.RawMessage, typ reflect.Type, path string) *toolFailure {
+	// Dereference pointers.
+	for typ.Kind() == reflect.Ptr {
+		typ = typ.Elem()
+	}
+	switch typ.Kind() {
+	case reflect.Struct:
+		// Allow null for struct pointers already handled; raw "null" means missing.
+		trimmed := bytes.TrimSpace(raw)
+		if len(trimmed) == 0 || string(trimmed) == "null" {
+			return nil
+		}
+		var fields map[string]json.RawMessage
+		if err := json.Unmarshal(raw, &fields); err != nil {
+			// Not an object — let the decoder report type errors.
+			return nil
+		}
+		allowed := structFieldMap(typ)
+		for key, value := range fields {
+			if isGloballyAllowedField(key) {
+				continue
+			}
+			fieldType, ok := allowed[key]
+			if !ok {
+				return &toolFailure{
+					Code:    "invalid_params",
+					Message: fmt.Sprintf("unknown field %q at %s.%s", key, path, key),
+					Data:    map[string]any{"field": key, "path": path + "." + key},
+				}
+			}
+			// Recurse into known field value.
+			fieldPath := path + "." + key
+			if failure := strictValidateArgs(value, fieldType, fieldPath); failure != nil {
+				return failure
+			}
+		}
+		return nil
+	case reflect.Slice, reflect.Array:
+		trimmed := bytes.TrimSpace(raw)
+		if len(trimmed) == 0 || string(trimmed) == "null" {
+			return nil
+		}
+		var elements []json.RawMessage
+		if err := json.Unmarshal(raw, &elements); err != nil {
+			return nil
+		}
+		elemType := typ.Elem()
+		for index, element := range elements {
+			elementPath := fmt.Sprintf("%s[%d]", path, index)
+			if failure := strictValidateArgs(element, elemType, elementPath); failure != nil {
+				return failure
+			}
+		}
+		return nil
+	case reflect.Map:
+		// Maps are open extension points (e.g. experiment arguments); do not validate inner keys.
+		return nil
+	case reflect.Interface:
+		// any / interface{} leaf (address fields that accept int|string) — do not recurse.
+		return nil
+	default:
+		return nil
+	}
+}
+
+func structFieldMap(typ reflect.Type) map[string]reflect.Type {
+	out := map[string]reflect.Type{}
+	for index := 0; index < typ.NumField(); index++ {
+		field := typ.Field(index)
+		if field.PkgPath != "" && !field.Anonymous {
+			continue
+		}
+		tag := field.Tag.Get("json")
+		if tag == "-" {
+			continue
+		}
+		name := ""
+		if tag != "" {
+			name = strings.Split(tag, ",")[0]
+		}
+		if name == "" {
+			name = strings.ToLower(field.Name[:1]) + field.Name[1:]
+		}
+		if field.Anonymous {
+			fieldType := field.Type
+			for fieldType.Kind() == reflect.Ptr {
+				fieldType = fieldType.Elem()
+			}
+			if fieldType.Kind() == reflect.Struct {
+				nested := structFieldMap(fieldType)
+				for key, nestedType := range nested {
+					out[key] = nestedType
+				}
+				continue
+			}
+		}
+		out[name] = field.Type
+	}
+	return out
 }
 
 // parseAddress accepts integral JSON numbers or the roadmap address string

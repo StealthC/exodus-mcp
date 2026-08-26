@@ -169,6 +169,7 @@ func vdpMemoryReadValue(tc toolContext, target string, address uint64, length ui
 		"target":                    target,
 		"address_space":             addressSpace,
 		"address":                   address,
+		"address_hex":               canonicalHex(address),
 		"length":                    len(raw),
 		"buffer_size":               uint64(bufferSize),
 		"entry_size":                uint64(entrySize),
@@ -518,6 +519,7 @@ func runVDPSpriteTable(tc toolContext, args json.RawMessage) map[string]any {
 	value := map[string]any{
 		"address_space":             "315-5313 VRAM",
 		"sprite_table_base":         base,
+		"sprite_table_base_hex":     canonicalHex(base),
 		"byte_order":                "big-endian",
 		"consistency":               "live",
 		"system_paused_during_read": pausedDuringRead,
@@ -1115,11 +1117,14 @@ func runVDPTileExport(tc toolContext, args json.RawMessage) map[string]any {
 	return okResult(map[string]any{
 		"summary": map[string]any{
 			"kind":                      "vdp-tiles",
+			"address_space":             "315-5313 VRAM",
 			"tile_count":                count,
 			"tile_size_bytes":           mdTileSizeBytes,
 			"bpp":                       4,
 			"vram_address_start":        firstByte,
+			"vram_address_start_hex":    canonicalHex(firstByte),
 			"vram_address_end":          firstByte + totalBytes - 1,
+			"vram_address_end_hex":      canonicalHex(firstByte + totalBytes - 1),
 			"palette_line":              parsed.Palette,
 			"nonzero_pixels_per_tile":   nonzeroPerTile,
 			"coherent_snapshot":         coherent,
@@ -1281,8 +1286,10 @@ func runVDPPlaneExport(tc toolContext, args json.RawMessage) map[string]any {
 	return okResult(map[string]any{
 		"summary": map[string]any{
 			"kind":                      "vdp-plane",
+			"address_space":             "315-5313 VRAM",
 			"plane":                     parsed.Plane,
 			"name_table_base":           nameTableBase,
+			"name_table_base_hex":       canonicalHex(nameTableBase),
 			"size_cells":                []int{widthCells, heightCells},
 			"png_size_bytes":            pngBuffer.Len(),
 			"png_width":                 width,

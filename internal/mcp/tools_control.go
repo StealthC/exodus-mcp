@@ -251,6 +251,17 @@ func runBreakpointSet(tc toolContext, args json.RawMessage) map[string]any {
 	if failure != nil {
 		return failureResult(failure, tc.modern)
 	}
+	payload["address"] = address
+	payload["address_hex"] = canonicalHex(address)
+	payload["address_space"] = parsed.CPU + "-bus"
+	if condition == "range" {
+		payload["range_end"] = rangeEnd
+		payload["range_end_hex"] = canonicalHex(rangeEnd)
+	}
+	if width, mask := addressBusWidthMask(parsed.CPU + "-bus"); width != 0 {
+		payload["address_width_bits"] = width
+		payload["address_mask_hex"] = canonicalHex(mask)
+	}
 	if id, ok := payload["breakpoint_id"].(float64); ok {
 		tc.server.trackDebugResource("breakpoint", uint64(id), debugResourceMeta{
 			ContextID:        context.ID,
@@ -357,6 +368,13 @@ func runWatchpointSet(tc toolContext, args json.RawMessage) map[string]any {
 	if failure != nil {
 		return failureResult(failure, tc.modern)
 	}
+	payload["address"] = address
+	payload["address_hex"] = canonicalHex(address)
+	payload["address_space"] = parsed.CPU + "-bus"
+	if width, mask := addressBusWidthMask(parsed.CPU + "-bus"); width != 0 {
+		payload["address_width_bits"] = width
+		payload["address_mask_hex"] = canonicalHex(mask)
+	}
 	if id, ok := payload["watchpoint_id"].(float64); ok {
 		tc.server.trackDebugResource("watchpoint", uint64(id), debugResourceMeta{
 			ContextID:        context.ID,
@@ -419,6 +437,22 @@ func annotateDebugList(payload map[string]any, kind, key, idKey string, server *
 		record, ok := entry.(map[string]any)
 		if !ok {
 			continue
+		}
+		// Normalize address-bearing fields.
+		if addr, ok := record["address"].(float64); ok {
+			record["address_hex"] = canonicalHex(uint64(addr))
+			if cpu, ok := record["cpu"].(string); ok && cpu != "" {
+				record["address_space"] = cpu + "-bus"
+			}
+			if space, ok := record["address_space"].(string); ok {
+				if width, mask := addressBusWidthMask(space); width != 0 {
+					record["address_width_bits"] = width
+					record["address_mask_hex"] = canonicalHex(mask)
+				}
+			}
+		}
+		if rangeEnd, ok := record["range_end"].(float64); ok {
+			record["range_end_hex"] = canonicalHex(uint64(rangeEnd))
 		}
 		id, ok := record[idKey].(float64)
 		if !ok {

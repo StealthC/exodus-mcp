@@ -389,13 +389,18 @@ func runMemoryFreeze(tc toolContext, args json.RawMessage) map[string]any {
 		"freeze_id":     entry.ID,
 		"space":         entry.Space,
 		"address":       entry.Address,
-		"address_hex":   fmt.Sprintf("0x%X", entry.Address),
+		"address_hex":   canonicalHex(entry.Address),
+		"address_space": entry.Space,
 		"byte_length":   len(entry.Data),
 		"data_sha256":   sha256Hex(entry.Data),
 		"data_hex_echo": hexEcho(entry.Data, 256),
 		"created_at":    entry.CreatedAt,
 		"replaced":      replaced,
 		"rewrite_hz":    1 / freezeTickInterval.Seconds(),
+	}
+	if width, mask := addressBusWidthMask(entry.Space); width != 0 {
+		result["address_width_bits"] = width
+		result["address_mask_hex"] = canonicalHex(mask)
 	}
 	return okResult(stampGenerations(result, before, after), tc.modern)
 }
@@ -405,7 +410,8 @@ func freezeEntryView(entry *freezeEntry) map[string]any {
 		"freeze_id":         entry.ID,
 		"space":             entry.Space,
 		"address":           entry.Address,
-		"address_hex":       fmt.Sprintf("0x%X", entry.Address),
+		"address_hex":       canonicalHex(entry.Address),
+		"address_space":     entry.Space,
 		"byte_length":       len(entry.Data),
 		"data_sha256":       sha256Hex(entry.Data),
 		"created_at":        entry.CreatedAt,
@@ -413,6 +419,10 @@ func freezeEntryView(entry *freezeEntry) map[string]any {
 		"context_id":        entry.ContextID,
 		"target_generation": entry.TargetGeneration,
 		"rom_path":          entry.ROMPath,
+	}
+	if width, mask := addressBusWidthMask(entry.Space); width != 0 {
+		view["address_width_bits"] = width
+		view["address_mask_hex"] = canonicalHex(mask)
 	}
 	if entry.ControlID != "" {
 		view["control_id"] = entry.ControlID
