@@ -487,12 +487,13 @@ exports byte-identical.
 
 ### P2 - Mega Drive map, ROM identity, and practical memory operations
 
-- [ ] Publish a structured operational Mega Drive memory map that combines the
+- [x] Publish a structured operational Mega Drive memory map that combines the
   reference bus map with the live target. Each region must state CPU-visible
   range, mirrors/mask, backing device, read/write capability, timing caveats,
   byte order, and I/O semantics. This is distinct from the generic
   `memory_spaces_list` inventory and must not imply that all reference regions
   exist on every loaded system.
+  **Delivered 2026-08-26**: `mega_drive_memory_map` with 7 reference regions (ROM, unmapped, Z80 RAM, YM2612, I/O, VDP ports, Work RAM) each with range/mirrors/backing device/read_write/timing/byte_order/io_semantics plus live existence via `memory_spaces_list`.
 - [x] Introduce one shared `rom_identity` object: SHA-256 of the loaded ROM
   file when available, file and padded mapping sizes, header serial/title,
   Sega checksum status (computed over the file, with completeness facts),
@@ -512,10 +513,11 @@ exports byte-identical.
   and optional read-back verification. **Delivered 2026-08-26**:
   `data_hex`/`data` mutual exclusion, `data_hex_echo`, `verify_readback` with
   `readback.matches` and a mask/transform note.
-- [ ] Extend raw pattern search with explicitly documented wildcard/mask
+- [x] Extend raw pattern search with explicitly documented wildcard/mask
   patterns and optional alignment, while retaining the current exact-byte mode
   unchanged. Result artifacts must serialize the parsed pattern and masks, not
   only the source text, so a search is reproducible.
+  **Delivered 2026-08-26**: `memory_search` now supports `??`/`?` wildcards and `alignment` (power-of-two) with `pattern_mask_hex` and `parsed_pattern` in artifact for reproducibility; exact-byte mode unchanged.
 
 **Acceptance checks:** the map marks VDP timed buffers as not directly writable;
 a larger-than-cap ROM reports incomplete checksum coverage; equivalent hex and
