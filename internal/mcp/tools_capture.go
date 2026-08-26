@@ -332,6 +332,13 @@ func runMemorySnapshotCapture(tc toolContext, args json.RawMessage) map[string]a
 		return failureResult(&toolFailure{Code: "artifact_error", Message: err.Error()}, tc.modern)
 	}
 
+	artifacts := make([]map[string]any, 0, len(readRanges)+1)
+	artifacts = append(artifacts, artifactDescriptor(tc.server, storedManifest, context.ID))
+	for _, entry := range readRanges {
+		if art, ok := entry["artifact"].(map[string]any); ok {
+			artifacts = append(artifacts, art)
+		}
+	}
 	result := map[string]any{
 		"summary": map[string]any{
 			"kind":                     captureKind,
@@ -346,8 +353,9 @@ func runMemorySnapshotCapture(tc toolContext, args json.RawMessage) map[string]a
 			"internal_lock_acquired":   internalLock,
 			"manifest_sha256":          storedManifest.SHA256,
 		},
-		"manifest": artifactDescriptor(tc.server, storedManifest, context.ID),
-		"ranges":   readRanges,
+		"manifest":  artifactDescriptor(tc.server, storedManifest, context.ID),
+		"ranges":    readRanges,
+		"artifacts": artifacts,
 	}
 	if restoreFailed {
 		result["run_state_restore_failed"] = true

@@ -138,9 +138,9 @@ func findSpaceSizeBytes(payload map[string]any, spaceID string) uint64 {
 // directly mapped on a CPU bus. Unknown or timed-buffer spaces return 0.
 func addressBusWidthMask(spaceID string) (int, uint64) {
 	switch spaceID {
-	case "m68k-bus", "mem-rom", "mem-ram", "mem-boot-rom":
+	case "m68k-bus", "mem-rom", "mem-ram", "mem-boot-rom", "m68k-ram":
 		return 24, 0xFFFFFF
-	case "z80-bus", "mem-z80-ram":
+	case "z80-bus", "mem-z80-ram", "z80-ram":
 		return 16, 0xFFFF
 	default:
 		return 0, 0

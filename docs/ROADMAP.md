@@ -314,26 +314,32 @@ argument decoding, so spelling errors may be silently lost. Output address
 format and artifact descriptions also vary between tools. These issues make
 agent orchestration and generated clients unnecessarily unreliable.
 
-- [ ] Define one reusable address schema using `oneOf` for non-negative JSON
+- [x] Define one reusable address schema using `oneOf` for non-negative JSON
   integer and supported string notation (`0x`, Motorola `$`, Zilog `h`, or
   decimal). Apply it to every address argument, including nested structures.
-- [ ] Require strict decoding of tool arguments. Reject unknown properties with
+  **Delivered 2026-08-26**: `addressProperty()` now returns `oneOf` integer/string with pattern `^(\$[0-9a-fA-F]+|[0-9a-fA-F]+[hH]|0[xX][0-9a-fA-F]+|[0-9]+)$`; applied to 18 sites including `memory_snapshot_capture` ranges and `symbols_set` items.
+- [x] Require strict decoding of tool arguments. Reject unknown properties with
   `invalid_params`, identify the full JSON path, and retain deliberate
   forward-compatible extension points only where documented.
-- [ ] Normalize address-bearing outputs to include numeric `address`, canonical
+  **Delivered 2026-08-26**: `decodeArgs` validates via `strictValidateArgs` with path like `$.ranges[0].address` and `$.symbols[0].nane`; `additionalProperties:false` on all object schemas; `context`/`control_id`/`expected_target_generation` allowed globally for experiment injection; typo `adress` correctly rejected.
+- [x] Normalize address-bearing outputs to include numeric `address`, canonical
   uppercase `address_hex`, `address_space`, effective address where translation
   occurred, and address-bus width/mask when relevant. Do not use strings in one
   response and numbers in an equivalent response without stating why.
-- [ ] Give every tool output a stable schema version or documented result type.
+  **Delivered 2026-08-26**: `memory_read`/`m68k_read_memory`/`z80_read_memory`, `memory_dump`, `vdp_memory_read`, `vdp_sprite_table`, `vdp_tile/plane_export`, `m68k/z80_disassemble`, `symbols_list`, `memory_search`/`memory_diff`, `memory_write`, `memory_freeze`, `memory_snapshot_capture`, `cpu_breakpoint/watchpoint` now return `address`+`address_hex` (`canonicalHex` 0x%06X) + `address_space` + `effective_address`/`effective_address_hex` + `address_width_bits`/`address_mask_hex` where bus-mapped.
+- [x] Give every tool output a stable schema version or documented result type.
   Preserve the bounded human-readable `content` field, but make
   `structuredContent` the authoritative machine contract.
-- [ ] Normalize artifact descriptors across all producers, including a single
+  **Delivered 2026-08-26**: `server.callTool` injects `result_type` (tool name) and `schema_version:"1"` into every successful `structuredContent` (and legacy `content`); `experiment` executor also injects.
+- [x] Normalize artifact descriptors across all producers, including a single
   `artifacts` field for multi-artifact results, MIME type, size, SHA-256,
   provenance reference, resource URI, and direct retrieval URL.
-- [ ] Audit descriptions and schemas against actual behavior. In particular,
+  **Delivered 2026-08-26**: `artifactDescriptor` already canonical; `experimentArtifactView` now includes `provenance`/`provenance_state`; `memory_snapshot_capture` now returns `artifacts` array aggregating manifest + range artifacts alongside legacy `manifest`/`ranges`.
+- [x] Audit descriptions and schemas against actual behavior. In particular,
   `memory_spaces_list` must report real readable and writable capabilities
   instead of unconditionally overwriting permissions with `read` while the
   server exposes `memory_write` for some spaces.
+  **Delivered 2026-08-26**: `runMemorySpacesList` now uses `spacePermissions` — VDP timed buffers and `mem-rom`/`mem-boot-rom` report `["read"]`, all other bus/memory spaces `["read","write"]`; validated that `memory_write` correctly rejects `write_not_supported` for timed buffers.
 - [x] `memory_spaces_list` must report each space's bus mapping
   (`bus_base`/`bus_offset`), because space-relative addresses are otherwise
   ambiguous (validated 2026-08-25: `memory_dump` on `mem-ram` rejected
