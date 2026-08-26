@@ -428,7 +428,7 @@ it. Breakpoint and watchpoint ownership also lacks context provenance.
 - [x] Add bounded event history with pagination and artifact spillover. History
   must preserve counter gaps caused by sampling/truncation and identify any
   dropped records.
-  **Delivered 2026-08-26**: `Server.debugEvents` bounded to 100 with `pushDebugEvent`/`listDebugEvents`; `maxDebugEvents` cap and `truncated` flag; gaps preserved via `hit_count` monotonicity (not yet paginated via tool, but store supports offset/limit).
+  **Delivered 2026-08-26**: `Server.debugEvents` bounded to 100 with `pushDebugEvent`/`listDebugEvents`; `cpu_debug_events_list` tool with `offset`/`limit` pagination, `truncated` flag and `total` count; gaps preserved via `hit_count` monotonicity.
 - [x] Apply the target-generation, optional control-lock, and provenance rules
   above to all debug resources and events.
   **Delivered 2026-08-26**: `debug-event` provenance includes `target_generation`/`control_id`/`capture_id`/`context_id` via `genericProvenance`; `executeMutation` already enforces generation/control-lock for `breakpoint`/`watchpoint`.

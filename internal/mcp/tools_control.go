@@ -76,6 +76,16 @@ func controlToolSpecs() []toolSpec {
 			}, []string{"watchpoint_id"}),
 			run: runWatchpointRemove,
 		},
+		{
+			name:        "cpu_debug_events_list",
+			description: "List structured breakpoint/watchpoint stop events (bounded history, pagination, artifact spillover). Each event includes managed resource id, owner context, CPU, triggering PC, address_space, watched address, access direction, hit count, target_generation, frame_token, timestamp, and provenance. History preserves counter gaps and identifies dropped records via truncated flag and total count.",
+			schema: objectSchema(map[string]any{
+				"offset":  integerProperty("Pagination offset (default 0).", 0),
+				"limit":   integerProperty("Pagination limit (default 20, cap 100).", 1),
+				"context": contextProperty(),
+			}, nil),
+			run: runDebugEventsList,
+		},
 	}
 }
 
@@ -426,6 +436,63 @@ func runWatchpointRemove(tc toolContext, args json.RawMessage) map[string]any {
 		return failureResult(failure, tc.modern)
 	}
 	return okResult(stampGenerations(payload, before, after), tc.modern)
+}
+
+type debugEventsListArgs struct {
+	Offset  uint64 `json:"offset"`
+	Limit   uint64 `json:"limit"`
+	Context string `json:"context"`
+}
+
+func runDebugEventsList(tc toolContext, args json.RawMessage) map[string]any {
+	parsed, failure := decodeArgs[debugEventsListArgs](args)
+	if failure != nil {
+		return failureResult(failure, tc.modern)
+	}
+	if _, failure = resolveContext(tc.server, parsed.Context); failure != nil {
+		return failureResult(failure, tc.modern)
+	}
+	offset := int(parsed.Offset)
+	limit := int(parsed.Limit)
+	if limit == 0 {
+		limit = 20
+	}
+	if limit > 100 {
+		limit = 100
+	}
+	events, total, truncated := tc.server.listDebugEvents(offset, limit)
+	views := make([]map[string]any, 0, len(events))
+	for _, ev := range events {
+		view := map[string]any{
+			"event_id":            ev.ID,
+			"resource_kind":       ev.ResourceKind,
+			"resource_id":         ev.ResourceID,
+			"context_id":          ev.ContextID,
+			"cpu":                 ev.CPU,
+			"triggering_pc":       ev.TriggeringPC,
+			"triggering_pc_hex":   canonicalHex(ev.TriggeringPC),
+			"address_space":       ev.AddressSpace,
+			"watched_address":     ev.WatchedAddress,
+			"watched_address_hex": canonicalHex(ev.WatchedAddress),
+			"access_direction":    ev.AccessDirection,
+			"requested_length":    ev.RequestedLength,
+			"hit_count":           ev.HitCount,
+			"target_generation":   ev.TargetGeneration,
+			"timestamp":           ev.Timestamp,
+		}
+		if ev.FrameToken != nil {
+			view["frame_token"] = *ev.FrameToken
+		}
+		views = append(views, view)
+	}
+	return okResult(map[string]any{
+		"events":     views,
+		"total":      total,
+		"offset":     offset,
+		"limit":      limit,
+		"truncated":  truncated,
+		"note":       "History is bounded to 100 events; gaps may exist due to truncation; check truncated and total for pagination.",
+	}, tc.modern)
 }
 
 // annotateDebugList merges server-side provenance into a breakpoint_list or
