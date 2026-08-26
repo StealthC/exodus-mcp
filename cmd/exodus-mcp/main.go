@@ -36,7 +36,7 @@ func (values *stringList) Set(value string) error {
 }
 
 func main() {
-	listen := flag.String("listen", envOrDefault("EXODUS_MCP_LISTEN", "127.0.0.1:8767"), "local address for the MCP HTTP endpoint")
+	listen := flag.String("listen", envOrDefault("EXODUS_MCP_LISTEN", "127.0.0.1:8768"), "local address for the MCP HTTP endpoint")
 	pipeName := flag.String("pipe-name", os.Getenv("EXODUS_MCP_PIPE_NAME"), "Windows named pipe used by ExodusMcpPlugin")
 	pipeCapability := flag.String("pipe-capability", os.Getenv("EXODUS_MCP_CAPABILITY"), "capability for the Windows named pipe")
 	exodusExecutable := flag.String("exodus", "", "launch Exodus with a generated bridge pipe and capability")
@@ -137,7 +137,7 @@ func main() {
 func portOf(address string) string {
 	_, port, err := net.SplitHostPort(address)
 	if err != nil || port == "" {
-		return "8767"
+		return "8768"
 	}
 	return port
 }

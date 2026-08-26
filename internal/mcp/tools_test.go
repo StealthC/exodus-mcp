@@ -33,7 +33,7 @@ func postToolCall(t *testing.T, server *Server, name, arguments string) map[stri
 	t.Helper()
 	params := fmt.Sprintf(`{"name":%q,"arguments":%s,"_meta":{"io.modelcontextprotocol/protocolVersion":%q}}`, name, arguments, ModernProtocolVersion)
 	body := fmt.Sprintf(`{"jsonrpc":"2.0","id":1,"method":"tools/call","params":%s}`, params)
-	request, err := http.NewRequest(http.MethodPost, "http://127.0.0.1:8767/mcp", strings.NewReader(body))
+	request, err := http.NewRequest(http.MethodPost, "http://127.0.0.1:8768/mcp", strings.NewReader(body))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -947,7 +947,7 @@ func TestLegacyToolsCallParity(t *testing.T) {
 		return json.RawMessage(memReadPayload([]byte{9, 9}, "little-endian", 0)), nil
 	}
 	body := `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"z80_read_memory","arguments":{"address":0,"length":2}}}`
-	request, err := http.NewRequest(http.MethodPost, "http://127.0.0.1:8767/mcp", strings.NewReader(body))
+	request, err := http.NewRequest(http.MethodPost, "http://127.0.0.1:8768/mcp", strings.NewReader(body))
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -1,6 +1,6 @@
 # MCP clients
 
-The development endpoint is `http://127.0.0.1:8767/mcp`. Start it in a second
+The development endpoint is `http://127.0.0.1:8768/mcp`. Start it in a second
 terminal before connecting a client:
 
 ```bash
@@ -24,7 +24,7 @@ backward compatibility, so one `opencode.json` works for either client:
   "mcp": {
     "exodus": {
       "type": "remote",
-      "url": "http://127.0.0.1:8767/mcp",
+      "url": "http://127.0.0.1:8768/mcp",
       "oauth": false,
       "enabled": true
     }
@@ -45,7 +45,7 @@ name, its tools appear as `exodus_bridge_status` and `exodus_target_info`.
 Register the Streamable HTTP endpoint directly:
 
 ```bash
-codex mcp add exodus --url http://127.0.0.1:8767/mcp
+codex mcp add exodus --url http://127.0.0.1:8768/mcp
 codex mcp get exodus
 ```
 
@@ -53,7 +53,7 @@ This writes the equivalent entry to `~/.codex/config.toml`:
 
 ```toml
 [mcp_servers.exodus]
-url = "http://127.0.0.1:8767/mcp"
+url = "http://127.0.0.1:8768/mcp"
 ```
 
 Restart Codex after adding it. Keep the URL loopback-only. The configuration is
@@ -66,7 +66,7 @@ named-pipe capability.
 For a personal configuration in the current project, run:
 
 ```bash
-claude mcp add --transport http exodus http://127.0.0.1:8767/mcp
+claude mcp add --transport http exodus http://127.0.0.1:8768/mcp
 claude mcp list
 ```
 

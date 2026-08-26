@@ -117,7 +117,7 @@ vendor/exodus/        pinned StealthC/Exodus Git submodule
 ```bash
 go test ./...                # unit and integration tests
 ./scripts/test.sh            # local quality gates (fmt, vet, race, Windows build)
-curl http://127.0.0.1:8767/healthz
+curl http://127.0.0.1:8768/healthz
 ```
 
 Under WSL, build the pair with `./scripts/build-windows.sh` and launch it with

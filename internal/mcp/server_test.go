@@ -74,7 +74,7 @@ func newFakeStatus() bridge.Status {
 
 func TestModernDiscover(t *testing.T) {
 	body := `{"jsonrpc":"2.0","id":1,"method":"server/discover","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientCapabilities":{}}}}`
-	request, err := http.NewRequest(http.MethodPost, "http://127.0.0.1:8767/mcp", strings.NewReader(body))
+	request, err := http.NewRequest(http.MethodPost, "http://127.0.0.1:8768/mcp", strings.NewReader(body))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -92,7 +92,7 @@ func TestModernDiscover(t *testing.T) {
 
 func TestModernRejectsMissingHeaders(t *testing.T) {
 	body := `{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28"}}}`
-	request, err := http.NewRequest(http.MethodPost, "http://127.0.0.1:8767/mcp", strings.NewReader(body))
+	request, err := http.NewRequest(http.MethodPost, "http://127.0.0.1:8768/mcp", strings.NewReader(body))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -108,7 +108,7 @@ func TestModernRejectsMissingHeaders(t *testing.T) {
 
 func TestModernRejectsUnsupportedProtocolVersion(t *testing.T) {
 	body := `{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"2024-11-05"}}}`
-	request, err := http.NewRequest(http.MethodPost, "http://127.0.0.1:8767/mcp", strings.NewReader(body))
+	request, err := http.NewRequest(http.MethodPost, "http://127.0.0.1:8768/mcp", strings.NewReader(body))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -126,7 +126,7 @@ func TestModernRejectsUnsupportedProtocolVersion(t *testing.T) {
 
 func TestLegacyInitialize(t *testing.T) {
 	body := `{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{}}}`
-	request, err := http.NewRequest(http.MethodPost, "http://127.0.0.1:8767/mcp", strings.NewReader(body))
+	request, err := http.NewRequest(http.MethodPost, "http://127.0.0.1:8768/mcp", strings.NewReader(body))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -141,7 +141,7 @@ func TestLegacyInitialize(t *testing.T) {
 }
 
 func TestRejectsForeignOrigin(t *testing.T) {
-	request, err := http.NewRequest(http.MethodGet, "http://127.0.0.1:8767/healthz", nil)
+	request, err := http.NewRequest(http.MethodGet, "http://127.0.0.1:8768/healthz", nil)
 	if err != nil {
 		t.Fatal(err)
 	}

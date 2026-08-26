@@ -61,7 +61,7 @@ func newRunner(t *testing.T, config Config) (*Runner, *artifact.Store) {
 		t.Fatal(err)
 	}
 	config.ScriptsDir = t.TempDir()
-	config.ArtifactBaseURL = "http://127.0.0.1:8767"
+	config.ArtifactBaseURL = "http://127.0.0.1:8768"
 	runner, err := NewRunner(config, store)
 	if err != nil {
 		t.Fatal(err)

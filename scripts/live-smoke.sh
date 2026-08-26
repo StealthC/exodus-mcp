@@ -16,10 +16,10 @@
 # Requires: bash, curl, python3. Run against an already-launched pair
 # (./scripts/run-windows.sh); never start a second pair for this script.
 #
-# Usage: ./scripts/live-smoke.sh [--url http://127.0.0.1:8767] [--full]
+# Usage: ./scripts/live-smoke.sh [--url http://127.0.0.1:8768] [--full]
 set -uo pipefail
 
-BASE_URL="http://127.0.0.1:8767"
+BASE_URL="http://127.0.0.1:8768"
 FULL=0
 while [ $# -gt 0 ]; do
 	case "$1" in

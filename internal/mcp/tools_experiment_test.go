@@ -29,7 +29,7 @@ func newExperimentServer(t *testing.T, client bridge.Client, scriptsDir string) 
 	server.SetStatesDir(t.TempDir())
 	runner, err := experiment.NewRunner(experiment.Config{
 		ScriptsDir:      scriptsDir,
-		ArtifactBaseURL: "http://127.0.0.1:8767",
+		ArtifactBaseURL: "http://127.0.0.1:8768",
 	}, store)
 	if err != nil {
 		t.Fatal(err)
@@ -362,7 +362,7 @@ func TestExperimentRunInvalidArguments(t *testing.T) {
 }
 
 func TestExperimentRunToolsListHasSchema(t *testing.T) {
-	request, err := http.NewRequest(http.MethodPost, "http://127.0.0.1:8767/mcp",
+	request, err := http.NewRequest(http.MethodPost, "http://127.0.0.1:8768/mcp",
 		strings.NewReader(`{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28"}}}`))
 	if err != nil {
 		t.Fatal(err)

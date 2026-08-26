@@ -86,7 +86,7 @@ always go through the wrappers.
 ### Self-service build/run/validate loop
 
 1. **Check what is running** before anything: `tasklist.exe | grep -iE
-   "exodus"` plus `curl -s http://127.0.0.1:8767/healthz`.
+   "exodus"` plus `curl -s http://127.0.0.1:8768/healthz`.
    - The health response includes the build version (e.g.
      `v0.1.0-6-gcadc8a1`, stamped from `git describe`), so you can confirm
      which build is live before and after a rebuild.
@@ -113,7 +113,7 @@ always go through the wrappers.
 4. **Run**: `./scripts/run-windows.sh` **in the background** — the launcher
    does not return until the pair is closed, so a foreground invocation
    blocks the shell. Redirect its output to `tmp/run-windows.log`. Then poll
-   `curl -s http://127.0.0.1:8767/healthz` from a separate foreground command
+   `curl -s http://127.0.0.1:8768/healthz` from a separate foreground command
    until it answers `"ok"` (a plain `for` loop with a bounded retry count is
    fine; the pipe can lag the HTTP gate by tens of seconds on Debug builds),
    and inspect `tmp/run-windows.log` for startup errors before driving tools.
@@ -138,7 +138,7 @@ always go through the wrappers.
 
 ### Direct HTTP validation (bypassing the harness)
 
-- Raw HTTP against `http://127.0.0.1:8767/mcp` exercises every tool without
+- Raw HTTP against `http://127.0.0.1:8768/mcp` exercises every tool without
   the cached MCP catalog; prefer it for build/test loops so a stale harness
   catalog never blocks verification.
 - For the **modern** dispatcher (the one that returns `structuredContent`),

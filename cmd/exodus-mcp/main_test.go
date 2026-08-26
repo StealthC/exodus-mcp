@@ -14,10 +14,10 @@ func TestResolveBaseURLFollowsListenAddress(t *testing.T) {
 		explicit string
 		want     string
 	}{
-		{"default port", "127.0.0.1:8767", "", "http://127.0.0.1:8767"},
+		{"default port", "127.0.0.1:8768", "", "http://127.0.0.1:8768"},
 		{"custom listen wins", "127.0.0.1:9000", "", "http://127.0.0.1:9000"},
 		{"explicit beats listen", "127.0.0.1:9000", "http://127.0.0.1:9000/", "http://127.0.0.1:9000"},
-		{"missing port falls back", "127.0.0.1", "", "http://127.0.0.1:8767"},
+		{"missing port falls back", "127.0.0.1", "", "http://127.0.0.1:8768"},
 	}
 	for _, testCase := range cases {
 		t.Run(testCase.name, func(t *testing.T) {

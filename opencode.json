@@ -3,7 +3,7 @@
   "mcp": {
     "exodus": {
       "type": "remote",
-      "url": "http://127.0.0.1:8767/mcp",
+      "url": "http://127.0.0.1:8768/mcp",
       "oauth": false,
       "enabled": true
     }

@@ -35,7 +35,7 @@ Tools that can produce significant output will return an object shaped like:
     "mime_type": "text/plain; charset=utf-8",
     "size_bytes": 1124059,
     "sha256": "...",
-    "url": "http://127.0.0.1:8767/artifacts/art_01J...",
+    "url": "http://127.0.0.1:8768/artifacts/art_01J...",
     "resource_uri": "exodus://artifacts/art_01J..."
   }
 }

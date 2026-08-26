@@ -248,7 +248,7 @@ per `AGENTS.md` upstream discipline.
 - Build/test ritual: `.\build.bat` (MSBuild plugin → copies DLL to
   `F:\projects\kid\emulators\Exodus_2.1\Plugins` → builds
   `bin\exodus-mcp.exe`), `.\run.bat` (launches Exodus child with generated
-  capability). Only ONE server may bind `127.0.0.1:8767`; announce restarts.
+  capability). Only ONE server may bind `127.0.0.1:8768`; announce restarts.
 - Wire protocol v2 (both sides in this repo): flat key/value request lines;
   response = 8-hex-digit length prefix + UTF-8 JSON envelope
   `{protocol_version:2,id,status,data|error}`; plugin holds the connection
