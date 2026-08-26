@@ -4,6 +4,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"strconv"
+	"strings"
+	"time"
 
 	"github.com/StealthC/exodus-mcp/internal/analysis"
 	"github.com/StealthC/exodus-mcp/internal/symbols"
@@ -20,12 +22,17 @@ func cpuToolSpecs() []toolSpec {
 	return []toolSpec{
 		{
 			name:        "cpu_trace_capture",
-			description: "Capture a bounded M68K or Z80 execution trace into a text artifact. The capture stops the system, routes the processor trace log through a temporary on-disk file (the in-memory ring accessor is unsafe across the extension boundary), and restores the prior run state. The system runs during the window, so the capture mutates the target and advances the target generation. Accepts optional expected_target_generation and control_id.",
+			description: "Capture a bounded M68K or Z80 execution trace into a text artifact plus a versioned JSONL artifact with one event per executed instruction (PC numeric/hex, address_space, opcode bytes, length, mnemonic/operands, cycle, target_generation, capture_id, frame_token where available, and typed control-flow where available). The capture stops the system, routes the processor trace log through a temporary on-disk file, and restores the prior run state. The system runs during the window, so the capture mutates the target and advances the target generation. Optional filters (address_range_start/end, include_rom/include_ram, retain_repeated) are applied to the JSONL view and recorded in provenance. Accepts optional expected_target_generation and control_id.",
 			schema: objectSchema(map[string]any{
 				"cpu":                        enumProperty("Processor to trace.", []string{"m68k", "z80"}),
 				"max_entries":                integerProperty(fmt.Sprintf("Maximum entries (default %d, cap %d).", defaultTraceEntries, maxTraceEntries), 1),
 				"timeout_ms":                 integerProperty("Capture window in milliseconds (default 5000, cap 30000).", 100),
-				"context":                    stringProperty("Analysis context that will own the trace artifact."),
+				"address_range_start":        addressProperty(),
+				"address_range_end":          addressProperty(),
+				"include_rom":                booleanProperty("Include ROM addresses when filtering by address space (default true)."),
+				"include_ram":                booleanProperty("Include RAM addresses when filtering (default true)."),
+				"retain_repeated":            booleanProperty("Retain repeated PC events in JSONL (default true); when false only the first occurrence per address is kept."),
+				"context":                    stringProperty("Analysis context that will own the trace artifacts."),
 				"expected_target_generation": integerProperty("Optional target generation the caller last observed; fails with target_generation_conflict on mismatch.", 1),
 				"control_id":                 stringProperty("Optional control id from target_control_acquire; required while the control lock is active."),
 			}, []string{"cpu"}),
@@ -438,10 +445,15 @@ func makeRunCpuMemoryRead(spaceID string) func(toolContext, json.RawMessage) map
 // Trace capture
 // ----------------------------------------------------------------------------------------------------------------------
 type traceCaptureArgs struct {
-	CPU        string `json:"cpu"`
-	MaxEntries uint64 `json:"max_entries"`
-	TimeoutMs  uint64 `json:"timeout_ms"`
-	Context    string `json:"context"`
+	CPU               string `json:"cpu"`
+	MaxEntries        uint64 `json:"max_entries"`
+	TimeoutMs         uint64 `json:"timeout_ms"`
+	AddressRangeStart any    `json:"address_range_start"`
+	AddressRangeEnd   any    `json:"address_range_end"`
+	IncludeROM        *bool  `json:"include_rom"`
+	IncludeRAM        *bool  `json:"include_ram"`
+	RetainRepeated    *bool  `json:"retain_repeated"`
+	Context           string `json:"context"`
 	guardArgs
 }
 
@@ -466,6 +478,10 @@ func runCpuTraceCapture(tc toolContext, args json.RawMessage) map[string]any {
 		timeoutMs = 5000
 	}
 
+	addressRangeStart, addressRangeEnd, filterFailure := parseTraceFilters(parsed)
+	if filterFailure != nil {
+		return failureResult(filterFailure, tc.modern)
+	}
 	params := map[string]string{
 		"cpu":         parsed.CPU,
 		"max_entries": strconv.FormatUint(maxEntries, 10),
@@ -478,16 +494,21 @@ func runCpuTraceCapture(tc toolContext, args json.RawMessage) map[string]any {
 		guard:     parsed.guard(),
 		contextID: context.ID,
 		detail: map[string]any{
-			"cpu":         parsed.CPU,
-			"max_entries": maxEntries,
-			"timeout_ms":  timeoutMs,
+			"cpu":                 parsed.CPU,
+			"max_entries":         maxEntries,
+			"timeout_ms":          timeoutMs,
+			"address_range_start": addressRangeStart,
+			"address_range_end":   addressRangeEnd,
+			"include_rom":         parsed.IncludeROM,
+			"include_ram":         parsed.IncludeRAM,
+			"retain_repeated":     parsed.RetainRepeated,
 		},
 	})
 	if failure != nil {
 		return failureResult(failure, tc.modern)
 	}
 
-	summary, artifactDesc, failure := traceArtifactFromPayload(tc, context, payload)
+	summary, artifactDesc, jsonlDesc, failure := traceArtifactsFromPayload(tc, context, payload, parsed, addressRangeStart, addressRangeEnd, before, after)
 	if failure != nil {
 		return failureResult(failure, tc.modern)
 	}
@@ -495,7 +516,323 @@ func runCpuTraceCapture(tc toolContext, args json.RawMessage) map[string]any {
 		"summary":  summary,
 		"artifact": artifactDesc,
 	}
+	if jsonlDesc != nil {
+		result["jsonl_artifact"] = jsonlDesc
+		result["artifacts"] = []map[string]any{artifactDesc, jsonlDesc}
+	}
 	return okResult(stampGenerations(result, before, after), tc.modern)
+}
+
+func parseTraceFilters(parsed *traceCaptureArgs) (uint64, uint64, *toolFailure) {
+	var start, end uint64
+	var err *toolFailure
+	if parsed.AddressRangeStart != nil {
+		start, err = parseAddress(parsed.AddressRangeStart)
+		if err != nil {
+			return 0, 0, &toolFailure{Code: "invalid_params", Message: "address_range_start: " + err.Message}
+		}
+	}
+	if parsed.AddressRangeEnd != nil {
+		end, err = parseAddress(parsed.AddressRangeEnd)
+		if err != nil {
+			return 0, 0, &toolFailure{Code: "invalid_params", Message: "address_range_end: " + err.Message}
+		}
+		if parsed.AddressRangeStart != nil && end <= start {
+			return 0, 0, &toolFailure{Code: "invalid_params", Message: "address_range_end must be greater than address_range_start"}
+		}
+	}
+	return start, end, nil
+}
+
+// traceArtifactsFromPayload creates the text and JSONL artifacts for a trace capture.
+// It keeps the existing text artifact as human-readable and adds a versioned JSONL artifact with one event per instruction.
+func traceArtifactsFromPayload(tc toolContext, context *analysis.Context, payload map[string]any, parsed *traceCaptureArgs, rangeStart, rangeEnd uint64, before, after uint64) (map[string]any, map[string]any, map[string]any, *toolFailure) {
+	traceText, _ := payload["trace_text"].(string)
+	cpu, _ := payload["cpu"].(string)
+	captureID := newCaptureID()
+	generation := tc.server.target.Generation()
+	frameToken := currentFrameToken(tc)
+
+	// Text artifact (existing behavior)
+	provenance := genericProvenance(tc.server, "cpu-trace", time.Now().UTC())
+	provenance.Device = cpu
+	provenance.CaptureID = captureID
+	if cpu == "z80" {
+		provenance.AddressSpace = "z80-bus"
+		provenance.ByteOrder = "little-endian"
+	} else {
+		provenance.AddressSpace = "m68k-bus"
+		provenance.ByteOrder = "big-endian"
+	}
+	// Record filters in provenance for reproducibility.
+	if parsed.AddressRangeStart != nil || parsed.AddressRangeEnd != nil {
+		provenance.StartAddress = &rangeStart
+		if parsed.AddressRangeEnd != nil {
+			length := rangeEnd - rangeStart
+			provenance.ByteLength = &length
+			end := rangeEnd - 1
+			provenance.EffectiveAddress = &end
+		}
+	}
+	storedText, err := tc.server.store.PutWithProvenance(context.ID, "cpu-trace", "text/plain; charset=utf-8", []byte(traceText), provenance)
+	if err != nil {
+		return nil, nil, nil, &toolFailure{Code: "artifact_error", Message: err.Error()}
+	}
+	// Build JSONL events
+	events, truncation := buildTraceJSONLEvents(tc, cpu, traceText, rangeStart, rangeEnd, parsed, captureID, generation, frameToken)
+	var jsonlBytes []byte
+	for _, event := range events {
+		line, _ := json.Marshal(event)
+		jsonlBytes = append(jsonlBytes, line...)
+		jsonlBytes = append(jsonlBytes, '\n')
+	}
+	jsonlProvenance := genericProvenance(tc.server, "cpu-trace-jsonl", time.Now().UTC())
+	jsonlProvenance.Device = cpu
+	jsonlProvenance.CaptureID = captureID
+	jsonlProvenance.AddressSpace = provenance.AddressSpace
+	jsonlProvenance.ByteOrder = provenance.ByteOrder
+	jsonlProvenance.StartAddress = provenance.StartAddress
+	jsonlProvenance.ByteLength = provenance.ByteLength
+	jsonlProvenance.EffectiveAddress = provenance.EffectiveAddress
+	if frameToken != nil {
+		jsonlProvenance.FrameToken = frameToken
+	}
+	storedJSONL, err := tc.server.store.PutWithProvenance(context.ID, "cpu-trace-jsonl", "application/jsonl", jsonlBytes, jsonlProvenance)
+	if err != nil {
+		return nil, nil, nil, &toolFailure{Code: "artifact_error", Message: err.Error()}
+	}
+	captured, _ := payload["captured"].(float64)
+	timedOut, _ := payload["timed_out"].(bool)
+	sample, _ := payload["sample"].([]any)
+	captureChannel, _ := payload["capture_channel"].(string)
+	summary := map[string]any{
+		"kind":            "cpu-trace",
+		"cpu":             cpu,
+		"captured":        int(captured),
+		"timed_out":       timedOut,
+		"sample":          sample,
+		"sha256":          storedText.SHA256,
+		"jsonl_sha256":    storedJSONL.SHA256,
+		"jsonl_events":    len(events),
+		"capture_id":      captureID,
+		"target_generation": generation,
+		"truncation":      truncation,
+	}
+	if note, ok := payload["sampling_note"].(string); ok && note != "" {
+		summary["sampling_note"] = note
+	} else {
+		summary["sampling_note"] = "Sampling follows live emulation only; a paused system yields few or no entries."
+	}
+	if captureChannel != "" {
+		summary["capture_channel"] = captureChannel
+	}
+	// Filters in summary for provenance
+	filters := map[string]any{}
+	if parsed.AddressRangeStart != nil {
+		filters["address_range_start"] = rangeStart
+		filters["address_range_start_hex"] = canonicalHex(rangeStart)
+	}
+	if parsed.AddressRangeEnd != nil {
+		filters["address_range_end"] = rangeEnd
+		filters["address_range_end_hex"] = canonicalHex(rangeEnd)
+	}
+	includeROM := true
+	if parsed.IncludeROM != nil {
+		includeROM = *parsed.IncludeROM
+	}
+	includeRAM := true
+	if parsed.IncludeRAM != nil {
+		includeRAM = *parsed.IncludeRAM
+	}
+	retainRepeated := true
+	if parsed.RetainRepeated != nil {
+		retainRepeated = *parsed.RetainRepeated
+	}
+	filters["include_rom"] = includeROM
+	filters["include_ram"] = includeRAM
+	filters["retain_repeated"] = retainRepeated
+	summary["filters"] = filters
+	summary["schema_version"] = "trace-jsonl/1"
+	delete(payload, "trace_text")
+	return summary, artifactDescriptor(tc.server, storedText, context.ID), artifactDescriptor(tc.server, storedJSONL, context.ID), nil
+}
+
+func buildTraceJSONLEvents(tc toolContext, cpu, traceText string, rangeStart, rangeEnd uint64, parsed *traceCaptureArgs, captureID string, generation uint64, frameToken *uint64) ([]map[string]any, map[string]any) {
+	lines := strings.Split(traceText, "\n")
+	events := []map[string]any{}
+	seen := map[uint64]bool{}
+	includeROM := true
+	if parsed.IncludeROM != nil {
+		includeROM = *parsed.IncludeROM
+	}
+	includeRAM := true
+	if parsed.IncludeRAM != nil {
+		includeRAM = *parsed.IncludeRAM
+	}
+	retainRepeated := true
+	if parsed.RetainRepeated != nil {
+		retainRepeated = *parsed.RetainRepeated
+	}
+	hasRange := parsed.AddressRangeStart != nil || parsed.AddressRangeEnd != nil
+	addressSpace := "m68k-bus"
+	if cpu == "z80" {
+		addressSpace = "z80-bus"
+	}
+	// Cache for instruction info
+	cache := map[uint64]map[string]any{}
+	truncationSource := len(lines)
+	decodedCount := 0
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		// Format is "ADDRESS CYCLE mnemonic operands"
+		fields := strings.Fields(line)
+		if len(fields) < 2 {
+			continue
+		}
+		pc, err := strconv.ParseUint(fields[0], 16, 64)
+		if err != nil {
+			continue
+		}
+		cycle := uint64(0)
+		if len(fields) >= 2 {
+			cycle, _ = strconv.ParseUint(fields[1], 10, 64)
+		}
+		mnemonic := ""
+		operands := ""
+		if len(fields) >= 3 {
+			mnemonic = fields[2]
+		}
+		if len(fields) >= 4 {
+			operands = strings.Join(fields[3:], " ")
+		}
+		// Filters
+		if hasRange {
+			if parsed.AddressRangeStart != nil && pc < rangeStart {
+				continue
+			}
+			if parsed.AddressRangeEnd != nil && pc >= rangeEnd {
+				continue
+			}
+		}
+		// ROM/RAM filter (simplified: treat as address range check)
+		if !includeROM && isROMAddress(pc, cpu) {
+			continue
+		}
+		if !includeRAM && isRAMAddress(pc, cpu) {
+			continue
+		}
+		if !retainRepeated {
+			if seen[pc] {
+				continue
+			}
+			seen[pc] = true
+		}
+		// Fetch instruction bytes/length via disasm cache
+		info, cached := cache[pc]
+		if !cached {
+			info = fetchInstructionInfo(tc, cpu, pc)
+			cache[pc] = info
+			decodedCount++
+		}
+		event := map[string]any{
+			"cpu":               cpu,
+			"address_space":     addressSpace,
+			"pc":                pc,
+			"pc_hex":            canonicalHex(pc),
+			"cycle":             cycle,
+			"target_generation": generation,
+			"capture_id":        captureID,
+			"schema_version":    "trace-event/1",
+		}
+		if frameToken != nil {
+			event["frame_token"] = *frameToken
+		}
+		if mnemonic != "" {
+			event["mnemonic"] = mnemonic
+		}
+		if operands != "" {
+			event["operands"] = operands
+		}
+		if info != nil {
+			if bytesHex, ok := info["bytes_hex"].(string); ok && bytesHex != "" {
+				event["opcode_bytes"] = bytesHex
+				event["opcode_bytes_hex"] = bytesHex
+			}
+			if length, ok := info["length"].(int); ok {
+				event["instruction_length"] = length
+			}
+			if len(info) == 0 {
+				event["decode_confidence"] = "unknown"
+			} else {
+				event["decode_confidence"] = "high"
+			}
+		} else {
+			event["decode_confidence"] = "unknown"
+		}
+		// Control-flow facts are not available from the trace; mark unknown.
+		event["control_flow"] = map[string]any{
+			"fallthrough_address":       nil,
+			"branch_target":             nil,
+			"branch_taken":              nil,
+			"call_return_classification": "unknown",
+			"exception_interrupt":       nil,
+			"confidence":                "unknown",
+		}
+		events = append(events, event)
+	}
+	truncation := map[string]any{
+		"source_events":    truncationSource,
+		"decoded_events":   decodedCount,
+		"unique_addresses": len(cache),
+		"filtered_events":  len(events),
+		"complete":         false,
+		"note":             "Trace ring/timeout limit may truncate; decoded events may be fewer than source; complete is false when captured == max_entries or timed_out is true.",
+	}
+	return events, truncation
+}
+
+func fetchInstructionInfo(tc toolContext, cpu string, pc uint64) map[string]any {
+	payload, failure := tc.server.executeCommand(tc.ctx, "disasm", map[string]string{"cpu": cpu, "address": strconv.FormatUint(pc, 10), "count": "1"})
+	if failure != nil {
+		return nil
+	}
+	lines, ok := payload["lines"].([]any)
+	if !ok || len(lines) == 0 {
+		return nil
+	}
+	line, ok := lines[0].(map[string]any)
+	if !ok {
+		return nil
+	}
+	bytesHex, _ := line["bytes"].(string)
+	lengthFloat, _ := line["length"].(float64)
+	length := int(lengthFloat)
+	if length == 0 {
+		// Fallback: try to infer from bytes length
+		length = len(bytesHex) / 2
+	}
+	return map[string]any{
+		"bytes_hex": bytesHex,
+		"length":    length,
+	}
+}
+
+func isROMAddress(addr uint64, cpu string) bool {
+	if cpu == "z80" {
+		return false
+	}
+	// M68K ROM window 0x000000-0x3FFFFF per header
+	return addr < 0x400000
+}
+
+func isRAMAddress(addr uint64, cpu string) bool {
+	if cpu == "z80" {
+		return addr < 0x2000 // Z80 RAM 8k
+	}
+	return addr >= 0xFF0000 && addr <= 0xFFFFFF
 }
 
 // ----------------------------------------------------------------------------------------------------------------------

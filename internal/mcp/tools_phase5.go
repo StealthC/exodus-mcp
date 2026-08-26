@@ -35,13 +35,16 @@ func phase5ToolSpecs() []toolSpec {
 		memorySnapshotCaptureSpec(),
 		{
 			name:        "cpu_coverage_capture",
-			description: "Run the system for a bounded window and record which code addresses executed into a coverage artifact (distinct addresses, merged ranges, page histogram). Reuses the trace_capture path; the prior run state is restored afterwards. The system runs during the window, so the capture mutates the target and advances the target generation. Accepts optional expected_target_generation and control_id.",
+			description: "Run the system for a bounded window and record which code addresses executed into a versioned coverage artifact with instruction-aware blocks, execution counts, and observed edges (not byte-adjacent). Reuses the trace_capture path; the prior run state is restored afterwards. The system runs during the window, so the capture mutates the target and advances the target generation. Optional filters (region_start/end, include_rom/include_ram, retain_repeated) are applied and recorded in provenance. Accepts optional expected_target_generation and control_id.",
 			schema: objectSchema(map[string]any{
 				"cpu":                        enumProperty("Processor to trace.", []string{"m68k", "z80"}),
 				"duration_ms":                integerProperty("Trace window in milliseconds (default 500, cap 5000).", 1),
 				"max_entries":                integerProperty("Maximum trace entries retained (default 10000, cap 10000).", 1),
 				"region_start":               addressProperty(),
 				"region_end":                 addressProperty(),
+				"include_rom":                booleanProperty("Include ROM addresses when filtering (default true)."),
+				"include_ram":                booleanProperty("Include RAM addresses when filtering (default true)."),
+				"retain_repeated":            booleanProperty("Retain repeated PC events when building coverage (default true); when false only distinct addresses are counted."),
 				"context":                    stringProperty("Analysis context that will own the coverage artifact."),
 				"expected_target_generation": integerProperty("Optional target generation the caller last observed; fails with target_generation_conflict on mismatch.", 1),
 				"control_id":                 stringProperty("Optional control id from target_control_acquire; required while the control lock is active."),
@@ -1460,7 +1463,7 @@ func runCpuTraceCaptureWatchpoint(tc toolContext, args json.RawMessage) map[stri
 		return failureResult(failure, tc.modern)
 	}
 
-	summary, artifactDesc, failure := traceArtifactFromPayload(tc, context, payload)
+	summary, artifactDesc, jsonlDesc, failure := traceArtifactsFromPayloadGeneric(tc, context, payload, "", 0, 0, false, true, true, true)
 	if failure != nil {
 		return failureResult(failure, tc.modern)
 	}
@@ -1477,19 +1480,38 @@ func runCpuTraceCaptureWatchpoint(tc toolContext, args json.RawMessage) map[stri
 	if value, ok := payload["event_note"].(string); ok {
 		summary["event_note"] = value
 	}
-	result := map[string]any{"summary": summary, "artifact": artifactDesc}
+	result := map[string]any{"summary": summary, "artifact": artifactDesc, "jsonl_artifact": jsonlDesc, "artifacts": []map[string]any{artifactDesc, jsonlDesc}}
 	return okResult(stampGenerations(result, before, after), tc.modern)
 }
 
-// traceArtifactFromPayload turns a trace_capture payload into a stored
-// text artifact plus a compact inline summary. The artifact carries capture
-// provenance naming the CPU, its bus address domain, target generation, and
-// ROM identity at capture time.
+// traceArtifactFromPayload turns a trace_capture payload into stored text and JSONL artifacts.
+// It is kept for watchpoint-driven traces that do not have filter args; the main trace path uses traceArtifactsFromPayload.
 func traceArtifactFromPayload(tc toolContext, context *analysis.Context, payload map[string]any) (map[string]any, map[string]any, *toolFailure) {
+	summary, textDesc, jsonlDesc, failure := traceArtifactsFromPayloadGeneric(tc, context, payload, "m68k", 0, 0, false, true, true, true)
+	if failure != nil {
+		return nil, nil, failure
+	}
+	// For backward compatibility, return only the text artifact; the caller for watchpoint will handle jsonl separately via the generic.
+	_ = jsonlDesc
+	return summary, textDesc, nil
+}
+
+// traceArtifactsFromPayloadGeneric is the shared implementation for both plain and watchpoint traces.
+func traceArtifactsFromPayloadGeneric(tc toolContext, context *analysis.Context, payload map[string]any, cpuOverride string, rangeStart, rangeEnd uint64, hasRange, includeROM, includeRAM bool, retainRepeated bool) (map[string]any, map[string]any, map[string]any, *toolFailure) {
 	traceText, _ := payload["trace_text"].(string)
 	cpu, _ := payload["cpu"].(string)
+	if cpu == "" {
+		cpu = cpuOverride
+	}
+	if cpu == "" {
+		cpu = "m68k"
+	}
+	captureID := newCaptureID()
+	generation := tc.server.target.Generation()
+	frameToken := currentFrameToken(tc)
 	provenance := genericProvenance(tc.server, "cpu-trace", time.Now().UTC())
 	provenance.Device = cpu
+	provenance.CaptureID = captureID
 	if cpu == "z80" {
 		provenance.AddressSpace = "z80-bus"
 		provenance.ByteOrder = "little-endian"
@@ -1497,23 +1519,69 @@ func traceArtifactFromPayload(tc toolContext, context *analysis.Context, payload
 		provenance.AddressSpace = "m68k-bus"
 		provenance.ByteOrder = "big-endian"
 	}
-	stored, err := tc.server.store.PutWithProvenance(context.ID, "cpu-trace", "text/plain; charset=utf-8", []byte(traceText), provenance)
-	if err != nil {
-		return nil, nil, &toolFailure{Code: "artifact_error", Message: err.Error()}
+	if hasRange {
+		provenance.StartAddress = &rangeStart
+		if rangeEnd > rangeStart {
+			length := rangeEnd - rangeStart
+			provenance.ByteLength = &length
+		}
 	}
-	delete(payload, "trace_text")
+	storedText, err := tc.server.store.PutWithProvenance(context.ID, "cpu-trace", "text/plain; charset=utf-8", []byte(traceText), provenance)
+	if err != nil {
+		return nil, nil, nil, &toolFailure{Code: "artifact_error", Message: err.Error()}
+	}
+	// Build JSONL
+	dummyArgs := &traceCaptureArgs{CPU: cpu, IncludeROM: &includeROM, IncludeRAM: &includeRAM, RetainRepeated: &retainRepeated}
+	if hasRange {
+		startCopy := rangeStart
+		endCopy := rangeEnd
+		// Use dummyArgs to carry range for filtering; set via closure below
+		dummyArgs.AddressRangeStart = startCopy
+		dummyArgs.AddressRangeEnd = endCopy
+	}
+	// For range filtering, we pass the range values directly
+	var rs, re uint64
+	if hasRange {
+		rs, re = rangeStart, rangeEnd
+	}
+	events, truncation := buildTraceJSONLEvents(tc, cpu, traceText, rs, re, dummyArgs, captureID, generation, frameToken)
+	var jsonlBytes []byte
+	for _, event := range events {
+		line, _ := json.Marshal(event)
+		jsonlBytes = append(jsonlBytes, line...)
+		jsonlBytes = append(jsonlBytes, '\n')
+	}
+	jsonlProvenance := genericProvenance(tc.server, "cpu-trace-jsonl", time.Now().UTC())
+	jsonlProvenance.Device = cpu
+	jsonlProvenance.CaptureID = captureID
+	jsonlProvenance.AddressSpace = provenance.AddressSpace
+	jsonlProvenance.ByteOrder = provenance.ByteOrder
+	jsonlProvenance.StartAddress = provenance.StartAddress
+	jsonlProvenance.ByteLength = provenance.ByteLength
+	if frameToken != nil {
+		jsonlProvenance.FrameToken = frameToken
+	}
+	storedJSONL, err := tc.server.store.PutWithProvenance(context.ID, "cpu-trace-jsonl", "application/jsonl", jsonlBytes, jsonlProvenance)
+	if err != nil {
+		return nil, nil, nil, &toolFailure{Code: "artifact_error", Message: err.Error()}
+	}
 	captured, _ := payload["captured"].(float64)
 	timedOut, _ := payload["timed_out"].(bool)
 	sample, _ := payload["sample"].([]any)
 	captureChannel, _ := payload["capture_channel"].(string)
-
 	summary := map[string]any{
-		"kind":      "cpu-trace",
-		"cpu":       cpu,
-		"captured":  int(captured),
-		"timed_out": timedOut,
-		"sample":    sample,
-		"sha256":    stored.SHA256,
+		"kind":              "cpu-trace",
+		"cpu":               cpu,
+		"captured":          int(captured),
+		"timed_out":         timedOut,
+		"sample":            sample,
+		"sha256":            storedText.SHA256,
+		"jsonl_sha256":      storedJSONL.SHA256,
+		"jsonl_events":      len(events),
+		"capture_id":        captureID,
+		"target_generation": generation,
+		"truncation":        truncation,
+		"schema_version":    "trace-jsonl/1",
 	}
 	if note, ok := payload["sampling_note"].(string); ok && note != "" {
 		summary["sampling_note"] = note
@@ -1523,7 +1591,20 @@ func traceArtifactFromPayload(tc toolContext, context *analysis.Context, payload
 	if captureChannel != "" {
 		summary["capture_channel"] = captureChannel
 	}
-	return summary, artifactDescriptor(tc.server, stored, context.ID), nil
+	filters := map[string]any{
+		"include_rom":     includeROM,
+		"include_ram":     includeRAM,
+		"retain_repeated": retainRepeated,
+	}
+	if hasRange {
+		filters["address_range_start"] = rs
+		filters["address_range_start_hex"] = canonicalHex(rs)
+		filters["address_range_end"] = re
+		filters["address_range_end_hex"] = canonicalHex(re)
+	}
+	summary["filters"] = filters
+	delete(payload, "trace_text")
+	return summary, artifactDescriptor(tc.server, storedText, context.ID), artifactDescriptor(tc.server, storedJSONL, context.ID), nil
 }
 
 // ----------------------------------------------------------------------------------------------------------------------
@@ -1531,12 +1612,15 @@ func traceArtifactFromPayload(tc toolContext, context *analysis.Context, payload
 // ----------------------------------------------------------------------------------------------------------------------
 
 type coverageCaptureArgs struct {
-	CPU         string `json:"cpu"`
-	DurationMs  uint64 `json:"duration_ms"`
-	MaxEntries  uint64 `json:"max_entries"`
-	RegionStart any    `json:"region_start"`
-	RegionEnd   any    `json:"region_end"`
-	Context     string `json:"context"`
+	CPU            string `json:"cpu"`
+	DurationMs     uint64 `json:"duration_ms"`
+	MaxEntries     uint64 `json:"max_entries"`
+	RegionStart    any    `json:"region_start"`
+	RegionEnd      any    `json:"region_end"`
+	IncludeROM     *bool  `json:"include_rom"`
+	IncludeRAM     *bool  `json:"include_ram"`
+	RetainRepeated *bool  `json:"retain_repeated"`
+	Context        string `json:"context"`
 	guardArgs
 }
 
@@ -1610,32 +1694,99 @@ func runCpuCoverageCapture(tc toolContext, args json.RawMessage) map[string]any 
 		return failureResult(failure, tc.modern)
 	}
 	traceText, _ := payload["trace_text"].(string)
-	addresses := parseTraceAddresses(traceText)
+	allAddresses := parseTraceAddresses(traceText)
+	entriesTotal := uint64(len(allAddresses))
 
-	filtered := addresses[:0]
-	entriesTotal := uint64(0)
-	for _, address := range addresses {
-		if address >= regionStart && address < regionEnd {
-			filtered = append(filtered, address)
-		}
-		entriesTotal++
+	// Apply filters
+	includeROM := true
+	if parsed.IncludeROM != nil {
+		includeROM = *parsed.IncludeROM
 	}
-	addresses = filtered
+	includeRAM := true
+	if parsed.IncludeRAM != nil {
+		includeRAM = *parsed.IncludeRAM
+	}
+	retainRepeated := true
+	if parsed.RetainRepeated != nil {
+		retainRepeated = *parsed.RetainRepeated
+	}
+	filtered := []uint64{}
+	for _, addr := range allAddresses {
+		if addr < regionStart || addr >= regionEnd {
+			continue
+		}
+		if !includeROM && isROMAddress(addr, parsed.CPU) {
+			continue
+		}
+		if !includeRAM && isRAMAddress(addr, parsed.CPU) {
+			continue
+		}
+		filtered = append(filtered, addr)
+	}
+	// For coverage, we need the ordered filtered sequence for edges, and the set for blocks.
+	// If retainRepeated is false, we deduplicate for the purpose of distinct set but keep edges from original filtered order.
+	addressesForBlocks := filtered
+	if !retainRepeated {
+		seen := map[uint64]bool{}
+		deduped := []uint64{}
+		for _, a := range filtered {
+			if !seen[a] {
+				seen[a] = true
+				deduped = append(deduped, a)
+			}
+		}
+		addressesForBlocks = deduped
+	}
 
-	coverage := buildCoverage(addresses, regionStart, regionEnd)
+	coverage := buildCoverageV2(tc, parsed.CPU, filtered, addressesForBlocks, regionStart, regionEnd)
+	// Build versioned document
 	coverageDocument := map[string]any{
+		"schema_version": "cpu-coverage/2",
 		"kind":           "cpu-coverage",
 		"cpu":            parsed.CPU,
-		"byte_order":     "M68K addresses are 24-bit big-endian address values; Z80 addresses are 16-bit little-endian values; addresses are reported in canonical hex",
-		"region":         map[string]any{"start_address": regionStart, "end_address": regionEnd},
-		"duration_ms":    duration,
-		"entries_total":  entriesTotal,
-		"distinct_total": coverage.Distinct,
-		"ranges":         coverage.Ranges,
-		"pages_top":      coverage.PagesTop,
-		"pages_total":    coverage.PagesTotal,
-		"truncated":      coverage.AddressesTruncated,
+		"address_space":  coverage.AddressSpace,
+		"byte_order":     coverage.ByteOrder,
+		"region":         map[string]any{"start_address": regionStart, "start_address_hex": canonicalHex(regionStart), "end_address": regionEnd, "end_address_hex": canonicalHex(regionEnd)},
+		"capture": map[string]any{
+			"duration_ms":     duration,
+			"max_entries":     maxEntries,
+			"region_start":    regionStart,
+			"region_end":      regionEnd,
+			"include_rom":     includeROM,
+			"include_ram":     includeRAM,
+			"retain_repeated": retainRepeated,
+		},
+		"execution": map[string]any{
+			"total_events":     entriesTotal,
+			"filtered_events":  len(filtered),
+			"unique_addresses": coverage.Distinct,
+			"addresses":        coverage.Addresses,
+			"counts":           coverage.Counts,
+		},
+		"blocks":      coverage.Blocks,
+		"edges":       coverage.Edges,
+		"pages_top":   coverage.PagesTop,
+		"pages_total": coverage.PagesTotal,
+		"truncation":  coverage.Truncation,
+		"provenance": map[string]any{
+			"capture_conditions": map[string]any{
+				"duration_ms":     duration,
+				"max_entries":     maxEntries,
+				"region_start":    regionStart,
+				"region_end":      regionEnd,
+				"include_rom":     includeROM,
+				"include_ram":     includeRAM,
+				"retain_repeated": retainRepeated,
+			},
+			"rom_identity": tc.server.romIdentityView(0),
+		},
 	}
+	// Keep legacy fields for backward compatibility
+	coverageDocument["duration_ms"] = duration
+	coverageDocument["entries_total"] = entriesTotal
+	coverageDocument["distinct_total"] = coverage.Distinct
+	coverageDocument["ranges"] = coverage.Ranges
+	coverageDocument["truncated"] = coverage.AddressesTruncated
 	if !coverage.AddressesTruncated {
 		coverageDocument["addresses"] = coverage.Addresses
 	} else {
@@ -1645,7 +1796,15 @@ func runCpuCoverageCapture(tc toolContext, args json.RawMessage) map[string]any 
 	if err != nil {
 		return failureResult(&toolFailure{Code: "artifact_error", Message: err.Error()}, tc.modern)
 	}
-	stored, err := tc.server.store.PutWithProvenance(context.ID, "cpu-coverage", "application/json", documentBytes, coverageProvenance(tc, parsed.CPU, regionStart, regionEnd))
+	provenance := coverageProvenance(tc, parsed.CPU, regionStart, regionEnd)
+	// Record filters in provenance
+	if !includeROM || !includeRAM || !retainRepeated {
+		provenance.CaptureConsistency = &artifact.CaptureConsistency{
+			State: "live",
+			Note:  fmt.Sprintf("Filters: include_rom=%v include_ram=%v retain_repeated=%v", includeROM, includeRAM, retainRepeated),
+		}
+	}
+	stored, err := tc.server.store.PutWithProvenance(context.ID, "cpu-coverage", "application/json", documentBytes, provenance)
 	if err != nil {
 		return failureResult(&toolFailure{Code: "artifact_error", Message: err.Error()}, tc.modern)
 	}
@@ -1653,18 +1812,28 @@ func runCpuCoverageCapture(tc toolContext, args json.RawMessage) map[string]any 
 	result := map[string]any{
 		"summary": map[string]any{
 			"kind":           "cpu-coverage",
+			"schema_version": "cpu-coverage/2",
 			"cpu":            parsed.CPU,
+			"address_space":  coverage.AddressSpace,
 			"duration_ms":    duration,
 			"entries_total":  entriesTotal,
+			"filtered_events": len(filtered),
 			"distinct_total": coverage.Distinct,
+			"blocks_count":   len(coverage.Blocks),
+			"edges_count":    len(coverage.Edges),
 			"ranges_count":   len(coverage.Ranges),
 			"pages_total":    coverage.PagesTotal,
 			"pages_top":      coverage.PagesTop,
-			"truncated":      coverage.AddressesTruncated,
+			"truncated":      coverage.Truncation,
 			"sha256":         stored.SHA256,
 		},
 		"artifact": artifactDescriptor(tc.server, stored, context.ID),
 	}
+	// Include legacy fields for existing tests
+	summary := result["summary"].(map[string]any)
+	summary["entries_total"] = entriesTotal
+	summary["distinct_total"] = coverage.Distinct
+	summary["ranges_count"] = len(coverage.Ranges)
 	return okResult(stampGenerations(result, before, after), tc.modern)
 }
 
@@ -1791,5 +1960,151 @@ func buildCoverage(addresses []uint64, regionStart, regionEnd uint64) coverageRe
 		PagesTotal:         uint64(len(pages)),
 		Addresses:          unique,
 		AddressesTruncated: uint64(len(unique)) > maxCoverageAddresses,
+	}
+}
+
+type coverageResultV2 struct {
+	coverageResult
+	AddressSpace string
+	ByteOrder    string
+	Counts       map[string]uint64
+	Blocks       []map[string]any
+	Edges        []map[string]any
+	Truncation   map[string]any
+}
+
+func buildCoverageV2(tc toolContext, cpu string, ordered []uint64, uniqueForBlocks []uint64, regionStart, regionEnd uint64) coverageResultV2 {
+	// Use the legacy unique set for distinct count, but build instruction-aware blocks from uniqueForBlocks.
+	base := buildCoverage(uniqueForBlocks, regionStart, regionEnd)
+	addressSpace := "m68k-bus"
+	byteOrder := "big-endian"
+	if cpu == "z80" {
+		addressSpace = "z80-bus"
+		byteOrder = "little-endian"
+	}
+	// Execution counts per address from ordered (including filtered) sequence
+	counts := map[uint64]uint64{}
+	for _, addr := range ordered {
+		counts[addr]++
+	}
+	countsStrKeys := map[string]uint64{}
+	for addr, cnt := range counts {
+		countsStrKeys[canonicalHex(addr)] = cnt
+	}
+	// Build edges from ordered sequence
+	edgeCounts := map[string]uint64{}
+	edgeFromTo := map[string][2]uint64{}
+	for i := 1; i < len(ordered); i++ {
+		from := ordered[i-1]
+		to := ordered[i]
+		key := canonicalHex(from) + "->" + canonicalHex(to)
+		edgeCounts[key]++
+		if _, ok := edgeFromTo[key]; !ok {
+			edgeFromTo[key] = [2]uint64{from, to}
+		}
+	}
+	edges := []map[string]any{}
+	for key, cnt := range edgeCounts {
+		fromTo := edgeFromTo[key]
+		edges = append(edges, map[string]any{
+			"from":     fromTo[0],
+			"from_hex": canonicalHex(fromTo[0]),
+			"to":       fromTo[1],
+			"to_hex":   canonicalHex(fromTo[1]),
+			"count":    cnt,
+		})
+	}
+	sort.Slice(edges, func(i, j int) bool {
+		if edges[i]["from"].(uint64) != edges[j]["from"].(uint64) {
+			return edges[i]["from"].(uint64) < edges[j]["from"].(uint64)
+		}
+		return edges[i]["to"].(uint64) < edges[j]["to"].(uint64)
+	})
+
+	// Instruction-aware blocks: need lengths
+	uniqueSorted := base.Addresses
+	// Fetch lengths for each unique address (cached)
+	lengths := map[uint64]int{}
+	for _, addr := range uniqueSorted {
+		info := fetchInstructionInfo(tc, cpu, addr)
+		if info != nil {
+			if l, ok := info["length"].(int); ok && l > 0 {
+				lengths[addr] = l
+			} else {
+				lengths[addr] = 2 // default for m68k
+				if cpu == "z80" {
+					lengths[addr] = 1
+				}
+			}
+		} else {
+			lengths[addr] = 2
+			if cpu == "z80" {
+				lengths[addr] = 1
+			}
+		}
+	}
+	blocks := []map[string]any{}
+	if len(uniqueSorted) > 0 {
+		blockStart := uniqueSorted[0]
+		blockEnd := uniqueSorted[0]
+		blockAddrs := []uint64{uniqueSorted[0]}
+		blockExecCount := counts[uniqueSorted[0]]
+		for idx := 1; idx < len(uniqueSorted); idx++ {
+			curr := uniqueSorted[idx]
+			prev := uniqueSorted[idx-1]
+			prevLen := lengths[prev]
+			expectedNext := prev + uint64(prevLen)
+			if curr == expectedNext {
+				// Same block
+				blockEnd = curr
+				blockAddrs = append(blockAddrs, curr)
+				blockExecCount += counts[curr]
+			} else {
+				// Close block
+				blocks = append(blocks, map[string]any{
+					"start_address":     blockStart,
+					"start_address_hex": canonicalHex(blockStart),
+					"end_address":       blockEnd,
+					"end_address_hex":   canonicalHex(blockEnd),
+					"instruction_count": len(blockAddrs),
+					"execution_count":   blockExecCount,
+					"addresses":         append([]uint64{}, blockAddrs...),
+					"address_space":     addressSpace,
+				})
+				blockStart = curr
+				blockEnd = curr
+				blockAddrs = []uint64{curr}
+				blockExecCount = counts[curr]
+			}
+		}
+		blocks = append(blocks, map[string]any{
+			"start_address":     blockStart,
+			"start_address_hex": canonicalHex(blockStart),
+			"end_address":       blockEnd,
+			"end_address_hex":   canonicalHex(blockEnd),
+			"instruction_count": len(blockAddrs),
+			"execution_count":   blockExecCount,
+			"addresses":         append([]uint64{}, blockAddrs...),
+			"address_space":     addressSpace,
+		})
+	}
+	// Truncation facts
+	truncation := map[string]any{
+		"source_events":    len(ordered),
+		"decoded_events":   len(ordered), // we decoded all for lengths
+		"unique_addresses": len(uniqueSorted),
+		"blocks":           len(blocks),
+		"edges":            len(edges),
+		"complete":         !base.AddressesTruncated,
+		"note":             "Truncation is per-category; a trace ring/timeout limit truncates source_events, which propagates to decoded/unique/blocks/edges. Complete is false when source was truncated.",
+	}
+	return coverageResultV2{
+		coverageResult: base,
+		AddressSpace:   addressSpace,
+		ByteOrder:      byteOrder,
+		Counts:         countsStrKeys,
+		Blocks:         blocks,
+		Edges:          edges,
+		Truncation:     truncation,
 	}
 }

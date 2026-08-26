@@ -651,6 +651,13 @@ func TestSegaChecksumOddTail(t *testing.T) {
 func TestCpuTraceCaptureWatchpointPassesParams(t *testing.T) {
 	client := &fakeBridgeClient{status: newFakeStatus()}
 	client.executeFunc = func(_ context.Context, method string, params map[string]string) (json.RawMessage, error) {
+		if method == "vdp_status" {
+			return json.RawMessage(`{"image_buffer":{"last_rendered_frame_token":0}}`), nil
+		}
+		if method == "disasm" {
+			addr, _ := strconv.ParseUint(params["address"], 10, 64)
+			return json.RawMessage(fmt.Sprintf(`{"cpu":"m68k","start_address":%d,"requested_count":1,"lines":[{"address":%d,"length":2,"bytes":"4E71","mnemonic":"nop","operands":""}]}`, addr, addr)), nil
+		}
 		if method != "trace_capture" {
 			t.Fatalf("method = %s", method)
 		}
@@ -715,6 +722,11 @@ func TestCpuCoverageCaptureBuildsCoverage(t *testing.T) {
 	trace := "0000100 10 move.l d0,-(sp)\n0000101 22 lea     0xFF0000,a0\n0000100 10 move.l d0,-(sp)\n0000104  7 rts\n0000200 14 nop"
 	client := &fakeBridgeClient{status: newFakeStatus()}
 	client.executeFunc = func(_ context.Context, method string, params map[string]string) (json.RawMessage, error) {
+		if method == "disasm" {
+			// Return length 1 for all to keep byte-adjacent grouping similar to legacy for this synthetic trace
+			addr, _ := strconv.ParseUint(params["address"], 10, 64)
+			return json.RawMessage(fmt.Sprintf(`{"cpu":"m68k","start_address":%d,"requested_count":1,"lines":[{"address":%d,"length":1,"bytes":"00","mnemonic":"nop","operands":""}]}`, addr, addr)), nil
+		}
 		if method != "trace_capture" {
 			t.Fatalf("method = %s", method)
 		}
@@ -754,6 +766,10 @@ func TestCpuCoverageCaptureRegionFilter(t *testing.T) {
 	trace := "0000100 1 nop\n0000101 1 nop\n0000200 1 nop"
 	client := &fakeBridgeClient{status: newFakeStatus()}
 	client.executeFunc = func(_ context.Context, method string, params map[string]string) (json.RawMessage, error) {
+		if method == "disasm" {
+			addr, _ := strconv.ParseUint(params["address"], 10, 64)
+			return json.RawMessage(fmt.Sprintf(`{"cpu":"m68k","start_address":%d,"requested_count":1,"lines":[{"address":%d,"length":1,"bytes":"00","mnemonic":"nop","operands":""}]}`, addr, addr)), nil
+		}
 		payload := fmt.Sprintf(`{"cpu":"m68k","requested_entries":10000,"captured":3,"timed_out":true,"duration_ms":500,"sample":[],"trace_text":%q}`, trace)
 		return json.RawMessage(payload), nil
 	}

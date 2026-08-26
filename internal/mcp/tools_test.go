@@ -276,6 +276,13 @@ func TestTraceCaptureWritesArtifact(t *testing.T) {
 	trace := "2064 10 move.l d0,-(sp)\n2066 22 rts"
 	client := &fakeBridgeClient{status: newFakeStatus()}
 	client.executeFunc = func(ctx context.Context, method string, params map[string]string) (json.RawMessage, error) {
+		if method == "vdp_status" {
+			return json.RawMessage(`{"image_buffer":{"last_rendered_frame_token":0}}`), nil
+		}
+		if method == "disasm" {
+			addr, _ := strconv.ParseUint(params["address"], 10, 64)
+			return json.RawMessage(fmt.Sprintf(`{"cpu":"m68k","start_address":%d,"requested_count":1,"lines":[{"address":%d,"length":2,"bytes":"4E71","mnemonic":"nop","operands":""}]}`, addr, addr)), nil
+		}
 		payload := fmt.Sprintf(`{"cpu":"m68k","requested_entries":2,"captured":2,"timed_out":false,"duration_ms":120,"sample":[{"address":2064,"cycle":10,"text":"2064 10 move.l"}],"trace_text":%q}`, trace)
 		return json.RawMessage(payload), nil
 	}
