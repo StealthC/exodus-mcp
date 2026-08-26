@@ -154,7 +154,7 @@ bridge ambiguity moves the target to a documented resynchronization state; the
 audit stream reproduces a ROM swap, breakpoint setup, input sequence, state
 restore, and associated generation transitions.
 
-### P0 - Artifact provenance and safe snapshot reuse
+### P0 - Artifact provenance and safe snapshot reuse — delivered 2026-08-26
 
 **Problem:** `memory_dump` stores raw bytes but its artifact metadata does not
 preserve the address domain and capture facts required to interpret it later.
@@ -163,37 +163,46 @@ preserve the address domain and capture facts required to interpret it later.
 reported later as if it began at `0x000000`. Two same-size snapshots from
 different spaces or ROMs can also be compared without an explicit rejection.
 
-- [ ] Define a versioned artifact provenance envelope for every artifact whose
+- [x] Define a versioned artifact provenance envelope for every artifact whose
   bytes have an address, time, target, or decoding interpretation. Preserve
   the original bytes unchanged; store the envelope as immutable artifact
-  metadata or as a linked JSON manifest with its own descriptor.
-- [ ] For memory dumps and snapshots, record at minimum: `artifact_schema`,
+  metadata (`artifact-provenance/1`, in-memory per session, immutable after
+  capture). Artifacts whose producer attached no metadata report the honest
+  `provenance_unknown` state instead of invented fields.
+- [x] For memory dumps and snapshots, record at minimum: `artifact_schema`,
   `kind`, `address_space`, requested and effective start addresses in decimal
   and canonical hex, byte length, raw-byte ordering, declared byte order,
   device/owner, target generation, ROM SHA-256, frame token if available,
   CPU run state, capture timestamp, and consistency mode.
-- [ ] Make `memory_search` derive `space`, start address, length, and byte
+- [x] Make `memory_search` derive `space`, start address, length, and byte
   ordering from `snapshot_id`. Parameters that duplicate provenance must be
-  absent or treated as assertions and rejected on mismatch. Search results
-  must include the source snapshot descriptor and its captured address range.
-- [ ] Make `memory_diff` require compatible provenance by default: same
+  absent or treated as assertions and rejected on mismatch
+  (`provenance_conflict` with both values). Search results include the source
+  snapshot descriptor and its captured address range.
+- [x] Make `memory_diff` require compatible provenance by default: same
   address space, same effective range, same byte length, and same ROM identity.
-  If comparing intentionally different ranges is useful, require an explicit
-  `allow_incompatible_provenance: true` and return a prominent warning with
-  both source manifests. Never fabricate a common address origin.
-- [ ] Extend provenance to traces, coverage, frames, VDP exports, save states,
-  and experiment manifests. A later agent must be able to determine which ROM,
-  target generation, state, and emulator instant produced any artifact without
-  retaining the original MCP response in its chat history.
-- [ ] Add `artifact_describe` or extend `artifact_get` so it returns the full
-  typed provenance envelope, not only generic file metadata and a download
-  URL. Keep `artifact_preview` bounded and byte-oriented.
+  Comparing intentionally different ranges requires an explicit
+  `allow_incompatible_provenance: true` and returns a prominent warning with
+  both source manifests. A common address origin is never fabricated; the
+  comparison is anchored to the before snapshot's captured range. The default
+  byte order for word/long cells derives from the before snapshot's captured
+  byte order.
+- [x] Extend provenance to traces, coverage, frames, VDP exports, save states,
+  and experiment manifests. A later agent can determine which ROM, target
+  generation, state, and emulator instant produced any artifact without
+  retaining the original MCP response in its chat history (states additionally
+  record `rom_sha256`; search/diff results artifacts embed the source
+  snapshot's descriptor and captured range).
+- [x] Add `artifact_describe` (and a provenance reference on every
+  `artifact_get` descriptor) returning the full typed provenance envelope,
+  not only generic file metadata and a download URL. `artifact_preview` stays
+  bounded and byte-oriented.
 
-**Acceptance checks:** a RAM dump starting at `0xFF0000` produces search and
-diff addresses in that range without caller restatement; comparing M68K RAM to
-Z80 RAM fails by default; artifact provenance survives an unrelated subsequent
-ROM load; tests cover legacy artifacts with an explicit `provenance_unknown`
-state rather than invented metadata.
+**Acceptance checks (all passing):** a RAM dump starting at `0xFF0000`
+produces search and diff addresses in that range without caller restatement;
+comparing M68K RAM to Z80 RAM fails by default; artifact provenance survives
+an unrelated subsequent ROM load; tests cover legacy artifacts with an
+explicit `provenance_unknown` state rather than invented metadata.
 
 ### P0 - Honest capture consistency
 
@@ -445,18 +454,25 @@ exports byte-identical.
   byte order, and I/O semantics. This is distinct from the generic
   `memory_spaces_list` inventory and must not imply that all reference regions
   exist on every loaded system.
-- [ ] Introduce one shared `rom_identity` object: SHA-256 of the loaded ROM
+- [x] Introduce one shared `rom_identity` object: SHA-256 of the loaded ROM
   file when available, file and padded mapping sizes, header serial/title,
-  Sega checksum status, mapped image base, and target generation. Attach it to
-  all ROM-derived artifacts, states, symbols, annotations, and exports.
-- [ ] Make incomplete checksum computation unambiguous. `rom_info` currently
+  Sega checksum status (computed over the file, with completeness facts),
+  mapped image base, and target generation. Attach it to `rom_info`,
+  artifact provenance, states (`rom_sha256`), and exports. An unreadable file
+  is reported honestly. **Delivered 2026-08-26.**
+- [x] Make incomplete checksum computation unambiguous. `rom_info` currently
   caps a body read at the generic dump cap; its result must expose
   `checksum_complete`, bytes covered, expected full range, cap reason, and
   must not describe a partial comparison as full header-checksum validation.
-- [ ] Add hex input (`data_hex`) as a mutually exclusive alternative to base64
+  **Delivered 2026-08-26**: `complete`, `bytes_covered`, `expected_range`,
+  and `cap_reason` (`none` | `dump_cap` | `declared_end_beyond_file` |
+  `degenerate_declared_range`) with a note on partial comparisons.
+- [x] Add hex input (`data_hex`) as a mutually exclusive alternative to base64
   for `memory_write` and `memory_freeze`. Normalize both to raw address-order
   bytes, echo bounded uppercase hexadecimal, effective address, write result,
-  and optional read-back verification.
+  and optional read-back verification. **Delivered 2026-08-26**:
+  `data_hex`/`data` mutual exclusion, `data_hex_echo`, `verify_readback` with
+  `readback.matches` and a mask/transform note.
 - [ ] Extend raw pattern search with explicitly documented wildcard/mask
   patterns and optional alignment, while retaining the current exact-byte mode
   unchanged. Result artifacts must serialize the parsed pattern and masks, not

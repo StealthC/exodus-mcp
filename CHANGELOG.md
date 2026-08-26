@@ -9,6 +9,47 @@ and this project will use [Semantic Versioning](https://semver.org/spec/v2.0.0.h
 
 ### Added
 
+- Versioned artifact capture provenance (`artifact-provenance/1`): every
+  artifact produced from capture data carries an immutable envelope with the
+  address domain (requested/effective addresses in decimal and canonical hex,
+  byte length, raw-byte ordering, declared byte order), owning device, target
+  generation, ROM SHA-256 and path, frame token where available, CPU run
+  state, capture consistency, and capture time. Artifacts without capture
+  metadata report the honest `provenance_unknown` state. Applied to memory
+  dumps and snapshots, search/diff results, ROM headers, traces, coverage,
+  frames, VDP exports, save states, and experiment manifests.
+- `artifact_describe`: returns the full typed provenance envelope of one
+  artifact (or `provenance_unknown` for legacy artifacts); `artifact_get`
+  descriptors carry the provenance reference. `artifact_preview` stays bounded
+  and byte-oriented.
+- `memory_search` derives address space, start address, byte length, and byte
+  order from the snapshot's capture provenance when `snapshot_id` is given;
+  parameters that duplicate provenance are assertions and are rejected with
+  `provenance_conflict` on mismatch. Search results include the source
+  snapshot descriptor and its captured address range.
+- `memory_diff` requires compatible provenance by default (same space, range,
+  byte length, ROM identity); cross-domain comparisons fail with
+  `incompatible_provenance` unless `allow_incompatible_provenance: true` is
+  passed, which returns a prominent warning with both source manifests. A
+  common address origin is never fabricated; the comparison is anchored to the
+  before snapshot's captured range and the default cell byte order derives
+  from its captured byte order.
+- Shared `rom_identity` object: SHA-256 of the loaded ROM file (when readable
+  from the server host), file and padded mapping sizes, header title/serial,
+  Sega checksum status computed over the file, mapped image base, and target
+  generation — attached to `rom_info`, artifact provenance, and states
+  (`rom_sha256`). An unreadable file is reported honestly.
+- Honest checksum completeness in `rom_info`: `complete`, `bytes_covered`,
+  `expected_range`, and `cap_reason` (`none` | `dump_cap` |
+  `declared_end_beyond_file` | `degenerate_declared_range`) state exactly what
+  was compared; a partial comparison carries a note that it is NOT full
+  header-checksum validation.
+- Hex write input: `memory_write` and `memory_freeze` accept `data_hex` (hex
+  bytes with optional spaces) as a mutually exclusive alternative to base64
+  `data`, normalize both to raw address-order bytes, echo bounded uppercase
+  hex (`data_hex_echo`), and `memory_write` adds optional `verify_readback`
+  reporting whether the space returned the exact written bytes.
+
 - Target revision (optimistic concurrency): a process-local
   `target_generation` starts at 1, advances exactly once per successful
   target mutation, and is stamped on every tool response. Every mutating

@@ -5,7 +5,7 @@ server, grouped by capability. Planned work is tracked in
 [ROADMAP.md](ROADMAP.md); the [CHANGELOG.md](../CHANGELOG.md) records the
 delivery history.
 
-The MCP server currently exposes **64 analysis tools** spanning the delivered
+The MCP server currently exposes **65 analysis tools** spanning the delivered
 roadmap phases 0-5: bridge and context foundations, memory and artifact
 access, both processors, VDP graphics, deterministic controlled
 experimentation, and advanced analysis. Everything below is covered by unit
@@ -19,6 +19,16 @@ and integration tests and exercised live against a running Exodus instance
   immutable artifact with SHA-256 digest, MIME type, size, direct local URL,
   and MCP resource URI. Artifacts support ETag and HTTP byte-range downloads,
   bounded previews, per-analysis-context scoping, and optional TTL retention.
+- **Versioned capture provenance.** Every artifact produced from capture data
+  carries an immutable `artifact-provenance/1` envelope (address domain with
+  requested/effective addresses in decimal and canonical hex, byte length,
+  byte order and raw-byte ordering, owning device, target generation, ROM
+  SHA-256 and path, frame token, CPU run state, capture consistency, capture
+  time). `artifact_describe` returns the full typed envelope; artifacts whose
+  producer attached no metadata are reported honestly as `provenance_unknown`
+  instead of inventing fields. Memory search and diff derive their address
+  domain from the envelope, so a dump captured at `0xFF0000` is searched and
+  diffed at `0xFF0000` without caller restatement.
 - **Byte order and address space metadata.** Every multi-byte value reports
   its byte order and address space. The Mega Drive baseline is M68K
   big-endian, Z80 little-endian, and device-specific for VDP semantics; raw
@@ -97,32 +107,51 @@ and integration tests and exercised live against a running Exodus instance
   effective-address echo, `system_paused_during_read`, and decode validation
   against the declared byte order.
 - `memory_dump`: artifact-first range output with hash and direct URL
-  (8 MiB per-call cap); the summary reports `effective_address` and
-  `system_paused_during_read`.
+  (8 MiB per-call cap); the summary reports `effective_address`,
+  `system_paused_during_read`, and the full capture-provenance envelope on the
+  artifact.
 - `memory_write`: debugger-path writes to CPU bus spaces
   (`SetMemorySpaceByte`) and entry-based memory devices (read-modify-write
   honoring byte order); timed-buffer spaces are refused with
   `write_not_supported`, ROM writes are discarded by the bus like real
-  hardware, and every call is audited.
+  hardware, and every call is audited. Bytes arrive as exactly one of `data`
+  (base64) or `data_hex` (hex bytes with optional spaces); the response echoes
+  bounded uppercase hex of the exact bytes written, the effective address, and
+  optional read-back verification (`verify_readback` reports whether the space
+  returned the exact written bytes or masks/transforms/discards them).
 - `memory_search`: byte-pattern search over a consistent `memory-snapshot`
   artifact (or an existing dump/snapshot by id) — bounded inline matches plus
-  a full-results artifact; reports `system_paused_during_read` when the
-  snapshot's live read paused the system, with a note explaining the flag
-  source when a snapshot is reused.
+  a full-results artifact. With `snapshot_id` the space, start address, byte
+  length, and byte order **derive from the snapshot's capture provenance**;
+  caller parameters that duplicate provenance are assertions and are rejected
+  with `provenance_conflict` on mismatch. Snapshots without provenance
+  (legacy) warn as `provenance_unknown` and fall back to caller addressing.
+  Reports `system_paused_during_read` when the snapshot's live read paused the
+  system, with a note explaining the flag source when a snapshot is reused.
 - `memory_diff`: cheat-finder comparison between two consistent snapshots.
-  Cell widths byte/word/long with explicit byte order (big-endian default)
-  and aligned scanning by default; modes `changed`, `unchanged`, `increased`,
-  `decreased`, `changed_by` (signed delta), `equal_to`, and `in_range`;
-  bounded inline matches plus a `memory-diff-results` artifact.
+  Cell widths byte/word/long with explicit byte order (default big-endian,
+  derived from the before snapshot's captured byte order when it has
+  provenance) and aligned scanning by default; modes `changed`, `unchanged`,
+  `increased`, `decreased`, `changed_by` (signed delta), `equal_to`, and
+  `in_range`. Snapshots with incompatible provenance (different space, range,
+  or ROM identity) fail with `incompatible_provenance` by default; passing
+  `allow_incompatible_provenance` forces the comparison with a prominent
+  warning naming both source manifests — a common address origin is never
+  fabricated. Bounded inline matches plus a `memory-diff-results` artifact.
 - `memory_freeze`, `memory_freeze_list`, `memory_freeze_remove`,
   `memory_freeze_clear`: server-managed value freezing with optional
   generation/control preconditions. A registered range is written once and
   re-applied at 20 Hz through the serialized bridge queue; the list tool
   surfaces write counts, last write time, provenance (context, target
   generation, ROM), and the last periodic-write error; the set is purged on
-  `rom_load` with an audited invalidation batch.
-- `artifact_get`, `artifact_preview`: metadata, bounded previews, and range
-  retrieval guidance for every produced artifact.
+  `rom_load` with an audited invalidation batch. `memory_freeze` accepts the
+  same mutually exclusive `data`/`data_hex` inputs as `memory_write` and
+  echoes bounded hex.
+- `artifact_get`, `artifact_preview`, `artifact_describe`: metadata, direct
+  retrieval, bounded byte-oriented previews, and the full typed provenance
+  envelope (address domain, device, target generation, ROM identity, frame
+  token, run state, consistency, capture time — or the honest
+  `provenance_unknown` state) for every produced artifact.
 
 ## Processors, symbols, and execution (Phase 2 and Phase 4 control)
 
@@ -154,13 +183,15 @@ and integration tests and exercised live against a running Exodus instance
   is routed through a temporary on-disk file, tracing is configured with the
   system stopped, and the prior run state is restored (the reproducible
   access-violation crash is resolved; see
-  [TRACE-CRASH-INVESTIGATION.md](TRACE-CRASH-INVESTIGATION.md)).
+  [TRACE-CRASH-INVESTIGATION.md](TRACE-CRASH-INVESTIGATION.md)). The trace
+  artifact carries capture provenance naming the CPU, its bus address domain,
+  target generation, and ROM identity.
 - `cpu_trace_capture_watchpoint`: event-driven trace capture — the system
   runs toward a managed watchpoint (even from a paused state) and the window
   ends when it fires, reporting the fired watchpoint ids and stop reason.
 - `cpu_coverage_capture`: execution coverage artifact from a bounded trace
   window — distinct executed addresses, merged consecutive-address spans, and
-  a page histogram.
+  a page histogram, with capture provenance over the requested region.
 - Symbols: `symbols_set`, `symbols_list`, `symbols_clear`, scoped to an
   analysis context.
 
@@ -172,7 +203,9 @@ and integration tests and exercised live against a running Exodus instance
 - `frame_capture`: the live rendered frame as a PNG artifact with frame/timing
   metadata — liveness (frame token advances while running) and paused
   determinism (identical hashes) validated. The frame buffer is read without
-  pausing, so `system_paused_during_read` is always false.
+  pausing, so `system_paused_during_read` is always false. The artifact's
+  capture provenance records the frame token, target generation, and ROM
+  identity.
 - `vdp_memory_read`: VRAM, CRAM, and VSRAM through the proven timed-buffer
   path. Raw views (`hexdump`, `array_u8`, `raw_base64`), big-endian
   `array_u16` words, and a decoded CRAM view expanding 9-bit RGB entries into
@@ -236,10 +269,10 @@ and integration tests and exercised live against a running Exodus instance
 - `state_save`, `state_load`, `state_list`: context-scoped system snapshots
   through the emulator's native save-state path (ZIP format), each verified
   with SHA-256 and size and carrying provenance (context, target generation,
-  ROM, optional control id). `state_save` does not mutate the target;
-  `state_load` does and reports before/after generations. Lists flag entries
-  stale for the loaded ROM and generation-mismatched while preserving them
-  for historical analysis.
+  ROM path and SHA-256, optional control id). `state_save` does not mutate the
+  target; `state_load` does and reports before/after generations. Lists flag
+  entries stale for the loaded ROM and generation-mismatched while preserving
+  them for historical analysis.
 - `frame_advance`: pause, execute exactly N rendered VDP frames, pause —
   reports the final frame token, before/after target generations, and times
   out with a diagnostic when the display is not rendering.
@@ -253,7 +286,16 @@ and integration tests and exercised live against a running Exodus instance
   copyright, domestic/overseas titles, serial/product/version, I/O support,
   ROM/RAM/backup-RAM windows, region) with header-checksum validation against
   the computed Sega sum, a reference 68K memory map, and a header-region
-  artifact. Reference tables in
+  artifact. Checksum validation is honest about coverage: `complete`,
+  `bytes_covered`, `expected_range`, and `cap_reason` (`none` |
+  `dump_cap` | `declared_end_beyond_file` | `degenerate_declared_range`) state
+  exactly what was compared, and a partial comparison carries a note that it
+  is NOT full header-checksum validation. The response also carries the shared
+  `rom_identity` object (file SHA-256 when the ROM file is readable from the
+  server host, file and padded mapping sizes, header title/serial, Sega
+  checksum status computed over the file, mapped image base, target
+  generation); an unreadable file is reported as such instead of inventing
+  file-derived facts. Reference tables in
   [SEGA-HEADER.md](SEGA-HEADER.md).
 - `experiment_run`: operator-authored Python 3 scripts (`.py`) or declarative
   fixtures (`.json`) from the configured scripts directory. Scripts talk to
@@ -265,9 +307,11 @@ and integration tests and exercised live against a running Exodus instance
   injects the experiment's context and control id, runs the whole experiment
   under exclusive control (reusing a caller-provided active `control_id` or
   acquiring an internal lock released after manifest finalization), records a
-  reproducible `experiment-manifest` artifact plus capped diagnostic output,
-  and mirrors every step in the audit stream. Scripts never see the native
-  pipe or capability; trust-in-operator-code applies (no OS sandboxing).
+  reproducible `experiment-manifest` artifact (with capture provenance naming
+  the target generation, ROM identity, and capture time) plus capped
+  diagnostic output, and mirrors every step in the audit stream. Scripts never
+  see the native pipe or capability; trust-in-operator-code applies (no OS
+  sandboxing).
 
 ## Operations
 
@@ -317,6 +361,15 @@ reference harness, in addition to unit and integration tests:
   frame advance and input with a 3-button controller; coverage capture;
   watchpoint-triggered trace capture; ROM header parsing and checksum
   validation.
+- Artifact provenance: a RAM dump captured at `0xFF0000` searches and diffs at
+  `0xFF0000` with no caller restatement; comparing M68K RAM to Z80 RAM fails
+  with `incompatible_provenance` by default and warns when forced; legacy
+  artifacts without capture metadata report `provenance_unknown`; the
+  `rom_identity` object (file SHA-256, header title/serial, file-based Sega
+  checksum) is computed from a real cartridge file with honest completeness
+  facts; `data_hex` and base64 writes normalize to the same bytes with the
+  same audit hash; `verify_readback` reports exact matches and mask/transform
+  differences.
 - Optimistic concurrency: two clients sharing one observed generation produce
   exactly one mutation and one `target_generation_conflict`; an unconditional
   single-agent mutation needs no lease or lock; a held control lock rejects
