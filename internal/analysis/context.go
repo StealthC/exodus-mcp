@@ -24,6 +24,10 @@ type Context struct {
 	Closed    bool      `json:"closed"`
 
 	Symbols *symbols.Store `json:"-"`
+
+	// Annotations stores the context's analyst-provided observations and
+	// hypotheses about addresses and ranges.
+	Annotations *AnnotationStore `json:"-"`
 }
 
 // Registry owns every context for one server process.
@@ -123,11 +127,12 @@ func (registry *Registry) create(name string, isDefault bool) *Context {
 	registry.mu.Lock()
 	defer registry.mu.Unlock()
 	context := &Context{
-		ID:        newID(),
-		Name:      name,
-		CreatedAt: time.Now().UTC(),
-		Default:   isDefault,
-		Symbols:   symbols.NewStore(),
+		ID:          newID(),
+		Name:        name,
+		CreatedAt:   time.Now().UTC(),
+		Default:     isDefault,
+		Symbols:     symbols.NewStore(),
+		Annotations: NewAnnotationStore(),
 	}
 	registry.contexts[context.ID] = context
 	return context

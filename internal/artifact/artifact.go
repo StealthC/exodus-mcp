@@ -189,6 +189,12 @@ type Store struct {
 	dir       string
 	mu        sync.RWMutex
 	artifacts map[string]Artifact
+
+	// OnPut, when non-nil, is invoked after a successful write with the
+	// stored artifact's kind. It lets the owner observe artifact creation
+	// without changing producer call sites. It is set once during
+	// construction, before the store is shared across goroutines.
+	OnPut func(kind string)
 }
 
 // NewStore creates or reopens a store directory. Stale files from earlier
@@ -283,6 +289,9 @@ func (store *Store) PutWithProvenance(contextID, kind, mimeType string, data []b
 	store.mu.Lock()
 	store.artifacts[id] = artifact
 	store.mu.Unlock()
+	if store.OnPut != nil {
+		store.OnPut(kind)
+	}
 	return artifact, nil
 }
 

@@ -524,23 +524,23 @@ a larger-than-cap ROM reports incomplete checksum coverage; equivalent hex and
 base64 writes produce the same audit hash; a masked signature search is
 reproducible from its result artifact.
 
-### P2 - Evidence annotations and analyst hypotheses
+### P2 - Evidence annotations and analyst hypotheses — delivered 2026-08-26
 
-- [ ] Add context-scoped annotations for addresses and ranges. An annotation
+- [x] Add context-scoped annotations for addresses and ranges. An annotation
   must support title, text, tags, category, author/source, confidence,
   creation/update timestamps, address space, address/range, ROM identity, and
   links to artifacts, states, captures, trace events, symbols, and managed
-  debug resources.
-- [ ] Distinguish observations from hypotheses. For example, an annotation may
+  debug resources. **Delivered 2026-08-26:** `annotation_create`/`_get`/`_update`/`_delete` with `internal/analysis/annotations.go` store (500 per context, `annotation_` ids), ROM identity via `romIdentityProvider` and target generation stamping.
+- [x] Distinguish observations from hypotheses. For example, an annotation may
   claim that `0xFF1234` is a life counter, but its evidence should link the
   memory-diff artifact and watchpoint event that support that claim. Do not
-  promote an annotation to a symbol automatically.
-- [ ] Provide bounded list/filter/search/export operations and a versioned
+  promote an annotation to a symbol automatically. **Delivered 2026-08-26:** `kind` `observation`/`hypothesis` enforced, evidence links to artifacts/states/captures/trace events/symbols/breakpoints/watchpoints, never promoted to symbols.
+- [x] Provide bounded list/filter/search/export operations and a versioned
   annotation artifact format. Include conflict handling when importing
-  annotations created by another analyst.
-- [ ] Invalidate or prominently flag annotations whose ROM identity or target
+  annotations created by another analyst. **Delivered 2026-08-26:** `annotation_list` (bounded pagination, query/tags/category/kind filters, stale policies, truncated flag), `annotation_export` (`annotation-export/1` artifact with provenance), `annotation_import` (artifact or inline JSON, conflict list, overwrite flag).
+- [x] Invalidate or prominently flag annotations whose ROM identity or target
   generation no longer matches the loaded target. Preserve them for historical
-  analysis rather than deleting them on ROM load.
+  analysis rather than deleting them on ROM load. **Delivered 2026-08-26:** staleness computed on read (`rom_sha256_mismatch`/`target_generation_mismatch`), flagged via `stale`+`stale_reason`, preserved across ROM loads; `annotation_list` defaults exclude stale with `stale_excluded` and `include_stale`/`stale_only` policies.
 
 **Acceptance checks:** an annotation can link a diff, state, watchpoint event,
 and symbol; it is exported with complete provenance; a different ROM produces
@@ -584,26 +584,29 @@ Delivered 2026-08-25 (see [FEATURES.md](FEATURES.md)): symbol-aware
 disassembly and conditional execution breakpoints (location conditions,
 native hit counters, break-on-Nth-hit). Remaining:
 
-- [ ] Register-based breakpoint conditions: evaluate conditions such as
+- [x] Register-based breakpoint conditions: evaluate conditions such as
   "D0 == $1234" or "A7 >= $FF0000" on a breakpoint hit. `IBreakpoint` has no
   register condition, so this needs either a fork-side extension of the
   breakpoint interface or a server-side post-hit evaluation loop (read
   registers after the pause, resume when the condition is false) with the
-  race and pause/resume cost that implies.
-- [ ] M68K backtrace: walk the stack (A7 + frame linkage) with symbol support
-  from `symbols_set`; heuristics documented and flagged as such.
-- [ ] State diff: compare two `state_save` snapshots (registers, memory, VDP)
-  into a structured differences report.
+  race and pause/resume cost that implies. **Delivered 2026-08-26:** `cpu_register_condition_evaluate` — server-side post-hit primitive (read `regs_get`, unsigned compare with `==`/`!=`/`>`/`<`/`>=`/`<=` plus `&&`/`||`, flexible hex parsing, m68k `D0-D7/A0-A7/PC/SR` and z80 `AF/BC/DE/HL/IX/IY/SP/PC` plus 8-bit derivatives), returns `matched` with register values and documents race/pause-resume cost; caller loops `cpu_breakpoint_set` + pause → evaluate → `cpu_run` if false.
+- [x] M68K backtrace: walk the stack (A7 + frame linkage) with symbol support
+  from `symbols_set` (`m68k_backtrace`, 2026-08-26); heuristics documented and
+  flagged as such.
+- [x] State diff: compare two `state_save` snapshots (registers, memory, VDP)
+  into a structured differences report (`state_diff`, 2026-08-26; read-only
+  metadata plus snapshot-file byte diff; semantic register/memory/VDP decode
+  requires a mutating state_load and is reported as not performed).
 
-## Phase 8 — Deterministic replay (planned)
+## Phase 8 — Deterministic replay (delivered 2026-08-26)
 
 **Outcome:** reproducible frame-by-frame input sequences for testing and
 demonstration.
 
-- [ ] Input recording: capture a `frame_advance`-stepped sequence of
-  `input_set` events into an artifact.
-- [ ] Replay: re-execute a recorded sequence from a saved state and verify
-  frame-for-frame determinism against the original run.
+- [x] Input recording: capture a `frame_advance`-stepped sequence of
+  `input_set` events into an artifact (`deterministic_replay` run 1, 2026-08-26).
+- [x] Replay: re-execute a recorded sequence from a saved state and verify
+  frame-for-frame determinism against the original run (`deterministic_replay`, 2026-08-26).
 
 ## Fork-side improvements (deferred)
 
@@ -624,10 +627,10 @@ their scope and rationale stay visible).
   survive pair restarts without the manual **File → Save System** action
   (today Exodus writes `Device.MapInput` only on that explicit menu action).
 
-## Operations (planned)
+## Operations (partially delivered)
 
-- [ ] `/metrics` endpoint with per-tool call counts, error rates, and artifact
-  counts for operators.
+- [x] `/metrics` endpoint with per-tool call counts, error rates, and artifact
+  counts for operators. **Delivered 2026-08-26:** `GET /metrics` (JSON) with per-tool `calls`/`errors`/`error_rate`, per-artifact-kind `by_kind`+`total`, and `totals`; hooked via `Store.OnPut` and `callTool` accounting.
 - [ ] Release automation for the changelog-cut → annotated tag → release-notes
   workflow (the v0.1.0 cut was performed manually).
 

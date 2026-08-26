@@ -162,8 +162,8 @@ func runMegaDriveMemoryMap(tc toolContext, args json.RawMessage) map[string]any 
 		{"0xFF0000-0xFFFFFF", "0xFF0000-0xFFFFFF", "mirrored every 64K (0xFF0000-0xFFFFFF repeats every 0x10000)", "Work RAM (mem-ram, m68k-bus)", "read+write", "Single-cycle RAM, no wait states", "big-endian", "RAM, not I/O", liveSpaces["mem-ram"]},
 	}
 	return okResult(map[string]any{
-		"regions": regions,
-		"note":    "Reference bus map combined with live target existence (exists_live). Not all regions exist on every loaded system; check liveSpaces via memory_spaces_list.",
+		"regions":     regions,
+		"note":        "Reference bus map combined with live target existence (exists_live). Not all regions exist on every loaded system; check liveSpaces via memory_spaces_list.",
 		"live_spaces": liveSpaces,
 	}, tc.modern)
 }
@@ -440,9 +440,9 @@ func runMemorySearch(tc toolContext, args json.RawMessage) map[string]any {
 			"start_address": source.startAddress,
 			"byte_length":   len(source.bytes),
 		},
-		"matches_total": total,
-		"truncated":     artifactTruncated,
-		"addresses":     matches.Addresses,
+		"matches_total":  total,
+		"truncated":      artifactTruncated,
+		"addresses":      matches.Addresses,
 		"parsed_pattern": map[string]any{"bytes_hex": patternHex, "mask_hex": maskHex, "alignment": parsed.Alignment},
 	}
 	resultsBytes, err := json.Marshal(results)
@@ -1862,23 +1862,23 @@ func debugEventDescriptor(server *Server, event debugEvent, contextID, captureID
 		provenance.FrameToken = event.FrameToken
 	}
 	eventData := map[string]any{
-		"kind":               "watchpoint-event",
-		"event_id":           event.ID,
-		"resource_kind":      event.ResourceKind,
-		"resource_id":        event.ResourceID,
-		"context_id":         event.ContextID,
-		"cpu":                event.CPU,
-		"triggering_pc":      event.TriggeringPC,
-		"triggering_pc_hex":  canonicalHex(event.TriggeringPC),
-		"address_space":      event.AddressSpace,
-		"watched_address":    event.WatchedAddress,
+		"kind":                "watchpoint-event",
+		"event_id":            event.ID,
+		"resource_kind":       event.ResourceKind,
+		"resource_id":         event.ResourceID,
+		"context_id":          event.ContextID,
+		"cpu":                 event.CPU,
+		"triggering_pc":       event.TriggeringPC,
+		"triggering_pc_hex":   canonicalHex(event.TriggeringPC),
+		"address_space":       event.AddressSpace,
+		"watched_address":     event.WatchedAddress,
 		"watched_address_hex": canonicalHex(event.WatchedAddress),
-		"access_direction":   event.AccessDirection,
-		"requested_length":   event.RequestedLength,
-		"hit_count":          event.HitCount,
-		"target_generation":  event.TargetGeneration,
-		"timestamp":          event.Timestamp,
-		"schema_version":     "debug-event/1",
+		"access_direction":    event.AccessDirection,
+		"requested_length":    event.RequestedLength,
+		"hit_count":           event.HitCount,
+		"target_generation":   event.TargetGeneration,
+		"timestamp":           event.Timestamp,
+		"schema_version":      "debug-event/1",
 	}
 	if event.FrameToken != nil {
 		eventData["frame_token"] = *event.FrameToken
@@ -2112,21 +2112,21 @@ func runCpuCoverageCapture(tc toolContext, args json.RawMessage) map[string]any 
 
 	result := map[string]any{
 		"summary": map[string]any{
-			"kind":           "cpu-coverage",
-			"schema_version": "cpu-coverage/2",
-			"cpu":            parsed.CPU,
-			"address_space":  coverage.AddressSpace,
-			"duration_ms":    duration,
-			"entries_total":  entriesTotal,
+			"kind":            "cpu-coverage",
+			"schema_version":  "cpu-coverage/2",
+			"cpu":             parsed.CPU,
+			"address_space":   coverage.AddressSpace,
+			"duration_ms":     duration,
+			"entries_total":   entriesTotal,
 			"filtered_events": len(filtered),
-			"distinct_total": coverage.Distinct,
-			"blocks_count":   len(coverage.Blocks),
-			"edges_count":    len(coverage.Edges),
-			"ranges_count":   len(coverage.Ranges),
-			"pages_total":    coverage.PagesTotal,
-			"pages_top":      coverage.PagesTop,
-			"truncated":      coverage.Truncation,
-			"sha256":         stored.SHA256,
+			"distinct_total":  coverage.Distinct,
+			"blocks_count":    len(coverage.Blocks),
+			"edges_count":     len(coverage.Edges),
+			"ranges_count":    len(coverage.Ranges),
+			"pages_total":     coverage.PagesTotal,
+			"pages_top":       coverage.PagesTop,
+			"truncated":       coverage.Truncation,
+			"sha256":          stored.SHA256,
 		},
 		"artifact": artifactDescriptor(tc.server, stored, context.ID),
 	}

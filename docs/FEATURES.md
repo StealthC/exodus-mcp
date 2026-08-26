@@ -5,10 +5,11 @@ server, grouped by capability. Planned work is tracked in
 [ROADMAP.md](ROADMAP.md); the [CHANGELOG.md](../CHANGELOG.md) records the
 delivery history.
 
-The MCP server currently exposes **66 analysis tools** spanning the delivered
-roadmap phases 0-5: bridge and context foundations, memory and artifact
+The MCP server currently exposes **80 analysis tools** spanning the delivered
+roadmap phases 0-8: bridge and context foundations, memory and artifact
 access, both processors, VDP graphics, deterministic controlled
-experimentation, and advanced analysis. Everything below is covered by unit
+experimentation, advanced analysis, evidence annotations, advanced debugging,
+and deterministic replay. Everything below is covered by unit
 and integration tests and exercised live against a running Exodus instance
 (see [Validation](#validation)).
 
@@ -354,8 +355,58 @@ and integration tests and exercised live against a running Exodus instance
   see the native pipe or capability; trust-in-operator-code applies (no OS
   sandboxing).
 
+## Evidence annotations (P2)
+
+- `annotation_create`, `annotation_get`, `annotation_update`, `annotation_delete`: context-scoped evidence store for addresses and ranges. Each annotation carries title, text, tags, category, author/source, confidence, `kind` (`observation` vs `hypothesis`), creation/update timestamps, address space/range (flexible `$`/`0x`/`h` parsing), ROM identity (`rom_sha256`+path) and `target_generation` stamping at creation, and evidence links to artifacts, states, captures, trace events, symbols, and managed debug resources. Hypotheses never promote to symbols automatically.
+- `annotation_list`: bounded, paginated view (default 20, cap 100, `truncated`+`next_offset`) with filters for query substring, tags, category, kind, address space, and staleness (`stale`/`stale_reason` `rom_sha256_mismatch`/`target_generation_mismatch`, `stale_only`/`include_stale` with `stale_excluded` honesty). Preserves history across ROM loads.
+- `annotation_export` / `annotation_import`: versioned `annotation-export/1` artifact (`application/json`, provenance via `genericProvenance`) and import with conflict detection (`overwrite` flag, per-id `conflicts` list, 500-per-context cap). Import honors the same staleness and provenance rules.
+
+## Advanced debugging (Phase 7)
+
+- `cpu_register_condition_evaluate`: server-side register-condition primitive for `cpu_breakpoint_set` hits. Evaluates conditions such as `D0 == $1234` or `A7 >= $FF0000` against live `regs_get` values (m68k `D0-D7/A0-A7/PC/SR` and z80 `AF/BC/DE/HL/IX/IY/SP/PC` plus 8-bit derivatives) with `==`/`!=`/`>`/`<`/`>=`/`<=` and `&&`/`||`, flexible hex parsing, and unsigned comparison. Returns `matched` with parsed register/expected values plus a note documenting the post-hit pause/resume race and that `cpu_run` must be called when the condition is false — the native `IBreakpoint` has no register filter, so this loop is heuristic, not atomic.
+- `m68k_backtrace`: heuristic M68K stack walk from A7 (the active stack
+  pointer, USP or SSP per the SR supervisor bit) with an optional A6
+  frame-pointer chain, resolving candidate return addresses against
+  `symbols_set` symbols. Frame 0 is the live PC (confidence high); every
+  other frame is flagged with its recovery method (`register_pc`,
+  `frame_pointer`, `stack_scan`), confidence, and a heuristic note — the
+  frame-linkage walk reads [A6]=saved A6 and [A6+4]=return address, and the
+  linear scan accepts nonzero, even stack-slot values inside the documented
+  executable regions (ROM 0x000000-0x3FFFFF, RAM 0xFF0000-0xFFFFFF;
+  confidence medium for ROM-window candidates, low for RAM-window code). The
+  tool never claims execution-verified call sites: the response states the
+  stack may contain data, not return addresses, and reports the composite
+  `capture_consistency` object for its live reads.
+- `state_diff`: read-only comparison of two `state_save` snapshots into a
+  `state-diff-results` artifact. It diffs snapshot metadata (name, size,
+  SHA-256, target generation, ROM identity, timestamps, control id) and the
+  raw snapshot files byte-by-byte (per-byte counts, contiguous diff regions,
+  bounded inline before/after hex, first-1KB previews, 8 MiB comparison cap),
+  and reports identical true/false plus an artifact-first full report. The
+  register/memory/VDP semantic sections are reported as explicitly requested
+  but not performed: decoding them would require loading each snapshot into
+  the emulator (`state_load`, a target mutation), which is out of scope for
+  this read-only tool.
+
+## Deterministic replay (Phase 8)
+
+- `deterministic_replay`: record and replay one declarative input sequence
+  from the same saved state under exclusive control to verify frame-for-frame
+  determinism. Each step holds the listed buttons down on a player port for N
+  frames (`input_set` down, `frame_advance`×N, `input_set` up; frames 1-60,
+  up to 64 steps). The tool runs the sequence twice from the same state —
+  capturing per-step VDP frame tokens and final M68K registers (pc/a7/d0) for
+  both runs — restores the initial state afterwards (caller-provided
+  `initial_state_id`, or a fresh snapshot of the current machine), and
+  reports `deterministic` true/false with named checks plus a
+  `replay-manifest/1` artifact recording both runs, the checks, and the
+  methodology. Recording (run 1) and replay verification (run 2) share one
+  code path, so a mismatch is a real emulator nondeterminism signal rather
+  than a harness artifact.
+
 ## Operations
 
+- `GET /metrics`: loopback operator endpoint (outside JSON-RPC) with per-tool `calls`/`errors`/`error_rate`, per-artifact-kind `by_kind`+`total`, and `totals`; backed by `Store.OnPut` and `callTool` accounting.
 - Configuration with one precedence rule (flag > environment > `.env` >
   default), published to Windows children via `WSLENV`.
 - Artifact retention: `--artifact-ttl` / `EXODUS_MCP_ARTIFACT_TTL` (e.g.

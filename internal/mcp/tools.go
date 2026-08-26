@@ -60,6 +60,11 @@ func buildToolRegistry() []toolSpec {
 	specs = append(specs, freezeToolSpecs()...)
 	specs = append(specs, phase5ToolSpecs()...)
 	specs = append(specs, experimentToolSpecs()...)
+	specs = append(specs, annotationToolSpecs()...)
+	specs = append(specs, backtraceToolSpecs()...)
+	specs = append(specs, stateDiffToolSpecs()...)
+	specs = append(specs, replayToolSpecs()...)
+	specs = append(specs, registerConditionToolSpecs()...)
 	sort.Slice(specs, func(i, j int) bool { return specs[i].name < specs[j].name })
 	return specs
 }
@@ -105,6 +110,8 @@ func (server *Server) callTool(ctx context.Context, params json.RawMessage, mode
 		call.Arguments = json.RawMessage("{}")
 	}
 	result := spec.run(toolContext{server: server, ctx: ctx, modern: modern}, call.Arguments)
+	failed, _ := result["isError"].(bool)
+	server.metrics.recordCall(call.Name, failed)
 	result = injectResultType(result, call.Name)
 	// Every result carries the target generation observed at response
 	// completion; mutations additionally report before/after.

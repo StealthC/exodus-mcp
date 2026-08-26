@@ -464,12 +464,12 @@ func vdpCaptureValue(tc toolContext, context *analysis.Context, includeFrame, in
 	provenanceBase.CaptureConsistency = consistency
 
 	manifest := map[string]any{
-		"kind":       "vdp-capture",
-		"capture_id": captureID,
-		"captured_at": capturedAt,
+		"kind":                "vdp-capture",
+		"capture_id":          captureID,
+		"captured_at":         capturedAt,
 		"capture_consistency": captureConsistencyToMap(consistency),
-		"components": map[string]any{},
-		"artifacts":  []map[string]any{},
+		"components":          map[string]any{},
+		"artifacts":           []map[string]any{},
 	}
 	var artifacts []map[string]any
 	// Helper to add artifact to manifest
@@ -553,12 +553,12 @@ func vdpCaptureValue(tc toolContext, context *analysis.Context, includeFrame, in
 
 	// Render manifest (simplified)
 	renderManifest := map[string]any{
-		"kind":       "vdp-render-manifest",
-		"capture_id": captureID,
+		"kind":             "vdp-render-manifest",
+		"capture_id":       captureID,
 		"display_geometry": map[string]any{"note": "Derived from vdp_status registers; see vdp_status artifact for details"},
-		"palette_state": map[string]any{"note": "CRAM artifact holds palette; decoded via vdp_palette_export"},
-		"sprite_state": map[string]any{"note": "Sprite table artifact holds link chain; see vdp_sprite_table"},
-		"scroll_state": map[string]any{"note": "VSRAM and hscroll data in vsram artifact"},
+		"palette_state":    map[string]any{"note": "CRAM artifact holds palette; decoded via vdp_palette_export"},
+		"sprite_state":     map[string]any{"note": "Sprite table artifact holds link chain; see vdp_sprite_table"},
+		"scroll_state":     map[string]any{"note": "VSRAM and hscroll data in vsram artifact"},
 	}
 	renderBytes, _ := json.Marshal(renderManifest)
 	renderProvenance := vdpProvenanceWithCapture(tc, "vdp-render-manifest", "vdp-buffers", "VDP", captureID, consistency)
@@ -575,12 +575,12 @@ func vdpCaptureValue(tc toolContext, context *analysis.Context, includeFrame, in
 	artifacts = append(artifacts, artifactDescriptor(tc.server, storedManifest, context.ID))
 	return map[string]any{
 		"summary": map[string]any{
-			"kind":              "vdp-capture",
-			"capture_id":        captureID,
+			"kind":                "vdp-capture",
+			"capture_id":          captureID,
 			"capture_consistency": captureConsistencyToMap(consistency),
 			"components_included": map[string]bool{"frame": includeFrame, "cram": includeCRAM, "vsram": includeVSRAM, "vram": includeVRAM, "sprite_table": includeSprite},
-			"artifact_count":    len(artifacts),
-			"manifest_sha256":   storedManifest.SHA256,
+			"artifact_count":      len(artifacts),
+			"manifest_sha256":     storedManifest.SHA256,
 		},
 		"manifest":  artifactDescriptor(tc.server, storedManifest, context.ID),
 		"artifacts": artifacts,
@@ -1334,29 +1334,29 @@ func runVDPTileExport(tc toolContext, args json.RawMessage) map[string]any {
 	}
 
 	summary := map[string]any{
-			"kind":                      "vdp-tiles",
-			"address_space":             "315-5313 VRAM",
-			"tile_count":                count,
-			"tile_size_bytes":           mdTileSizeBytes,
-			"bpp":                       4,
-			"vram_address_start":        firstByte,
-			"vram_address_start_hex":    canonicalHex(firstByte),
-			"vram_address_end":          firstByte + totalBytes - 1,
-			"vram_address_end_hex":      canonicalHex(firstByte + totalBytes - 1),
-			"palette_line":              parsed.Palette,
-			"nonzero_pixels_per_tile":   nonzeroPerTile,
-			"coherent_snapshot":         coherent,
-			"system_paused_during_read": !coherent,
-			"consistency":               "live",
-			"capture_id":                captureID,
-			"capture_consistency":       captureConsistencyToMap(consistency),
-			"byte_order":                "big-endian",
-			"layout_note":               "Each tile is 8x8 4bpp: four bytes per row, two pixels per byte, high nibble left. Pixel 0 is transparent unless transparent_zero is false. system_paused_during_read is true when any chunked read had to pause a running system; coherent_snapshot is true only when every chunk found it already paused. Both artifacts share one capture_id; when the composition is composite_non_atomic the VRAM and CRAM pieces may come from different frames and must not be combined into a coherent instant.",
-			"png_size_bytes":            pngBuffer.Len(),
-			"png_sha256":                pngStored.SHA256,
-			"json_size_bytes":           len(jsonDocument),
-			"json_sha256":               jsonStored.SHA256,
-		}
+		"kind":                      "vdp-tiles",
+		"address_space":             "315-5313 VRAM",
+		"tile_count":                count,
+		"tile_size_bytes":           mdTileSizeBytes,
+		"bpp":                       4,
+		"vram_address_start":        firstByte,
+		"vram_address_start_hex":    canonicalHex(firstByte),
+		"vram_address_end":          firstByte + totalBytes - 1,
+		"vram_address_end_hex":      canonicalHex(firstByte + totalBytes - 1),
+		"palette_line":              parsed.Palette,
+		"nonzero_pixels_per_tile":   nonzeroPerTile,
+		"coherent_snapshot":         coherent,
+		"system_paused_during_read": !coherent,
+		"consistency":               "live",
+		"capture_id":                captureID,
+		"capture_consistency":       captureConsistencyToMap(consistency),
+		"byte_order":                "big-endian",
+		"layout_note":               "Each tile is 8x8 4bpp: four bytes per row, two pixels per byte, high nibble left. Pixel 0 is transparent unless transparent_zero is false. system_paused_during_read is true when any chunked read had to pause a running system; coherent_snapshot is true only when every chunk found it already paused. Both artifacts share one capture_id; when the composition is composite_non_atomic the VRAM and CRAM pieces may come from different frames and must not be combined into a coherent instant.",
+		"png_size_bytes":            pngBuffer.Len(),
+		"png_sha256":                pngStored.SHA256,
+		"json_size_bytes":           len(jsonDocument),
+		"json_sha256":               jsonStored.SHA256,
+	}
 	if parsed.VDPCaptureID != "" {
 		summary["vdp_capture_reused"] = true
 		summary["vdp_capture_id"] = parsed.VDPCaptureID
@@ -1516,31 +1516,31 @@ func runVDPPlaneExport(tc toolContext, args json.RawMessage) map[string]any {
 	}
 
 	summary := map[string]any{
-			"kind":                      "vdp-plane",
-			"address_space":             "315-5313 VRAM",
-			"plane":                     parsed.Plane,
-			"name_table_base":           nameTableBase,
-			"name_table_base_hex":       canonicalHex(nameTableBase),
-			"size_cells":                []int{widthCells, heightCells},
-			"png_size_bytes":            pngBuffer.Len(),
-			"png_width":                 width,
-			"png_height":                height,
-			"png_sha256":                pngStored.SHA256,
-			"json_size_bytes":           len(jsonDocument),
-			"json_sha256":               jsonStored.SHA256,
-			"distinct_tiles":            len(histogram),
-			"priority_entries":          priorityEntries,
-			"invalid_entries":           invalidEntries,
-			"truncated":                 truncated,
-			"interlace_active":          interlaceActive,
-			"coherent_snapshot":         coherent,
-			"system_paused_during_read": !coherent,
-			"consistency":               "live",
-			"capture_id":                captureID,
-			"capture_consistency":       captureConsistencyToMap(consistency),
-			"byte_order":                "big-endian",
-			"notes":                     notes,
-		}
+		"kind":                      "vdp-plane",
+		"address_space":             "315-5313 VRAM",
+		"plane":                     parsed.Plane,
+		"name_table_base":           nameTableBase,
+		"name_table_base_hex":       canonicalHex(nameTableBase),
+		"size_cells":                []int{widthCells, heightCells},
+		"png_size_bytes":            pngBuffer.Len(),
+		"png_width":                 width,
+		"png_height":                height,
+		"png_sha256":                pngStored.SHA256,
+		"json_size_bytes":           len(jsonDocument),
+		"json_sha256":               jsonStored.SHA256,
+		"distinct_tiles":            len(histogram),
+		"priority_entries":          priorityEntries,
+		"invalid_entries":           invalidEntries,
+		"truncated":                 truncated,
+		"interlace_active":          interlaceActive,
+		"coherent_snapshot":         coherent,
+		"system_paused_during_read": !coherent,
+		"consistency":               "live",
+		"capture_id":                captureID,
+		"capture_consistency":       captureConsistencyToMap(consistency),
+		"byte_order":                "big-endian",
+		"notes":                     notes,
+	}
 	if parsed.VDPCaptureID != "" {
 		summary["vdp_capture_reused"] = true
 		summary["vdp_capture_id"] = parsed.VDPCaptureID

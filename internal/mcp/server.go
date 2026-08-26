@@ -107,6 +107,10 @@ type Server struct {
 	// actors and records externally observed transitions in the audit stream.
 	runState *runStateTracker
 
+	// metrics accumulates per-tool call/error counts and per-artifact-kind
+	// counts for the /metrics endpoint.
+	metrics *metricsStore
+
 	statusMu      sync.Mutex
 	statusExpires time.Time
 	statusCache   bridge.Status
@@ -135,6 +139,12 @@ func NewServer(version string, client bridge.Client, store *artifact.Store, cont
 		freezes:     newFreezeRegistry(),
 		runState:    &runStateTracker{},
 		romIdentity: newROMIdentityProvider(),
+		metrics:     newMetricsStore(),
+	}
+	// Artifact creation is observed at the store so producers (including the
+	// experiment runner, which shares the store) do not need per-call plumbing.
+	if store != nil {
+		store.OnPut = server.metrics.recordArtifact
 	}
 	// Every control-lock end (release, expiry, context close, bridge loss)
 	// lands in the audit stream with the reason it ended.
@@ -154,8 +164,8 @@ func NewServer(version string, client bridge.Client, store *artifact.Store, cont
 	return server
 }
 
-// Handler returns the local HTTP handler covering /healthz, /mcp, and
-// /artifacts/{id}.
+// Handler returns the local HTTP handler covering /healthz, /mcp,
+// /artifacts/{id}, and /metrics.
 func (server *Server) Handler() http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if !validOrigin(r.Header.Get("Origin")) {
@@ -165,6 +175,8 @@ func (server *Server) Handler() http.Handler {
 		switch {
 		case r.URL.Path == "/healthz":
 			health(server.version, w, r)
+		case r.URL.Path == "/metrics":
+			metricsHandler(server, w, r)
 		case strings.HasPrefix(r.URL.Path, "/artifacts/"):
 			server.store.Handler().ServeHTTP(w, r)
 		case r.URL.Path == "/mcp":
@@ -216,6 +228,17 @@ func health(version string, w http.ResponseWriter, r *http.Request) {
 		"status":  "ok",
 		"version": version,
 	})
+}
+
+// metricsHandler serves the process metrics snapshot over plain HTTP GET,
+// outside the JSON-RPC boundary.
+func metricsHandler(server *Server, w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		w.Header().Set("Allow", http.MethodGet)
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	writeJSON(w, http.StatusOK, server.metrics.snapshot())
 }
 
 func dispatch(server *Server, w http.ResponseWriter, r *http.Request) {

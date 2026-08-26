@@ -486,12 +486,12 @@ func runDebugEventsList(tc toolContext, args json.RawMessage) map[string]any {
 		views = append(views, view)
 	}
 	return okResult(map[string]any{
-		"events":     views,
-		"total":      total,
-		"offset":     offset,
-		"limit":      limit,
-		"truncated":  truncated,
-		"note":       "History is bounded to 100 events; gaps may exist due to truncation; check truncated and total for pagination.",
+		"events":    views,
+		"total":     total,
+		"offset":    offset,
+		"limit":     limit,
+		"truncated": truncated,
+		"note":      "History is bounded to 100 events; gaps may exist due to truncation; check truncated and total for pagination.",
 	}, tc.modern)
 }
 

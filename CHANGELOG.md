@@ -122,6 +122,29 @@ and this project will use [Semantic Versioning](https://semver.org/spec/v2.0.0.h
   for another address space never annotate; a payload without matching
   symbols passes through unchanged (`symbols_annotated` and
   `annotation_method` are added when any annotation applies).
+- `GET /metrics`: operator endpoint with per-tool call/error counts and
+  per-artifact-kind totals (loopback-only, `Store.OnPut` hook).
+- Evidence annotations (P2): `annotation_create`, `annotation_list`,
+  `annotation_get`, `annotation_update`, `annotation_delete`,
+  `annotation_export` (`annotation-export/1`), `annotation_import` — context-
+  scoped, `observation`/`hypothesis` kinds, ROM identity and target generation
+  stamping, evidence links to artifacts/states/captures/trace events/symbols/
+  debug resources, staleness flagging (`rom_sha256_mismatch` /
+  `target_generation_mismatch`), bounded pagination, conflict handling, 500-
+  per-context cap.
+- `m68k_backtrace`: heuristic M68K stack walk (A7 plus optional A6 frame
+  chain, executable-region filtering, symbol resolution, `capture_consistency`
+  reporting).
+- `state_diff`: read-only comparison of two `state_save` snapshots
+  (metadata plus raw file byte diff into `state-diff-results` artifact, 8 MiB
+  cap, bounded inline diffs).
+- `deterministic_replay`: record and replay a declarative `frame_advance`-
+  stepped `input_set` sequence twice from one state under exclusive control,
+  verifying determinism via per-step frame tokens and final registers into a
+  `replay-manifest/1` artifact.
+- `cpu_register_condition_evaluate`: server-side register-condition primitive
+  (`D0 == $1234`, `A7 >= $FF0000`, `&&`/`||`) for `cpu_breakpoint_set` hits;
+  reads `regs_get`, documents pause/resume race, returns `matched`.
 - Conditional execution breakpoints: `cpu_breakpoint_set` accepts optional
   `condition` (`greater`, `less`, `range` with exclusive `range_end` bound),
   `break_on_counter`, and `break_counter` (break on every Nth hit; ignored
@@ -227,6 +250,27 @@ and this project will use [Semantic Versioning](https://semver.org/spec/v2.0.0.h
 - `scripts/live-smoke.sh --full` covers the conditional-breakpoint lifecycle
   (range-condition echo/list/remove) and asserts the plain-breakpoint
   `break_counter` default.
+- `m68k_backtrace`: heuristic M68K stack walk (roadmap Phase 7) from A7 (the
+  active stack pointer, USP or SSP per the SR supervisor bit) with an optional
+  A6 frame-pointer chain and context-symbol resolution. Frame 0 is the live
+  PC; every other frame is flagged per method (`register_pc`,
+  `frame_pointer`, `stack_scan`), confidence (high/medium/low), and a
+  heuristic note, with the composite `capture_consistency` object for its
+  live reads. Never claims execution-verified call sites.
+- `state_diff`: read-only comparison of two `state_save` snapshots (roadmap
+  Phase 7) into a `state-diff-results` artifact — snapshot metadata diff plus
+  a raw snapshot-file byte diff (per-byte counts, contiguous diff regions,
+  bounded inline before/after hex, first-1KB previews, 8 MiB comparison cap).
+  The register/memory/VDP semantic sections are reported as requested but not
+  performed because decoding them requires a mutating `state_load`.
+- `deterministic_replay`: record-and-replay determinism verification (roadmap
+  Phase 8) — runs one declarative input sequence (`input_set` +
+  `frame_advance` steps) twice from the same saved state under exclusive
+  control, compares per-step VDP frame tokens and final M68K registers, and
+  stores a `replay-manifest/1` artifact reporting `deterministic` plus named
+  checks and the methodology. Restores the initial state afterwards
+  (caller-provided `initial_state_id` or a fresh snapshot of the current
+  machine).
 
 ### Removed
 

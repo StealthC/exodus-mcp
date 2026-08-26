@@ -606,17 +606,17 @@ func traceArtifactsFromPayload(tc toolContext, context *analysis.Context, payloa
 	sample, _ := payload["sample"].([]any)
 	captureChannel, _ := payload["capture_channel"].(string)
 	summary := map[string]any{
-		"kind":            "cpu-trace",
-		"cpu":             cpu,
-		"captured":        int(captured),
-		"timed_out":       timedOut,
-		"sample":          sample,
-		"sha256":          storedText.SHA256,
-		"jsonl_sha256":    storedJSONL.SHA256,
-		"jsonl_events":    len(events),
-		"capture_id":      captureID,
+		"kind":              "cpu-trace",
+		"cpu":               cpu,
+		"captured":          int(captured),
+		"timed_out":         timedOut,
+		"sample":            sample,
+		"sha256":            storedText.SHA256,
+		"jsonl_sha256":      storedJSONL.SHA256,
+		"jsonl_events":      len(events),
+		"capture_id":        captureID,
 		"target_generation": generation,
-		"truncation":      truncation,
+		"truncation":        truncation,
 	}
 	if note, ok := payload["sampling_note"].(string); ok && note != "" {
 		summary["sampling_note"] = note
@@ -774,12 +774,12 @@ func buildTraceJSONLEvents(tc toolContext, cpu, traceText string, rangeStart, ra
 		}
 		// Control-flow facts are not available from the trace; mark unknown.
 		event["control_flow"] = map[string]any{
-			"fallthrough_address":       nil,
-			"branch_target":             nil,
-			"branch_taken":              nil,
+			"fallthrough_address":        nil,
+			"branch_target":              nil,
+			"branch_taken":               nil,
 			"call_return_classification": "unknown",
-			"exception_interrupt":       nil,
-			"confidence":                "unknown",
+			"exception_interrupt":        nil,
+			"confidence":                 "unknown",
 		}
 		events = append(events, event)
 	}
@@ -906,10 +906,10 @@ func runSymbolsList(tc toolContext, args json.RawMessage) map[string]any {
 	views := make([]map[string]any, 0, len(symbols))
 	for _, symbol := range symbols {
 		view := map[string]any{
-			"name":         symbol.Name,
-			"space_id":     symbol.SpaceID,
-			"address":      symbol.Address,
-			"address_hex":  canonicalHex(symbol.Address),
+			"name":          symbol.Name,
+			"space_id":      symbol.SpaceID,
+			"address":       symbol.Address,
+			"address_hex":   canonicalHex(symbol.Address),
 			"address_space": symbol.SpaceID,
 		}
 		if width, mask := addressBusWidthMask(symbol.SpaceID); width != 0 {
