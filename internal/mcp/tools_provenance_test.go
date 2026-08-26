@@ -87,7 +87,7 @@ func TestMemoryDumpRecordsFullCaptureProvenance(t *testing.T) {
 		t.Fatalf("effective address wrong: %v", summary)
 	}
 	provenance := provenanceOf(result)
-	if provenance["artifact_schema"] != "artifact-provenance/1" || provenance["state"] != "complete" {
+	if provenance["artifact_schema"] != "artifact-provenance/2" || provenance["state"] != "complete" {
 		t.Fatalf("envelope not stamped: %v", provenance)
 	}
 	if provenance["address_space"] != "mem-ram" || provenance["device"] != "68000 work RAM" {
@@ -332,7 +332,7 @@ func TestArtifactDescribeReturnsTypedEnvelope(t *testing.T) {
 		t.Fatalf("artifact_describe failed: %v", described)
 	}
 	provenance := described["provenance"].(map[string]any)
-	if provenance["artifact_schema"] != "artifact-provenance/1" || provenance["state"] != "complete" {
+	if provenance["artifact_schema"] != "artifact-provenance/2" || provenance["state"] != "complete" {
 		t.Fatalf("envelope wrong: %v", provenance)
 	}
 	for _, key := range []string{"address_space", "start_address", "effective_address", "start_address_hex", "effective_address_hex", "byte_length", "byte_order", "raw_byte_ordering", "device", "target_generation", "captured_at"} {

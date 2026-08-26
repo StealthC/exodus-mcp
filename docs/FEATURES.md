@@ -5,7 +5,7 @@ server, grouped by capability. Planned work is tracked in
 [ROADMAP.md](ROADMAP.md); the [CHANGELOG.md](../CHANGELOG.md) records the
 delivery history.
 
-The MCP server currently exposes **65 analysis tools** spanning the delivered
+The MCP server currently exposes **66 analysis tools** spanning the delivered
 roadmap phases 0-5: bridge and context foundations, memory and artifact
 access, both processors, VDP graphics, deterministic controlled
 experimentation, and advanced analysis. Everything below is covered by unit
@@ -20,15 +20,17 @@ and integration tests and exercised live against a running Exodus instance
   and MCP resource URI. Artifacts support ETag and HTTP byte-range downloads,
   bounded previews, per-analysis-context scoping, and optional TTL retention.
 - **Versioned capture provenance.** Every artifact produced from capture data
-  carries an immutable `artifact-provenance/1` envelope (address domain with
+  carries an immutable `artifact-provenance/2` envelope (address domain with
   requested/effective addresses in decimal and canonical hex, byte length,
   byte order and raw-byte ordering, owning device, target generation, ROM
   SHA-256 and path, frame token, CPU run state, capture consistency, capture
-  time). `artifact_describe` returns the full typed envelope; artifacts whose
-  producer attached no metadata are reported honestly as `provenance_unknown`
-  instead of inventing fields. Memory search and diff derive their address
-  domain from the envelope, so a dump captured at `0xFF0000` is searched and
-  diffed at `0xFF0000` without caller restatement.
+  time, plus the standardized `capture_consistency` object and — for
+  composite captures — a stable `capture_id`). `artifact_describe` returns the
+  full typed envelope; artifacts whose producer attached no metadata are
+  reported honestly as `provenance_unknown` instead of inventing fields.
+  Memory search and diff derive their address domain from the envelope, so a
+  dump captured at `0xFF0000` is searched and diffed at `0xFF0000` without
+  caller restatement.
 - **Byte order and address space metadata.** Every multi-byte value reports
   its byte order and address space. The Mega Drive baseline is M68K
   big-endian, Z80 little-endian, and device-specific for VDP semantics; raw
@@ -56,11 +58,22 @@ and integration tests and exercised live against a running Exodus instance
 - **Consistent reads only.** Searches and diffs run over snapshot artifacts
   (never a live racy scan); timed-buffer VDP reads briefly pause a running
   system, restore it afterwards, and report that in the response.
-- **Honest capture consistency.** Every read tool reports
-  `system_paused_during_read` — whether the handler had to pause a running
-  system to sample (and restored it afterwards) — so an agent can tell a
-  temporally atomic capture from a live, internally inconsistent one without
-  inferring it from the tool name.
+- **Honest capture consistency.** Every state-observing tool reports the
+  standardized `capture_consistency` object: `live` (sampled while running
+  without pausing; possibly internally inconsistent), `paused` (system was
+  already stopped), `atomic` (the capture itself paused once and restored),
+  `state_restored` (describes a restored snapshot), or
+  `composite_non_atomic` (component reads spanned multiple moments). The
+  object states whether execution was paused by the tool and resumed
+  afterwards, observed initial/final run states, and frame tokens when the
+  VDP exposes them. `memory_snapshot_capture` captures one or more named
+  ranges in one pause window (exactly one pause/resume cycle, one capture id,
+  one manifest); `memory_read`, `memory_dump`, `vdp_memory_read`, and
+  `frame_capture` accept an optional `capture_mode: "paused"` guard that makes
+  a single sample temporally atomic — the default `"live"` never pauses, so
+  timing-sensitive software is never silently perturbed. Mixing artifacts
+  from different composite captures is rejected by `memory_diff` unless
+  explicitly allowed.
 - **Run-state observability.** `emulator_status` reports `pause_source`
   (`mcp` | `ui_or_external` | `breakpoint_or_watchpoint` | `unknown`) and
   `last_run_state_change` (UTC). Externally observed transitions (UI pauses,
@@ -104,12 +117,15 @@ and integration tests and exercised live against a running Exodus instance
   mapped instead of guessing). Out-of-range failures include the valid
   canonical hex range.
 - `memory_read`: bounded inline reads with explicit representation,
-  effective-address echo, `system_paused_during_read`, and decode validation
-  against the declared byte order.
+  effective-address echo, `system_paused_during_read`, the standardized
+  `capture_consistency` object, and decode validation against the declared
+  byte order. Optional `capture_mode: "paused"` makes the sample temporally
+  atomic (pauses once, restores); the default `"live"` never pauses.
 - `memory_dump`: artifact-first range output with hash and direct URL
   (8 MiB per-call cap); the summary reports `effective_address`,
-  `system_paused_during_read`, and the full capture-provenance envelope on the
-  artifact.
+  `system_paused_during_read`, the `capture_consistency` object, and the full
+  capture-provenance envelope on the artifact. Optional `capture_mode:
+  "paused"` makes the dump a temporally atomic snapshot.
 - `memory_write`: debugger-path writes to CPU bus spaces
   (`SetMemorySpaceByte`) and entry-based memory devices (read-modify-write
   honoring byte order); timed-buffer spaces are refused with
@@ -134,10 +150,23 @@ and integration tests and exercised live against a running Exodus instance
   provenance) and aligned scanning by default; modes `changed`, `unchanged`,
   `increased`, `decreased`, `changed_by` (signed delta), `equal_to`, and
   `in_range`. Snapshots with incompatible provenance (different space, range,
-  or ROM identity) fail with `incompatible_provenance` by default; passing
+  ROM identity, or artifacts from different composite captures) fail with
+  `incompatible_provenance` by default; passing
   `allow_incompatible_provenance` forces the comparison with a prominent
   warning naming both source manifests — a common address origin is never
-  fabricated. Bounded inline matches plus a `memory-diff-results` artifact.
+  fabricated. Reports both capture ids when the snapshots belong to composite
+  captures. Bounded inline matches plus a `memory-diff-results` artifact.
+- `memory_snapshot_capture`: bounded paused composite capture — one or more
+  named ranges of one address space are read inside a single pause window
+  (the system is paused exactly once when running and restored afterwards;
+  zero pause/resume cycles when already paused), so every range describes one
+  temporally atomic instant. All raw range artifacts and the JSON manifest
+  share one stable `capture_id` and the `artifact-provenance/2` envelope; the
+  summary reports the pause/resume cycle count, the target generation span,
+  initial/final run states, frame tokens, and the atomic capture-consistency
+  object. Runs under exclusive control for the full window (caller
+  `control_id` reused or internal lock). A paused capture can perturb
+  real-time behavior; the cost is documented in the tool description.
 - `memory_freeze`, `memory_freeze_list`, `memory_freeze_remove`,
   `memory_freeze_clear`: server-managed value freezing with optional
   generation/control preconditions. A registered range is written once and
@@ -203,26 +232,36 @@ and integration tests and exercised live against a running Exodus instance
 - `frame_capture`: the live rendered frame as a PNG artifact with frame/timing
   metadata — liveness (frame token advances while running) and paused
   determinism (identical hashes) validated. The frame buffer is read without
-  pausing, so `system_paused_during_read` is always false. The artifact's
-  capture provenance records the frame token, target generation, and ROM
-  identity.
+  pausing, so `system_paused_during_read` is always false and
+  `capture_consistency.state` is `live` (the frame token identifies the
+  rendered frame). Optional `capture_mode: "paused"` makes the frame match a
+  temporally atomic instant. The artifact's capture provenance records the
+  frame token, target generation, and ROM identity.
 - `vdp_memory_read`: VRAM, CRAM, and VSRAM through the proven timed-buffer
   path. Raw views (`hexdump`, `array_u8`, `raw_base64`), big-endian
   `array_u16` words, and a decoded CRAM view expanding 9-bit RGB entries into
   8-bit RGB (`-RRR-GGG-BBB-` channel layout). Reports
-  `system_paused_during_read` when execution had to be stopped.
+  `system_paused_during_read` when execution had to be stopped and the
+  standardized `capture_consistency` object (atomic for a paused timed-buffer
+  read); optional `capture_mode: "paused"` makes the sample temporally
+  atomic.
 - `vdp_tile_export`: consecutive 8x8 4bpp patterns as a scaled PNG plus a JSON
   pixel-index artifact, colored through a chosen CRAM palette line with
   optional transparent color 0 (high-nibble-left pixel order). Reports
-  `coherent_snapshot` and `system_paused_during_read` (true when any chunked
-  read had to pause a running system).
+  `coherent_snapshot`, `system_paused_during_read`, and the standardized
+  `capture_consistency` object — when any chunked read found the system
+  running, the composition is `composite_non_atomic` and the VRAM/CRAM pieces
+  must not be combined into a coherent instant. Both artifacts share one
+  `capture_id`.
 - `vdp_plane_export`: full unscrolled scroll-plane texture view (A, B, or
   window) rendered from the name table with flip, palette, and priority
-  decoding; reports distinct tiles, priority counts, `coherent_snapshot`, and
-  `system_paused_during_read`.
+  decoding; reports distinct tiles, priority counts, `coherent_snapshot`,
+  `system_paused_during_read`, the `capture_consistency` object, and a shared
+  `capture_id` across both artifacts.
 - `vdp_palette_export`: CRAM as four 16-color lines into a PNG swatch
   artifact plus a JSON decode artifact, with nonzero counts per line, the
-  backdrop color inline, and `system_paused_during_read`.
+  backdrop color inline, `system_paused_during_read`, and a shared
+  `capture_id` plus `capture_consistency` object on both artifacts.
 - `vdp_sprite_table`: decoded sprite attribute table with positions, cell
   sizes, tile mapping, palette, priority, and a globally accurate link-chain
   walk (termination, cycle, dangling-link, and truncation flags), paged over
@@ -270,9 +309,11 @@ and integration tests and exercised live against a running Exodus instance
   through the emulator's native save-state path (ZIP format), each verified
   with SHA-256 and size and carrying provenance (context, target generation,
   ROM path and SHA-256, optional control id). `state_save` does not mutate the
-  target; `state_load` does and reports before/after generations. Lists flag
-  entries stale for the loaded ROM and generation-mismatched while preserving
-  them for historical analysis.
+  target; `state_load` does and reports before/after generations plus
+  `capture_consistency.state: "state_restored"` (observations describe the
+  restored instant until the system runs again). Lists flag entries stale for
+  the loaded ROM and generation-mismatched while preserving them for
+  historical analysis.
 - `frame_advance`: pause, execute exactly N rendered VDP frames, pause —
   reports the final frame token, before/after target generations, and times
   out with a diagnostic when the display is not rendering.
@@ -370,6 +411,16 @@ reference harness, in addition to unit and integration tests:
   facts; `data_hex` and base64 writes normalize to the same bytes with the
   same audit hash; `verify_readback` reports exact matches and mask/transform
   differences.
+- Capture consistency: `memory_snapshot_capture` on a running ROM reports
+  exactly one pause/resume cycle with all range artifacts and the manifest
+  sharing one capture id and the atomic object; a capture with the system
+  already paused performs no pause/resume mutations; a guarded
+  (`capture_mode: "paused"`) read pauses once, reads, and restores (also on
+  read failure); a composite VDP export whose chunked reads found the system
+  running reports `composite_non_atomic` and never claims coherence; mixing
+  artifacts from different composite captures fails with
+  `incompatible_provenance` unless explicitly allowed; `state_load` reports
+  `state_restored`.
 - Optimistic concurrency: two clients sharing one observed generation produce
   exactly one mutation and one `target_generation_conflict`; an unconditional
   single-agent mutation needs no lease or lock; a held control lock rejects

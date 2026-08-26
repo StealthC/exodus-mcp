@@ -9,6 +9,31 @@ and this project will use [Semantic Versioning](https://semver.org/spec/v2.0.0.h
 
 ### Added
 
+- Standardized `capture_consistency` object on every state-observing tool
+  (`live` | `paused` | `atomic` | `state_restored` | `composite_non_atomic`)
+  with execution paused/resumed facts, observed initial/final run states, and
+  frame tokens where the VDP exposes them. Applied to memory reads/dumps/
+  search, CPU registers and CPU reads, `vdp_memory_read`,
+  `vdp_sprite_table`, the VDP exports, `vdp_pixel_info`, `frame_capture`, and
+  `state_load` (`state_restored`).
+- `memory_snapshot_capture`: bounded paused composite capture of one or more
+  named ranges in one address space — pauses exactly once when running (zero
+  cycles when already paused), reads every range while paused, restores the
+  prior run state, and links all raw range artifacts plus a JSON manifest to
+  one stable `capture_id`. Runs under exclusive control for the full window;
+  the summary reports the pause/resume cycle, generation span, run states,
+  frame tokens, and the atomic capture-consistency object.
+- Optional capture guard: `capture_mode: "paused"` on `memory_read`,
+  `memory_dump`, `vdp_memory_read`, `frame_capture`, and the CPU read tools
+  makes one sample temporally atomic (pause once, read, restore — also on
+  read failure); the default `"live"` never pauses timing-sensitive software.
+- Envelope v2: provenance is now `artifact-provenance/2` and carries the
+  `capture_consistency` object and, for composite captures, a stable
+  `capture_id`. VDP exports share one capture id across their artifacts;
+  `memory_diff` reports both capture ids and rejects snapshots from different
+  composite captures with `incompatible_provenance` unless
+  `allow_incompatible_provenance` is passed (prominent warning, no fabricated
+  common address origin).
 - Versioned artifact capture provenance (`artifact-provenance/1`): every
   artifact produced from capture data carries an immutable envelope with the
   address domain (requested/effective addresses in decimal and canonical hex,

@@ -32,6 +32,7 @@ const (
 
 func phase5ToolSpecs() []toolSpec {
 	return []toolSpec{
+		memorySnapshotCaptureSpec(),
 		{
 			name:        "cpu_coverage_capture",
 			description: "Run the system for a bounded window and record which code addresses executed into a coverage artifact (distinct addresses, merged ranges, page histogram). Reuses the trace_capture path; the prior run state is restored afterwards. The system runs during the window, so the capture mutates the target and advances the target generation. Accepts optional expected_target_generation and control_id.",
@@ -62,7 +63,7 @@ func phase5ToolSpecs() []toolSpec {
 		},
 		{
 			name:        "memory_search",
-			description: "Search a consistent snapshot for a raw byte pattern. Without snapshot_id the tool dumps the range into a snapshot artifact first (never a live racy scan); with snapshot_id it searches that artifact without any new read and derives the address space, start address, byte length, and byte order from the snapshot's capture provenance — caller parameters that duplicate provenance are treated as assertions and rejected with provenance_conflict on mismatch. Snapshots without capture metadata (legacy artifacts) are reported as provenance_unknown and fall back to caller-provided addressing. Reports whether the snapshot read paused a running system (system_paused_during_read). Returns bounded inline matches plus a full-results artifact.",
+			description: "Search a consistent snapshot for a raw byte pattern. Without snapshot_id the tool dumps the range into a snapshot artifact first (never a live racy scan); with snapshot_id it searches that artifact without any new read and derives the address space, start address, byte length, and byte order from the snapshot's capture provenance — caller parameters that duplicate provenance are treated as assertions and rejected with provenance_conflict on mismatch. Snapshots without capture metadata (legacy artifacts) are reported as provenance_unknown and fall back to caller-provided addressing. Reports whether the snapshot read paused a running system (system_paused_during_read) and the standardized capture_consistency object of the searched snapshot. Returns bounded inline matches plus a full-results artifact.",
 			schema: objectSchema(map[string]any{
 				"space":         stringProperty("Address space id from memory_spaces_list; required without snapshot_id or when the snapshot lacks provenance. With a proven snapshot it must match the snapshot's captured space."),
 				"pattern":       stringProperty("Byte pattern as hex with optional spaces, e.g. \"4A 42 41\" or \"4a4241\"."),
@@ -201,7 +202,7 @@ func resolveSearchSource(tc toolContext, contextID string, args memorySearchArgs
 			"consistency":               "live",
 			"system_paused_during_read": pausedDuringRead,
 		}
-		provenance := captureProvenance(tc.server, "memory-snapshot", space, startAddress, uint64(len(raw)), payload, time.Now().UTC())
+		provenance := captureProvenance(tc.server, "memory-snapshot", space, startAddress, uint64(len(raw)), payload, time.Now().UTC(), "", nil)
 		stored, err := tc.server.store.PutWithProvenance(contextID, "memory-snapshot", "application/octet-stream", raw, provenance)
 		if err != nil {
 			return source, &toolFailure{Code: "artifact_error", Message: err.Error()}
@@ -212,6 +213,7 @@ func resolveSearchSource(tc toolContext, contextID string, args memorySearchArgs
 		source.startAddress = uint64(effective)
 		source.byteOrder = byteOrder
 		source.pausedDuringRead = pausedDuringRead
+		source.consistency = buildCaptureConsistency(tc.server, payload, false, true, nil, nil)
 		source.readOrigin = "live read; system_paused_during_read reports whether the snapshot read temporarily paused a running system"
 		source.provenanceNote = "complete"
 		return source, nil
@@ -255,6 +257,7 @@ func resolveSearchSource(tc toolContext, contextID string, args memorySearchArgs
 		source.startAddress = derivedStart
 		source.byteOrder = provenance.ByteOrder
 		source.provenance = provenance
+		source.consistency = provenance.CaptureConsistency
 		source.provenanceNote = "complete"
 		return source, nil
 	}
@@ -286,6 +289,7 @@ type searchSource struct {
 	pausedDuringRead bool
 	readOrigin       string
 	provenanceNote   string
+	consistency      *artifact.CaptureConsistency
 }
 
 // sourceRange renders the captured address range of the searched snapshot.
@@ -395,6 +399,9 @@ func runMemorySearch(tc toolContext, args json.RawMessage) map[string]any {
 		"snapshot_read_note":         source.readOrigin,
 		"snapshot":                   source.descriptor,
 		"source_range":               source.sourceRange(),
+	}
+	if source.consistency != nil {
+		summary["capture_consistency"] = captureConsistencyToMap(source.consistency)
 	}
 	if source.byteOrder != "" {
 		summary["byte_order"] = source.byteOrder
@@ -563,6 +570,13 @@ func compareProvenance(before, after *artifact.Provenance) provenanceCompatibili
 	afterLength, _ := after.CapturedLength()
 	if beforeLength != afterLength {
 		reasons = append(reasons, fmt.Sprintf("captured byte length differs: %d vs %d", beforeLength, afterLength))
+	}
+	// Artifacts from different composite captures describe different atomic
+	// windows; mixing them into one comparison is an explicit cross-capture
+	// operation (escapable with allow_incompatible_provenance). Standalone
+	// single-read artifacts carry no capture id and are unaffected.
+	if before.CaptureID != "" && after.CaptureID != "" && before.CaptureID != after.CaptureID {
+		reasons = append(reasons, fmt.Sprintf("artifacts belong to different composite captures: %s vs %s (each capture is one atomic window)", before.CaptureID, after.CaptureID))
 	}
 	if before.ROMSHA256 != "" || after.ROMSHA256 != "" {
 		if before.ROMSHA256 != after.ROMSHA256 {
@@ -778,7 +792,7 @@ func runMemoryDiff(tc toolContext, args json.RawMessage) map[string]any {
 			"consistency":               "live",
 			"system_paused_during_read": pausedDuringRead,
 		}
-		provenance := captureProvenance(tc.server, "memory-snapshot", space, freshStart, uint64(len(raw)), payload, time.Now().UTC())
+		provenance := captureProvenance(tc.server, "memory-snapshot", space, freshStart, uint64(len(raw)), payload, time.Now().UTC(), "", nil)
 		stored, err := tc.server.store.PutWithProvenance(context.ID, "memory-snapshot", "application/octet-stream", raw, provenance)
 		if err != nil {
 			return failureResult(&toolFailure{Code: "artifact_error", Message: err.Error()}, tc.modern)
@@ -909,6 +923,15 @@ func runMemoryDiff(tc toolContext, args json.RawMessage) map[string]any {
 	if warning != "" {
 		document["provenance_warning"] = warning
 	}
+	if beforeProvenance != nil && beforeProvenance.CaptureID != "" {
+		document["before_capture_id"] = beforeProvenance.CaptureID
+	}
+	if afterProvenance != nil && afterProvenance.CaptureID != "" {
+		document["after_capture_id"] = afterProvenance.CaptureID
+	}
+	if afterProvenance != nil && afterProvenance.CaptureConsistency != nil {
+		document["capture_consistency"] = captureConsistencyToMap(afterProvenance.CaptureConsistency)
+	}
 	if parsed.Mode == "equal_to" {
 		document["value"] = *parsed.Value
 	}
@@ -947,6 +970,15 @@ func runMemoryDiff(tc toolContext, args json.RawMessage) map[string]any {
 	}
 	if warning != "" {
 		summary["provenance_warning"] = warning
+	}
+	if beforeProvenance != nil && beforeProvenance.CaptureID != "" {
+		summary["before_capture_id"] = beforeProvenance.CaptureID
+	}
+	if afterProvenance != nil && afterProvenance.CaptureID != "" {
+		summary["after_capture_id"] = afterProvenance.CaptureID
+	}
+	if afterProvenance != nil && afterProvenance.CaptureConsistency != nil {
+		summary["capture_consistency"] = captureConsistencyToMap(afterProvenance.CaptureConsistency)
 	}
 	if parsed.Mode == "equal_to" {
 		summary["value"] = *parsed.Value
@@ -1277,6 +1309,7 @@ func mdROMInfo(tc toolContext, contextID string, romSizeBytes uint64, paddedSize
 		ROMPath:             tc.server.currentROMPath(),
 		Consistency:         "live",
 		CapturedAt:          time.Now().UTC(),
+		CaptureConsistency:  buildCaptureConsistency(tc.server, map[string]any{}, false, true, nil, nil),
 	}
 	headerArtifact, err := tc.server.store.PutWithProvenance(contextID, "rom-header", "application/octet-stream", header, headerProvenance)
 	if err != nil {

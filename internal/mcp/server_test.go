@@ -190,7 +190,7 @@ func TestToolsListDeterministicAndComplete(t *testing.T) {
 		"cpu_trace_capture_watchpoint",
 		"frame_advance", "input_set",
 		"m68k_disassemble", "m68k_read_memory", "m68k_registers",
-		"memory_dump", "memory_read", "memory_search", "memory_spaces_list", "memory_write",
+		"memory_dump", "memory_read", "memory_search", "memory_snapshot_capture", "memory_spaces_list", "memory_write",
 		"rom_info", "rom_load",
 		"state_list", "state_load", "state_save",
 		"symbols_clear", "symbols_list", "symbols_set",

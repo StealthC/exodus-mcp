@@ -32,7 +32,11 @@ var errUnknownArtifact = errors.New("unknown artifact")
 // ProvenanceSchema is the versioned envelope schema stamped on every
 // provenance record. Consumers must compare it for equality; a future schema
 // revision is a separate version, never a silent shape change.
-const ProvenanceSchema = "artifact-provenance/1"
+//
+// Version 2 adds capture_id and the standardized capture_consistency object
+// (P0 honest capture consistency); version 1 artifacts (no capture id, flat
+// consistency label only) never persist across server sessions.
+const ProvenanceSchema = "artifact-provenance/2"
 
 // Provenance state values. An artifact created without capture metadata is
 // honestly reported as provenance_unknown instead of inventing fields.
@@ -40,6 +44,43 @@ const (
 	ProvenanceStateComplete = "complete"
 	ProvenanceStateUnknown  = "provenance_unknown"
 )
+
+// CaptureConsistency is the standardized capture-consistency object of one
+// capture. State distinguishes how the sample relates to the emulated
+// instant:
+//
+//   - "live": sampled while the system was running without pausing; raw
+//     values can be internally inconsistent across reads.
+//   - "paused": the system was already paused when sampled; values are
+//     stable, and no run-state change was caused by the capture.
+//   - "atomic": the capture itself paused the system once (and restored it
+//     afterwards), so the sample is temporally atomic.
+//   - "state_restored": the sample describes a machine restored from a saved
+//     state, not a live capture.
+//   - "composite_non_atomic": composed of multiple reads that spanned
+//     multiple emulated moments (component reads found the system running);
+//     the pieces must not be combined into a coherent instant.
+type CaptureConsistency struct {
+	State string `json:"state"`
+
+	// ExecutionPausedByTool reports whether the capture stopped a running
+	// system; ExecutionResumedAfter reports whether it restored the prior
+	// run state afterwards.
+	ExecutionPausedByTool bool `json:"execution_paused_by_tool"`
+	ExecutionResumedAfter bool `json:"execution_resumed_after"`
+
+	// InitialRunState/FinalRunState are "running", "paused", or "unknown"
+	// as observed before and after the capture.
+	InitialRunState string `json:"initial_run_state,omitempty"`
+	FinalRunState   string `json:"final_run_state,omitempty"`
+
+	// InitialFrameToken/FinalFrameToken identify the rendered frame before
+	// and after the capture when the capture path provides them.
+	InitialFrameToken *uint64 `json:"initial_frame_token,omitempty"`
+	FinalFrameToken   *uint64 `json:"final_frame_token,omitempty"`
+
+	Note string `json:"note,omitempty"`
+}
 
 // Provenance is the immutable, versioned capture envelope of one artifact:
 // the address/time/target/decoding facts required to interpret its bytes
@@ -89,6 +130,18 @@ type Provenance struct {
 	CPURunState string    `json:"cpu_run_state,omitempty"`
 	Consistency string    `json:"consistency,omitempty"`
 	CapturedAt  time.Time `json:"captured_at,omitempty"`
+
+	// CaptureID links artifacts produced by one composite capture (all raw
+	// ranges and the manifest of memory_snapshot_capture, both artifacts of
+	// one VDP export). Mixing artifacts from different capture ids into a
+	// coherent conclusion is rejected by tools that claim cross-domain
+	// coherence.
+	CaptureID string `json:"capture_id,omitempty"`
+
+	// CaptureConsistency is the standardized capture-consistency object
+	// (P0): how the sample relates to the emulated instant, whether the
+	// capture paused the system, and observed run states and frame tokens.
+	CaptureConsistency *CaptureConsistency `json:"capture_consistency,omitempty"`
 }
 
 // Known reports whether the provenance envelope is complete enough to trust

@@ -43,13 +43,13 @@ func cpuToolSpecs() []toolSpec {
 		},
 		{
 			name:        "m68k_read_memory",
-			description: "Read memory through the 68000 bus view. Declared byte order: big-endian. Inline reads are capped at 4096 bytes.",
+			description: "Read memory through the 68000 bus view. Declared byte order: big-endian. Inline reads are capped at 4096 bytes. Reports the standardized capture_consistency object; optional capture_mode \"paused\" makes the read temporally atomic.",
 			schema:      cpuReadMemorySchema(),
 			run:         makeRunCpuMemoryRead("m68k-bus"),
 		},
 		{
 			name:        "m68k_registers",
-			description: "Return all M68000 registers and decomposed status flags as plain integers (byte order not applicable).",
+			description: "Return all M68000 registers and decomposed status flags as plain integers (byte order not applicable), with the standardized capture_consistency object (live while running, paused when already stopped).",
 			schema:      objectSchema(map[string]any{}, nil),
 			run:         makeRunRegisters("m68k"),
 		},
@@ -103,13 +103,13 @@ func cpuToolSpecs() []toolSpec {
 		},
 		{
 			name:        "z80_read_memory",
-			description: "Read memory through the Z80 bus view. Declared byte order: little-endian. Inline reads are capped at 4096 bytes.",
+			description: "Read memory through the Z80 bus view. Declared byte order: little-endian. Inline reads are capped at 4096 bytes. Reports the standardized capture_consistency object; optional capture_mode \"paused\" makes the read temporally atomic.",
 			schema:      cpuReadMemorySchema(),
 			run:         makeRunCpuMemoryRead("z80-bus"),
 		},
 		{
 			name:        "z80_registers",
-			description: "Return Z80 register pairs, index registers, interrupt state, and decomposed flags as plain integers (byte order not applicable).",
+			description: "Return Z80 register pairs, index registers, interrupt state, and decomposed flags as plain integers (byte order not applicable), with the standardized capture_consistency object (live while running, paused when already stopped).",
 			schema:      objectSchema(map[string]any{}, nil),
 			run:         makeRunRegisters("z80"),
 		},
@@ -122,6 +122,7 @@ func cpuReadMemorySchema() map[string]any {
 		"length":         integerProperty(fmt.Sprintf("Byte length between 1 and %d.", inlineReadCapBytes), 1),
 		"representation": enumProperty("Inline rendering.", []string{"raw_base64", "hexdump", "array_u8"}),
 		"decode":         decodeSchemaProperty(),
+		"capture_mode":   captureModeProperty(),
 		"context":        contextProperty(),
 	}, []string{"address", "length"})
 }
@@ -135,6 +136,7 @@ func makeRunRegisters(cpu string) func(toolContext, json.RawMessage) map[string]
 		if failure != nil {
 			return failureResult(failure, tc.modern)
 		}
+		payload["capture_consistency"] = captureConsistencyToMap(buildCaptureConsistency(tc.server, payload, false, true, nil, nil))
 		return okResult(payload, tc.modern)
 	}
 }
@@ -381,11 +383,15 @@ func makeRunCpuMemoryRead(spaceID string) func(toolContext, json.RawMessage) map
 		if _, failure = resolveContext(tc.server, parsed.Context); failure != nil {
 			return failureResult(failure, tc.modern)
 		}
+		guard := captureGuard{Mode: parsed.CaptureMode}
+		if failure = guard.resolve(); failure != nil {
+			return failureResult(failure, tc.modern)
+		}
 		address, failure := parseAddress(parsed.Address)
 		if failure != nil {
 			return failureResult(failure, tc.modern)
 		}
-		return readMemory(tc, spaceID, address, parsed.Length, parsed.Representation, parsed.Decode)
+		return readMemory(tc, spaceID, address, parsed.Length, parsed.Representation, parsed.Decode, guard)
 	}
 }
 

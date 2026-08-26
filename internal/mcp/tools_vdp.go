@@ -11,6 +11,7 @@ import (
 	"strconv"
 	"time"
 
+	"github.com/StealthC/exodus-mcp/internal/analysis"
 	"github.com/StealthC/exodus-mcp/internal/artifact"
 )
 
@@ -24,12 +25,13 @@ func vdpToolSpecs() []toolSpec {
 		},
 		{
 			name:        "vdp_memory_read",
-			description: fmt.Sprintf("Read raw VRAM, CRAM, or VSRAM bytes inline (cap %d) with explicit byte-order metadata, plus VDP-specific decoded views: big-endian words and CRAM 9-bit RGB entries.", inlineReadCapBytes),
+			description: fmt.Sprintf("Read raw VRAM, CRAM, or VSRAM bytes inline (cap %d) with explicit byte-order metadata, plus VDP-specific decoded views: big-endian words and CRAM 9-bit RGB entries. Reports the standardized capture_consistency object (atomic when the timed-buffer read had to pause the system); optional capture_mode \"paused\" makes the sample temporally atomic.", inlineReadCapBytes),
 			schema: objectSchema(map[string]any{
 				"target":         enumProperty("VDP memory buffer to read.", []string{"vram", "cram", "vsram"}),
 				"address":        addressProperty(),
 				"length":         integerProperty(fmt.Sprintf("Byte length between 1 and %d (default %d). Word views require an even address and length.", inlineReadCapBytes, defaultVDPMemoryReadLen), 1),
 				"representation": enumProperty("Inline rendering.", []string{"hexdump", "array_u8", "raw_base64", "array_u16", "cram_rgb333"}),
+				"capture_mode":   captureModeProperty(),
 				"context":        contextProperty(),
 			}, []string{"target", "address"}),
 			run: runVDPMemoryRead,
@@ -86,8 +88,8 @@ func vdpToolSpecs() []toolSpec {
 		},
 		{
 			name:        "frame_capture",
-			description: "Capture the current rendered VDP frame as a PNG image artifact. The frame buffer is read without pausing the system, so system_paused_during_read is always false.",
-			schema:      objectSchema(map[string]any{"context": contextProperty()}, nil),
+			description: "Capture the current rendered VDP frame as a PNG image artifact. The frame buffer is read without pausing the system, so system_paused_during_read is always false and capture_consistency.state is live (the frame token identifies the rendered frame). Optional capture_mode \"paused\" pauses once before the capture and restores the prior run state, making the frame match a temporally atomic instant.",
+			schema:      objectSchema(map[string]any{"capture_mode": captureModeProperty(), "context": contextProperty()}, nil),
 			run:         runFrameCapture,
 		},
 	}
@@ -115,13 +117,89 @@ type vdpMemoryReadArgs struct {
 	Address        any    `json:"address"`
 	Length         uint64 `json:"length"`
 	Representation string `json:"representation"`
+	CaptureMode    string `json:"capture_mode"`
 	Context        string `json:"context"`
 }
 
-// runVDPMemoryRead reads one VDP buffer through the plugin's timed-buffer
-// ReadLatest path and renders it inline. The bridge returns raw bytes; all
-// multi-byte decoding happens here so every view can carry explicit byte-order
-// metadata.
+// vdpMemoryReadValue reads one VDP buffer through the plugin's timed-buffer
+// ReadLatest path and renders it inline, attaching the standardized
+// capture_consistency object. The bridge returns raw bytes; all multi-byte
+// decoding happens here so every view can carry explicit byte-order metadata.
+func vdpMemoryReadValue(tc toolContext, target string, address uint64, length uint64, representation string) (map[string]any, *toolFailure) {
+	wordView := representation == "array_u16" || representation == "cram_rgb333"
+	if wordView && (address%2 != 0 || length%2 != 0) {
+		return nil, &toolFailure{
+			Code:    "unaligned_request",
+			Message: fmt.Sprintf("%s reads whole 2-byte entries; address and length must both be even.", representation),
+		}
+	}
+	if representation == "cram_rgb333" && target != "cram" {
+		return nil, &toolFailure{Code: "invalid_params", Message: "cram_rgb333 is only valid with target cram"}
+	}
+	if !wordView {
+		switch representation {
+		case "hexdump", "array_u8", "raw_base64":
+		default:
+			return nil, &toolFailure{Code: "invalid_params", Message: "representation must be hexdump, array_u8, raw_base64, array_u16, or cram_rgb333"}
+		}
+	}
+
+	payload, failure := tc.server.executeCommand(tc.ctx, "vdp_mem_read", map[string]string{
+		"target":  target,
+		"address": strconv.FormatUint(address, 10),
+		"length":  strconv.FormatUint(length, 10),
+	})
+	if failure != nil {
+		return nil, failure
+	}
+	rawDataBase64, _ := payload["data"].(string)
+	byteOrder, _ := payload["byte_order"].(string)
+	addressSpace, _ := payload["address_space"].(string)
+	entrySize, _ := payload["entry_size"].(float64)
+	bufferSize, _ := payload["buffer_size"].(float64)
+	// The bridge reports whether the read had to stop a running system;
+	// surfacing it lets callers judge snapshot coherence.
+	pausedDuringRead, _ := payload["system_paused_during_read"].(bool)
+	raw, err := base64.StdEncoding.DecodeString(rawDataBase64)
+	if err != nil {
+		return nil, &toolFailure{Code: "bridge_error", Message: "decode base64 vdp memory payload: " + err.Error()}
+	}
+
+	value := map[string]any{
+		"target":                    target,
+		"address_space":             addressSpace,
+		"address":                   address,
+		"length":                    len(raw),
+		"buffer_size":               uint64(bufferSize),
+		"entry_size":                uint64(entrySize),
+		"byte_order":                byteOrder,
+		"consistency":               payload["consistency"],
+		"representation":            representation,
+		"representation_note":       representationNote(representation),
+		"system_paused_during_read": pausedDuringRead,
+		"capture_consistency":       captureConsistencyToMap(buildCaptureConsistency(tc.server, payload, false, true, nil, nil)),
+	}
+	switch representation {
+	case "hexdump":
+		value["hex"] = artifact.HexDump(raw, int64(address))
+	case "array_u8":
+		values := make([]int, 0, len(raw))
+		for _, single := range raw {
+			values = append(values, int(single))
+		}
+		value["values"] = values
+	case "raw_base64":
+		value["data_base64"] = base64.StdEncoding.EncodeToString(raw)
+	case "array_u16":
+		value["values"] = bigEndianWords(raw)
+	default:
+		value["entries"] = cramRGB333Entries(raw)
+	}
+	return value, nil
+}
+
+// runVDPMemoryRead renders one VDP buffer read, honoring the optional capture
+// guard ("paused" makes the timed-buffer sample temporally atomic).
 func runVDPMemoryRead(tc toolContext, args json.RawMessage) map[string]any {
 	parsed, failure := decodeArgs[vdpMemoryReadArgs](args)
 	if failure != nil {
@@ -154,75 +232,13 @@ func runVDPMemoryRead(tc toolContext, args json.RawMessage) map[string]any {
 	if representation == "" {
 		representation = "hexdump"
 	}
-	wordView := representation == "array_u16" || representation == "cram_rgb333"
-	if wordView && (address%2 != 0 || length%2 != 0) {
-		return failureResult(&toolFailure{
-			Code:    "unaligned_request",
-			Message: fmt.Sprintf("%s reads whole 2-byte entries; address and length must both be even.", representation),
-		}, tc.modern)
-	}
-	if representation == "cram_rgb333" && parsed.Target != "cram" {
-		return errorResult("invalid_params", "cram_rgb333 is only valid with target cram", tc.modern)
-	}
-	if !wordView {
-		switch representation {
-		case "hexdump", "array_u8", "raw_base64":
-		default:
-			return errorResult("invalid_params", "representation must be hexdump, array_u8, raw_base64, array_u16, or cram_rgb333", tc.modern)
-		}
-	}
-
-	payload, failure := tc.server.executeCommand(tc.ctx, "vdp_mem_read", map[string]string{
-		"target":  parsed.Target,
-		"address": strconv.FormatUint(address, 10),
-		"length":  strconv.FormatUint(length, 10),
-	})
-	if failure != nil {
+	guard := captureGuard{Mode: parsed.CaptureMode}
+	if failure = guard.resolve(); failure != nil {
 		return failureResult(failure, tc.modern)
 	}
-	rawDataBase64, _ := payload["data"].(string)
-	byteOrder, _ := payload["byte_order"].(string)
-	addressSpace, _ := payload["address_space"].(string)
-	entrySize, _ := payload["entry_size"].(float64)
-	bufferSize, _ := payload["buffer_size"].(float64)
-	// The bridge reports whether the read had to stop a running system;
-	// surfacing it lets callers judge snapshot coherence.
-	pausedDuringRead, _ := payload["system_paused_during_read"].(bool)
-	raw, err := base64.StdEncoding.DecodeString(rawDataBase64)
-	if err != nil {
-		return failureResult(&toolFailure{Code: "bridge_error", Message: "decode base64 vdp memory payload: " + err.Error()}, tc.modern)
-	}
-
-	value := map[string]any{
-		"target":                    parsed.Target,
-		"address_space":             addressSpace,
-		"address":                   address,
-		"length":                    len(raw),
-		"buffer_size":               uint64(bufferSize),
-		"entry_size":                uint64(entrySize),
-		"byte_order":                byteOrder,
-		"consistency":               payload["consistency"],
-		"representation":            representation,
-		"representation_note":       representationNote(representation),
-		"system_paused_during_read": pausedDuringRead,
-	}
-	switch representation {
-	case "hexdump":
-		value["hex"] = artifact.HexDump(raw, int64(address))
-	case "array_u8":
-		values := make([]int, 0, len(raw))
-		for _, single := range raw {
-			values = append(values, int(single))
-		}
-		value["values"] = values
-	case "raw_base64":
-		value["data_base64"] = base64.StdEncoding.EncodeToString(raw)
-	case "array_u16":
-		value["values"] = bigEndianWords(raw)
-	default:
-		value["entries"] = cramRGB333Entries(raw)
-	}
-	return okResult(value, tc.modern)
+	return withCaptureGuard(tc, guard, func() (map[string]any, *toolFailure) {
+		return vdpMemoryReadValue(tc, parsed.Target, address, length, representation)
+	})
 }
 
 func representationNote(representation string) string {
@@ -271,13 +287,82 @@ func cramRGB333Entries(raw []byte) []map[string]any {
 }
 
 type frameCaptureArgs struct {
-	Context string `json:"context"`
+	CaptureMode string `json:"capture_mode"`
+	Context     string `json:"context"`
 }
 
-// runFrameCapture fetches the live rendered frame from the plugin as tightly
-// packed RGB24 bytes and stores a PNG artifact. The raw pixel payload never
+// frameCaptureValue fetches the live rendered frame and stores the PNG
+// artifact, honoring the optional capture guard. The raw pixel payload never
 // reaches model context; the response is a compact summary plus the artifact
 // descriptor.
+func frameCaptureValue(tc toolContext, context *analysis.Context) (map[string]any, *toolFailure) {
+	payload, failure := tc.server.executeCommand(tc.ctx, "frame_capture", nil)
+	if failure != nil {
+		return nil, failure
+	}
+
+	rawDataBase64, _ := payload["data"].(string)
+	rawRGB, err := base64.StdEncoding.DecodeString(rawDataBase64)
+	if err != nil {
+		return nil, &toolFailure{Code: "bridge_error", Message: "decode base64 frame payload: " + err.Error()}
+	}
+	widthValue, _ := payload["width"].(float64)
+	heightValue, _ := payload["height"].(float64)
+	width := int(widthValue)
+	height := int(heightValue)
+	if width <= 0 || height <= 0 || len(rawRGB) != width*height*3 {
+		return nil, &toolFailure{
+			Code:    "bridge_error",
+			Message: fmt.Sprintf("frame payload does not match declared dimensions (%dx%d, %d bytes).", width, height, len(rawRGB)),
+		}
+	}
+
+	frame, err := rgb24ToNRGBA(rawRGB, width, height)
+	if err != nil {
+		return nil, &toolFailure{Code: "artifact_error", Message: err.Error()}
+	}
+	var pngBuffer bytes.Buffer
+	if err := png.Encode(&pngBuffer, frame); err != nil {
+		return nil, &toolFailure{Code: "artifact_error", Message: "encode PNG: " + err.Error()}
+	}
+	frameToken, _ := payload["frame_token"].(float64)
+	provenance := vdpProvenance(tc, "frame-capture", "vdp-buffers", "VDP frame buffer")
+	token := uint64(frameToken)
+	if token != 0 {
+		provenance.FrameToken = &token
+	}
+	provenance.ByteOrder = "not-applicable"
+	provenance.CaptureConsistency = &artifact.CaptureConsistency{
+		State: consistencyLive,
+		Note:  "The frame buffer is sampled as one rendered frame under the VDP's own lock; the frame token identifies it. The handler never pauses the system.",
+	}
+	stored, err := tc.server.store.PutWithProvenance(context.ID, "frame-capture", "image/png", pngBuffer.Bytes(), provenance)
+	if err != nil {
+		return nil, &toolFailure{Code: "artifact_error", Message: err.Error()}
+	}
+	return map[string]any{
+		"summary": map[string]any{
+			"kind":                      "frame-capture",
+			"width":                     width,
+			"height":                    height,
+			"source_format":             "rgb24",
+			"byte_order":                "not-applicable",
+			"consistency":               "live",
+			"frame_token":               token,
+			"system_paused_during_read": false,
+			"capture_consistency": map[string]any{
+				"state": consistencyLive,
+				"note":  "The frame buffer is sampled as one rendered frame under the VDP's own lock; the frame token identifies it. The handler never pauses the system.",
+			},
+			"png_size_bytes": pngBuffer.Len(),
+			"sha256":         stored.SHA256,
+		},
+		"artifact": artifactDescriptor(tc.server, stored, context.ID),
+	}, nil
+}
+
+// runFrameCapture renders one frame capture, honoring the optional capture
+// guard ("paused" makes the frame match a temporally atomic instant).
 func runFrameCapture(tc toolContext, args json.RawMessage) map[string]any {
 	parsed, failure := decodeArgs[frameCaptureArgs](args)
 	if failure != nil {
@@ -287,61 +372,13 @@ func runFrameCapture(tc toolContext, args json.RawMessage) map[string]any {
 	if failure != nil {
 		return failureResult(failure, tc.modern)
 	}
-	payload, failure := tc.server.executeCommand(tc.ctx, "frame_capture", nil)
-	if failure != nil {
+	guard := captureGuard{Mode: parsed.CaptureMode}
+	if failure = guard.resolve(); failure != nil {
 		return failureResult(failure, tc.modern)
 	}
-
-	rawDataBase64, _ := payload["data"].(string)
-	rawRGB, err := base64.StdEncoding.DecodeString(rawDataBase64)
-	if err != nil {
-		return failureResult(&toolFailure{Code: "bridge_error", Message: "decode base64 frame payload: " + err.Error()}, tc.modern)
-	}
-	widthValue, _ := payload["width"].(float64)
-	heightValue, _ := payload["height"].(float64)
-	width := int(widthValue)
-	height := int(heightValue)
-	if width <= 0 || height <= 0 || len(rawRGB) != width*height*3 {
-		return failureResult(&toolFailure{
-			Code:    "bridge_error",
-			Message: fmt.Sprintf("frame payload does not match declared dimensions (%dx%d, %d bytes).", width, height, len(rawRGB)),
-		}, tc.modern)
-	}
-
-	frame, err := rgb24ToNRGBA(rawRGB, width, height)
-	if err != nil {
-		return failureResult(&toolFailure{Code: "artifact_error", Message: err.Error()}, tc.modern)
-	}
-	var pngBuffer bytes.Buffer
-	if err := png.Encode(&pngBuffer, frame); err != nil {
-		return failureResult(&toolFailure{Code: "artifact_error", Message: "encode PNG: " + err.Error()}, tc.modern)
-	}
-	frameToken, _ := payload["frame_token"].(float64)
-	provenance := vdpProvenance(tc, "frame-capture", "vdp-buffers", "VDP frame buffer")
-	token := uint64(frameToken)
-	if token != 0 {
-		provenance.FrameToken = &token
-	}
-	provenance.ByteOrder = "not-applicable"
-	stored, err := tc.server.store.PutWithProvenance(context.ID, "frame-capture", "image/png", pngBuffer.Bytes(), provenance)
-	if err != nil {
-		return failureResult(&toolFailure{Code: "artifact_error", Message: err.Error()}, tc.modern)
-	}
-	return okResult(map[string]any{
-		"summary": map[string]any{
-			"kind":                      "frame-capture",
-			"width":                     width,
-			"height":                    height,
-			"source_format":             "rgb24",
-			"byte_order":                "not-applicable",
-			"consistency":               "live",
-			"frame_token":               uint64(frameToken),
-			"system_paused_during_read": false,
-			"png_size_bytes":            pngBuffer.Len(),
-			"sha256":                    stored.SHA256,
-		},
-		"artifact": artifactDescriptor(tc.server, stored, context.ID),
-	}, tc.modern)
+	return withCaptureGuard(tc, guard, func() (map[string]any, *toolFailure) {
+		return frameCaptureValue(tc, context)
+	})
 }
 
 func rgb24ToNRGBA(raw []byte, width, height int) (*image.NRGBA, error) {
@@ -484,6 +521,7 @@ func runVDPSpriteTable(tc toolContext, args json.RawMessage) map[string]any {
 		"byte_order":                "big-endian",
 		"consistency":               "live",
 		"system_paused_during_read": pausedDuringRead,
+		"capture_consistency":       captureConsistencyToMap(buildCaptureConsistency(tc.server, map[string]any{"system_paused_during_read": pausedDuringRead}, false, true, nil, nil)),
 		"entries":                   window,
 		"returned_entries":          len(window),
 		"table_entries_valid":       len(all),
@@ -610,13 +648,15 @@ func runVDPPaletteExport(tc toolContext, args json.RawMessage) map[string]any {
 			Message: fmt.Sprintf("CRAM payload decoded to %d entries instead of 64.", len(decoded)),
 		}, tc.modern)
 	}
+	captureID := newCaptureID()
+	consistency := buildCaptureConsistency(tc.server, map[string]any{"system_paused_during_read": pausedDuringRead}, false, true, nil, nil)
 
 	paletteImg := renderPalettePNG(decoded)
 	var pngBuffer bytes.Buffer
 	if err := png.Encode(&pngBuffer, paletteImg); err != nil {
 		return failureResult(&toolFailure{Code: "artifact_error", Message: "encode PNG: " + err.Error()}, tc.modern)
 	}
-	paletteProvenance := vdpProvenance(tc, "vdp-palette", "mem-vdp-cram", "VDP CRAM")
+	paletteProvenance := vdpProvenanceWithCapture(tc, "vdp-palette", "mem-vdp-cram", "VDP CRAM", captureID, consistency)
 	cramLength := uint64(128)
 	paletteProvenance.ByteLength = &cramLength
 	pngStored, err := tc.server.store.PutWithProvenance(context.ID, "vdp-palette", "image/png", pngBuffer.Bytes(), paletteProvenance)
@@ -625,7 +665,7 @@ func runVDPPaletteExport(tc toolContext, args json.RawMessage) map[string]any {
 	}
 
 	jsonDocument := buildPaletteJSON(decoded)
-	jsonProvenance := vdpProvenance(tc, "vdp-palette-json", "mem-vdp-cram", "VDP CRAM")
+	jsonProvenance := vdpProvenanceWithCapture(tc, "vdp-palette-json", "mem-vdp-cram", "VDP CRAM", captureID, consistency)
 	jsonProvenance.ByteLength = &cramLength
 	jsonStored, err := tc.server.store.PutWithProvenance(context.ID, "vdp-palette-json", "application/json", jsonDocument, jsonProvenance)
 	if err != nil {
@@ -648,6 +688,8 @@ func runVDPPaletteExport(tc toolContext, args json.RawMessage) map[string]any {
 			"color_format":              "9-bit RGB expanded to 8-bit",
 			"byte_order":                "big-endian",
 			"consistency":               "live",
+			"capture_id":                captureID,
+			"capture_consistency":       captureConsistencyToMap(consistency),
 			"system_paused_during_read": pausedDuringRead,
 			"png_size_bytes":            pngBuffer.Len(),
 			"png_sha256":                pngStored.SHA256,
@@ -882,8 +924,8 @@ func drawMDTile(img *image.NRGBA, tile *[mdTileEdgePixels][mdTileEdgePixels]int,
 	}
 }
 
-func storeArtifactAndDescriptor(tc toolContext, contextID, kind, mimeType string, payload []byte) (artifact.Artifact, map[string]any, error) {
-	provenance := vdpProvenance(tc, kind, vdpSpaceForKind(kind), vdpDeviceForKind(kind))
+func storeArtifactAndDescriptor(tc toolContext, contextID, kind, mimeType string, payload []byte, captureID string, consistency *artifact.CaptureConsistency) (artifact.Artifact, map[string]any, error) {
+	provenance := vdpProvenanceWithCapture(tc, kind, vdpSpaceForKind(kind), vdpDeviceForKind(kind), captureID, consistency)
 	stored, err := tc.server.store.PutWithProvenance(contextID, kind, mimeType, payload, provenance)
 	if err != nil {
 		return artifact.Artifact{}, nil, err
@@ -897,6 +939,13 @@ func storeArtifactAndDescriptor(tc toolContext, contextID, kind, mimeType string
 // device-relative and the caller sets byte length when it knows the captured
 // range exactly (the export summaries always state their ranges inline).
 func vdpProvenance(tc toolContext, kind, spaceID, device string) *artifact.Provenance {
+	return vdpProvenanceWithCapture(tc, kind, spaceID, device, "", nil)
+}
+
+// vdpProvenanceWithCapture is vdpProvenance with an explicit capture id and
+// capture-consistency object, used by exports whose artifacts belong to one
+// composite capture.
+func vdpProvenanceWithCapture(tc toolContext, kind, spaceID, device string, captureID string, consistency *artifact.CaptureConsistency) *artifact.Provenance {
 	provenance := genericProvenance(tc.server, kind, time.Now().UTC())
 	start := uint64(0)
 	provenance.AddressSpace = spaceID
@@ -908,6 +957,12 @@ func vdpProvenance(tc toolContext, kind, spaceID, device string) *artifact.Prove
 	provenance.SpaceKind = "timed-buffer"
 	provenance.ByteOrder = "device-specific"
 	provenance.Consistency = "live"
+	if captureID != "" {
+		provenance.CaptureID = captureID
+	}
+	if consistency != nil {
+		provenance.CaptureConsistency = consistency
+	}
 	return provenance
 }
 
@@ -1000,6 +1055,8 @@ func runVDPTileExport(tc toolContext, args json.RawMessage) map[string]any {
 		return failureResult(failure, tc.modern)
 	}
 	colors := cramPaletteColors(cramRGB333Entries(cramRaw))
+	captureID := newCaptureID()
+	consistency := compositeCaptureConsistency(tc.server, coherent)
 
 	width := int(count) * mdTileEdgePixels * scale
 	height := mdTileEdgePixels * scale
@@ -1046,11 +1103,11 @@ func runVDPTileExport(tc toolContext, args json.RawMessage) map[string]any {
 		return failureResult(&toolFailure{Code: "artifact_error", Message: err.Error()}, tc.modern)
 	}
 
-	pngStored, pngDescriptor, err := storeArtifactAndDescriptor(tc, context.ID, "vdp-tiles", "image/png", pngBuffer.Bytes())
+	pngStored, pngDescriptor, err := storeArtifactAndDescriptor(tc, context.ID, "vdp-tiles", "image/png", pngBuffer.Bytes(), captureID, consistency)
 	if err != nil {
 		return failureResult(&toolFailure{Code: "artifact_error", Message: err.Error()}, tc.modern)
 	}
-	jsonStored, jsonDescriptor, err := storeArtifactAndDescriptor(tc, context.ID, "vdp-tiles-json", "application/json", jsonDocument)
+	jsonStored, jsonDescriptor, err := storeArtifactAndDescriptor(tc, context.ID, "vdp-tiles-json", "application/json", jsonDocument, captureID, consistency)
 	if err != nil {
 		return failureResult(&toolFailure{Code: "artifact_error", Message: err.Error()}, tc.modern)
 	}
@@ -1068,8 +1125,10 @@ func runVDPTileExport(tc toolContext, args json.RawMessage) map[string]any {
 			"coherent_snapshot":         coherent,
 			"system_paused_during_read": !coherent,
 			"consistency":               "live",
+			"capture_id":                captureID,
+			"capture_consistency":       captureConsistencyToMap(consistency),
 			"byte_order":                "big-endian",
-			"layout_note":               "Each tile is 8x8 4bpp: four bytes per row, two pixels per byte, high nibble left. Pixel 0 is transparent unless transparent_zero is false. system_paused_during_read is true when any chunked read had to pause a running system; coherent_snapshot is true only when every chunk found it already paused.",
+			"layout_note":               "Each tile is 8x8 4bpp: four bytes per row, two pixels per byte, high nibble left. Pixel 0 is transparent unless transparent_zero is false. system_paused_during_read is true when any chunked read had to pause a running system; coherent_snapshot is true only when every chunk found it already paused. Both artifacts share one capture_id; when the composition is composite_non_atomic the VRAM and CRAM pieces may come from different frames and must not be combined into a coherent instant.",
 			"png_size_bytes":            pngBuffer.Len(),
 			"png_sha256":                pngStored.SHA256,
 			"json_size_bytes":           len(jsonDocument),
@@ -1129,6 +1188,8 @@ func runVDPPlaneExport(tc toolContext, args json.RawMessage) map[string]any {
 		return failureResult(failure, tc.modern)
 	}
 	colors := cramPaletteColors(cramRGB333Entries(cramRaw))
+	captureID := newCaptureID()
+	consistency := compositeCaptureConsistency(tc.server, coherent)
 
 	nameTableBytes := widthCells * heightCells * 2
 	truncated := false
@@ -1200,11 +1261,11 @@ func runVDPPlaneExport(tc toolContext, args json.RawMessage) map[string]any {
 		return failureResult(&toolFailure{Code: "artifact_error", Message: err.Error()}, tc.modern)
 	}
 
-	pngStored, pngDescriptor, err := storeArtifactAndDescriptor(tc, context.ID, "vdp-plane", "image/png", pngBuffer.Bytes())
+	pngStored, pngDescriptor, err := storeArtifactAndDescriptor(tc, context.ID, "vdp-plane", "image/png", pngBuffer.Bytes(), captureID, consistency)
 	if err != nil {
 		return failureResult(&toolFailure{Code: "artifact_error", Message: err.Error()}, tc.modern)
 	}
-	jsonStored, jsonDescriptor, err := storeArtifactAndDescriptor(tc, context.ID, "vdp-plane-json", "application/json", jsonDocument)
+	jsonStored, jsonDescriptor, err := storeArtifactAndDescriptor(tc, context.ID, "vdp-plane-json", "application/json", jsonDocument, captureID, consistency)
 	if err != nil {
 		return failureResult(&toolFailure{Code: "artifact_error", Message: err.Error()}, tc.modern)
 	}
@@ -1237,6 +1298,8 @@ func runVDPPlaneExport(tc toolContext, args json.RawMessage) map[string]any {
 			"coherent_snapshot":         coherent,
 			"system_paused_during_read": !coherent,
 			"consistency":               "live",
+			"capture_id":                captureID,
+			"capture_consistency":       captureConsistencyToMap(consistency),
 			"byte_order":                "big-endian",
 			"notes":                     notes,
 		},
@@ -1287,5 +1350,9 @@ func runVDPPixelInfo(tc toolContext, args json.RawMessage) map[string]any {
 	// Pixel attribution reads the completed render buffer under the VDP's own
 	// lock; the handler never pauses the system for it.
 	payload["system_paused_during_read"] = false
+	payload["capture_consistency"] = map[string]any{
+		"state": consistencyLive,
+		"note":  "The completed render buffer is read under the VDP's own lock; the read never pauses the system and the buffer may advance between reads.",
+	}
 	return okResult(payload, tc.modern)
 }

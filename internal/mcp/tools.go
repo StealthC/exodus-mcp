@@ -197,6 +197,13 @@ func contextProperty() map[string]any {
 	return stringProperty("Analysis context handle; omitted means the implicit default context.")
 }
 
+// captureModeProperty is the optional capture guard: "paused" pauses once
+// before the read and restores the prior run state (temporally atomic, but
+// perturbs real-time behavior); "live" (default) never pauses.
+func captureModeProperty() map[string]any {
+	return enumProperty("Capture guard. \"paused\" pauses once before the read and restores the prior run state (temporally atomic, perturbs timing-sensitive software); \"live\" (default) never pauses and samples a possibly inconsistent instant.", []string{"live", "paused"})
+}
+
 // ----------------------------------------------------------------------------------------------------------------------
 // Argument helpers
 // ----------------------------------------------------------------------------------------------------------------------

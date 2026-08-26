@@ -76,24 +76,26 @@ func phase1ToolSpecs() []toolSpec {
 		},
 		{
 			name:        "memory_dump",
-			description: "Dump up to 8 MiB of memory into an immutable artifact carrying a versioned capture-provenance envelope (address domain, byte order, device, target generation, ROM identity, run state, consistency). Returns a compact summary (address space, effective address, byte length, byte order, capture consistency, and whether the read temporarily paused a running system) plus descriptor; raw bytes stay out of model context.",
+			description: "Dump up to 8 MiB of memory into an immutable artifact carrying a versioned capture-provenance envelope (address domain, byte order, device, target generation, ROM identity, run state, consistency, capture_consistency). Optional capture_mode \"paused\" pauses once before the dump and restores the prior run state, making the artifact a temporally atomic snapshot at the cost of perturbing real-time behavior; the default \"live\" never pauses. Returns a compact summary (address space, effective address, byte length, byte order, capture consistency, and whether the read temporarily paused a running system) plus descriptor; raw bytes stay out of model context.",
 			schema: objectSchema(map[string]any{
-				"space":   stringProperty("Address space id from memory_spaces_list."),
-				"address": addressProperty(),
-				"length":  integerProperty(fmt.Sprintf("Byte length between 1 and %d.", dumpCapBytes), 1),
-				"context": stringProperty("Analysis context that will own the artifact."),
+				"space":        stringProperty("Address space id from memory_spaces_list."),
+				"address":      addressProperty(),
+				"length":       integerProperty(fmt.Sprintf("Byte length between 1 and %d.", dumpCapBytes), 1),
+				"capture_mode": captureModeProperty(),
+				"context":      stringProperty("Analysis context that will own the artifact."),
 			}, []string{"space", "address", "length"}),
 			run: runMemoryDump,
 		},
 		{
 			name:        "memory_read",
-			description: fmt.Sprintf("Read at most %d bytes inline with explicit byte-order metadata, effective-address echo, and whether the read temporarily paused a running system (system_paused_during_read). Larger ranges must use memory_dump.", inlineReadCapBytes),
+			description: fmt.Sprintf("Read at most %d bytes inline with explicit byte-order metadata, effective-address echo, and the standardized capture_consistency object (live when the system runs unpaused, paused when it was already stopped, atomic when the read had to pause it). Optional capture_mode %q pauses once before the read and restores the prior run state, making the sample temporally atomic at the cost of perturbing real-time behavior; the default %q never pauses. Larger ranges must use memory_dump.", inlineReadCapBytes, captureModePaused, captureModeLive),
 			schema: objectSchema(map[string]any{
 				"space":          stringProperty("Address space id from memory_spaces_list."),
 				"address":        addressProperty(),
 				"length":         integerProperty(fmt.Sprintf("Byte length between 1 and %d.", inlineReadCapBytes), 1),
 				"representation": enumProperty("Inline rendering.", []string{"raw_base64", "hexdump", "array_u8"}),
 				"decode":         decodeSchemaProperty(),
+				"capture_mode":   captureModeProperty(),
 				"context":        contextProperty(),
 			}, []string{"space", "address", "length"}),
 			run: runMemoryRead,
@@ -424,22 +426,25 @@ type memoryReadArgs struct {
 	Length         uint64         `json:"length"`
 	Representation string         `json:"representation"`
 	Decode         *decodeRequest `json:"decode"`
+	CaptureMode    string         `json:"capture_mode"`
 	Context        string         `json:"context"`
 }
 
-// readMemory executes mem_read and renders the bounded inline representation.
-func readMemory(tc toolContext, spaceID string, address uint64, length uint64, representation string, decode *decodeRequest) map[string]any {
+// readMemoryValue executes mem_read and renders the bounded inline
+// representation, returning the value map and any failure. The standardized
+// capture_consistency object is attached from the bridge payload.
+func readMemoryValue(tc toolContext, spaceID string, address uint64, length uint64, representation string, decode *decodeRequest) (map[string]any, *toolFailure) {
 	if length < 1 || length > inlineReadCapBytes {
-		return failureResult(&toolFailure{
+		return nil, &toolFailure{
 			Code:    "length_exceeds_inline_cap",
 			Message: fmt.Sprintf("Inline reads are capped at %d bytes; use memory_dump for larger ranges.", inlineReadCapBytes),
 			Data:    map[string]any{"inline_cap_bytes": inlineReadCapBytes},
-		}, tc.modern)
+		}
 	}
 	switch representation {
 	case "", "raw_base64", "hexdump", "array_u8":
 	default:
-		return errorResult("invalid_params", "representation must be raw_base64, hexdump, or array_u8", tc.modern)
+		return nil, &toolFailure{Code: "invalid_params", Message: "representation must be raw_base64, hexdump, or array_u8"}
 	}
 	params := map[string]string{
 		"space":   spaceID,
@@ -448,7 +453,7 @@ func readMemory(tc toolContext, spaceID string, address uint64, length uint64, r
 	}
 	payload, failure := tc.server.executeCommand(tc.ctx, "mem_read", params)
 	if failure != nil {
-		return failureResult(annotateSpaceRangeFailure(tc, failure, spaceID), tc.modern)
+		return nil, annotateSpaceRangeFailure(tc, failure, spaceID)
 	}
 	rawDataBase64, _ := payload["data"].(string)
 	byteOrder, _ := payload["byte_order"].(string)
@@ -457,7 +462,7 @@ func readMemory(tc toolContext, spaceID string, address uint64, length uint64, r
 
 	raw, err := base64.StdEncoding.DecodeString(rawDataBase64)
 	if err != nil {
-		return failureResult(&toolFailure{Code: "bridge_error", Message: "decode base64 memory payload: " + err.Error()}, tc.modern)
+		return nil, &toolFailure{Code: "bridge_error", Message: "decode base64 memory payload: " + err.Error()}
 	}
 
 	value := map[string]any{
@@ -468,6 +473,7 @@ func readMemory(tc toolContext, spaceID string, address uint64, length uint64, r
 		"byte_order":                byteOrder,
 		"consistency":               payload["consistency"],
 		"system_paused_during_read": pausedDuringRead,
+		"capture_consistency":       captureConsistencyToMap(buildCaptureConsistency(tc.server, payload, false, true, nil, nil)),
 		"representation":            representation,
 	}
 	switch representation {
@@ -487,11 +493,37 @@ func readMemory(tc toolContext, spaceID string, address uint64, length uint64, r
 	if decode != nil {
 		decoded, failure := decodeValues(raw, byteOrder, decode)
 		if failure != nil {
-			return failureResult(failure, tc.modern)
+			return nil, failure
 		}
 		value["decoded"] = decoded
 	}
-	return okResult(value, tc.modern)
+	return value, nil
+}
+
+// readMemory renders one inline read, honoring the optional capture guard.
+func readMemory(tc toolContext, spaceID string, address uint64, length uint64, representation string, decode *decodeRequest, guard captureGuard) map[string]any {
+	return withCaptureGuard(tc, guard, func() (map[string]any, *toolFailure) {
+		return readMemoryValue(tc, spaceID, address, length, representation, decode)
+	})
+}
+
+func runMemoryRead(tc toolContext, args json.RawMessage) map[string]any {
+	parsed, failure := decodeArgs[memoryReadArgs](args)
+	if failure != nil {
+		return failureResult(failure, tc.modern)
+	}
+	if _, failure = resolveContext(tc.server, parsed.Context); failure != nil {
+		return failureResult(failure, tc.modern)
+	}
+	guard := captureGuard{Mode: parsed.CaptureMode}
+	if failure = guard.resolve(); failure != nil {
+		return failureResult(failure, tc.modern)
+	}
+	address, failure := parseAddress(parsed.Address)
+	if failure != nil {
+		return failureResult(failure, tc.modern)
+	}
+	return readMemory(tc, parsed.Space, address, parsed.Length, parsed.Representation, parsed.Decode, guard)
 }
 
 func decodeValues(raw []byte, spaceOrder string, decode *decodeRequest) (map[string]any, *toolFailure) {
@@ -575,26 +607,74 @@ func decodeValues(raw []byte, spaceOrder string, decode *decodeRequest) (map[str
 	}, nil
 }
 
-func runMemoryRead(tc toolContext, args json.RawMessage) map[string]any {
-	parsed, failure := decodeArgs[memoryReadArgs](args)
-	if failure != nil {
-		return failureResult(failure, tc.modern)
-	}
-	if _, failure = resolveContext(tc.server, parsed.Context); failure != nil {
-		return failureResult(failure, tc.modern)
-	}
-	address, failure := parseAddress(parsed.Address)
-	if failure != nil {
-		return failureResult(failure, tc.modern)
-	}
-	return readMemory(tc, parsed.Space, address, parsed.Length, parsed.Representation, parsed.Decode)
+type memoryDumpArgs struct {
+	Space       string `json:"space"`
+	Address     any    `json:"address"`
+	Length      uint64 `json:"length"`
+	CaptureMode string `json:"capture_mode"`
+	Context     string `json:"context"`
 }
 
-type memoryDumpArgs struct {
-	Space   string `json:"space"`
-	Address any    `json:"address"`
-	Length  uint64 `json:"length"`
-	Context string `json:"context"`
+// memoryDumpValue reads the range, stores the artifact with its capture
+// provenance, and renders the bounded summary. The standardized
+// capture_consistency object is derived from the read payload; the optional
+// capture guard overrides it at the result level.
+func memoryDumpValue(tc toolContext, context *analysis.Context, spaceID string, address uint64, length uint64) (map[string]any, *toolFailure) {
+	if length < 1 || length > dumpCapBytes {
+		return nil, &toolFailure{
+			Code:    "length_out_of_range",
+			Message: fmt.Sprintf("memory_dump length must be between 1 and %d bytes.", dumpCapBytes),
+			Data:    map[string]any{"max_length_bytes": dumpCapBytes},
+		}
+	}
+	params := map[string]string{
+		"space":   spaceID,
+		"address": strconv.FormatUint(address, 10),
+		"length":  strconv.FormatUint(length, 10),
+	}
+	payload, failure := tc.server.executeCommand(tc.ctx, "mem_read", params)
+	if failure != nil {
+		return nil, annotateSpaceRangeFailure(tc, failure, spaceID)
+	}
+	rawDataBase64, _ := payload["data"].(string)
+	raw, err := base64.StdEncoding.DecodeString(rawDataBase64)
+	if err != nil {
+		return nil, &toolFailure{Code: "bridge_error", Message: "decode base64 memory payload: " + err.Error()}
+	}
+	provenance := captureProvenance(tc.server, "memory-dump", spaceID, address, uint64(len(raw)), payload, time.Now().UTC(), "", nil)
+	stored, err := tc.server.store.PutWithProvenance(context.ID, "memory-dump", "application/octet-stream", raw, provenance)
+	if err != nil {
+		return nil, &toolFailure{Code: "artifact_error", Message: err.Error()}
+	}
+
+	previewLength := int64(96)
+	if int64(len(raw)) < previewLength {
+		previewLength = int64(len(raw))
+	}
+	byteOrder, _ := payload["byte_order"].(string)
+	consistency, _ := payload["consistency"].(string)
+	effective, _ := payload["effective_address"].(float64)
+	pausedDuringRead, _ := payload["system_paused_during_read"].(bool)
+	summary := map[string]any{
+		"kind":                      "memory-dump",
+		"address_space":             spaceID,
+		"start_address":             address,
+		"start_address_hex":         canonicalHex(address),
+		"effective_address":         uint64(effective),
+		"effective_address_hex":     canonicalHex(uint64(effective)),
+		"byte_length":               len(raw),
+		"byte_order":                byteOrder,
+		"consistency":               consistency,
+		"system_paused_during_read": pausedDuringRead,
+		"capture_consistency":       captureConsistencyToMap(buildCaptureConsistency(tc.server, payload, false, true, nil, nil)),
+		"preview_hex":               artifact.HexDump(raw[:previewLength], int64(uint64(effective))),
+		"sha256":                    stored.SHA256,
+		"provenance_state":          stored.Provenance.State,
+	}
+	return map[string]any{
+		"summary":  summary,
+		"artifact": artifactDescriptor(tc.server, stored, context.ID),
+	}, nil
 }
 
 func runMemoryDump(tc toolContext, args json.RawMessage) map[string]any {
@@ -610,60 +690,13 @@ func runMemoryDump(tc toolContext, args json.RawMessage) map[string]any {
 	if failure != nil {
 		return failureResult(failure, tc.modern)
 	}
-	if parsed.Length < 1 || parsed.Length > dumpCapBytes {
-		return failureResult(&toolFailure{
-			Code:    "length_out_of_range",
-			Message: fmt.Sprintf("memory_dump length must be between 1 and %d bytes.", dumpCapBytes),
-			Data:    map[string]any{"max_length_bytes": dumpCapBytes},
-		}, tc.modern)
+	guard := captureGuard{Mode: parsed.CaptureMode}
+	if failure = guard.resolve(); failure != nil {
+		return failureResult(failure, tc.modern)
 	}
-
-	params := map[string]string{
-		"space":   parsed.Space,
-		"address": strconv.FormatUint(address, 10),
-		"length":  strconv.FormatUint(parsed.Length, 10),
-	}
-	payload, failure := tc.server.executeCommand(tc.ctx, "mem_read", params)
-	if failure != nil {
-		return failureResult(annotateSpaceRangeFailure(tc, failure, parsed.Space), tc.modern)
-	}
-	rawDataBase64, _ := payload["data"].(string)
-	raw, err := base64.StdEncoding.DecodeString(rawDataBase64)
-	if err != nil {
-		return failureResult(&toolFailure{Code: "bridge_error", Message: "decode base64 memory payload: " + err.Error()}, tc.modern)
-	}
-	provenance := captureProvenance(tc.server, "memory-dump", parsed.Space, address, uint64(len(raw)), payload, time.Now().UTC())
-	stored, err := tc.server.store.PutWithProvenance(context.ID, "memory-dump", "application/octet-stream", raw, provenance)
-	if err != nil {
-		return failureResult(&toolFailure{Code: "artifact_error", Message: err.Error()}, tc.modern)
-	}
-
-	previewLength := int64(96)
-	if int64(len(raw)) < previewLength {
-		previewLength = int64(len(raw))
-	}
-	byteOrder, _ := payload["byte_order"].(string)
-	consistency, _ := payload["consistency"].(string)
-	effective, _ := payload["effective_address"].(float64)
-	pausedDuringRead, _ := payload["system_paused_during_read"].(bool)
-	return okResult(map[string]any{
-		"summary": map[string]any{
-			"kind":                      "memory-dump",
-			"address_space":             parsed.Space,
-			"start_address":             address,
-			"start_address_hex":         canonicalHex(address),
-			"effective_address":         uint64(effective),
-			"effective_address_hex":     canonicalHex(uint64(effective)),
-			"byte_length":               len(raw),
-			"byte_order":                byteOrder,
-			"consistency":               consistency,
-			"system_paused_during_read": pausedDuringRead,
-			"preview_hex":               artifact.HexDump(raw[:previewLength], int64(uint64(effective))),
-			"sha256":                    stored.SHA256,
-			"provenance_state":          stored.Provenance.State,
-		},
-		"artifact": artifactDescriptor(tc.server, stored, context.ID),
-	}, tc.modern)
+	return withCaptureGuard(tc, guard, func() (map[string]any, *toolFailure) {
+		return memoryDumpValue(tc, context, parsed.Space, address, parsed.Length)
+	})
 }
 
 // ----------------------------------------------------------------------------------------------------------------------

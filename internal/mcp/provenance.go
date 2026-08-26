@@ -12,7 +12,8 @@ import (
 // or decoding interpretation. The envelope is immutable artifact metadata;
 // memory_search and memory_diff derive their address domain from it instead of
 // accepting caller restatement, and artifact_describe exposes the full typed
-// view.
+// view. Since envelope v2 the envelope also carries the standardized
+// capture_consistency object and, for composite captures, a stable capture id.
 
 // mdSpaceDevice names the owning device of each known space on the documented
 // Mega Drive baseline, mirroring the bus mapping table in spacemap.go. Unknown
@@ -56,33 +57,41 @@ func provenanceUnknownView() map[string]any {
 
 // genericProvenance builds a minimal envelope for producers without an address
 // domain (frames, traces, coverage, exports): kind, target generation, ROM
-// identity, and capture time. Byte order is recorded when the producer knows
-// it; otherwise the field is omitted rather than guessed.
+// identity, capture time, and the standardized capture-consistency object.
+// Byte order is recorded when the producer knows it; otherwise the field is
+// omitted rather than guessed.
 func genericProvenance(server *Server, kind string, capturedAt time.Time) *artifact.Provenance {
 	generation := server.target.Generation()
 	romFacts := server.romIdentity.romFileFacts(server.currentROMPath())
 	provenance := &artifact.Provenance{
-		State:            artifact.ProvenanceStateComplete,
-		Kind:             kind,
-		TargetGeneration: &generation,
-		ROMSHA256:        romFacts.SHA256,
-		ROMPath:          server.currentROMPath(),
-		CapturedAt:       capturedAt,
-		RawByteOrdering:  "address-order",
-		CPURunState:      server.runStateString(),
+		State:              artifact.ProvenanceStateComplete,
+		Kind:               kind,
+		TargetGeneration:   &generation,
+		ROMSHA256:          romFacts.SHA256,
+		ROMPath:            server.currentROMPath(),
+		CapturedAt:         capturedAt,
+		RawByteOrdering:    "address-order",
+		CPURunState:        server.runStateString(),
+		CaptureConsistency: buildCaptureConsistency(server, map[string]any{}, false, true, nil, nil),
+	}
+	if provenance.CaptureConsistency.Note == "" {
+		provenance.CaptureConsistency.Note = "Capture-time run state; the artifact may span an execution window (see the tool summary)."
 	}
 	return provenance
 }
 
 // captureProvenance builds the full envelope for a mem_read-style capture:
 // address domain, byte order, space kind, device, target identity, run state,
-// and consistency from one bridge payload. requestedAddress is the
-// caller-supplied range start; payload mirrors the plugin mem_read shape.
-func captureProvenance(server *Server, kind, spaceID string, requestedAddress uint64, byteLength uint64, payload map[string]any, capturedAt time.Time) *artifact.Provenance {
+// consistency, and capture time from one bridge payload. requestedAddress is
+// the caller-supplied range start; payload mirrors the plugin mem_read shape.
+// captureID links artifacts of one composite capture ("" for standalone
+// reads); consistency overrides the derived object (nil derives it from the
+// payload and the run-state tracker).
+func captureProvenance(server *Server, kind, spaceID string, requestedAddress uint64, byteLength uint64, payload map[string]any, capturedAt time.Time, captureID string, consistency *artifact.CaptureConsistency) *artifact.Provenance {
 	effective, _ := payload["effective_address"].(float64)
 	byteOrder, _ := payload["byte_order"].(string)
 	spaceKind, _ := payload["kind"].(string)
-	consistency, _ := payload["consistency"].(string)
+	consistencyLabel, _ := payload["consistency"].(string)
 	pausedDuringRead, _ := payload["system_paused_during_read"].(bool)
 	generation := server.target.Generation()
 	romFacts := server.romIdentity.romFileFacts(server.currentROMPath())
@@ -109,8 +118,9 @@ func captureProvenance(server *Server, kind, spaceID string, requestedAddress ui
 		TargetGeneration:    &generation,
 		ROMSHA256:           romFacts.SHA256,
 		ROMPath:             server.currentROMPath(),
-		Consistency:         consistency,
+		Consistency:         consistencyLabel,
 		CapturedAt:          capturedAt,
+		CaptureID:           captureID,
 	}
 	if device, known := mdSpaceDevice[spaceID]; known {
 		provenance.Device = device
@@ -130,6 +140,10 @@ func captureProvenance(server *Server, kind, spaceID string, requestedAddress ui
 	} else {
 		provenance.CPURunState = "unknown"
 	}
+	if consistency == nil {
+		consistency = buildCaptureConsistency(server, payload, false, true, nil, nil)
+	}
+	provenance.CaptureConsistency = consistency
 	return provenance
 }
 

@@ -166,9 +166,11 @@ different spaces or ROMs can also be compared without an explicit rejection.
 - [x] Define a versioned artifact provenance envelope for every artifact whose
   bytes have an address, time, target, or decoding interpretation. Preserve
   the original bytes unchanged; store the envelope as immutable artifact
-  metadata (`artifact-provenance/1`, in-memory per session, immutable after
-  capture). Artifacts whose producer attached no metadata report the honest
-  `provenance_unknown` state instead of invented fields.
+  metadata (`artifact-provenance/2`, in-memory per session, immutable after
+  capture; version 2 adds the `capture_consistency` object and `capture_id`
+  to the original version 1 shape). Artifacts whose producer attached no
+  metadata report the honest `provenance_unknown` state instead of invented
+  fields.
 - [x] For memory dumps and snapshots, record at minimum: `artifact_schema`,
   `kind`, `address_space`, requested and effective start addresses in decimal
   and canonical hex, byte length, raw-byte ordering, declared byte order,
@@ -204,7 +206,7 @@ comparing M68K RAM to Z80 RAM fails by default; artifact provenance survives
 an unrelated subsequent ROM load; tests cover legacy artifacts with an
 explicit `provenance_unknown` state rather than invented metadata.
 
-### P0 - Honest capture consistency
+### P0 - Honest capture consistency — delivered 2026-08-26
 
 **Problem:** an immutable artifact is not automatically a temporally atomic
 snapshot of a running emulator. Current RAM reads report bridge-level `live`
@@ -212,11 +214,15 @@ consistency, while larger VDP exports may compose multiple reads and already
 report that they are not coherent. Reverse engineering needs to know whether a
 value, register set, VDP table, and frame describe the same emulated instant.
 
-- [ ] Standardize a `capture_consistency` object for every state-observing
-  tool. It must distinguish `live`, `paused`, `atomic`, `state_restored`, and
-  `composite_non_atomic`; state whether execution was paused by the tool,
+- [x] Standardize a `capture_consistency` object for every state-observing
+  tool. It distinguishes `live`, `paused`, `atomic`, `state_restored`, and
+  `composite_non_atomic`; states whether execution was paused by the tool and
   whether it was resumed afterwards, and the observed initial/final frame
-  tokens and run states.
+  tokens and run states. Applied to `memory_read`, `memory_dump`,
+  `memory_search`, the CPU register and read tools, `vdp_memory_read`,
+  `vdp_sprite_table`, the VDP exports, `vdp_pixel_info`, `frame_capture`, and
+  `state_load` (`state_restored`); the envelope records the object on every
+  artifact (`artifact-provenance/2`).
 - [x] Propagate the existing `system_paused_during_read` flag (today only on
   `vdp_memory_read`) to every read tool: `memory_read`, `memory_dump`,
   `memory_search`, `vdp_sprite_table`, `vdp_tile_export`, `vdp_plane_export`,
@@ -227,27 +233,38 @@ value, register set, VDP table, and frame describe the same emulated instant.
   an inline answer. **Delivered 2026-08-25**: the flag is propagated to all
   nine read tools; no tool's run-state behavior changed (the flag reports
   only).
-- [ ] Add a bounded paused memory snapshot operation. It accepts one or more
-  named ranges, pauses once if necessary, reads them all while paused, restores
-  the original run state, and returns a manifest linking all produced raw
-  artifacts to one capture id. It must not call the current per-range live read
-  loop and call the result atomic.
-- [ ] Add an optional capture guard to individual memory, register, VDP, and
-  frame tools where the native implementation can provide it. Default behavior
-  must remain explicit and safe for compatibility: do not silently turn a
-  `live` call into a pause that changes timing-sensitive software.
-- [ ] Record a stable capture id and target generation in all outputs from a
+- [x] Add a bounded paused memory snapshot operation
+  (`memory_snapshot_capture`). It accepts one or more named ranges, pauses
+  once if necessary, reads them all while paused, restores the original run
+  state, and returns a manifest linking all produced raw artifacts to one
+  capture id. It does not call the current per-range live read loop and
+  reports the capture as atomic with the exact pause/resume cycle count. The
+  whole window runs under exclusive control so no other mutation interleaves.
+- [x] Add an optional capture guard to individual memory, register, VDP, and
+  frame tools where the native implementation can provide it
+  (`capture_mode: "paused"` on `memory_read`, `memory_dump`,
+  `vdp_memory_read`, `frame_capture`, and the CPU read tools). Default
+  behavior remains explicit and safe for compatibility: `"live"` never
+  silently turns a call into a pause that changes timing-sensitive software.
+- [x] Record a stable capture id and target generation in all outputs from a
   composite capture. Reject mixing artifacts from separate captures in tools
-  that claim a coherent cross-domain conclusion.
-- [ ] Document the operational costs: a paused capture can perturb real-time
-  behavior, while a live capture can be internally inconsistent. Agents must
-  be able to choose based on this metadata rather than infer it from a tool
-  name such as "snapshot".
+  that claim a coherent cross-domain conclusion: `memory_diff` reports both
+  capture ids and fails with `incompatible_provenance` when the snapshots
+  belong to different composite captures unless `allow_incompatible_provenance`
+  is passed (with a prominent warning). VDP exports share one capture id
+  across their artifacts and never claim coherence when VRAM and CRAM came
+  from different frames (`composite_non_atomic`).
+- [x] Document the operational costs: a paused capture can perturb real-time
+  behavior, while a live capture can be internally inconsistent. Agents
+  choose based on the `capture_consistency` metadata rather than inferring it
+  from a tool name such as "snapshot" (documented in tool descriptions and
+  the manifest note).
 
-**Acceptance checks:** a composite capture from a running ROM reports exactly
-one pause/resume cycle and matching capture ids; a deliberately changing RAM
-counter demonstrates the difference between `live` and paused captures; VDP
-exports never claim coherence when VRAM and CRAM came from different frames.
+**Acceptance checks (all passing):** a composite capture from a running ROM
+reports exactly one pause/resume cycle and matching capture ids; a
+deliberately changing RAM counter demonstrates the difference between `live`
+and paused captures; VDP exports never claim coherence when VRAM and CRAM came
+from different frames.
 
 ### P1 - Run-state observability — delivered 2026-08-25
 

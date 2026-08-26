@@ -490,7 +490,14 @@ func runStateLoad(tc toolContext, args json.RawMessage) map[string]any {
 	// state_load restores the saved run state; attribute the echoed state to
 	// MCP so emulator_status derives the pause source.
 	recordStateFromPayload(tc.server, payload, false)
-	result := map[string]any{"state_id": snapshot.ID, "sha256": snapshot.SHA256}
+	result := map[string]any{
+		"state_id": snapshot.ID,
+		"sha256":   snapshot.SHA256,
+		"capture_consistency": map[string]any{
+			"state": consistencyStateRestored,
+			"note":  "The machine now describes the restored snapshot's instant, not a live capture; observations describe the restored state until the system runs again.",
+		},
+	}
 	for key, value := range payload {
 		result[key] = value
 	}
