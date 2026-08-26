@@ -276,3 +276,27 @@ func TestMemoryFreezeClear(t *testing.T) {
 		t.Fatalf("mutation log missing memory_freeze_clear: %v", entries)
 	}
 }
+
+func TestFreezeRegistryGeneratesUniqueIDs(t *testing.T) {
+	registry := newFreezeRegistry()
+	seen := make(map[string]bool)
+	for index := 0; index < freezeMaxEntries; index++ {
+		entry, _, err := registry.set("m68k-bus", uint64(index), []byte{byte(index)}, freezeProvenance{})
+		if err != nil {
+			t.Fatalf("entry %d failed: %v", index, err)
+		}
+		if seen[entry.ID] {
+			t.Fatalf("duplicate freeze id %q", entry.ID)
+		}
+		seen[entry.ID] = true
+	}
+
+	registry.purge()
+	entry, _, err := registry.set("m68k-bus", 100, []byte{1}, freezeProvenance{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if seen[entry.ID] {
+		t.Fatalf("freeze id reused after purge: %q", entry.ID)
+	}
+}

@@ -57,10 +57,11 @@ type freezeProvenance struct {
 // why rom_load purges the whole set (stale addresses would be written into the
 // new program's memory map).
 type freezeRegistry struct {
-	mu    sync.Mutex
-	byID  map[string]*freezeEntry
-	byKey map[string]string // space + ":" + address -> freeze id
-	order []*freezeEntry    // stable listing order
+	mu     sync.Mutex
+	nextID uint64
+	byID   map[string]*freezeEntry
+	byKey  map[string]string // space + ":" + address -> freeze id
+	order  []*freezeEntry    // stable listing order
 }
 
 func newFreezeRegistry() *freezeRegistry {
@@ -94,8 +95,9 @@ func (registry *freezeRegistry) set(space string, address uint64, data []byte, p
 	if len(registry.byID) >= freezeMaxEntries {
 		return nil, false, errFreezeLimit
 	}
+	registry.nextID++
 	entry := &freezeEntry{
-		ID:               "frz_" + strconv.FormatInt(time.Now().UnixNano(), 36),
+		ID:               "frz_" + strconv.FormatUint(registry.nextID, 36),
 		Space:            space,
 		Address:          address,
 		Data:             append([]byte{}, data...),
