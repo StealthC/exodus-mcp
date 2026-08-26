@@ -466,10 +466,11 @@ manifest plus linked raw and derived artifacts sharing one capture id.
   treatment, interlace behavior, shadow/highlight state, and any unsupported
   mode. Never flatten these into generic CPU-memory values.
   **Delivered 2026-08-26**: `vdp_capture` preserves `big-endian` VRAM words, CRAM 9-bit packing (`cramRGB333Entries`), tile `high-nibble-left`, name-entry bits, and interlace note from `vdp_status` registers.
-- [ ] Make `vdp_plane_export`, `vdp_tile_export`, `vdp_sprite_table`, and
+- [x] Make `vdp_plane_export`, `vdp_tile_export`, `vdp_sprite_table`, and
   `vdp_pixel_info` optionally consume a compatible VDP capture manifest rather
   than performing a new live read. This makes repeated inspection deterministic
   and avoids pausing the game repeatedly.
+  **Delivered 2026-08-26**: `vdp_tile_export`/`vdp_plane_export`/`vdp_sprite_table`/`vdp_pixel_info` now accept `vdp_capture_id` (cap_...) and report `vdp_capture_reused`/`vdp_capture_id` with note; validated that capture reuse is byte-identical and does not pause.
 - [x] `vdp_sprite_table` must surface chain-vs-table divergence: report the
   link-chain length next to the entry count and add a warning when the chain
   implies fewer visible sprites than entries (validated 2026-08-25: chain

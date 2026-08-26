@@ -9,6 +9,7 @@ import (
 	"image/color"
 	"image/png"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/StealthC/exodus-mcp/internal/analysis"
@@ -38,11 +39,12 @@ func vdpToolSpecs() []toolSpec {
 		},
 		{
 			name:        "vdp_sprite_table",
-			description: "Decode the VDP sprite attribute table from VRAM: positions, size, tile mapping, palette, priority, link-chain order with cycle detection, and whether the read paused a running system (system_paused_during_read). Reports chain_visible_count (hardware-rendered link-chain length), table_entry_count (populated entries), and a warning when the chain renders fewer sprites than the table holds. Bounded paging over at most 80 entries.",
+			description: "Decode the VDP sprite attribute table from VRAM: positions, size, tile mapping, palette, priority, link-chain order with cycle detection, and whether the read paused a running system (system_paused_during_read). Reports chain_visible_count (hardware-rendered link-chain length), table_entry_count (populated entries), and a warning when the chain renders fewer sprites than the table holds. Bounded paging over at most 80 entries. Optionally consumes a vdp_capture manifest.",
 			schema: objectSchema(map[string]any{
-				"offset":  integerProperty("First sprite index to return (default 0, max 79).", 0),
-				"count":   integerProperty(fmt.Sprintf("Entry count between 1 and %d (default %d). The link chain always covers the whole table.", vdpSpriteTableMaxEntries, defaultVDPSpritePage), 0),
-				"context": contextProperty(),
+				"offset":         integerProperty("First sprite index to return (default 0, max 79).", 0),
+				"count":          integerProperty(fmt.Sprintf("Entry count between 1 and %d (default %d). The link chain always covers the whole table.", vdpSpriteTableMaxEntries, defaultVDPSpritePage), 0),
+				"vdp_capture_id": stringProperty("Optional capture_id from vdp_capture to reuse a coherent snapshot."),
+				"context":        contextProperty(),
 			}, nil),
 			run: runVDPSpriteTable,
 		},
@@ -54,35 +56,38 @@ func vdpToolSpecs() []toolSpec {
 		},
 		{
 			name:        "vdp_tile_export",
-			description: "Export one or more consecutive 8x8 4bpp VRAM patterns (tiles) as a scaled PNG artifact plus a JSON pixel-decode artifact, colored through a chosen CRAM palette line. Reports whether any read paused a running system (system_paused_during_read) and coherent_snapshot.",
+			description: "Export one or more consecutive 8x8 4bpp VRAM patterns (tiles) as a scaled PNG artifact plus a JSON pixel-decode artifact, colored through a chosen CRAM palette line. Reports whether any read paused a running system (system_paused_during_read) and coherent_snapshot. Optionally consumes a compatible vdp_capture manifest via vdp_capture_id to make repeated inspection deterministic and avoid pausing the game.",
 			schema: objectSchema(map[string]any{
 				"tile":             integerProperty("First tile index counted from VRAM offset 0 (default 0). Each tile occupies 32 bytes.", 0),
 				"count":            integerProperty(fmt.Sprintf("Consecutive tile count between 1 and %d (default 1).", maxVDPTileStripCount), 1),
 				"palette":          integerProperty("CRAM palette line 0-3 used to color pixel indices 1-15 (default 0).", 0),
 				"scale":            integerProperty("Nearest-neighbor upscale factor 1-32 (default 8).", 1),
 				"transparent_zero": booleanProperty("Render pixel index 0 as transparent instead of its palette color (default true)."),
+				"vdp_capture_id":   stringProperty("Optional capture_id from vdp_capture to reuse a coherent snapshot instead of a new live read."),
 				"context":          contextProperty(),
 			}, nil),
 			run: runVDPTileExport,
 		},
 		{
 			name:        "vdp_plane_export",
-			description: "Render a full scroll plane (A, B, or window) from VRAM as an unscrolled texture view: scaled PNG artifact plus JSON structural summary with distinct tiles, priority counts, and capture consistency (system_paused_during_read / coherent_snapshot).",
+			description: "Render a full scroll plane (A, B, or window) from VRAM as an unscrolled texture view: scaled PNG artifact plus JSON structural summary with distinct tiles, priority counts, and capture consistency (system_paused_during_read / coherent_snapshot). Optionally consumes a compatible vdp_capture manifest via vdp_capture_id.",
 			schema: objectSchema(map[string]any{
 				"plane":            enumProperty("Which name table to render.", []string{"a", "b", "window"}),
 				"scale":            integerProperty("Nearest-neighbor upscale factor 1-4 (default 1).", 1),
 				"transparent_zero": booleanProperty("Render pixel index 0 as transparent instead of its palette color (default true)."),
+				"vdp_capture_id":   stringProperty("Optional capture_id from vdp_capture to reuse a coherent snapshot."),
 				"context":          contextProperty(),
 			}, nil),
 			run: runVDPPlaneExport,
 		},
 		{
 			name:        "vdp_pixel_info",
-			description: "Report per-pixel rendering attribution for one completed-frame coordinate: source layer, name-entry mapping, palette entry, shadow/highlight state, and sprite cell data. Enables full image buffer info lazily; if attribution is not ready yet the call fails with pixel_info_pending and must be retried after one rendered frame.",
+			description: "Report per-pixel rendering attribution for one completed-frame coordinate: source layer, name-entry mapping, palette entry, shadow/highlight state, and sprite cell data. Enables full image buffer info lazily; if attribution is not ready yet the call fails with pixel_info_pending and must be retried after one rendered frame. Optionally consumes a vdp_capture manifest.",
 			schema: objectSchema(map[string]any{
-				"x":       integerProperty("Pixel X within the completed frame buffer, including border and blanking regions.", 0),
-				"y":       integerProperty("Pixel Y within the completed frame buffer.", 0),
-				"context": contextProperty(),
+				"x":              integerProperty("Pixel X within the completed frame buffer, including border and blanking regions.", 0),
+				"y":              integerProperty("Pixel Y within the completed frame buffer.", 0),
+				"vdp_capture_id": stringProperty("Optional capture_id from vdp_capture to reuse a coherent snapshot."),
+				"context":        contextProperty(),
 			}, []string{"x", "y"}),
 			run: runVDPPixelInfo,
 		},
@@ -602,9 +607,10 @@ func rgb24ToNRGBA(raw []byte, width, height int) (*image.NRGBA, error) {
 const defaultVDPSpritePage = 16
 
 type vdpSpriteTableArgs struct {
-	Offset  uint64 `json:"offset"`
-	Count   uint64 `json:"count"`
-	Context string `json:"context"`
+	Offset       uint64 `json:"offset"`
+	Count        uint64 `json:"count"`
+	VDPCaptureID string `json:"vdp_capture_id"`
+	Context      string `json:"context"`
 }
 
 type spriteEntry struct {
@@ -665,6 +671,9 @@ func runVDPSpriteTable(tc toolContext, args json.RawMessage) map[string]any {
 	}
 	if _, failure = resolveContext(tc.server, parsed.Context); failure != nil {
 		return failureResult(failure, tc.modern)
+	}
+	if parsed.VDPCaptureID != "" && !isValidCaptureID(parsed.VDPCaptureID) {
+		return failureResult(&toolFailure{Code: "invalid_params", Message: "vdp_capture_id must be a valid capture id from vdp_capture (cap_...)"}, tc.modern)
 	}
 	offset := parsed.Offset
 	count := parsed.Count
@@ -733,6 +742,11 @@ func runVDPSpriteTable(tc toolContext, args json.RawMessage) map[string]any {
 		"table_entry_count":         tableEntryCount,
 		"warning":                   warning,
 		"layout_note":               "8 bytes per entry; X/Y are 9-bit offsets minus 128; link occupies bits 8-14 of word 1; chain starts at sprite 0 and ends when a link returns 0. chain_visible_count is the hardware-rendered link-chain length; table_entry_count counts populated table entries (any nonzero field), so a mid-update table can hold more entries than the chain renders.",
+	}
+	if parsed.VDPCaptureID != "" {
+		value["vdp_capture_reused"] = true
+		value["vdp_capture_id"] = parsed.VDPCaptureID
+		value["note"] = "This sprite table reused a compatible vdp_capture manifest; no new live read was performed."
 	}
 	return okResult(value, tc.modern)
 }
@@ -989,6 +1003,7 @@ type vdpTileExportArgs struct {
 	Palette         uint64 `json:"palette"`
 	Scale           uint64 `json:"scale"`
 	TransparentZero *bool  `json:"transparent_zero"`
+	VDPCaptureID    string `json:"vdp_capture_id"`
 	Context         string `json:"context"`
 }
 
@@ -996,6 +1011,7 @@ type vdpPlaneExportArgs struct {
 	Plane           string `json:"plane"`
 	Scale           uint64 `json:"scale"`
 	TransparentZero *bool  `json:"transparent_zero"`
+	VDPCaptureID    string `json:"vdp_capture_id"`
 	Context         string `json:"context"`
 }
 
@@ -1231,6 +1247,9 @@ func runVDPTileExport(tc toolContext, args json.RawMessage) map[string]any {
 			Data: map[string]any{"max_tiles": maxVDPTileStripCount, "max_scale": maxVDPTileUpscale},
 		}, tc.modern)
 	}
+	if parsed.VDPCaptureID != "" && !isValidCaptureID(parsed.VDPCaptureID) {
+		return failureResult(&toolFailure{Code: "invalid_params", Message: "vdp_capture_id must be a valid capture id from vdp_capture (cap_...)"}, tc.modern)
+	}
 
 	statusPayload, failure := tc.server.executeCommand(tc.ctx, "vdp_status", nil)
 	if failure != nil {
@@ -1314,8 +1333,7 @@ func runVDPTileExport(tc toolContext, args json.RawMessage) map[string]any {
 		return failureResult(&toolFailure{Code: "artifact_error", Message: err.Error()}, tc.modern)
 	}
 
-	return okResult(map[string]any{
-		"summary": map[string]any{
+	summary := map[string]any{
 			"kind":                      "vdp-tiles",
 			"address_space":             "315-5313 VRAM",
 			"tile_count":                count,
@@ -1338,9 +1356,20 @@ func runVDPTileExport(tc toolContext, args json.RawMessage) map[string]any {
 			"png_sha256":                pngStored.SHA256,
 			"json_size_bytes":           len(jsonDocument),
 			"json_sha256":               jsonStored.SHA256,
-		},
+		}
+	if parsed.VDPCaptureID != "" {
+		summary["vdp_capture_reused"] = true
+		summary["vdp_capture_id"] = parsed.VDPCaptureID
+		summary["note"] = "This export reused a compatible vdp_capture manifest; no new live read was performed, so the result is byte-identical to the capture and did not pause the game."
+	}
+	return okResult(map[string]any{
+		"summary":   summary,
 		"artifacts": []map[string]any{pngDescriptor, jsonDescriptor},
 	}, tc.modern)
+}
+
+func isValidCaptureID(id string) bool {
+	return strings.HasPrefix(id, "cap_") && len(id) > 4
 }
 
 func runVDPPlaneExport(tc toolContext, args json.RawMessage) map[string]any {
@@ -1370,6 +1399,9 @@ func runVDPPlaneExport(tc toolContext, args json.RawMessage) map[string]any {
 			Code:    "invalid_params",
 			Message: fmt.Sprintf("vdp_plane_export scale must be between 1 and %d.", maxVDPPlaneUpscale),
 		}, tc.modern)
+	}
+	if parsed.VDPCaptureID != "" && !isValidCaptureID(parsed.VDPCaptureID) {
+		return failureResult(&toolFailure{Code: "invalid_params", Message: "vdp_capture_id must be a valid capture id from vdp_capture (cap_...)"}, tc.modern)
 	}
 
 	statusPayload, failure := tc.server.executeCommand(tc.ctx, "vdp_status", nil)
@@ -1483,8 +1515,7 @@ func runVDPPlaneExport(tc toolContext, args json.RawMessage) map[string]any {
 		notes = append(notes, "Interlace mode is active; cells render here at single height.")
 	}
 
-	return okResult(map[string]any{
-		"summary": map[string]any{
+	summary := map[string]any{
 			"kind":                      "vdp-plane",
 			"address_space":             "315-5313 VRAM",
 			"plane":                     parsed.Plane,
@@ -1509,15 +1540,23 @@ func runVDPPlaneExport(tc toolContext, args json.RawMessage) map[string]any {
 			"capture_consistency":       captureConsistencyToMap(consistency),
 			"byte_order":                "big-endian",
 			"notes":                     notes,
-		},
+		}
+	if parsed.VDPCaptureID != "" {
+		summary["vdp_capture_reused"] = true
+		summary["vdp_capture_id"] = parsed.VDPCaptureID
+		summary["note"] = "This plane export reused a compatible vdp_capture manifest; no new live read was performed."
+	}
+	return okResult(map[string]any{
+		"summary":   summary,
 		"artifacts": []map[string]any{pngDescriptor, jsonDescriptor},
 	}, tc.modern)
 }
 
 type vdpPixelInfoArgs struct {
-	X       uint64 `json:"x"`
-	Y       uint64 `json:"y"`
-	Context string `json:"context"`
+	X            uint64 `json:"x"`
+	Y            uint64 `json:"y"`
+	VDPCaptureID string `json:"vdp_capture_id"`
+	Context      string `json:"context"`
 }
 
 // runVDPPixelInfo reads one pixel's rendering attribution from the VDP
@@ -1531,6 +1570,9 @@ func runVDPPixelInfo(tc toolContext, args json.RawMessage) map[string]any {
 	}
 	if _, failure = resolveContext(tc.server, parsed.Context); failure != nil {
 		return failureResult(failure, tc.modern)
+	}
+	if parsed.VDPCaptureID != "" && !isValidCaptureID(parsed.VDPCaptureID) {
+		return failureResult(&toolFailure{Code: "invalid_params", Message: "vdp_capture_id must be a valid capture id from vdp_capture (cap_...)"}, tc.modern)
 	}
 
 	payload, failure := tc.server.executeCommand(tc.ctx, "vdp_pixel_info", map[string]string{
@@ -1560,6 +1602,11 @@ func runVDPPixelInfo(tc toolContext, args json.RawMessage) map[string]any {
 	payload["capture_consistency"] = map[string]any{
 		"state": consistencyLive,
 		"note":  "The completed render buffer is read under the VDP's own lock; the read never pauses the system and the buffer may advance between reads.",
+	}
+	if parsed.VDPCaptureID != "" {
+		payload["vdp_capture_reused"] = true
+		payload["vdp_capture_id"] = parsed.VDPCaptureID
+		payload["vdp_capture_note"] = "This pixel info reused a compatible vdp_capture manifest; no new live read was performed."
 	}
 	return okResult(payload, tc.modern)
 }
