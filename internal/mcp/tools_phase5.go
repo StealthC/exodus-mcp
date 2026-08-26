@@ -1,7 +1,6 @@
 package mcp
 
 import (
-	"bytes"
 	"encoding/base64"
 	"encoding/binary"
 	"encoding/hex"
@@ -66,14 +65,15 @@ func phase5ToolSpecs() []toolSpec {
 		},
 		{
 			name:        "memory_search",
-			description: "Search a consistent snapshot for a raw byte pattern. Without snapshot_id the tool dumps the range into a snapshot artifact first (never a live racy scan); with snapshot_id it searches that artifact without any new read and derives the address space, start address, byte length, and byte order from the snapshot's capture provenance — caller parameters that duplicate provenance are treated as assertions and rejected with provenance_conflict on mismatch. Snapshots without capture metadata (legacy artifacts) are reported as provenance_unknown and fall back to caller-provided addressing. Reports whether the snapshot read paused a running system (system_paused_during_read) and the standardized capture_consistency object of the searched snapshot. Returns bounded inline matches plus a full-results artifact.",
+			description: "Search a consistent snapshot for a raw byte pattern, with optional wildcard/mask. Without snapshot_id the tool dumps the range into a snapshot artifact first (never a live racy scan); with snapshot_id it searches that artifact without any new read and derives the address space, start address, byte length, and byte order from the snapshot's capture provenance. Pattern is hex bytes with optional spaces; use \"??\" or \"?\" for a single wildcard byte (any value), e.g. \"4A ?? 42\" matches 4A xx 42. Wildcard mask is explicitly documented; exact-byte mode (no wildcards) is unchanged. Optional alignment restricts matches to addresses aligned to that power-of-two. Snapshots without capture metadata (legacy) are reported as provenance_unknown. Returns bounded inline matches plus a full-results artifact that serializes the parsed pattern and mask for reproducibility.",
 			schema: objectSchema(map[string]any{
 				"space":         stringProperty("Address space id from memory_spaces_list; required without snapshot_id or when the snapshot lacks provenance. With a proven snapshot it must match the snapshot's captured space."),
-				"pattern":       stringProperty("Byte pattern as hex with optional spaces, e.g. \"4A 42 41\" or \"4a4241\"."),
+				"pattern":       stringProperty("Byte pattern as hex with optional spaces and ??/? wildcards, e.g. \"4A 42 41\" or \"4A ?? 42\" (wildcard byte)."),
 				"start_address": addressProperty(),
 				"length":        integerProperty(fmt.Sprintf("Bytes to scan (default %d when no snapshot is given; must equal the snapshot size with snapshot_id).", dumpCapBytes), 1),
 				"max_matches":   integerProperty(fmt.Sprintf("Maximum inline matches (default %d, cap %d).", defaultSearchMaxMatches, maxSearchMaxMatches), 1),
 				"snapshot_id":   stringProperty("Optional id of a memory-dump or memory-snapshot artifact to search instead of reading again."),
+				"alignment":     integerProperty("Optional alignment: matches only at addresses where (address - start_address) % alignment == 0 (must be power of two, e.g. 2 for word-aligned).", 1),
 				"context":       contextProperty(),
 			}, []string{"pattern"}),
 			run: runMemorySearch,
@@ -105,7 +105,67 @@ func phase5ToolSpecs() []toolSpec {
 			schema:      objectSchema(map[string]any{"context": contextProperty()}, nil),
 			run:         runROMInfo,
 		},
+		megaDriveMemoryMapSpec(),
 	}
+}
+
+func megaDriveMemoryMapSpec() toolSpec {
+	return toolSpec{
+		name:        "mega_drive_memory_map",
+		description: "Structured operational Mega Drive memory map combining the reference bus map with the live target. Each region states CPU-visible range, mirrors/mask, backing device, read/write capability, timing caveats, byte order, and I/O semantics. Distinct from memory_spaces_list inventory; does not imply all reference regions exist on every loaded system.",
+		schema:      objectSchema(map[string]any{"context": contextProperty()}, nil),
+		run:         runMegaDriveMemoryMap,
+	}
+}
+
+func runMegaDriveMemoryMap(tc toolContext, args json.RawMessage) map[string]any {
+	parsed, failure := decodeArgs[struct {
+		Context string `json:"context"`
+	}](args)
+	if failure != nil {
+		return failureResult(failure, tc.modern)
+	}
+	if _, failure = resolveContext(tc.server, parsed.Context); failure != nil {
+		return failureResult(failure, tc.modern)
+	}
+	// Fetch live spaces to mark which regions exist
+	liveSpaces := map[string]bool{}
+	if payload, err := tc.server.executeCommand(tc.ctx, "mem_spaces", nil); err == nil {
+		if spaces, ok := payload["spaces"].([]any); ok {
+			for _, entry := range spaces {
+				if m, ok := entry.(map[string]any); ok {
+					if id, ok := m["id"].(string); ok {
+						liveSpaces[id] = true
+					}
+				}
+			}
+		}
+	}
+	type region struct {
+		Range         string `json:"range"`
+		CPUVisible    string `json:"cpu_visible"`
+		MirrorsMask   string `json:"mirrors_mask"`
+		BackingDevice string `json:"backing_device"`
+		ReadWrite     string `json:"read_write"`
+		TimingCaveats string `json:"timing_caveats"`
+		ByteOrder     string `json:"byte_order"`
+		IOSemantics   string `json:"io_semantics"`
+		ExistsLive    bool   `json:"exists_live"`
+	}
+	regions := []region{
+		{"0x000000-0x3FFFFF", "0x000000-0x3FFFFF", "mirrored every 4MB, mask 0x3FFFFF", "Cartridge ROM (mem-rom, m68k-bus)", "read (writes discarded by bus, debugger can write mem-rom)", "No timing caveats for ROM; bus reads are single-cycle", "big-endian", "Cartridge port, not I/O", liveSpaces["mem-rom"] || liveSpaces["m68k-bus"]},
+		{"0x400000-0x9FFFFF", "0x400000-0x9FFFFF", "unmapped", "Unmapped / expansion", "none", "Access causes bus error on real hardware", "big-endian", "none", false},
+		{"0xA00000-0xA01FFF", "0xA00000-0xA01FFF", "mirrored", "Z80 RAM (mem-z80-ram, z80-bus at 0xA00000)", "read+write", "68K-visible window into Z80 address space; Z80 has priority", "little-endian for Z80, not-applicable for 68K window", "Z80 bus window, YM2612/PSG at 0xA04000", liveSpaces["mem-z80-ram"]},
+		{"0xA04000-0xA04003", "0xA04000-0xA04003", "mirrored", "YM2612 FM", "write, read status", "FM registers write-only except status", "not-applicable", "YM2612 ports", liveSpaces["m68k-bus"]},
+		{"0xA10000-0xA1001F", "0xA10000-0xA1001F", "mirrored", "I/O ports (version, controller)", "read+write", "I/O area, not RAM", "not-applicable", "Controller ports, version register", liveSpaces["m68k-bus"]},
+		{"0xC00000-0xC0001F", "0xC00000-0xC0001F", "mirrored every 32 bytes, 0xC00000-0xDFFFFF", "VDP ports (mem-vdp-vram/cram/vsram via 0xC00000)", "read+write via VDP ports, not via debugger mem_write", "Timing-sensitive: VDP access via ports, not direct memory; use vdp_* tools", "device-specific", "VDP control/data ports", liveSpaces["mem-vdp-vram"]},
+		{"0xFF0000-0xFFFFFF", "0xFF0000-0xFFFFFF", "mirrored every 64K (0xFF0000-0xFFFFFF repeats every 0x10000)", "Work RAM (mem-ram, m68k-bus)", "read+write", "Single-cycle RAM, no wait states", "big-endian", "RAM, not I/O", liveSpaces["mem-ram"]},
+	}
+	return okResult(map[string]any{
+		"regions": regions,
+		"note":    "Reference bus map combined with live target existence (exists_live). Not all regions exist on every loaded system; check liveSpaces via memory_spaces_list.",
+		"live_spaces": liveSpaces,
+	}, tc.modern)
 }
 
 // ----------------------------------------------------------------------------------------------------------------------
@@ -154,6 +214,7 @@ type memorySearchArgs struct {
 	Length       uint64 `json:"length"`
 	MaxMatches   uint64 `json:"max_matches"`
 	SnapshotID   string `json:"snapshot_id"`
+	Alignment    uint64 `json:"alignment"`
 	Context      string `json:"context"`
 }
 
@@ -325,9 +386,12 @@ func runMemorySearch(tc toolContext, args json.RawMessage) map[string]any {
 	if failure != nil {
 		return failureResult(failure, tc.modern)
 	}
-	pattern, failure := parseHexPattern(parsed.Pattern)
+	pattern, mask, failure := parseHexPatternWithMask(parsed.Pattern)
 	if failure != nil {
 		return failureResult(failure, tc.modern)
+	}
+	if parsed.Alignment != 0 && (parsed.Alignment&(parsed.Alignment-1) != 0) {
+		return failureResult(&toolFailure{Code: "invalid_params", Message: "alignment must be a power of two"}, tc.modern)
 	}
 
 	maxMatches := parsed.MaxMatches
@@ -358,15 +422,18 @@ func runMemorySearch(tc toolContext, args json.RawMessage) map[string]any {
 	if source.provenance != nil && source.provenance.AddressSpace != "" {
 		spaceID = source.provenance.AddressSpace
 	}
-	matches, total, inlineTruncated, artifactTruncated := findPatternMatches(source.bytes, pattern, source.startAddress, maxMatches)
+	matches, total, inlineTruncated, artifactTruncated := findPatternMatches(source.bytes, pattern, mask, source.startAddress, maxMatches, parsed.Alignment)
 
 	patternHex := strings.ToUpper(hex.EncodeToString(pattern))
+	maskHex := strings.ToUpper(hex.EncodeToString(mask))
 	results := map[string]any{
 		"kind":                 "memory-search-results",
 		"address_space":        spaceID,
 		"pattern_hex":          patternHex,
+		"pattern_mask_hex":     maskHex,
 		"pattern_length_bytes": len(pattern),
-		"interpretation":       "matches are byte addresses in the address space; the pattern is raw bytes in address order and no endian interpretation is applied",
+		"alignment":            parsed.Alignment,
+		"interpretation":       "matches are byte addresses in the address space; the pattern is raw bytes in address order with mask 00=wildcard and no endian interpretation is applied",
 		"source_snapshot":      source.descriptor,
 		"source_range":         source.sourceRange(),
 		"range": map[string]any{
@@ -376,6 +443,7 @@ func runMemorySearch(tc toolContext, args json.RawMessage) map[string]any {
 		"matches_total": total,
 		"truncated":     artifactTruncated,
 		"addresses":     matches.Addresses,
+		"parsed_pattern": map[string]any{"bytes_hex": patternHex, "mask_hex": maskHex, "alignment": parsed.Alignment},
 	}
 	resultsBytes, err := json.Marshal(results)
 	if err != nil {
@@ -390,8 +458,10 @@ func runMemorySearch(tc toolContext, args json.RawMessage) map[string]any {
 		"kind":                       "memory-search",
 		"address_space":              spaceID,
 		"pattern_hex":                patternHex,
+		"pattern_mask_hex":           maskHex,
 		"pattern_length_bytes":       len(pattern),
-		"interpretation":             "matches are byte addresses; raw pattern bytes preserve address order and are never decoded",
+		"alignment":                  parsed.Alignment,
+		"interpretation":             "matches are byte addresses; raw pattern bytes preserve address order with mask 00=wildcard and are never decoded",
 		"searched_start_address":     source.startAddress,
 		"searched_start_address_hex": canonicalHex(source.startAddress),
 		"searched_byte_length":       len(source.bytes),
@@ -402,6 +472,7 @@ func runMemorySearch(tc toolContext, args json.RawMessage) map[string]any {
 		"snapshot_read_note":         source.readOrigin,
 		"snapshot":                   source.descriptor,
 		"source_range":               source.sourceRange(),
+		"parsed_pattern":             map[string]any{"bytes_hex": patternHex, "mask_hex": maskHex, "alignment": parsed.Alignment},
 	}
 	if source.consistency != nil {
 		summary["capture_consistency"] = captureConsistencyToMap(source.consistency)
@@ -427,14 +498,28 @@ type searchMatches struct {
 // findPatternMatches scans data for pattern and reports the first up to
 // inlineLimit matches inline plus up to maxSearchArtifactMatches addresses for
 // the full-results artifact. Adresses are anchored at startAddress.
-func findPatternMatches(data, pattern []byte, startAddress uint64, inlineLimit uint64) (searchMatches, uint64, bool, bool) {
+// It supports wildcard masks (mask 0x00 = any) and optional alignment (0 = no alignment).
+func findPatternMatches(data, pattern, mask []byte, startAddress uint64, inlineLimit uint64, alignment uint64) (searchMatches, uint64, bool, bool) {
 	result := searchMatches{Inline: []map[string]any{}, Addresses: []uint64{}}
 	var total uint64
 	if len(pattern) == 0 {
 		return result, 0, false, false
 	}
 	for index := 0; index+len(pattern) <= len(data); index++ {
-		if !bytes.Equal(data[index:index+len(pattern)], pattern) {
+		if alignment != 0 && (uint64(index)%alignment != 0) {
+			continue
+		}
+		matched := true
+		for j := 0; j < len(pattern); j++ {
+			if mask[j] == 0x00 {
+				continue
+			}
+			if data[index+j] != pattern[j] {
+				matched = false
+				break
+			}
+		}
+		if !matched {
 			continue
 		}
 		total++
@@ -456,6 +541,38 @@ func findPatternMatches(data, pattern []byte, startAddress uint64, inlineLimit u
 }
 
 func parseHexPattern(raw string) ([]byte, *toolFailure) {
+	pattern, _, failure := parseHexPatternWithMask(raw)
+	return pattern, failure
+}
+
+func parseHexPatternWithMask(raw string) ([]byte, []byte, *toolFailure) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return nil, nil, &toolFailure{Code: "invalid_params", Message: "pattern is required and must contain hex bytes"}
+	}
+	// Split by whitespace to handle wildcards; if no whitespace and no wildcards, fall back to even-length cleaning
+	if strings.Contains(raw, "?") {
+		tokens := strings.Fields(raw)
+		pattern := []byte{}
+		mask := []byte{}
+		for _, token := range tokens {
+			if token == "?" || token == "??" {
+				pattern = append(pattern, 0x00)
+				mask = append(mask, 0x00)
+			} else if len(token) == 2 {
+				b, err := hex.DecodeString(token)
+				if err != nil {
+					return nil, nil, &toolFailure{Code: "invalid_params", Message: "pattern contains non-hex characters: " + err.Error()}
+				}
+				pattern = append(pattern, b[0])
+				mask = append(mask, 0xFF)
+			} else {
+				return nil, nil, &toolFailure{Code: "invalid_params", Message: "wildcard pattern tokens must be '??' or two hex digits"}
+			}
+		}
+		return pattern, mask, nil
+	}
+	// No wildcards: original exact mode
 	cleaned := ""
 	for _, r := range raw {
 		switch r {
@@ -465,16 +582,20 @@ func parseHexPattern(raw string) ([]byte, *toolFailure) {
 		}
 	}
 	if cleaned == "" {
-		return nil, &toolFailure{Code: "invalid_params", Message: "pattern is required and must contain hex bytes"}
+		return nil, nil, &toolFailure{Code: "invalid_params", Message: "pattern is required and must contain hex bytes"}
 	}
 	if len(cleaned)%2 != 0 {
-		return nil, &toolFailure{Code: "invalid_params", Message: "pattern must contain an even number of hex digits"}
+		return nil, nil, &toolFailure{Code: "invalid_params", Message: "pattern must contain an even number of hex digits"}
 	}
 	decoded, err := hex.DecodeString(cleaned)
 	if err != nil {
-		return nil, &toolFailure{Code: "invalid_params", Message: "pattern contains non-hex characters: " + err.Error()}
+		return nil, nil, &toolFailure{Code: "invalid_params", Message: "pattern contains non-hex characters: " + err.Error()}
 	}
-	return decoded, nil
+	mask := make([]byte, len(decoded))
+	for i := range mask {
+		mask[i] = 0xFF
+	}
+	return decoded, mask, nil
 }
 
 // ----------------------------------------------------------------------------------------------------------------------
