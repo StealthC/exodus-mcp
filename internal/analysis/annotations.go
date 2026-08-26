@@ -275,7 +275,11 @@ func (store *AnnotationStore) Update(ctxID, id string, updates AnnotationUpdate)
 	if err := validateAnnotation(&current); err != nil {
 		return nil, err
 	}
-	current.UpdatedAt = time.Now().UTC()
+	now := time.Now().UTC()
+	if !now.After(current.UpdatedAt) {
+		now = current.UpdatedAt.Add(time.Nanosecond)
+	}
+	current.UpdatedAt = now
 	store.byID[id] = current
 	// Re-sort the context list so ordering stays newest-first by UpdatedAt.
 	store.sortByCtxLocked(ctxID)
