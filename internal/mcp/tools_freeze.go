@@ -254,15 +254,16 @@ func freezeToolSpecs() []toolSpec {
 	return []toolSpec{
 		{
 			name:        "memory_freeze",
-			description: "Register a cell range that the server re-writes at about 20 Hz, undoing the emulated program's own updates to it. Applies the bytes once immediately (like memory_write), then keeps them pinned while the entry exists. Replacing an entry at the same space+address updates the pinned bytes; rom_load purges the whole set with an audited invalidation. Accepts optional expected_target_generation and control_id.",
+			description: "Register a cell range that the server re-writes at about 20 Hz, undoing the emulated program's own updates to it. Applies the bytes once immediately (like memory_write), then keeps them pinned while the entry exists. Bytes arrive as exactly one of data (base64) or data_hex (hex bytes with optional spaces). Replacing an entry at the same space+address updates the pinned bytes; rom_load purges the whole set with an audited invalidation. Accepts optional expected_target_generation and control_id.",
 			schema: objectSchema(map[string]any{
 				"context":                    contextProperty(),
 				"space":                      stringProperty("Space id from memory_spaces_list, such as m68k-bus."),
 				"address":                    addressProperty(),
-				"data":                       stringProperty("Bytes to keep in place, base64-encoded (up to 4096 bytes)."),
+				"data":                       stringProperty("Bytes to keep in place, base64-encoded (up to 4096 bytes). Mutually exclusive with data_hex."),
+				"data_hex":                   stringProperty("Bytes to keep in place as hex with optional spaces, e.g. \"4A 42 41\" (up to 4096 bytes). Mutually exclusive with data."),
 				"expected_target_generation": integerProperty("Optional target generation the caller last observed; fails with target_generation_conflict on mismatch.", 1),
 				"control_id":                 stringProperty("Optional control id from target_control_acquire; required while the control lock is active."),
-			}, []string{"space", "address", "data"}),
+			}, []string{"space", "address"}),
 			run: runMemoryFreeze,
 		},
 		{
@@ -300,6 +301,7 @@ type memoryFreezeArgs struct {
 	Space   string `json:"space"`
 	Address any    `json:"address"`
 	Data    string `json:"data"`
+	DataHex string `json:"data_hex"`
 	guardArgs
 }
 
@@ -319,9 +321,9 @@ func runMemoryFreeze(tc toolContext, args json.RawMessage) map[string]any {
 	if parsed.Space == "" {
 		return failureResult(&toolFailure{Code: "invalid_params", Message: "space must name a space id from memory_spaces_list"}, tc.modern)
 	}
-	bytes, err := base64.StdEncoding.DecodeString(parsed.Data)
-	if err != nil {
-		return failureResult(&toolFailure{Code: "invalid_params", Message: "data must be valid base64"}, tc.modern)
+	bytes, failure := decodeWriteBytes(parsed.Data, parsed.DataHex)
+	if failure != nil {
+		return failureResult(failure, tc.modern)
 	}
 	if len(bytes) < 1 || len(bytes) > maxMemoryWriteBytes {
 		return failureResult(&toolFailure{Code: "invalid_params", Message: fmt.Sprintf("data must hold between 1 and %d bytes", maxMemoryWriteBytes)}, tc.modern)
@@ -337,7 +339,7 @@ func runMemoryFreeze(tc toolContext, args json.RawMessage) map[string]any {
 			"space":   parsed.Space,
 			"address": strconv.FormatUint(address, 10),
 			"length":  strconv.Itoa(len(bytes)),
-			"data":    parsed.Data,
+			"data":    base64.StdEncoding.EncodeToString(bytes),
 		},
 		guard:     parsed.guard(),
 		contextID: context.ID,
@@ -346,6 +348,7 @@ func runMemoryFreeze(tc toolContext, args json.RawMessage) map[string]any {
 			"address": address,
 			"length":  len(bytes),
 			"sha256":  sha256Hex(bytes),
+			"input":   "data_hex",
 		},
 		prepare: func() *toolFailure {
 			existing := tc.server.freezes.getAt(parsed.Space, address)
@@ -381,15 +384,16 @@ func runMemoryFreeze(tc toolContext, args json.RawMessage) map[string]any {
 	}
 
 	result := map[string]any{
-		"freeze_id":   entry.ID,
-		"space":       entry.Space,
-		"address":     entry.Address,
-		"address_hex": fmt.Sprintf("0x%X", entry.Address),
-		"byte_length": len(entry.Data),
-		"data_sha256": sha256Hex(entry.Data),
-		"created_at":  entry.CreatedAt,
-		"replaced":    replaced,
-		"rewrite_hz":  1 / freezeTickInterval.Seconds(),
+		"freeze_id":     entry.ID,
+		"space":         entry.Space,
+		"address":       entry.Address,
+		"address_hex":   fmt.Sprintf("0x%X", entry.Address),
+		"byte_length":   len(entry.Data),
+		"data_sha256":   sha256Hex(entry.Data),
+		"data_hex_echo": hexEcho(entry.Data, 256),
+		"created_at":    entry.CreatedAt,
+		"replaced":      replaced,
+		"rewrite_hz":    1 / freezeTickInterval.Seconds(),
 	}
 	return okResult(stampGenerations(result, before, after), tc.modern)
 }

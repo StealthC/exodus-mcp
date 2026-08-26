@@ -23,6 +23,7 @@ type Snapshot struct {
 	SizeBytes        int64     `json:"size_bytes"`
 	CreatedAt        time.Time `json:"created_at"`
 	ROMPath          string    `json:"rom_path,omitempty"`
+	ROMSHA256        string    `json:"rom_sha256,omitempty"`
 	ControlID        string    `json:"control_id,omitempty"`
 	TargetGeneration uint64    `json:"target_generation"`
 }

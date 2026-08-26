@@ -9,6 +9,7 @@ import (
 	"image/color"
 	"image/png"
 	"strconv"
+	"time"
 
 	"github.com/StealthC/exodus-mcp/internal/artifact"
 )
@@ -315,12 +316,17 @@ func runFrameCapture(tc toolContext, args json.RawMessage) map[string]any {
 	if err := png.Encode(&pngBuffer, frame); err != nil {
 		return failureResult(&toolFailure{Code: "artifact_error", Message: "encode PNG: " + err.Error()}, tc.modern)
 	}
-	stored, err := tc.server.store.Put(context.ID, "frame-capture", "image/png", pngBuffer.Bytes())
+	frameToken, _ := payload["frame_token"].(float64)
+	provenance := vdpProvenance(tc, "frame-capture", "vdp-buffers", "VDP frame buffer")
+	token := uint64(frameToken)
+	if token != 0 {
+		provenance.FrameToken = &token
+	}
+	provenance.ByteOrder = "not-applicable"
+	stored, err := tc.server.store.PutWithProvenance(context.ID, "frame-capture", "image/png", pngBuffer.Bytes(), provenance)
 	if err != nil {
 		return failureResult(&toolFailure{Code: "artifact_error", Message: err.Error()}, tc.modern)
 	}
-
-	frameToken, _ := payload["frame_token"].(float64)
 	return okResult(map[string]any{
 		"summary": map[string]any{
 			"kind":                      "frame-capture",
@@ -610,13 +616,18 @@ func runVDPPaletteExport(tc toolContext, args json.RawMessage) map[string]any {
 	if err := png.Encode(&pngBuffer, paletteImg); err != nil {
 		return failureResult(&toolFailure{Code: "artifact_error", Message: "encode PNG: " + err.Error()}, tc.modern)
 	}
-	pngStored, err := tc.server.store.Put(context.ID, "vdp-palette", "image/png", pngBuffer.Bytes())
+	paletteProvenance := vdpProvenance(tc, "vdp-palette", "mem-vdp-cram", "VDP CRAM")
+	cramLength := uint64(128)
+	paletteProvenance.ByteLength = &cramLength
+	pngStored, err := tc.server.store.PutWithProvenance(context.ID, "vdp-palette", "image/png", pngBuffer.Bytes(), paletteProvenance)
 	if err != nil {
 		return failureResult(&toolFailure{Code: "artifact_error", Message: err.Error()}, tc.modern)
 	}
 
 	jsonDocument := buildPaletteJSON(decoded)
-	jsonStored, err := tc.server.store.Put(context.ID, "vdp-palette-json", "application/json", jsonDocument)
+	jsonProvenance := vdpProvenance(tc, "vdp-palette-json", "mem-vdp-cram", "VDP CRAM")
+	jsonProvenance.ByteLength = &cramLength
+	jsonStored, err := tc.server.store.PutWithProvenance(context.ID, "vdp-palette-json", "application/json", jsonDocument, jsonProvenance)
 	if err != nil {
 		return failureResult(&toolFailure{Code: "artifact_error", Message: err.Error()}, tc.modern)
 	}
@@ -872,11 +883,61 @@ func drawMDTile(img *image.NRGBA, tile *[mdTileEdgePixels][mdTileEdgePixels]int,
 }
 
 func storeArtifactAndDescriptor(tc toolContext, contextID, kind, mimeType string, payload []byte) (artifact.Artifact, map[string]any, error) {
-	stored, err := tc.server.store.Put(contextID, kind, mimeType, payload)
+	provenance := vdpProvenance(tc, kind, vdpSpaceForKind(kind), vdpDeviceForKind(kind))
+	stored, err := tc.server.store.PutWithProvenance(contextID, kind, mimeType, payload, provenance)
 	if err != nil {
 		return artifact.Artifact{}, nil, err
 	}
 	return stored, artifactDescriptor(tc.server, stored, contextID), nil
+}
+
+// vdpProvenance builds the capture envelope for a VDP-derived artifact: the
+// device buffer domain (VRAM/CRAM/VSRAM are not linearly CPU-mapped, so the
+// space carries a note), target identity, and capture time. Addresses are
+// device-relative and the caller sets byte length when it knows the captured
+// range exactly (the export summaries always state their ranges inline).
+func vdpProvenance(tc toolContext, kind, spaceID, device string) *artifact.Provenance {
+	provenance := genericProvenance(tc.server, kind, time.Now().UTC())
+	start := uint64(0)
+	provenance.AddressSpace = spaceID
+	provenance.Device = device
+	provenance.StartAddress = &start
+	provenance.EffectiveAddress = &start
+	provenance.StartAddressHex = canonicalHex(0)
+	provenance.EffectiveAddressHex = canonicalHex(0)
+	provenance.SpaceKind = "timed-buffer"
+	provenance.ByteOrder = "device-specific"
+	provenance.Consistency = "live"
+	return provenance
+}
+
+// vdpSpaceForKind maps an export artifact kind to the VDP buffer space it was
+// read from, for provenance. Unknown kinds fall back to the generic VDP space.
+func vdpSpaceForKind(kind string) string {
+	switch kind {
+	case "vdp-palette", "vdp-palette-json":
+		return "mem-vdp-cram"
+	case "vdp-plane-a", "vdp-plane-b", "vdp-plane-window", "vdp-plane-json":
+		return "mem-vdp-vram"
+	case "vdp-tile-strip", "vdp-tile-json":
+		return "mem-vdp-vram"
+	default:
+		return "vdp-buffers"
+	}
+}
+
+// vdpDeviceForKind names the owning device for VDP export kinds.
+func vdpDeviceForKind(kind string) string {
+	switch kind {
+	case "vdp-palette", "vdp-palette-json":
+		return "VDP CRAM"
+	case "vdp-plane-a", "vdp-plane-b", "vdp-plane-window", "vdp-plane-json":
+		return "VDP VRAM"
+	case "vdp-tile-strip", "vdp-tile-json":
+		return "VDP VRAM"
+	default:
+		return "VDP"
+	}
 }
 
 type exportedTile struct {

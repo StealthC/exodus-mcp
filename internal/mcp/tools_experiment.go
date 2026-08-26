@@ -155,6 +155,10 @@ func runExperiment(tc toolContext, args json.RawMessage) map[string]any {
 		InitialStateID: parsed.InitialStateID,
 		Timeout:        timeout,
 		Exec:           executor,
+		// The manifest artifact records which target, ROM, and instant
+		// produced this run, so a later agent can interpret it without the
+		// original response.
+		Provenance: genericProvenance(tc.server, "experiment-manifest", time.Now().UTC()),
 	})
 	if err != nil {
 		return failureResult(&toolFailure{Code: "experiment_error", Message: err.Error()}, tc.modern)

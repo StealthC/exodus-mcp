@@ -183,6 +183,92 @@ func TestStartupSweepRemovesStaleFiles(t *testing.T) {
 	}
 }
 
+func TestPutWithoutProvenanceReportsUnknownState(t *testing.T) {
+	store := newTestStore(t)
+	stored, err := store.Put("ctx_a", "memory-dump", "application/octet-stream", []byte("legacy bytes"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stored.Provenance != nil {
+		t.Fatalf("legacy artifact must carry nil provenance: %+v", stored.Provenance)
+	}
+	if stored.Provenance.Known() {
+		t.Fatal("nil provenance must not count as known")
+	}
+	if _, ok := stored.Provenance.CapturedStart(); ok {
+		t.Fatal("nil provenance must not claim a start address")
+	}
+}
+
+func TestPutWithProvenanceStampsSchemaAndState(t *testing.T) {
+	store := newTestStore(t)
+	start := uint64(0xFF0000)
+	length := uint64(16)
+	generation := uint64(7)
+	frame := uint64(42)
+	provenance := &Provenance{
+		Kind:                "memory-dump",
+		AddressSpace:        "mem-ram",
+		StartAddress:        &start,
+		EffectiveAddress:    &start,
+		StartAddressHex:     "0xFF0000",
+		EffectiveAddressHex: "0xFF0000",
+		ByteLength:          &length,
+		RawByteOrdering:     "address-order",
+		ByteOrder:           "big-endian",
+		SpaceKind:           "memory",
+		Device:              "68000 work RAM",
+		TargetGeneration:    &generation,
+		ROMSHA256:           "abc123",
+		ROMPath:             "F:\\roms\\kid.bin",
+		FrameToken:          &frame,
+		CPURunState:         "running",
+		Consistency:         "live",
+		CapturedAt:          time.Now().UTC().Add(-time.Minute),
+	}
+	stored, err := store.PutWithProvenance("ctx_a", "memory-dump", "application/octet-stream", []byte("bytes"), provenance)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stored.Provenance == nil {
+		t.Fatal("provenance lost on store")
+	}
+	if stored.Provenance.Schema != ProvenanceSchema || stored.Provenance.State != ProvenanceStateComplete {
+		t.Fatalf("envelope not stamped: %+v", stored.Provenance)
+	}
+	if !stored.Provenance.Known() {
+		t.Fatal("complete envelope must be known")
+	}
+	if captured, ok := stored.Provenance.CapturedStart(); !ok || captured != 0xFF0000 {
+		t.Fatalf("captured start wrong: %d %v", captured, ok)
+	}
+	if length, ok := stored.Provenance.CapturedLength(); !ok || length != 16 {
+		t.Fatalf("captured length wrong: %d %v", length, ok)
+	}
+	if !stored.Provenance.CapturedAt.Equal(provenance.CapturedAt) {
+		t.Fatalf("captured_at must be preserved: %v", stored.Provenance.CapturedAt)
+	}
+	// Metadata and Bytes return the same immutable envelope.
+	meta, err := store.Metadata(stored.ID, "ctx_a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if meta.Provenance == nil || meta.Provenance.ROMSHA256 != "abc123" {
+		t.Fatalf("metadata provenance wrong: %+v", meta.Provenance)
+	}
+}
+
+func TestPutWithNilProvenanceIsUnknown(t *testing.T) {
+	store := newTestStore(t)
+	stored, err := store.PutWithProvenance("ctx_a", "memory-dump", "application/octet-stream", []byte("bytes"), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stored.Provenance != nil {
+		t.Fatalf("nil provenance must stay nil: %+v", stored.Provenance)
+	}
+}
+
 func httpNewRequest(method, url string) (*http.Request, error) {
 	return http.NewRequest(method, url, nil)
 }

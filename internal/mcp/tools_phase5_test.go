@@ -147,8 +147,13 @@ func TestMemorySearchSnapshotMismatch(t *testing.T) {
 	dump := structured(postToolCall(t, server, "memory_dump", `{"space":"m68k-bus","address":0,"length":4}`))
 	artifactID := dump["artifact"].(map[string]any)["id"].(string)
 	result := structured(postToolCall(t, server, "memory_search", fmt.Sprintf(`{"space":"m68k-bus","pattern":"01","snapshot_id":%q,"length":3}`, artifactID)))
-	if result["code"] != "invalid_params" {
-		t.Fatalf("length mismatch must be rejected: %v", result)
+	if result["code"] != "provenance_conflict" {
+		t.Fatalf("length assertion mismatch must be provenance_conflict: %v", result)
+	}
+	// The same length as the snapshot is an assertion that passes.
+	ok := structured(postToolCall(t, server, "memory_search", fmt.Sprintf(`{"space":"m68k-bus","pattern":"01","snapshot_id":%q,"length":4}`, artifactID)))
+	if ok["code"] != nil {
+		t.Fatalf("matching assertion must pass: %v", ok)
 	}
 }
 
@@ -397,11 +402,18 @@ func TestMemoryDiffValidation(t *testing.T) {
 		{"in_range without bounds", server, fmt.Sprintf(`{"snapshot_before_id":%q,"snapshot_after_id":%q,"mode":"in_range"}`, beforeID, afterID), "invalid_params"},
 		{"in_range inverted", server, fmt.Sprintf(`{"snapshot_before_id":%q,"snapshot_after_id":%q,"mode":"in_range","min_value":5,"max_value":2}`, beforeID, afterID), "invalid_params"},
 		{"length mismatch", shortServer, fmt.Sprintf(`{"snapshot_before_id":%q,"snapshot_after_id":%q,"mode":"changed"}`, shortBefore, shortAfter), "invalid_params"},
-		{"fresh read without space", server, fmt.Sprintf(`{"snapshot_before_id":%q,"mode":"changed"}`, beforeID), "invalid_params"},
+		{"fresh read derives space from provenance", server, fmt.Sprintf(`{"snapshot_before_id":%q,"mode":"changed"}`, beforeID), ""},
+		{"fresh read with conflicting space", server, fmt.Sprintf(`{"snapshot_before_id":%q,"mode":"changed","space":"mem-z80-ram"}`, beforeID), "incompatible_provenance"},
 		{"unknown artifact", server, `{"snapshot_before_id":"art_nope","mode":"changed"}`, "unknown_artifact"},
 	}
 	for _, tc := range cases {
 		result := structured(postToolCall(t, tc.server, "memory_diff", tc.arguments))
+		if tc.code == "" {
+			if result["code"] != nil {
+				t.Fatalf("%s: expected success, got %v (%v)", tc.name, result["code"], result)
+			}
+			continue
+		}
 		if result["code"] != tc.code {
 			t.Fatalf("%s: code = %v (%v)", tc.name, result["code"], result)
 		}

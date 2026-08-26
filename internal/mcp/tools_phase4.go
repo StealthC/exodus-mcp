@@ -1,6 +1,7 @@
 package mcp
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
@@ -60,15 +61,17 @@ func phase4ToolSpecs() []toolSpec {
 		},
 		{
 			name:        "memory_write",
-			description: "Write bytes into a memory space through the emulator debugger path. Only CPU bus spaces and non-timed memory devices are writable; ROM writes are discarded by the bus like real hardware. The response echoes the exact bytes written and the target generations before/after, and the call is recorded in the target audit stream. Accepts optional expected_target_generation and control_id.",
+			description: "Write bytes into a memory space through the emulator debugger path. Only CPU bus spaces and non-timed memory devices are writable; ROM writes are discarded by the bus like real hardware. Bytes arrive as exactly one of data (base64) or data_hex (hex bytes with optional spaces); the response echoes bounded uppercase hex of the exact bytes written, the effective address, the write result, and optional read-back verification. The call is recorded in the target audit stream. Accepts optional expected_target_generation and control_id.",
 			schema: objectSchema(map[string]any{
 				"context":                    contextProperty(),
 				"space":                      stringProperty("Space id from memory_spaces_list, such as m68k-bus."),
 				"address":                    addressProperty(),
-				"data":                       stringProperty("Bytes to write, base64-encoded (up to 4096 bytes)."),
+				"data":                       stringProperty("Bytes to write, base64-encoded (up to 4096 bytes). Mutually exclusive with data_hex."),
+				"data_hex":                   stringProperty("Bytes to write as hex with optional spaces, e.g. \"4A 42 41\" (up to 4096 bytes). Mutually exclusive with data."),
+				"verify_readback":            booleanProperty("Read the written range back afterwards and report whether it matches."),
 				"expected_target_generation": integerProperty("Optional target generation the caller last observed; fails with target_generation_conflict on mismatch.", 1),
 				"control_id":                 stringProperty("Optional control id from target_control_acquire; required while the control lock is active."),
-			}, []string{"space", "address", "data"}),
+			}, []string{"space", "address"}),
 			run: runMemoryWrite,
 		},
 		{
@@ -222,11 +225,50 @@ func runInputSet(tc toolContext, args json.RawMessage) map[string]any {
 // ----------------------------------------------------------------------------------------------------------------------
 
 type memoryWriteArgs struct {
-	Context string `json:"context"`
-	Space   string `json:"space"`
-	Address any    `json:"address"`
-	Data    string `json:"data"`
+	Context        string `json:"context"`
+	Space          string `json:"space"`
+	Address        any    `json:"address"`
+	Data           string `json:"data"`
+	DataHex        string `json:"data_hex"`
+	VerifyReadback bool   `json:"verify_readback"`
 	guardArgs
+}
+
+// decodeWriteBytes resolves the raw address-order bytes for a write or freeze
+// from the mutually exclusive data (base64) and data_hex inputs. Both empty or
+// both set is a validation error; the caller enforces size limits.
+func decodeWriteBytes(data, dataHex string) ([]byte, *toolFailure) {
+	if data == "" && dataHex == "" {
+		return nil, &toolFailure{Code: "invalid_params", Message: "data (base64) or data_hex is required"}
+	}
+	if data != "" && dataHex != "" {
+		return nil, &toolFailure{Code: "invalid_params", Message: "data and data_hex are mutually exclusive; pass exactly one"}
+	}
+	if dataHex != "" {
+		decoded, failure := parseHexPattern(dataHex)
+		if failure != nil {
+			return nil, &toolFailure{Code: "invalid_params", Message: "data_hex must be hex bytes: " + failure.Message}
+		}
+		return decoded, nil
+	}
+	decoded, err := base64.StdEncoding.DecodeString(data)
+	if err != nil {
+		return nil, &toolFailure{Code: "invalid_params", Message: "data must be valid base64"}
+	}
+	return decoded, nil
+}
+
+// hexEcho renders a bounded uppercase hex view of raw bytes for responses.
+func hexEcho(raw []byte, capBytes int) map[string]any {
+	echo := map[string]any{"truncated": false, "bytes_total": len(raw)}
+	if len(raw) <= capBytes {
+		echo["hex"] = strings.ToUpper(hex.EncodeToString(raw))
+		return echo
+	}
+	echo["hex"] = strings.ToUpper(hex.EncodeToString(raw[:capBytes])) + "..."
+	echo["truncated"] = true
+	echo["bytes_shown"] = capBytes
+	return echo
 }
 
 func runMemoryWrite(tc toolContext, args json.RawMessage) map[string]any {
@@ -245,9 +287,9 @@ func runMemoryWrite(tc toolContext, args json.RawMessage) map[string]any {
 	if parsed.Space == "" {
 		return failureResult(&toolFailure{Code: "invalid_params", Message: "space must name a space id from memory_spaces_list"}, tc.modern)
 	}
-	bytes, err := base64.StdEncoding.DecodeString(parsed.Data)
-	if err != nil {
-		return failureResult(&toolFailure{Code: "invalid_params", Message: "data must be valid base64"}, tc.modern)
+	bytes, failure := decodeWriteBytes(parsed.Data, parsed.DataHex)
+	if failure != nil {
+		return failureResult(failure, tc.modern)
 	}
 	if len(bytes) < 1 || len(bytes) > maxMemoryWriteBytes {
 		return failureResult(&toolFailure{Code: "invalid_params", Message: fmt.Sprintf("data must hold between 1 and %d bytes", maxMemoryWriteBytes)}, tc.modern)
@@ -259,7 +301,7 @@ func runMemoryWrite(tc toolContext, args json.RawMessage) map[string]any {
 			"space":   parsed.Space,
 			"address": strconv.FormatUint(address, 10),
 			"length":  strconv.Itoa(len(bytes)),
-			"data":    parsed.Data,
+			"data":    base64.StdEncoding.EncodeToString(bytes),
 		},
 		guard:     parsed.guard(),
 		contextID: context.ID,
@@ -268,12 +310,47 @@ func runMemoryWrite(tc toolContext, args json.RawMessage) map[string]any {
 			"address": address,
 			"length":  len(bytes),
 			"sha256":  sha256Hex(bytes),
+			"input":   "data_hex",
 		},
 	})
 	if failure != nil {
 		return failureResult(failure, tc.modern)
 	}
+	payload["data_hex_echo"] = hexEcho(bytes, 256)
+	if parsed.VerifyReadback {
+		payload["readback"] = verifyWriteReadback(tc, parsed.Space, address, bytes)
+	}
 	return okResult(stampGenerations(payload, before, after), tc.modern)
+}
+
+// verifyWriteReadback reads the written range back through the bridge and
+// reports whether the space returned the exact written bytes. A failed or
+// undecodable read-back reports verified=false with the reason; a byte
+// difference reports the note that the space may mask, transform, or discard
+// writes (ROM is the documented case).
+func verifyWriteReadback(tc toolContext, space string, address uint64, written []byte) map[string]any {
+	rbPayload, failure := tc.server.executeCommand(tc.ctx, "mem_read", map[string]string{
+		"space":   space,
+		"address": strconv.FormatUint(address, 10),
+		"length":  strconv.Itoa(len(written)),
+	})
+	if failure != nil {
+		return map[string]any{"verified": false, "note": "read-back failed: " + failure.Code + ": " + failure.Message}
+	}
+	rbData, _ := rbPayload["data"].(string)
+	rbRaw, err := base64.StdEncoding.DecodeString(rbData)
+	if err != nil {
+		return map[string]any{"verified": false, "note": "read-back payload undecodable: " + err.Error()}
+	}
+	view := map[string]any{
+		"verified": true,
+		"matches":  bytes.Equal(rbRaw, written),
+		"hex":      hexEcho(rbRaw, 256),
+	}
+	if !bytes.Equal(rbRaw, written) {
+		view["note"] = "the read-back bytes differ from the written bytes; the space may mask, transform, or discard writes (ROM is the documented case)."
+	}
+	return view
 }
 
 func sha256Hex(data []byte) string {
@@ -337,6 +414,7 @@ func runStateSave(tc toolContext, args json.RawMessage) map[string]any {
 		SizeBytes:        info.Size(),
 		CreatedAt:        time.Now().UTC(),
 		ROMPath:          tc.server.currentROMPath(),
+		ROMSHA256:        tc.server.romIdentity.romFileFacts(tc.server.currentROMPath()).SHA256,
 		ControlID:        parsed.ControlID,
 		TargetGeneration: generation,
 	})
@@ -444,6 +522,7 @@ func runStateList(tc toolContext, args json.RawMessage) map[string]any {
 			"sha256":              snapshot.SHA256,
 			"target_generation":   snapshot.TargetGeneration,
 			"rom_path":            snapshot.ROMPath,
+			"rom_sha256":          snapshot.ROMSHA256,
 			"stale":               stale,
 			"generation_mismatch": snapshot.TargetGeneration != 0 && snapshot.TargetGeneration != currentGen,
 		}

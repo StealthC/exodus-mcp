@@ -139,3 +139,14 @@ func (tracker *runStateTracker) firstObservedAt() time.Time {
 	defer tracker.mu.Unlock()
 	return tracker.firstObserved
 }
+
+// currentState returns the last observed run state and whether any
+// observation exists yet.
+func (tracker *runStateTracker) currentState() (running bool, known bool) {
+	tracker.mu.Lock()
+	defer tracker.mu.Unlock()
+	if tracker.observed == nil {
+		return false, false
+	}
+	return *tracker.observed, true
+}

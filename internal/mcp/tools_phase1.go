@@ -24,6 +24,15 @@ func phase1ToolSpecs() []toolSpec {
 			run: runArtifactGet,
 		},
 		{
+			name:        "artifact_describe",
+			description: "Return the full typed provenance envelope of one artifact: address domain (space, requested and effective addresses in decimal and canonical hex, byte length, byte order, raw-byte ordering), owning device, target generation, ROM identity, frame token, CPU run state, capture consistency, and capture time. Artifacts whose producer attached no capture metadata are reported honestly with the provenance_unknown state instead of invented fields.",
+			schema: objectSchema(map[string]any{
+				"artifact_id": stringProperty("Opaque artifact id returned by a producing tool."),
+				"context":     contextProperty(),
+			}, []string{"artifact_id"}),
+			run: runArtifactDescribe,
+		},
+		{
 			name:        "artifact_preview",
 			description: "Render a bounded hex, text, or base64 preview of an artifact without downloading its full bytes.",
 			schema: objectSchema(map[string]any{
@@ -67,7 +76,7 @@ func phase1ToolSpecs() []toolSpec {
 		},
 		{
 			name:        "memory_dump",
-			description: "Dump up to 8 MiB of memory into an immutable artifact. Returns a compact summary (address space, effective address, byte length, byte order, capture consistency, and whether the read temporarily paused a running system) plus descriptor; raw bytes stay out of model context.",
+			description: "Dump up to 8 MiB of memory into an immutable artifact carrying a versioned capture-provenance envelope (address domain, byte order, device, target generation, ROM identity, run state, consistency). Returns a compact summary (address space, effective address, byte length, byte order, capture consistency, and whether the read temporarily paused a running system) plus descriptor; raw bytes stay out of model context.",
 			schema: objectSchema(map[string]any{
 				"space":   stringProperty("Address space id from memory_spaces_list."),
 				"address": addressProperty(),
@@ -623,7 +632,8 @@ func runMemoryDump(tc toolContext, args json.RawMessage) map[string]any {
 	if err != nil {
 		return failureResult(&toolFailure{Code: "bridge_error", Message: "decode base64 memory payload: " + err.Error()}, tc.modern)
 	}
-	stored, err := tc.server.store.Put(context.ID, "memory-dump", "application/octet-stream", raw)
+	provenance := captureProvenance(tc.server, "memory-dump", parsed.Space, address, uint64(len(raw)), payload, time.Now().UTC())
+	stored, err := tc.server.store.PutWithProvenance(context.ID, "memory-dump", "application/octet-stream", raw, provenance)
 	if err != nil {
 		return failureResult(&toolFailure{Code: "artifact_error", Message: err.Error()}, tc.modern)
 	}
@@ -641,13 +651,16 @@ func runMemoryDump(tc toolContext, args json.RawMessage) map[string]any {
 			"kind":                      "memory-dump",
 			"address_space":             parsed.Space,
 			"start_address":             address,
+			"start_address_hex":         canonicalHex(address),
 			"effective_address":         uint64(effective),
+			"effective_address_hex":     canonicalHex(uint64(effective)),
 			"byte_length":               len(raw),
 			"byte_order":                byteOrder,
 			"consistency":               consistency,
 			"system_paused_during_read": pausedDuringRead,
 			"preview_hex":               artifact.HexDump(raw[:previewLength], int64(uint64(effective))),
 			"sha256":                    stored.SHA256,
+			"provenance_state":          stored.Provenance.State,
 		},
 		"artifact": artifactDescriptor(tc.server, stored, context.ID),
 	}, tc.modern)
@@ -689,6 +702,41 @@ type artifactPreviewArgs struct {
 	Length     uint64 `json:"length"`
 	Mode       string `json:"mode"`
 	Context    string `json:"context"`
+}
+
+// runArtifactDescribe returns the full typed provenance envelope of one
+// artifact: the versioned envelope when the producer attached one, or the
+// honest provenance_unknown state for legacy artifacts. It never downloads
+// or previews bytes; artifact_preview stays the bounded byte-oriented view.
+func runArtifactDescribe(tc toolContext, args json.RawMessage) map[string]any {
+	parsed, failure := decodeArgs[artifactRefArgs](args)
+	if failure != nil {
+		return failureResult(failure, tc.modern)
+	}
+	context, failure := resolveContext(tc.server, parsed.Context)
+	if failure != nil {
+		return failureResult(failure, tc.modern)
+	}
+	stored, err := tc.server.store.Metadata(parsed.ArtifactID, context.ID)
+	if err != nil {
+		return failureResult(&toolFailure{Code: "unknown_artifact", Message: err.Error()}, tc.modern)
+	}
+	result := map[string]any{
+		"artifact_id": stored.ID,
+		"kind":        stored.Kind,
+		"created_at":  stored.CreatedAt,
+		"sha256":      stored.SHA256,
+		"retrieval": map[string]string{
+			"hint":  "Fetch the URL directly with curl or a script; HTTP byte ranges are supported. Use artifact_preview for a bounded in-context view.",
+			"range": "Range: bytes=<start>-<end>",
+		},
+	}
+	if stored.Provenance != nil {
+		result["provenance"] = provenanceEnvelopeView(*stored.Provenance)
+	} else {
+		result["provenance"] = provenanceUnknownView()
+	}
+	return okResult(result, tc.modern)
 }
 
 func runArtifactPreview(tc toolContext, args json.RawMessage) map[string]any {

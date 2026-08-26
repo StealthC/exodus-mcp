@@ -29,15 +29,106 @@ var ErrUnknownArtifact = errUnknownArtifact
 
 var errUnknownArtifact = errors.New("unknown artifact")
 
+// ProvenanceSchema is the versioned envelope schema stamped on every
+// provenance record. Consumers must compare it for equality; a future schema
+// revision is a separate version, never a silent shape change.
+const ProvenanceSchema = "artifact-provenance/1"
+
+// Provenance state values. An artifact created without capture metadata is
+// honestly reported as provenance_unknown instead of inventing fields.
+const (
+	ProvenanceStateComplete = "complete"
+	ProvenanceStateUnknown  = "provenance_unknown"
+)
+
+// Provenance is the immutable, versioned capture envelope of one artifact:
+// the address/time/target/decoding facts required to interpret its bytes
+// later, without retaining the original MCP response. Every field is
+// populated by the producing tool at capture time and never edited afterwards.
+// A nil Provenance on an Artifact means the producer did not attach one and
+// the artifact must be treated as provenance_unknown.
+type Provenance struct {
+	Schema string `json:"artifact_schema"` // ProvenanceSchema
+	State  string `json:"state"`           // ProvenanceStateComplete | ProvenanceStateUnknown
+
+	Kind string `json:"kind"` // artifact kind, e.g. "memory-dump"
+
+	// Address domain. StartAddress is the caller-requested range start;
+	// EffectiveAddress is where the capture actually began (translation,
+	// clamping, or masking can move it). Both are space-relative addresses.
+	StartAddress        *uint64 `json:"start_address,omitempty"`
+	EffectiveAddress    *uint64 `json:"effective_address,omitempty"`
+	StartAddressHex     string  `json:"start_address_hex,omitempty"`
+	EffectiveAddressHex string  `json:"effective_address_hex,omitempty"`
+	ByteLength          *uint64 `json:"byte_length,omitempty"`
+	AddressSpace        string  `json:"address_space,omitempty"`
+
+	// RawByteOrdering describes how bytes are laid out in the artifact:
+	// "address-order" means index i corresponds to effective address + i.
+	// ByteOrder is the space's declared multi-byte convention
+	// ("big-endian", "little-endian", "not-applicable", or a device note).
+	RawByteOrdering string `json:"raw_byte_ordering,omitempty"`
+	ByteOrder       string `json:"byte_order,omitempty"`
+
+	// SpaceKind is the plugin's space classification ("bus", "memory",
+	// "timed-buffer"); Device names the owning device.
+	SpaceKind string `json:"space_kind,omitempty"`
+	Device    string `json:"device,omitempty"`
+
+	// Target identity at capture time. ROMSHA256 is the SHA-256 of the ROM
+	// file when it was readable from the server host; ROMPath is the last
+	// known cartridge path ("" when unknown).
+	TargetGeneration *uint64 `json:"target_generation,omitempty"`
+	ROMSHA256        string  `json:"rom_sha256,omitempty"`
+	ROMPath          string  `json:"rom_path,omitempty"`
+
+	// FrameToken identifies the rendered frame when the capture path provides
+	// one; CPURunState is "running", "paused", or "unknown" as observed at
+	// capture time; Consistency is the plugin's capture consistency label.
+	FrameToken  *uint64   `json:"frame_token,omitempty"`
+	CPURunState string    `json:"cpu_run_state,omitempty"`
+	Consistency string    `json:"consistency,omitempty"`
+	CapturedAt  time.Time `json:"captured_at,omitempty"`
+}
+
+// Known reports whether the provenance envelope is complete enough to trust
+// its address and target fields.
+func (provenance *Provenance) Known() bool {
+	return provenance != nil && provenance.State == ProvenanceStateComplete
+}
+
+// CapturedStart returns the effective start address and whether it is known.
+func (provenance *Provenance) CapturedStart() (uint64, bool) {
+	if provenance == nil {
+		return 0, false
+	}
+	if provenance.EffectiveAddress != nil {
+		return *provenance.EffectiveAddress, true
+	}
+	if provenance.StartAddress != nil {
+		return *provenance.StartAddress, true
+	}
+	return 0, false
+}
+
+// CapturedLength returns the captured byte length and whether it is known.
+func (provenance *Provenance) CapturedLength() (uint64, bool) {
+	if provenance == nil || provenance.ByteLength == nil {
+		return 0, false
+	}
+	return *provenance.ByteLength, true
+}
+
 // Artifact is the bounded metadata returned in tool results.
 type Artifact struct {
-	ID        string    `json:"id"`
-	Kind      string    `json:"kind"`
-	MimeType  string    `json:"mime_type"`
-	SizeBytes int64     `json:"size_bytes"`
-	SHA256    string    `json:"sha256"`
-	ContextID string    `json:"context_id"`
-	CreatedAt time.Time `json:"created_at"`
+	ID         string      `json:"id"`
+	Kind       string      `json:"kind"`
+	MimeType   string      `json:"mime_type"`
+	SizeBytes  int64       `json:"size_bytes"`
+	SHA256     string      `json:"sha256"`
+	ContextID  string      `json:"context_id"`
+	CreatedAt  time.Time   `json:"created_at"`
+	Provenance *Provenance `json:"provenance,omitempty"`
 }
 
 // Store persists immutable artifacts on disk with an in-memory index.
@@ -96,8 +187,18 @@ func (store *Store) ExpireOlderThan(ttl time.Duration) (int, error) {
 	return removed, nil
 }
 
-// Put writes one immutable artifact and returns its descriptor.
+// Put writes one immutable artifact without capture metadata. Artifacts
+// stored this way are reported with the honest provenance_unknown state;
+// producers that can attach capture facts should use PutWithProvenance.
 func (store *Store) Put(contextID, kind, mimeType string, data []byte) (Artifact, error) {
+	return store.PutWithProvenance(contextID, kind, mimeType, data, nil)
+}
+
+// PutWithProvenance writes one immutable artifact and returns its descriptor.
+// A nil provenance stores the artifact with the provenance_unknown state;
+// otherwise the envelope is stamped with the versioned schema and the
+// complete state, and stored immutably with the artifact's metadata.
+func (store *Store) PutWithProvenance(contextID, kind, mimeType string, data []byte, provenance *Provenance) (Artifact, error) {
 	id, err := newID()
 	if err != nil {
 		return Artifact{}, err
@@ -111,6 +212,17 @@ func (store *Store) Put(contextID, kind, mimeType string, data []byte) (Artifact
 		SHA256:    hex.EncodeToString(sum[:]),
 		ContextID: contextID,
 		CreatedAt: time.Now().UTC(),
+	}
+	if provenance != nil {
+		stamped := *provenance
+		stamped.Schema = ProvenanceSchema
+		if stamped.State == "" {
+			stamped.State = ProvenanceStateComplete
+		}
+		if stamped.CapturedAt.IsZero() {
+			stamped.CapturedAt = artifact.CreatedAt
+		}
+		artifact.Provenance = &stamped
 	}
 	if err := os.WriteFile(store.path(id), data, 0o600); err != nil {
 		return Artifact{}, fmt.Errorf("write artifact bytes: %w", err)

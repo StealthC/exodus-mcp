@@ -253,7 +253,7 @@ func resolveContext(server *Server, handle string) (*analysis.Context, *toolFail
 }
 
 func artifactDescriptor(server *Server, stored artifact.Artifact, contextID string) map[string]any {
-	return map[string]any{
+	descriptor := map[string]any{
 		"id":           stored.ID,
 		"kind":         stored.Kind,
 		"mime_type":    stored.MimeType,
@@ -262,6 +262,14 @@ func artifactDescriptor(server *Server, stored artifact.Artifact, contextID stri
 		"url":          fmt.Sprintf("%s/artifacts/%s?context=%s", server.baseURL, stored.ID, contextID),
 		"resource_uri": "exodus://artifacts/" + stored.ID,
 	}
+	if stored.Provenance != nil {
+		descriptor["provenance"] = provenanceEnvelopeView(*stored.Provenance)
+		descriptor["provenance_state"] = stored.Provenance.State
+	} else {
+		descriptor["provenance"] = provenanceUnknownView()
+		descriptor["provenance_state"] = artifact.ProvenanceStateUnknown
+	}
+	return descriptor
 }
 
 func jsonText(value any) string {

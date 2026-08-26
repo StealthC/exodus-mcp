@@ -74,6 +74,11 @@ type Server struct {
 	romPathMu sync.Mutex
 	romPath   string
 
+	// romIdentity caches the file-derived cartridge identity (SHA-256,
+	// header, checksum) per file version for artifact provenance and
+	// rom_info; the provider is always non-nil after NewServer.
+	romIdentity *romIdentityProvider
+
 	// debugMu guards the server-side provenance of MCP-managed breakpoints
 	// and watchpoints (the plugin owns the native resources; the server
 	// records who created them and when).
@@ -124,6 +129,7 @@ func NewServer(version string, client bridge.Client, store *artifact.Store, cont
 		watchpoints: make(map[uint64]debugResourceMeta),
 		freezes:     newFreezeRegistry(),
 		runState:    &runStateTracker{},
+		romIdentity: newROMIdentityProvider(),
 	}
 	// Every control-lock end (release, expiry, context close, bridge loss)
 	// lands in the audit stream with the reason it ended.

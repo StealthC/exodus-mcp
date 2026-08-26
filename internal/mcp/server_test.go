@@ -184,7 +184,7 @@ func TestToolsListDeterministicAndComplete(t *testing.T) {
 		t.Fatal("tools/list order is not deterministic")
 	}
 	expected := []string{
-		"artifact_get", "artifact_preview", "bridge_status", "context_close",
+		"artifact_describe", "artifact_get", "artifact_preview", "bridge_status", "context_close",
 		"context_create", "context_list",
 		"context_mutation_log", "cpu_coverage_capture", "cpu_trace_capture",
 		"cpu_trace_capture_watchpoint",

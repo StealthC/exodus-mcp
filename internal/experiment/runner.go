@@ -100,6 +100,10 @@ type RunRequest struct {
 	InitialStateID string
 	Timeout        time.Duration
 	Exec           Executor
+	// Provenance is the capture envelope stamped onto the manifest artifact
+	// (target generation, ROM identity, capture time); nil keeps the legacy
+	// provenance_unknown state.
+	Provenance *artifact.Provenance
 }
 
 // Runner executes scripts and fixtures. It is safe for concurrent use.
@@ -192,7 +196,7 @@ func (runner *Runner) Run(ctx context.Context, request RunRequest) (*Result, err
 	if err != nil {
 		return nil, fmt.Errorf("encode experiment manifest: %w", err)
 	}
-	manifest, err := runner.store.Put(request.ContextID, "experiment-manifest", "application/json", manifestBytes)
+	manifest, err := runner.store.PutWithProvenance(request.ContextID, "experiment-manifest", "application/json", manifestBytes, request.Provenance)
 	if err != nil {
 		return nil, fmt.Errorf("store experiment manifest: %w", err)
 	}

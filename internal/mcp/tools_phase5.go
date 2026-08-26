@@ -10,8 +10,10 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/StealthC/exodus-mcp/internal/analysis"
+	"github.com/StealthC/exodus-mcp/internal/artifact"
 )
 
 // Phase 5 — Advanced analysis tools. Each tool is artifact-first and either
@@ -60,35 +62,36 @@ func phase5ToolSpecs() []toolSpec {
 		},
 		{
 			name:        "memory_search",
-			description: "Search a consistent snapshot for a raw byte pattern. Without snapshot_id the tool dumps the range into a snapshot artifact first (never a live racy scan); with snapshot_id it searches that artifact without any new read. Reports whether the snapshot read paused a running system (system_paused_during_read). Returns bounded inline matches plus a full-results artifact.",
+			description: "Search a consistent snapshot for a raw byte pattern. Without snapshot_id the tool dumps the range into a snapshot artifact first (never a live racy scan); with snapshot_id it searches that artifact without any new read and derives the address space, start address, byte length, and byte order from the snapshot's capture provenance — caller parameters that duplicate provenance are treated as assertions and rejected with provenance_conflict on mismatch. Snapshots without capture metadata (legacy artifacts) are reported as provenance_unknown and fall back to caller-provided addressing. Reports whether the snapshot read paused a running system (system_paused_during_read). Returns bounded inline matches plus a full-results artifact.",
 			schema: objectSchema(map[string]any{
-				"space":         stringProperty("Address space id from memory_spaces_list; defines the address domain of the matches."),
+				"space":         stringProperty("Address space id from memory_spaces_list; required without snapshot_id or when the snapshot lacks provenance. With a proven snapshot it must match the snapshot's captured space."),
 				"pattern":       stringProperty("Byte pattern as hex with optional spaces, e.g. \"4A 42 41\" or \"4a4241\"."),
 				"start_address": addressProperty(),
 				"length":        integerProperty(fmt.Sprintf("Bytes to scan (default %d when no snapshot is given; must equal the snapshot size with snapshot_id).", dumpCapBytes), 1),
 				"max_matches":   integerProperty(fmt.Sprintf("Maximum inline matches (default %d, cap %d).", defaultSearchMaxMatches, maxSearchMaxMatches), 1),
 				"snapshot_id":   stringProperty("Optional id of a memory-dump or memory-snapshot artifact to search instead of reading again."),
 				"context":       contextProperty(),
-			}, []string{"space", "pattern"}),
+			}, []string{"pattern"}),
 			run: runMemorySearch,
 		},
 		{
 			name:        "memory_diff",
-			description: "Compare two consistent memory snapshots cell-by-cell and report cells matching a comparison mode. Without snapshot_after_id the region is read fresh into a snapshot first (never a live racy scan). Modes: changed, unchanged, increased, decreased, changed_by (signed delta), equal_to (after value), in_range (after value bounds). Width byte/word/long with explicit byte order (default big-endian) and aligned scanning by default. Returns bounded inline matches plus a full-results artifact.",
+			description: "Compare two consistent memory snapshots cell-by-cell and report cells matching a comparison mode. Without snapshot_after_id the region is read fresh into a snapshot first (never a live racy scan). The before snapshot's capture provenance supplies the address space, range, and default byte order; comparing snapshots with incompatible provenance (different space, range, or ROM identity) fails with incompatible_provenance by default — pass allow_incompatible_provenance to force it, and the response warns with both source manifests instead of fabricating a common address origin. Snapshots without capture metadata (legacy) are reported provenance_unknown. Modes: changed, unchanged, increased, decreased, changed_by (signed delta), equal_to (after value), in_range (after value bounds). Width byte/word/long with explicit byte order (default big-endian) and aligned scanning by default. Returns bounded inline matches plus a full-results artifact.",
 			schema: objectSchema(map[string]any{
-				"snapshot_before_id": stringProperty("id of a memory-dump or memory-snapshot artifact representing the earlier state."),
-				"snapshot_after_id":  stringProperty("optional id of a memory-dump or memory-snapshot artifact representing the later state; when omitted, the before range is read fresh into a snapshot before comparing."),
-				"space":              stringProperty("Address space id from memory_spaces_list; required when snapshot_after_id is omitted."),
-				"mode":               enumProperty("Comparison mode.", []string{"changed", "unchanged", "increased", "decreased", "changed_by", "equal_to", "in_range"}),
-				"width":              enumProperty("Cell width. Default byte; word/long cells honor byte_order.", []string{"byte", "word", "long"}),
-				"byte_order":         enumProperty("Byte order for word/long cells. Default big-endian (M68K domain); use little-endian for Z80 RAM cells.", []string{"big-endian", "little-endian"}),
-				"value":              integerProperty("Value for equal_to (unsigned, must fit the width) or the signed delta for changed_by.", 0),
-				"min_value":          integerProperty("Lower bound for in_range.", 0),
-				"max_value":          integerProperty("Upper bound for in_range.", 0),
-				"start_address":      addressProperty(),
-				"max_matches":        integerProperty(fmt.Sprintf("Maximum inline matches (default %d, cap %d).", defaultSearchMaxMatches, maxSearchMaxMatches), 1),
-				"allow_misaligned":   booleanProperty("Scan every cell offset instead of aligning to the cell width in the address domain."),
-				"context":            contextProperty(),
+				"snapshot_before_id":            stringProperty("id of a memory-dump or memory-snapshot artifact representing the earlier state."),
+				"snapshot_after_id":             stringProperty("optional id of a memory-dump or memory-snapshot artifact representing the later state; when omitted, the before range is read fresh into a snapshot before comparing."),
+				"space":                         stringProperty("Address space id from memory_spaces_list; required when snapshot_after_id is omitted and the before snapshot lacks provenance. With a proven before snapshot it must match the captured space."),
+				"mode":                          enumProperty("Comparison mode.", []string{"changed", "unchanged", "increased", "decreased", "changed_by", "equal_to", "in_range"}),
+				"width":                         enumProperty("Cell width. Default byte; word/long cells honor byte_order.", []string{"byte", "word", "long"}),
+				"byte_order":                    enumProperty("Byte order for word/long cells. Defaults to the before snapshot's captured byte order when it has provenance; otherwise big-endian (M68K domain); use little-endian for Z80 RAM cells.", []string{"big-endian", "little-endian"}),
+				"value":                         integerProperty("Value for equal_to (unsigned, must fit the width) or the signed delta for changed_by.", 0),
+				"min_value":                     integerProperty("Lower bound for in_range.", 0),
+				"max_value":                     integerProperty("Upper bound for in_range.", 0),
+				"start_address":                 addressProperty(),
+				"max_matches":                   integerProperty(fmt.Sprintf("Maximum inline matches (default %d, cap %d).", defaultSearchMaxMatches, maxSearchMaxMatches), 1),
+				"allow_misaligned":              booleanProperty("Scan every cell offset instead of aligning to the cell width in the address domain."),
+				"allow_incompatible_provenance": booleanProperty("Compare snapshots whose capture provenance differs (space, range, or ROM identity) and report a prominent warning instead of failing with incompatible_provenance. Never fabricates a common address origin."),
+				"context":                       contextProperty(),
 			}, []string{"snapshot_before_id", "mode"}),
 			run: runMemoryDiff,
 		},
@@ -150,13 +153,166 @@ type memorySearchArgs struct {
 	Context      string `json:"context"`
 }
 
+// provenanceConflict builds the structured failure for a caller parameter that
+// duplicates a proven capture fact and contradicts it.
+func provenanceConflict(parameter string, expected, provided any) *toolFailure {
+	return &toolFailure{
+		Code:    "provenance_conflict",
+		Message: fmt.Sprintf("%s duplicates the snapshot's capture provenance and does not match: provenance says %v, call says %v. Omit the parameter to derive it from the snapshot.", parameter, expected, provided),
+		Data: map[string]any{
+			"parameter":        parameter,
+			"provenance_value": expected,
+			"provided_value":   provided,
+		},
+	}
+}
+
+// resolveSearchSource resolves the byte range memory_search scans over. With a
+// snapshot_id the artifact's capture provenance supplies space, start address,
+// byte length, and byte order; caller duplicates are assertions and rejected
+// on mismatch. Without provenance (legacy artifacts) the caller must supply
+// the addressing and the mismatch with the capture provenance is reported
+// honestly. Without a snapshot the range is read fresh and stored as a
+// proven snapshot artifact.
+func resolveSearchSource(tc toolContext, contextID string, args memorySearchArgs, startAddress uint64, pattern []byte) (searchSource, *toolFailure) {
+	source := searchSource{startAddress: startAddress, byteOrder: ""}
+	if args.SnapshotID == "" {
+		space := strings.TrimSpace(args.Space)
+		if space == "" {
+			return source, &toolFailure{Code: "invalid_params", Message: "space is required when no snapshot_id is given"}
+		}
+		length := args.Length
+		if length == 0 {
+			length = dumpCapBytes
+		}
+		if length < 1 || length > dumpCapBytes {
+			return source, &toolFailure{
+				Code:    "length_out_of_range",
+				Message: fmt.Sprintf("length must be between 1 and %d bytes.", dumpCapBytes),
+			}
+		}
+		raw, byteOrder, effective, pausedDuringRead, failure := readBridgeBytes(tc, space, startAddress, length)
+		if failure != nil {
+			return source, failure
+		}
+		payload := map[string]any{
+			"effective_address":         float64(effective),
+			"byte_order":                byteOrder,
+			"consistency":               "live",
+			"system_paused_during_read": pausedDuringRead,
+		}
+		provenance := captureProvenance(tc.server, "memory-snapshot", space, startAddress, uint64(len(raw)), payload, time.Now().UTC())
+		stored, err := tc.server.store.PutWithProvenance(contextID, "memory-snapshot", "application/octet-stream", raw, provenance)
+		if err != nil {
+			return source, &toolFailure{Code: "artifact_error", Message: err.Error()}
+		}
+		source.bytes = raw
+		source.descriptor = artifactDescriptor(tc.server, stored, contextID)
+		source.provenance = provenance
+		source.startAddress = uint64(effective)
+		source.byteOrder = byteOrder
+		source.pausedDuringRead = pausedDuringRead
+		source.readOrigin = "live read; system_paused_during_read reports whether the snapshot read temporarily paused a running system"
+		source.provenanceNote = "complete"
+		return source, nil
+	}
+
+	meta, err := tc.server.store.Metadata(args.SnapshotID, contextID)
+	if err != nil {
+		return source, &toolFailure{Code: "unknown_artifact", Message: err.Error()}
+	}
+	if meta.Kind != "memory-dump" && meta.Kind != "memory-snapshot" {
+		return source, &toolFailure{
+			Code:    "invalid_params",
+			Message: "snapshot_id must reference a memory-dump or memory-snapshot artifact; got kind " + meta.Kind,
+		}
+	}
+	raw, _, err := tc.server.store.Bytes(args.SnapshotID, contextID)
+	if err != nil {
+		return source, &toolFailure{Code: "artifact_error", Message: err.Error()}
+	}
+	source.bytes = raw
+	source.descriptor = artifactDescriptor(tc.server, meta, contextID)
+	source.pausedDuringRead = false
+	source.readOrigin = "snapshot artifact reused; no new read performed, so system_paused_during_read is false"
+
+	if meta.Provenance != nil && meta.Provenance.Known() {
+		provenance := meta.Provenance
+		derivedStart, _ := provenance.CapturedStart()
+		derivedLength, _ := provenance.CapturedLength()
+		if args.Space != "" && args.Space != provenance.AddressSpace {
+			return source, provenanceConflict("space", provenance.AddressSpace, args.Space)
+		}
+		if args.StartAddress != nil && startAddress != derivedStart {
+			return source, provenanceConflict("start_address", derivedStart, startAddress)
+		}
+		if args.Length != 0 && args.Length != derivedLength {
+			return source, provenanceConflict("length", derivedLength, args.Length)
+		}
+		if args.Length == 0 && derivedLength == 0 {
+			return source, &toolFailure{Code: "invalid_params", Message: "the snapshot's captured byte length is unknown; pass length explicitly"}
+		}
+		source.startAddress = derivedStart
+		source.byteOrder = provenance.ByteOrder
+		source.provenance = provenance
+		source.provenanceNote = "complete"
+		return source, nil
+	}
+
+	// Legacy artifact: no capture metadata. The caller's addressing anchors
+	// the scan; the result is honest about the unknown origin.
+	if strings.TrimSpace(args.Space) == "" {
+		return source, &toolFailure{Code: "invalid_params", Message: "space is required: the snapshot has no capture provenance (legacy artifact) and its address domain cannot be derived"}
+	}
+	if args.Length != 0 && args.Length != uint64(len(raw)) {
+		return source, &toolFailure{
+			Code:    "invalid_params",
+			Message: fmt.Sprintf("length %d does not match the snapshot byte length %d", args.Length, len(raw)),
+		}
+	}
+	source.startAddress = startAddress
+	source.readOrigin = "snapshot artifact reused; the artifact has no capture provenance (provenance_unknown), so matches are anchored to the caller-provided start address " + canonicalHex(startAddress)
+	source.provenanceNote = "provenance_unknown"
+	return source, nil
+}
+
+// searchSource is the resolved byte range and its provenance for one search.
+type searchSource struct {
+	bytes            []byte
+	descriptor       map[string]any
+	provenance       *artifact.Provenance
+	startAddress     uint64
+	byteOrder        string
+	pausedDuringRead bool
+	readOrigin       string
+	provenanceNote   string
+}
+
+// sourceRange renders the captured address range of the searched snapshot.
+func (source *searchSource) sourceRange() map[string]any {
+	rangeInfo := map[string]any{
+		"start_address":     source.startAddress,
+		"start_address_hex": canonicalHex(source.startAddress),
+		"byte_length":       len(source.bytes),
+		"end_address":       source.startAddress + uint64(len(source.bytes)) - 1,
+		"end_address_hex":   canonicalHex(source.startAddress + uint64(len(source.bytes)) - 1),
+	}
+	if source.provenance != nil {
+		if source.provenance.EffectiveAddress != nil {
+			rangeInfo["effective_address"] = *source.provenance.EffectiveAddress
+			rangeInfo["effective_address_hex"] = canonicalHex(*source.provenance.EffectiveAddress)
+		}
+		if source.provenance.AddressSpace != "" {
+			rangeInfo["address_space"] = source.provenance.AddressSpace
+		}
+	}
+	return rangeInfo
+}
+
 func runMemorySearch(tc toolContext, args json.RawMessage) map[string]any {
 	parsed, failure := decodeArgs[memorySearchArgs](args)
 	if failure != nil {
 		return failureResult(failure, tc.modern)
-	}
-	if strings.TrimSpace(parsed.Space) == "" {
-		return errorResult("invalid_params", "space is required", tc.modern)
 	}
 	context, failure := resolveContext(tc.server, parsed.Context)
 	if failure != nil {
@@ -186,71 +342,29 @@ func runMemorySearch(tc toolContext, args json.RawMessage) map[string]any {
 		}
 	}
 
-	var snapshotBytes []byte
-	var snapshot = make(map[string]any)
-	// The flag reports whether the snapshot's own (live) read paused the
-	// system; reusing an existing snapshot performs no read at all.
-	pausedDuringReadResult := false
-	snapshotReadOrigin := "snapshot artifact reused; no new read performed, so system_paused_during_read is false"
-	if parsed.SnapshotID != "" {
-		meta, err := tc.server.store.Metadata(parsed.SnapshotID, context.ID)
-		if err != nil {
-			return failureResult(&toolFailure{Code: "unknown_artifact", Message: err.Error()}, tc.modern)
-		}
-		if meta.Kind != "memory-dump" && meta.Kind != "memory-snapshot" {
-			return failureResult(&toolFailure{
-				Code:    "invalid_params",
-				Message: "snapshot_id must reference a memory-dump or memory-snapshot artifact; got kind " + meta.Kind,
-			}, tc.modern)
-		}
-		snapshotBytes, _, err = tc.server.store.Bytes(parsed.SnapshotID, context.ID)
-		if err != nil {
-			return failureResult(&toolFailure{Code: "artifact_error", Message: err.Error()}, tc.modern)
-		}
-		if parsed.Length != 0 && parsed.Length != uint64(len(snapshotBytes)) {
-			return failureResult(&toolFailure{
-				Code:    "invalid_params",
-				Message: fmt.Sprintf("length %d does not match the snapshot byte length %d", parsed.Length, len(snapshotBytes)),
-			}, tc.modern)
-		}
-		snapshot = artifactDescriptor(tc.server, meta, context.ID)
-	} else {
-		length := parsed.Length
-		if length == 0 {
-			length = dumpCapBytes
-		}
-		if length < 1 || length > dumpCapBytes {
-			return failureResult(&toolFailure{
-				Code:    "length_out_of_range",
-				Message: fmt.Sprintf("length must be between 1 and %d bytes.", dumpCapBytes),
-			}, tc.modern)
-		}
-		raw, _, _, pausedDuringRead, failure := readBridgeBytes(tc, parsed.Space, startAddress, length)
-		if failure != nil {
-			return failureResult(failure, tc.modern)
-		}
-		snapshotBytes = raw
-		stored, err := tc.server.store.Put(context.ID, "memory-snapshot", "application/octet-stream", raw)
-		if err != nil {
-			return failureResult(&toolFailure{Code: "artifact_error", Message: err.Error()}, tc.modern)
-		}
-		snapshot = artifactDescriptor(tc.server, stored, context.ID)
-		pausedDuringReadResult = pausedDuringRead
-		snapshotReadOrigin = "live read; system_paused_during_read reports whether the snapshot read temporarily paused a running system"
+	source, failure := resolveSearchSource(tc, context.ID, *parsed, startAddress, pattern)
+	if failure != nil {
+		return failureResult(failure, tc.modern)
 	}
 
-	matches, total, inlineTruncated, artifactTruncated := findPatternMatches(snapshotBytes, pattern, startAddress, maxMatches)
+	spaceID := parsed.Space
+	if source.provenance != nil && source.provenance.AddressSpace != "" {
+		spaceID = source.provenance.AddressSpace
+	}
+	matches, total, inlineTruncated, artifactTruncated := findPatternMatches(source.bytes, pattern, source.startAddress, maxMatches)
 
 	patternHex := strings.ToUpper(hex.EncodeToString(pattern))
 	results := map[string]any{
 		"kind":                 "memory-search-results",
-		"address_space":        parsed.Space,
+		"address_space":        spaceID,
 		"pattern_hex":          patternHex,
 		"pattern_length_bytes": len(pattern),
 		"interpretation":       "matches are byte addresses in the address space; the pattern is raw bytes in address order and no endian interpretation is applied",
+		"source_snapshot":      source.descriptor,
+		"source_range":         source.sourceRange(),
 		"range": map[string]any{
-			"start_address": startAddress,
-			"byte_length":   len(snapshotBytes),
+			"start_address": source.startAddress,
+			"byte_length":   len(source.bytes),
 		},
 		"matches_total": total,
 		"truncated":     artifactTruncated,
@@ -260,27 +374,36 @@ func runMemorySearch(tc toolContext, args json.RawMessage) map[string]any {
 	if err != nil {
 		return failureResult(&toolFailure{Code: "artifact_error", Message: err.Error()}, tc.modern)
 	}
-	storedResults, err := tc.server.store.Put(context.ID, "memory-search-results", "application/json", resultsBytes)
+	storedResults, err := tc.server.store.PutWithProvenance(context.ID, "memory-search-results", "application/json", resultsBytes, genericProvenance(tc.server, "memory-search-results", time.Now().UTC()))
 	if err != nil {
 		return failureResult(&toolFailure{Code: "artifact_error", Message: err.Error()}, tc.modern)
 	}
 
+	summary := map[string]any{
+		"kind":                       "memory-search",
+		"address_space":              spaceID,
+		"pattern_hex":                patternHex,
+		"pattern_length_bytes":       len(pattern),
+		"interpretation":             "matches are byte addresses; raw pattern bytes preserve address order and are never decoded",
+		"searched_start_address":     source.startAddress,
+		"searched_start_address_hex": canonicalHex(source.startAddress),
+		"searched_byte_length":       len(source.bytes),
+		"matches_total":              total,
+		"inline_matches_shown":       len(matches.Inline),
+		"matches_truncated":          inlineTruncated,
+		"system_paused_during_read":  source.pausedDuringRead,
+		"snapshot_read_note":         source.readOrigin,
+		"snapshot":                   source.descriptor,
+		"source_range":               source.sourceRange(),
+	}
+	if source.byteOrder != "" {
+		summary["byte_order"] = source.byteOrder
+	}
+	if source.provenanceNote == "provenance_unknown" {
+		summary["provenance_warning"] = "The searched snapshot has no capture provenance (provenance_unknown, legacy artifact); its address origin cannot be verified and matches are anchored to the caller-provided start address."
+	}
 	return okResult(map[string]any{
-		"summary": map[string]any{
-			"kind":                      "memory-search",
-			"address_space":             parsed.Space,
-			"pattern_hex":               patternHex,
-			"pattern_length_bytes":      len(pattern),
-			"interpretation":            "matches are byte addresses; raw pattern bytes preserve address order and are never decoded",
-			"searched_start_address":    startAddress,
-			"searched_byte_length":      len(snapshotBytes),
-			"matches_total":             total,
-			"inline_matches_shown":      len(matches.Inline),
-			"matches_truncated":         inlineTruncated,
-			"system_paused_during_read": pausedDuringReadResult,
-			"snapshot_read_note":        snapshotReadOrigin,
-			"snapshot":                  snapshot,
-		},
+		"summary":  summary,
 		"matches":  matches.Inline,
 		"artifact": artifactDescriptor(tc.server, storedResults, context.ID),
 	}, tc.modern)
@@ -349,19 +472,20 @@ func parseHexPattern(raw string) ([]byte, *toolFailure) {
 // ----------------------------------------------------------------------------------------------------------------------
 
 type memoryDiffArgs struct {
-	SnapshotBeforeID string  `json:"snapshot_before_id"`
-	SnapshotAfterID  string  `json:"snapshot_after_id"`
-	Space            string  `json:"space"`
-	Mode             string  `json:"mode"`
-	Width            string  `json:"width"`
-	ByteOrder        string  `json:"byte_order"`
-	Value            *int64  `json:"value"`
-	MinValue         *uint64 `json:"min_value"`
-	MaxValue         *uint64 `json:"max_value"`
-	StartAddress     any     `json:"start_address"`
-	MaxMatches       uint64  `json:"max_matches"`
-	AllowMisaligned  bool    `json:"allow_misaligned"`
-	Context          string  `json:"context"`
+	SnapshotBeforeID            string  `json:"snapshot_before_id"`
+	SnapshotAfterID             string  `json:"snapshot_after_id"`
+	Space                       string  `json:"space"`
+	Mode                        string  `json:"mode"`
+	Width                       string  `json:"width"`
+	ByteOrder                   string  `json:"byte_order"`
+	Value                       *int64  `json:"value"`
+	MinValue                    *uint64 `json:"min_value"`
+	MaxValue                    *uint64 `json:"max_value"`
+	StartAddress                any     `json:"start_address"`
+	MaxMatches                  uint64  `json:"max_matches"`
+	AllowMisaligned             bool    `json:"allow_misaligned"`
+	AllowIncompatibleProvenance bool    `json:"allow_incompatible_provenance"`
+	Context                     string  `json:"context"`
 }
 
 // diffWidths maps the width argument to its byte size.
@@ -384,23 +508,110 @@ func maxCellValue(width int) uint64 {
 }
 
 // loadDiffSnapshot resolves one memory snapshot artifact and returns its raw
-// bytes, its descriptor, and the space used for a fresh read when needed.
-func loadDiffSnapshot(tc toolContext, contextID, id string) ([]byte, map[string]any, *toolFailure) {
+// bytes, its descriptor, its provenance (nil for legacy artifacts), and the
+// space used for a fresh read when needed.
+func loadDiffSnapshot(tc toolContext, contextID, id string) ([]byte, map[string]any, *artifact.Provenance, *toolFailure) {
 	meta, err := tc.server.store.Metadata(id, contextID)
 	if err != nil {
-		return nil, nil, &toolFailure{Code: "unknown_artifact", Message: err.Error()}
+		return nil, nil, nil, &toolFailure{Code: "unknown_artifact", Message: err.Error()}
 	}
 	if meta.Kind != "memory-dump" && meta.Kind != "memory-snapshot" {
-		return nil, nil, &toolFailure{
+		return nil, nil, nil, &toolFailure{
 			Code:    "invalid_params",
 			Message: "snapshot ids must reference memory-dump or memory-snapshot artifacts; got kind " + meta.Kind,
 		}
 	}
 	data, _, err := tc.server.store.Bytes(id, contextID)
 	if err != nil {
-		return nil, nil, &toolFailure{Code: "artifact_error", Message: err.Error()}
+		return nil, nil, nil, &toolFailure{Code: "artifact_error", Message: err.Error()}
 	}
-	return data, artifactDescriptor(tc.server, meta, contextID), nil
+	return data, artifactDescriptor(tc.server, meta, contextID), meta.Provenance, nil
+}
+
+// provenanceCompatibility compares two proven snapshots and reports whether
+// their address domain and ROM identity match. Provenance may be nil on either
+// side (legacy artifacts); a nil side is reported as unknown rather than
+// incompatible, and the caller decides how to proceed.
+type provenanceCompatibility struct {
+	compatible  bool
+	unknownSide string   // "before", "after", or "" when both are proven
+	reasons     []string // why the proven sides are incompatible
+}
+
+func compareProvenance(before, after *artifact.Provenance) provenanceCompatibility {
+	if !before.Known() || !after.Known() {
+		side := ""
+		if !before.Known() && !after.Known() {
+			side = "both snapshots"
+		} else if !before.Known() {
+			side = "the before snapshot"
+		} else {
+			side = "the after snapshot"
+		}
+		return provenanceCompatibility{compatible: true, unknownSide: side}
+	}
+	reasons := []string{}
+	if before.AddressSpace != after.AddressSpace {
+		reasons = append(reasons, fmt.Sprintf("address space differs: %s vs %s", before.AddressSpace, after.AddressSpace))
+	}
+	beforeStart, _ := before.CapturedStart()
+	afterStart, _ := after.CapturedStart()
+	if beforeStart != afterStart {
+		reasons = append(reasons, fmt.Sprintf("captured start address differs: %s vs %s", canonicalHex(beforeStart), canonicalHex(afterStart)))
+	}
+	beforeLength, _ := before.CapturedLength()
+	afterLength, _ := after.CapturedLength()
+	if beforeLength != afterLength {
+		reasons = append(reasons, fmt.Sprintf("captured byte length differs: %d vs %d", beforeLength, afterLength))
+	}
+	if before.ROMSHA256 != "" || after.ROMSHA256 != "" {
+		if before.ROMSHA256 != after.ROMSHA256 {
+			reasons = append(reasons, "ROM identity differs (rom_sha256)")
+		}
+	} else if before.ROMPath != "" || after.ROMPath != "" {
+		if before.ROMPath != after.ROMPath {
+			reasons = append(reasons, "ROM identity differs (rom_path)")
+		}
+	}
+	return provenanceCompatibility{compatible: len(reasons) == 0, reasons: reasons}
+}
+
+// incompatibleProvenanceFailure builds the structured rejection for a
+// cross-domain comparison, carrying both source manifests for the agent.
+func incompatibleProvenanceFailure(reasons []string, beforeDescriptor, afterDescriptor map[string]any) *toolFailure {
+	message := "snapshots have incompatible capture provenance: " + strings.Join(reasons, "; ")
+	if afterDescriptor == nil {
+		message += ". Pass allow_incompatible_provenance: true to read the after range from the caller-supplied space anyway; the result then carries a prominent warning and never fabricates a common address origin."
+	} else {
+		message += ". Pass allow_incompatible_provenance: true to compare them anyway; the result then carries a prominent warning with both source manifests and never fabricates a common address origin."
+	}
+	data := map[string]any{
+		"reasons":         reasons,
+		"before_snapshot": beforeDescriptor,
+	}
+	if afterDescriptor != nil {
+		data["after_snapshot"] = afterDescriptor
+	}
+	return &toolFailure{Code: "incompatible_provenance", Message: message, Data: data}
+}
+
+// provenanceWarning renders the prominent cross-domain warning used when an
+// incompatible or unknown-provenance comparison is forced.
+func provenanceWarning(kind string, compatibility provenanceCompatibility, beforeDescriptor, afterDescriptor map[string]any) string {
+	anchor := "the before snapshot's captured range"
+	if provenance, ok := beforeDescriptor["provenance"].(map[string]any); ok {
+		if hexValue, present := provenance["effective_address_hex"].(string); present && hexValue != "" {
+			anchor = "the before snapshot's captured range (" + hexValue + ")"
+		}
+	}
+	switch kind {
+	case "forced":
+		return "WARNING: comparing snapshots with incompatible capture provenance (" + strings.Join(compatibility.reasons, "; ") + "). The result is anchored to " + anchor + "; no common address origin was fabricated. See both source manifests below."
+	case "unknown":
+		return "WARNING: " + compatibility.unknownSide + " has no capture provenance (provenance_unknown, legacy artifact); its address origin cannot be verified. The result is anchored to " + anchor + " when known, otherwise to the caller-provided start address."
+	default:
+		return ""
+	}
 }
 
 func runMemoryDiff(tc toolContext, args json.RawMessage) map[string]any {
@@ -465,9 +676,9 @@ func runMemoryDiff(tc toolContext, args json.RawMessage) map[string]any {
 	if failure != nil {
 		return failureResult(failure, tc.modern)
 	}
-	startAddress := uint64(0)
+	requestedStart := uint64(0)
 	if parsed.StartAddress != nil {
-		startAddress, failure = parseAddress(parsed.StartAddress)
+		requestedStart, failure = parseAddress(parsed.StartAddress)
 		if failure != nil {
 			return failureResult(failure, tc.modern)
 		}
@@ -483,7 +694,7 @@ func runMemoryDiff(tc toolContext, args json.RawMessage) map[string]any {
 		}, tc.modern)
 	}
 
-	beforeBytes, beforeSnapshot, failure := loadDiffSnapshot(tc, context.ID, parsed.SnapshotBeforeID)
+	beforeBytes, beforeSnapshot, beforeProvenance, failure := loadDiffSnapshot(tc, context.ID, parsed.SnapshotBeforeID)
 	if failure != nil {
 		return failureResult(failure, tc.modern)
 	}
@@ -491,11 +702,30 @@ func runMemoryDiff(tc toolContext, args json.RawMessage) map[string]any {
 		return failureResult(&toolFailure{Code: "invalid_params", Message: "the before snapshot is empty; nothing to compare."}, tc.modern)
 	}
 
+	// The comparison's address domain derives from the before snapshot's
+	// capture provenance; caller parameters that duplicate provenance are
+	// assertions and are rejected on mismatch.
+	startAddress := requestedStart
+	beforeProven := beforeProvenance != nil && beforeProvenance.Known()
+	if beforeProven {
+		if derivedStart, ok := beforeProvenance.CapturedStart(); ok {
+			if parsed.StartAddress != nil && requestedStart != derivedStart {
+				return failureResult(provenanceConflict("start_address", derivedStart, requestedStart), tc.modern)
+			}
+			startAddress = derivedStart
+		}
+	}
+	if parsed.ByteOrder == "" && beforeProven && beforeProvenance.ByteOrder != "" {
+		byteOrder = beforeProvenance.ByteOrder
+	}
+
 	var afterBytes []byte
 	var afterSnapshot map[string]any
+	var afterProvenance *artifact.Provenance
 	freshAfterRead := false
+	warning := ""
 	if parsed.SnapshotAfterID != "" {
-		afterBytes, afterSnapshot, failure = loadDiffSnapshot(tc, context.ID, parsed.SnapshotAfterID)
+		afterBytes, afterSnapshot, afterProvenance, failure = loadDiffSnapshot(tc, context.ID, parsed.SnapshotAfterID)
 		if failure != nil {
 			return failureResult(failure, tc.modern)
 		}
@@ -505,21 +735,61 @@ func runMemoryDiff(tc toolContext, args json.RawMessage) map[string]any {
 				Message: fmt.Sprintf("snapshot lengths differ: before %d bytes, after %d bytes; both snapshots must cover the same range", len(beforeBytes), len(afterBytes)),
 			}, tc.modern)
 		}
-	} else {
-		if parsed.Space == "" {
-			return errorResult("invalid_params", "space is required when snapshot_after_id is omitted", tc.modern)
+		compatibility := compareProvenance(beforeProvenance, afterProvenance)
+		if !compatibility.compatible {
+			if !parsed.AllowIncompatibleProvenance {
+				return failureResult(incompatibleProvenanceFailure(compatibility.reasons, beforeSnapshot, afterSnapshot), tc.modern)
+			}
+			warning = provenanceWarning("forced", compatibility, beforeSnapshot, afterSnapshot)
+		} else if compatibility.unknownSide != "" {
+			warning = provenanceWarning("unknown", compatibility, beforeSnapshot, afterSnapshot)
 		}
-		raw, _, _, _, failure := readBridgeBytes(tc, parsed.Space, startAddress, uint64(len(beforeBytes)))
+	} else {
+		// Fresh after read: capture the same proven range again, never a live
+		// racy scan. With proven provenance the space/start are derived;
+		// contradicting them is an incompatible-comparison case.
+		space := strings.TrimSpace(parsed.Space)
+		freshStart := startAddress
+		if beforeProven {
+			if beforeProvenance.AddressSpace == "" {
+				return failureResult(&toolFailure{Code: "invalid_params", Message: "the before snapshot's provenance names no address space; pass space explicitly"}, tc.modern)
+			}
+			if space != "" && space != beforeProvenance.AddressSpace {
+				if !parsed.AllowIncompatibleProvenance {
+					return failureResult(incompatibleProvenanceFailure(
+						[]string{fmt.Sprintf("address space differs: %s (provenance) vs %s (call)", beforeProvenance.AddressSpace, space)},
+						beforeSnapshot, nil), tc.modern)
+				}
+				warning = "WARNING: the fresh after read uses caller space " + space + " while the before snapshot was captured in " + beforeProvenance.AddressSpace + "; the result is anchored to the before snapshot's captured range and no common address origin is fabricated."
+			} else {
+				space = beforeProvenance.AddressSpace
+			}
+		}
+		if space == "" {
+			return errorResult("invalid_params", "space is required when snapshot_after_id is omitted and the before snapshot has no capture provenance", tc.modern)
+		}
+		raw, spaceOrder, effective, pausedDuringRead, failure := readBridgeBytes(tc, space, freshStart, uint64(len(beforeBytes)))
 		if failure != nil {
 			return failureResult(failure, tc.modern)
 		}
-		afterBytes = raw
-		stored, err := tc.server.store.Put(context.ID, "memory-snapshot", "application/octet-stream", raw)
+		payload := map[string]any{
+			"effective_address":         float64(effective),
+			"byte_order":                spaceOrder,
+			"consistency":               "live",
+			"system_paused_during_read": pausedDuringRead,
+		}
+		provenance := captureProvenance(tc.server, "memory-snapshot", space, freshStart, uint64(len(raw)), payload, time.Now().UTC())
+		stored, err := tc.server.store.PutWithProvenance(context.ID, "memory-snapshot", "application/octet-stream", raw, provenance)
 		if err != nil {
 			return failureResult(&toolFailure{Code: "artifact_error", Message: err.Error()}, tc.modern)
 		}
+		afterBytes = raw
 		afterSnapshot = artifactDescriptor(tc.server, stored, context.ID)
+		afterProvenance = provenance
 		freshAfterRead = true
+		if warning == "" && (beforeProvenance == nil || !beforeProvenance.Known()) {
+			warning = provenanceWarning("unknown", provenanceCompatibility{unknownSide: "the before snapshot"}, beforeSnapshot, afterSnapshot)
+		}
 	}
 
 	// Alignment policy: by default the scan is aligned to the cell width in
@@ -608,11 +878,17 @@ func runMemoryDiff(tc toolContext, args json.RawMessage) map[string]any {
 
 	rangeInfo := map[string]any{
 		"start_address":          startAddress,
+		"start_address_hex":      canonicalHex(startAddress),
+		"end_address":            startAddress + uint64(len(beforeBytes)) - 1,
+		"end_address_hex":        canonicalHex(startAddress + uint64(len(beforeBytes)) - 1),
 		"byte_length":            len(beforeBytes),
 		"width_bytes":            width,
 		"cells_scanned":          cellsScanned,
 		"first_cell_offset":      firstCell,
 		"trailing_bytes_ignored": trailingBytes,
+	}
+	if beforeProvenance != nil && beforeProvenance.AddressSpace != "" {
+		rangeInfo["address_space"] = beforeProvenance.AddressSpace
 	}
 	document := map[string]any{
 		"kind":             "memory-diff-results",
@@ -621,7 +897,7 @@ func runMemoryDiff(tc toolContext, args json.RawMessage) map[string]any {
 		"width_bytes":      width,
 		"byte_order":       byteOrder,
 		"alignment":        alignment,
-		"interpretation":   fmt.Sprintf("cells are compared at %d-byte granularity in address order; the %s representation is applied per cell and %s is the alignment policy", width, byteOrder, alignment),
+		"interpretation":   fmt.Sprintf("cells are compared at %d-byte granularity in address order; the %s representation is applied per cell and %s is the alignment policy. The comparison is anchored to the before snapshot's captured range; no common address origin is fabricated.", width, byteOrder, alignment),
 		"range":            rangeInfo,
 		"before_snapshot":  beforeSnapshot,
 		"after_snapshot":   afterSnapshot,
@@ -629,6 +905,9 @@ func runMemoryDiff(tc toolContext, args json.RawMessage) map[string]any {
 		"matches_total":    total,
 		"truncated":        artifactTruncated,
 		"matches":          records,
+	}
+	if warning != "" {
+		document["provenance_warning"] = warning
 	}
 	if parsed.Mode == "equal_to" {
 		document["value"] = *parsed.Value
@@ -644,7 +923,7 @@ func runMemoryDiff(tc toolContext, args json.RawMessage) map[string]any {
 	if err != nil {
 		return failureResult(&toolFailure{Code: "artifact_error", Message: err.Error()}, tc.modern)
 	}
-	storedResults, err := tc.server.store.Put(context.ID, "memory-diff-results", "application/json", documentBytes)
+	storedResults, err := tc.server.store.PutWithProvenance(context.ID, "memory-diff-results", "application/json", documentBytes, genericProvenance(tc.server, "memory-diff-results", time.Now().UTC()))
 	if err != nil {
 		return failureResult(&toolFailure{Code: "artifact_error", Message: err.Error()}, tc.modern)
 	}
@@ -656,7 +935,7 @@ func runMemoryDiff(tc toolContext, args json.RawMessage) map[string]any {
 		"width_bytes":          width,
 		"byte_order":           byteOrder,
 		"alignment":            alignment,
-		"interpretation":       fmt.Sprintf("cells are compared at %d-byte granularity in address order; the %s representation is applied per cell and %s is the alignment policy", width, byteOrder, alignment),
+		"interpretation":       fmt.Sprintf("cells are compared at %d-byte granularity in address order; the %s representation is applied per cell and %s is the alignment policy. The comparison is anchored to the before snapshot's captured range; no common address origin is fabricated.", width, byteOrder, alignment),
 		"range":                rangeInfo,
 		"before_snapshot":      beforeSnapshot,
 		"after_snapshot":       afterSnapshot,
@@ -665,6 +944,9 @@ func runMemoryDiff(tc toolContext, args json.RawMessage) map[string]any {
 		"inline_matches_shown": len(matches),
 		"matches_truncated":    inlineTruncated,
 		"sha256":               storedResults.SHA256,
+	}
+	if warning != "" {
+		summary["provenance_warning"] = warning
 	}
 	if parsed.Mode == "equal_to" {
 		summary["value"] = *parsed.Value
@@ -893,9 +1175,10 @@ var mdBusMap = []map[string]any{
 
 // mdROMInfo reads the header and ROM body through the M68K bus and returns the
 // full parsed cartridge summary. romSizeBytes is the loaded ROM file size from
-// emulator_status (0 when unknown), used to clamp the checksum range; contextID
-// scopes the header artifact.
-func mdROMInfo(tc toolContext, contextID string, romSizeBytes uint64) (map[string]any, *toolFailure) {
+// emulator_status (0 when unknown), used to clamp the checksum range;
+// paddedSizeBytes is the padded mapping size for the rom_identity view;
+// contextID scopes the header artifact.
+func mdROMInfo(tc toolContext, contextID string, romSizeBytes uint64, paddedSizeBytes uint64) (map[string]any, *toolFailure) {
 	header, byteOrder, effective, _, failure := readBridgeBytes(tc, "m68k-bus", 0x100, 0x100)
 	if failure != nil {
 		return nil, failure
@@ -908,19 +1191,51 @@ func mdROMInfo(tc toolContext, contextID string, romSizeBytes uint64) (map[strin
 	// Checksum body: [0x200, min(declared ROM end + 1, loaded file size)).
 	// Licensed games store the ROM end address in the header; the file size
 	// keeps a broken/generic header from dragging the read past the real ROM.
-	bodyEnd := uint64(parsed.ROMEnd) + 1
-	rangeCapped := false
-	if romSizeBytes > 0 && bodyEnd > romSizeBytes {
-		bodyEnd = romSizeBytes
-		rangeCapped = true
-	}
+	// Completeness is reported explicitly: a range cut by the dump cap or by a
+	// file shorter than the declared body is never presented as full
+	// header-checksum validation.
 	readStart := uint64(0x200)
+	declaredEnd := uint64(parsed.ROMEnd) + 1
+	declaredSane := declaredEnd > readStart && uint64(parsed.ROMEnd) >= uint64(parsed.ROMStart)
+	expectedEnd := declaredEnd
+	if !declaredSane {
+		expectedEnd = romSizeBytes
+	}
+	if romSizeBytes > 0 && expectedEnd > romSizeBytes {
+		expectedEnd = romSizeBytes
+	}
+	expectedLength := uint64(0)
+	if expectedEnd > readStart {
+		expectedLength = expectedEnd - readStart
+	}
+	expectedRange := map[string]any{
+		"start_address": readStart,
+		"end_address":   expectedEnd - 1,
+		"byte_length":   expectedLength,
+	}
+	bodyEnd := expectedEnd
+	rangeCapped := false
+	capReason := "none"
 	if bodyEnd > readStart+dumpCapBytes {
 		bodyEnd = readStart + dumpCapBytes
 		rangeCapped = true
+		capReason = "dump_cap"
+	}
+	if declaredSane && declaredEnd > romSizeBytes && capReason != "dump_cap" {
+		rangeCapped = true
+		capReason = "declared_end_beyond_file"
+	}
+	if !declaredSane && capReason == "none" {
+		rangeCapped = true
+		capReason = "degenerate_declared_range"
 	}
 	computed := uint16(0)
-	checksumRange := map[string]any{"start_address": readStart, "end_address": uint64(0x1FF)}
+	checksumRange := map[string]any{
+		"start_address": readStart,
+		"end_address":   uint64(0x1FF),
+		"byte_length":   uint64(0),
+		"capped":        rangeCapped,
+	}
 	if bodyEnd > readStart {
 		body, _, _, _, failure := readBridgeBytes(tc, "m68k-bus", readStart, bodyEnd-readStart)
 		if failure != nil {
@@ -934,10 +1249,36 @@ func mdROMInfo(tc toolContext, contextID string, romSizeBytes uint64) (map[strin
 			"capped":        rangeCapped,
 		}
 	}
+	checksumComplete := declaredSane && bodyEnd == declaredEnd && !rangeCapped
+	checksumNote := ""
+	if !checksumComplete {
+		checksumNote = fmt.Sprintf("The comparison covers only the range above (%d bytes, %s); it is NOT full header-checksum validation of the declared ROM body (%d bytes).", bodyEnd-readStart, capReason, expectedLength)
+	}
 
 	countries, hardwareCode := decodeRegions(parsed.Region)
 
-	headerArtifact, err := tc.server.store.Put(contextID, "rom-header", "application/octet-stream", header)
+	generation := tc.server.target.Generation()
+	romFacts := tc.server.romIdentity.romFileFacts(tc.server.currentROMPath())
+	headerProvenance := &artifact.Provenance{
+		State:               artifact.ProvenanceStateComplete,
+		Kind:                "rom-header",
+		AddressSpace:        "m68k-bus",
+		StartAddress:        uint64Ptr(0x100),
+		EffectiveAddress:    uint64Ptr(effective),
+		StartAddressHex:     canonicalHex(0x100),
+		EffectiveAddressHex: canonicalHex(effective),
+		ByteLength:          uint64Ptr(0x100),
+		RawByteOrdering:     "address-order",
+		ByteOrder:           byteOrder,
+		SpaceKind:           "bus",
+		Device:              "cartridge ROM",
+		TargetGeneration:    &generation,
+		ROMSHA256:           romFacts.SHA256,
+		ROMPath:             tc.server.currentROMPath(),
+		Consistency:         "live",
+		CapturedAt:          time.Now().UTC(),
+	}
+	headerArtifact, err := tc.server.store.PutWithProvenance(contextID, "rom-header", "application/octet-stream", header, headerProvenance)
 	if err != nil {
 		return nil, &toolFailure{Code: "artifact_error", Message: err.Error()}
 	}
@@ -956,11 +1297,26 @@ func mdROMInfo(tc toolContext, contextID string, romSizeBytes uint64) (map[strin
 		}
 	}
 
+	checksumView := map[string]any{
+		"stored":         parsed.Checksum,
+		"computed":       computed,
+		"matches":        parsed.Checksum == computed,
+		"complete":       checksumComplete,
+		"bytes_covered":  checksumRange["byte_length"],
+		"expected_range": expectedRange,
+		"cap_reason":     capReason,
+		"range":          checksumRange,
+	}
+	if checksumNote != "" {
+		checksumView["note"] = checksumNote
+	}
+
 	result := map[string]any{
 		"identified":        true,
 		"byte_order":        "big-endian (M68K cartridge header; the bus read reported " + byteOrder + ")",
 		"effective_address": effective,
 		"loaded_size_bytes": romSizeBytes,
+		"rom_identity":      tc.server.romIdentityView(paddedSizeBytes),
 		"header": map[string]any{
 			"system_type":   parsed.SystemType,
 			"copyright":     parsed.Copyright,
@@ -970,12 +1326,7 @@ func mdROMInfo(tc toolContext, contextID string, romSizeBytes uint64) (map[strin
 			"io_support":    parsed.IOSupport,
 			"modem":         parsed.Modem,
 			"memo":          parsed.Memo,
-			"checksum": map[string]any{
-				"stored":   parsed.Checksum,
-				"computed": computed,
-				"matches":  parsed.Checksum == computed,
-				"range":    checksumRange,
-			},
+			"checksum":      checksumView,
 			"backup_ram": map[string]any{
 				"present":       parsed.SRAMPresent,
 				"type":          parsed.SRAMType,
@@ -996,6 +1347,9 @@ func mdROMInfo(tc toolContext, contextID string, romSizeBytes uint64) (map[strin
 	return result, nil
 }
 
+// uint64Ptr is a small helper for building provenance envelopes.
+func uint64Ptr(value uint64) *uint64 { return &value }
+
 func runROMInfo(tc toolContext, args json.RawMessage) map[string]any {
 	parsed, failure := decodeArgs[struct{ Context string }](args)
 	if failure != nil {
@@ -1009,7 +1363,7 @@ func runROMInfo(tc toolContext, args json.RawMessage) map[string]any {
 	if failure != nil {
 		return failureResult(failure, tc.modern)
 	}
-	info, failure := mdROMInfo(tc, context.ID, status.Rom.SizeBytes)
+	info, failure := mdROMInfo(tc, context.ID, status.Rom.SizeBytes, status.Rom.PaddedSizeBytes)
 	if failure != nil {
 		return failureResult(failure, tc.modern)
 	}
@@ -1095,17 +1449,28 @@ func runCpuTraceCaptureWatchpoint(tc toolContext, args json.RawMessage) map[stri
 }
 
 // traceArtifactFromPayload turns a trace_capture payload into a stored
-// text artifact plus a compact inline summary.
+// text artifact plus a compact inline summary. The artifact carries capture
+// provenance naming the CPU, its bus address domain, target generation, and
+// ROM identity at capture time.
 func traceArtifactFromPayload(tc toolContext, context *analysis.Context, payload map[string]any) (map[string]any, map[string]any, *toolFailure) {
 	traceText, _ := payload["trace_text"].(string)
-	stored, err := tc.server.store.Put(context.ID, "cpu-trace", "text/plain; charset=utf-8", []byte(traceText))
+	cpu, _ := payload["cpu"].(string)
+	provenance := genericProvenance(tc.server, "cpu-trace", time.Now().UTC())
+	provenance.Device = cpu
+	if cpu == "z80" {
+		provenance.AddressSpace = "z80-bus"
+		provenance.ByteOrder = "little-endian"
+	} else {
+		provenance.AddressSpace = "m68k-bus"
+		provenance.ByteOrder = "big-endian"
+	}
+	stored, err := tc.server.store.PutWithProvenance(context.ID, "cpu-trace", "text/plain; charset=utf-8", []byte(traceText), provenance)
 	if err != nil {
 		return nil, nil, &toolFailure{Code: "artifact_error", Message: err.Error()}
 	}
 	delete(payload, "trace_text")
 	captured, _ := payload["captured"].(float64)
 	timedOut, _ := payload["timed_out"].(bool)
-	cpu, _ := payload["cpu"].(string)
 	sample, _ := payload["sample"].([]any)
 	captureChannel, _ := payload["capture_channel"].(string)
 
@@ -1247,7 +1612,7 @@ func runCpuCoverageCapture(tc toolContext, args json.RawMessage) map[string]any 
 	if err != nil {
 		return failureResult(&toolFailure{Code: "artifact_error", Message: err.Error()}, tc.modern)
 	}
-	stored, err := tc.server.store.Put(context.ID, "cpu-coverage", "application/json", documentBytes)
+	stored, err := tc.server.store.PutWithProvenance(context.ID, "cpu-coverage", "application/json", documentBytes, coverageProvenance(tc, parsed.CPU, regionStart, regionEnd))
 	if err != nil {
 		return failureResult(&toolFailure{Code: "artifact_error", Message: err.Error()}, tc.modern)
 	}
@@ -1268,6 +1633,30 @@ func runCpuCoverageCapture(tc toolContext, args json.RawMessage) map[string]any 
 		"artifact": artifactDescriptor(tc.server, stored, context.ID),
 	}
 	return okResult(stampGenerations(result, before, after), tc.modern)
+}
+
+// coverageProvenance builds the capture envelope for one coverage artifact:
+// the CPU's bus address domain over the requested region plus target and ROM
+// identity at capture time. The region window is recorded as the captured
+// address domain; the executed-address set itself lives in the document.
+func coverageProvenance(tc toolContext, cpu string, regionStart, regionEnd uint64) *artifact.Provenance {
+	provenance := genericProvenance(tc.server, "cpu-coverage", time.Now().UTC())
+	start := regionStart
+	length := regionEnd - regionStart
+	if cpu == "z80" {
+		provenance.AddressSpace = "z80-bus"
+		provenance.ByteOrder = "little-endian"
+	} else {
+		provenance.AddressSpace = "m68k-bus"
+		provenance.ByteOrder = "big-endian"
+	}
+	provenance.Device = cpu
+	provenance.StartAddress = &start
+	provenance.EffectiveAddress = &start
+	provenance.StartAddressHex = canonicalHex(start)
+	provenance.EffectiveAddressHex = canonicalHex(start)
+	provenance.ByteLength = &length
+	return provenance
 }
 
 // parseTraceAddresses reads the leading hex address of every trace line
