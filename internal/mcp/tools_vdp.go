@@ -17,7 +17,7 @@ func vdpToolSpecs() []toolSpec {
 	return []toolSpec{
 		{
 			name:        "vdp_status",
-			description: "Report Mega Drive VDP registers, decoded key fields, and image buffer geometry.",
+			description: "Report Mega Drive VDP registers, decoded key fields, and image buffer geometry. Register state is read without pausing the system (system_paused_during_read is false).",
 			schema:      objectSchema(map[string]any{}, nil),
 			run:         runVdpStatus,
 		},
@@ -35,7 +35,7 @@ func vdpToolSpecs() []toolSpec {
 		},
 		{
 			name:        "vdp_sprite_table",
-			description: "Decode the VDP sprite attribute table from VRAM: positions, size, tile mapping, palette, priority, and link-chain order with cycle detection. Bounded paging over at most 80 entries.",
+			description: "Decode the VDP sprite attribute table from VRAM: positions, size, tile mapping, palette, priority, link-chain order with cycle detection, and whether the read paused a running system (system_paused_during_read). Reports chain_visible_count (hardware-rendered link-chain length), table_entry_count (populated entries), and a warning when the chain renders fewer sprites than the table holds. Bounded paging over at most 80 entries.",
 			schema: objectSchema(map[string]any{
 				"offset":  integerProperty("First sprite index to return (default 0, max 79).", 0),
 				"count":   integerProperty(fmt.Sprintf("Entry count between 1 and %d (default %d). The link chain always covers the whole table.", vdpSpriteTableMaxEntries, defaultVDPSpritePage), 0),
@@ -45,13 +45,13 @@ func vdpToolSpecs() []toolSpec {
 		},
 		{
 			name:        "vdp_palette_export",
-			description: "Export CRAM as four 16-color palette lines: a PNG swatch artifact, a JSON decode artifact, and a compact structural summary.",
+			description: "Export CRAM as four 16-color palette lines: a PNG swatch artifact, a JSON decode artifact, and a compact structural summary with capture consistency (system_paused_during_read).",
 			schema:      objectSchema(map[string]any{"context": contextProperty()}, nil),
 			run:         runVDPPaletteExport,
 		},
 		{
 			name:        "vdp_tile_export",
-			description: "Export one or more consecutive 8x8 4bpp VRAM patterns (tiles) as a scaled PNG artifact plus a JSON pixel-decode artifact, colored through a chosen CRAM palette line.",
+			description: "Export one or more consecutive 8x8 4bpp VRAM patterns (tiles) as a scaled PNG artifact plus a JSON pixel-decode artifact, colored through a chosen CRAM palette line. Reports whether any read paused a running system (system_paused_during_read) and coherent_snapshot.",
 			schema: objectSchema(map[string]any{
 				"tile":             integerProperty("First tile index counted from VRAM offset 0 (default 0). Each tile occupies 32 bytes.", 0),
 				"count":            integerProperty(fmt.Sprintf("Consecutive tile count between 1 and %d (default 1).", maxVDPTileStripCount), 1),
@@ -64,7 +64,7 @@ func vdpToolSpecs() []toolSpec {
 		},
 		{
 			name:        "vdp_plane_export",
-			description: "Render a full scroll plane (A, B, or window) from VRAM as an unscrolled texture view: scaled PNG artifact plus JSON structural summary with distinct tiles and priority counts.",
+			description: "Render a full scroll plane (A, B, or window) from VRAM as an unscrolled texture view: scaled PNG artifact plus JSON structural summary with distinct tiles, priority counts, and capture consistency (system_paused_during_read / coherent_snapshot).",
 			schema: objectSchema(map[string]any{
 				"plane":            enumProperty("Which name table to render.", []string{"a", "b", "window"}),
 				"scale":            integerProperty("Nearest-neighbor upscale factor 1-4 (default 1).", 1),
@@ -85,7 +85,7 @@ func vdpToolSpecs() []toolSpec {
 		},
 		{
 			name:        "frame_capture",
-			description: "Capture the current rendered VDP frame as a PNG image artifact.",
+			description: "Capture the current rendered VDP frame as a PNG image artifact. The frame buffer is read without pausing the system, so system_paused_during_read is always false.",
 			schema:      objectSchema(map[string]any{"context": contextProperty()}, nil),
 			run:         runFrameCapture,
 		},
@@ -323,15 +323,16 @@ func runFrameCapture(tc toolContext, args json.RawMessage) map[string]any {
 	frameToken, _ := payload["frame_token"].(float64)
 	return okResult(map[string]any{
 		"summary": map[string]any{
-			"kind":           "frame-capture",
-			"width":          width,
-			"height":         height,
-			"source_format":  "rgb24",
-			"byte_order":     "not-applicable",
-			"consistency":    "live",
-			"frame_token":    uint64(frameToken),
-			"png_size_bytes": pngBuffer.Len(),
-			"sha256":         stored.SHA256,
+			"kind":                      "frame-capture",
+			"width":                     width,
+			"height":                    height,
+			"source_format":             "rgb24",
+			"byte_order":                "not-applicable",
+			"consistency":               "live",
+			"frame_token":               uint64(frameToken),
+			"system_paused_during_read": false,
+			"png_size_bytes":            pngBuffer.Len(),
+			"sha256":                    stored.SHA256,
 		},
 		"artifact": artifactDescriptor(tc.server, stored, context.ID),
 	}, tc.modern)
@@ -378,22 +379,25 @@ type spriteEntry struct {
 	ScreenX     int  `json:"screen_x"`
 }
 
-// fetchVDPBytes reads raw bytes through the plugin timed-buffer path.
-func fetchVDPBytes(tc toolContext, target string, address uint64, length uint64) ([]byte, *toolFailure) {
+// fetchVDPBytes reads raw bytes through the plugin timed-buffer path and
+// reports whether the read temporarily paused a running system (the plugin
+// stops and restores when the buffer's worker threads would otherwise race).
+func fetchVDPBytes(tc toolContext, target string, address uint64, length uint64) ([]byte, bool, *toolFailure) {
 	payload, failure := tc.server.executeCommand(tc.ctx, "vdp_mem_read", map[string]string{
 		"target":  target,
 		"address": strconv.FormatUint(address, 10),
 		"length":  strconv.FormatUint(length, 10),
 	})
 	if failure != nil {
-		return nil, failure
+		return nil, false, failure
 	}
 	rawDataBase64, _ := payload["data"].(string)
 	raw, err := base64.StdEncoding.DecodeString(rawDataBase64)
 	if err != nil {
-		return nil, &toolFailure{Code: "bridge_error", Message: "decode base64 vdp payload: " + err.Error()}
+		return nil, false, &toolFailure{Code: "bridge_error", Message: "decode base64 vdp payload: " + err.Error()}
 	}
-	return raw, nil
+	pausedDuringRead, _ := payload["system_paused_during_read"].(bool)
+	return raw, pausedDuringRead, nil
 }
 
 // fetchVRAMSize resolves the active VRAM byte size from the status payload so
@@ -445,7 +449,7 @@ func runVDPSpriteTable(tc toolContext, args json.RawMessage) map[string]any {
 	if remaining := (vramSize - base) / 8; remaining < uint64(fetchCount) {
 		fetchCount = int(remaining)
 	}
-	raw, failure := fetchVDPBytes(tc, "vram", base, uint64(fetchCount)*8)
+	raw, pausedDuringRead, failure := fetchVDPBytes(tc, "vram", base, uint64(fetchCount)*8)
 	if failure != nil {
 		return failureResult(failure, tc.modern)
 	}
@@ -457,20 +461,50 @@ func runVDPSpriteTable(tc toolContext, args json.RawMessage) map[string]any {
 	}
 	window := all[offset:windowEnd]
 	chain := walkLinkChain(all, vdpSpriteTableMaxEntries)
+	chainVisible, _ := chain["length"].(int)
+	tableEntryCount := populatedSpriteEntryCount(all)
+
+	// The hardware renders exactly the link-chain entries; a table with more
+	// populated entries than visible chain entries means the links were
+	// mid-update or stale relative to the rendered frame.
+	warning := ""
+	if tableEntryCount > chainVisible {
+		warning = fmt.Sprintf("link chain renders %d of %d entries; verify against the rendered frame (system may have been mid-update)", chainVisible, tableEntryCount)
+	}
 
 	value := map[string]any{
-		"address_space":       "315-5313 VRAM",
-		"sprite_table_base":   base,
-		"byte_order":          "big-endian",
-		"consistency":         "live",
-		"entries":             window,
-		"returned_entries":    len(window),
-		"table_entries_valid": len(all),
-		"paging":              map[string]any{"offset": offset, "count": len(window)},
-		"chain":               chain,
-		"layout_note":         "8 bytes per entry; X/Y are 9-bit offsets minus 128; link occupies bits 8-14 of word 1; chain starts at sprite 0 and ends when a link returns 0.",
+		"address_space":             "315-5313 VRAM",
+		"sprite_table_base":         base,
+		"byte_order":                "big-endian",
+		"consistency":               "live",
+		"system_paused_during_read": pausedDuringRead,
+		"entries":                   window,
+		"returned_entries":          len(window),
+		"table_entries_valid":       len(all),
+		"paging":                    map[string]any{"offset": offset, "count": len(window)},
+		"chain":                     chain,
+		"chain_visible_count":       chainVisible,
+		"table_entry_count":         tableEntryCount,
+		"warning":                   warning,
+		"layout_note":               "8 bytes per entry; X/Y are 9-bit offsets minus 128; link occupies bits 8-14 of word 1; chain starts at sprite 0 and ends when a link returns 0. chain_visible_count is the hardware-rendered link-chain length; table_entry_count counts populated table entries (any nonzero field), so a mid-update table can hold more entries than the chain renders.",
 	}
 	return okResult(value, tc.modern)
+}
+
+// populatedSpriteEntryCount counts table entries with at least one nonzero
+// decoded field. A fully zero entry (all four words zero) is an unused slot:
+// Y=0, X=0, tile=0, link=0, size 1x1, palette 0 — indistinguishable from an
+// intentionally empty entry on real hardware.
+func populatedSpriteEntryCount(entries []spriteEntry) int {
+	count := 0
+	for _, entry := range entries {
+		if entry.YRaw != 0 || entry.XRaw != 0 || entry.Tile != 0 || entry.Link != 0 ||
+			entry.Palette != 0 || entry.Priority || entry.HFlip || entry.VFlip ||
+			entry.WidthCells != 1 || entry.HeightCells != 1 {
+			count++
+		}
+	}
+	return count
 }
 
 func parseSpriteEntries(raw []byte) []spriteEntry {
@@ -559,7 +593,7 @@ func runVDPPaletteExport(tc toolContext, args json.RawMessage) map[string]any {
 	if failure != nil {
 		return failureResult(failure, tc.modern)
 	}
-	raw, failure := fetchVDPBytes(tc, "cram", 0, 128)
+	raw, pausedDuringRead, failure := fetchVDPBytes(tc, "cram", 0, 128)
 	if failure != nil {
 		return failureResult(failure, tc.modern)
 	}
@@ -595,18 +629,19 @@ func runVDPPaletteExport(tc toolContext, args json.RawMessage) map[string]any {
 	}
 	return okResult(map[string]any{
 		"summary": map[string]any{
-			"kind":             "vdp-palette",
-			"line_count":       4,
-			"colors_per_line":  16,
-			"nonzero_per_line": linesNonZero,
-			"backdrop_color":   decoded[0]["color_hex"],
-			"color_format":     "9-bit RGB expanded to 8-bit",
-			"byte_order":       "big-endian",
-			"consistency":      "live",
-			"png_size_bytes":   pngBuffer.Len(),
-			"png_sha256":       pngStored.SHA256,
-			"json_size_bytes":  len(jsonDocument),
-			"json_sha256":      jsonStored.SHA256,
+			"kind":                      "vdp-palette",
+			"line_count":                4,
+			"colors_per_line":           16,
+			"nonzero_per_line":          linesNonZero,
+			"backdrop_color":            decoded[0]["color_hex"],
+			"color_format":              "9-bit RGB expanded to 8-bit",
+			"byte_order":                "big-endian",
+			"consistency":               "live",
+			"system_paused_during_read": pausedDuringRead,
+			"png_size_bytes":            pngBuffer.Len(),
+			"png_sha256":                pngStored.SHA256,
+			"json_size_bytes":           len(jsonDocument),
+			"json_sha256":               jsonStored.SHA256,
 		},
 		"artifacts": []map[string]any{
 			artifactDescriptor(tc.server, pngStored, context.ID),
@@ -961,22 +996,23 @@ func runVDPTileExport(tc toolContext, args json.RawMessage) map[string]any {
 
 	return okResult(map[string]any{
 		"summary": map[string]any{
-			"kind":                    "vdp-tiles",
-			"tile_count":              count,
-			"tile_size_bytes":         mdTileSizeBytes,
-			"bpp":                     4,
-			"vram_address_start":      firstByte,
-			"vram_address_end":        firstByte + totalBytes - 1,
-			"palette_line":            parsed.Palette,
-			"nonzero_pixels_per_tile": nonzeroPerTile,
-			"coherent_snapshot":       coherent,
-			"consistency":             "live",
-			"byte_order":              "big-endian",
-			"layout_note":             "Each tile is 8x8 4bpp: four bytes per row, two pixels per byte, high nibble left. Pixel 0 is transparent unless transparent_zero is false.",
-			"png_size_bytes":          pngBuffer.Len(),
-			"png_sha256":              pngStored.SHA256,
-			"json_size_bytes":         len(jsonDocument),
-			"json_sha256":             jsonStored.SHA256,
+			"kind":                      "vdp-tiles",
+			"tile_count":                count,
+			"tile_size_bytes":           mdTileSizeBytes,
+			"bpp":                       4,
+			"vram_address_start":        firstByte,
+			"vram_address_end":          firstByte + totalBytes - 1,
+			"palette_line":              parsed.Palette,
+			"nonzero_pixels_per_tile":   nonzeroPerTile,
+			"coherent_snapshot":         coherent,
+			"system_paused_during_read": !coherent,
+			"consistency":               "live",
+			"byte_order":                "big-endian",
+			"layout_note":               "Each tile is 8x8 4bpp: four bytes per row, two pixels per byte, high nibble left. Pixel 0 is transparent unless transparent_zero is false. system_paused_during_read is true when any chunked read had to pause a running system; coherent_snapshot is true only when every chunk found it already paused.",
+			"png_size_bytes":            pngBuffer.Len(),
+			"png_sha256":                pngStored.SHA256,
+			"json_size_bytes":           len(jsonDocument),
+			"json_sha256":               jsonStored.SHA256,
 		},
 		"artifacts": []map[string]any{pngDescriptor, jsonDescriptor},
 	}, tc.modern)
@@ -1122,25 +1158,26 @@ func runVDPPlaneExport(tc toolContext, args json.RawMessage) map[string]any {
 
 	return okResult(map[string]any{
 		"summary": map[string]any{
-			"kind":              "vdp-plane",
-			"plane":             parsed.Plane,
-			"name_table_base":   nameTableBase,
-			"size_cells":        []int{widthCells, heightCells},
-			"png_size_bytes":    pngBuffer.Len(),
-			"png_width":         width,
-			"png_height":        height,
-			"png_sha256":        pngStored.SHA256,
-			"json_size_bytes":   len(jsonDocument),
-			"json_sha256":       jsonStored.SHA256,
-			"distinct_tiles":    len(histogram),
-			"priority_entries":  priorityEntries,
-			"invalid_entries":   invalidEntries,
-			"truncated":         truncated,
-			"interlace_active":  interlaceActive,
-			"coherent_snapshot": coherent,
-			"consistency":       "live",
-			"byte_order":        "big-endian",
-			"notes":             notes,
+			"kind":                      "vdp-plane",
+			"plane":                     parsed.Plane,
+			"name_table_base":           nameTableBase,
+			"size_cells":                []int{widthCells, heightCells},
+			"png_size_bytes":            pngBuffer.Len(),
+			"png_width":                 width,
+			"png_height":                height,
+			"png_sha256":                pngStored.SHA256,
+			"json_size_bytes":           len(jsonDocument),
+			"json_sha256":               jsonStored.SHA256,
+			"distinct_tiles":            len(histogram),
+			"priority_entries":          priorityEntries,
+			"invalid_entries":           invalidEntries,
+			"truncated":                 truncated,
+			"interlace_active":          interlaceActive,
+			"coherent_snapshot":         coherent,
+			"system_paused_during_read": !coherent,
+			"consistency":               "live",
+			"byte_order":                "big-endian",
+			"notes":                     notes,
 		},
 		"artifacts": []map[string]any{pngDescriptor, jsonDescriptor},
 	}, tc.modern)
@@ -1186,5 +1223,8 @@ func runVDPPixelInfo(tc toolContext, args json.RawMessage) map[string]any {
 	payload["address_space"] = "315-5313 completed image buffer"
 	payload["coordinate_space"] = "completed frame buffer coordinates, including border and blanking regions"
 	payload["consistency"] = "live"
+	// Pixel attribution reads the completed render buffer under the VDP's own
+	// lock; the handler never pauses the system for it.
+	payload["system_paused_during_read"] = false
 	return okResult(payload, tc.modern)
 }
