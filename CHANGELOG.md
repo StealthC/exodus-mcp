@@ -90,6 +90,31 @@ and this project will use [Semantic Versioning](https://semver.org/spec/v2.0.0.h
   `memory_freeze_clear` drops every entry at once. Validated by unit tests and
   the live smoke (pinning across a running window, write-count growth,
   per-entry removal, bulk clear).
+- Honest capture consistency everywhere: `system_paused_during_read` now
+  propagates to `memory_read`, `memory_dump`, `memory_search`,
+  `vdp_sprite_table`, `vdp_tile_export`, `vdp_plane_export`,
+  `vdp_palette_export`, `vdp_pixel_info`, and `frame_capture` (today it
+  existed only on `vdp_memory_read`). The flag reports whether the handler
+  paused a running system to sample and restored it afterwards; no tool's
+  run-state behavior changed.
+- Run-state observability: `emulator_status` reports `pause_source` (`mcp`,
+  `ui_or_external`, `breakpoint_or_watchpoint`, `unknown`) and
+  `last_run_state_change` (UTC). The server attributes the state to the last
+  run-state-affecting MCP action (cpu controls, steps, `frame_advance`,
+  `state_load`, `rom_load`); transitions observed without any MCP action
+  (UI pauses, other bridge clients, native stops) land in the audit stream
+  as `run_state_change` events with the observed target generation and never
+  advance it.
+- Address-domain hardening: `memory_spaces_list` reports each space's bus
+  mapping (`bus`, `bus_base`, `bus_offset` with the documented Mega Drive
+  baseline: RAM → `0xFF0000`, Z80 RAM → `0xA00000`, ROM → `0x000000`, VDP
+  buffers explain why they are not linearly mapped); `out_of_range` failures
+  from `memory_read`/`memory_dump` include the valid canonical hex range; and
+  `memory_dump` now returns an `effective_address` like `memory_read` does.
+- `vdp_sprite_table` chain-vs-table divergence: `chain_visible_count`
+  (hardware-rendered link-chain length) next to `table_entry_count`
+  (populated entries), with a `warning` when the chain renders fewer sprites
+  than the table holds (mid-update or stale links).
 
 ### Changed
 

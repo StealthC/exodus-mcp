@@ -208,6 +208,16 @@ value, register set, VDP table, and frame describe the same emulated instant.
   `composite_non_atomic`; state whether execution was paused by the tool,
   whether it was resumed afterwards, and the observed initial/final frame
   tokens and run states.
+- [x] Propagate the existing `system_paused_during_read` flag (today only on
+  `vdp_memory_read`) to every read tool: `memory_read`, `memory_dump`,
+  `memory_search`, `vdp_sprite_table`, `vdp_tile_export`, `vdp_plane_export`,
+  `vdp_palette_export`, `vdp_pixel_info`, and `frame_capture`. Validated
+  2026-08-25 during a live Kid Chameleon RE session: the flag was the only
+  signal that a multi-byte sprite table was sampled from a running system,
+  and its absence on sibling reads forced a forensic cross-check instead of
+  an inline answer. **Delivered 2026-08-25**: the flag is propagated to all
+  nine read tools; no tool's run-state behavior changed (the flag reports
+  only).
 - [ ] Add a bounded paused memory snapshot operation. It accepts one or more
   named ranges, pauses once if necessary, reads them all while paused, restores
   the original run state, and returns a manifest linking all produced raw
@@ -229,6 +239,46 @@ value, register set, VDP table, and frame describe the same emulated instant.
 one pause/resume cycle and matching capture ids; a deliberately changing RAM
 counter demonstrates the difference between `live` and paused captures; VDP
 exports never claim coherence when VRAM and CRAM came from different frames.
+
+### P1 - Run-state observability — delivered 2026-08-25
+
+**Problem:** an agent cannot tell from any single response whether the emulator
+is running or paused at that instant, who paused it, or when the run state last
+changed. In a live session, `emulator_status.system_running` flipped between
+responses while the user believed the system was paused; the audit log proved no
+MCP mutation caused it (the pause came from the emulator UI, which is invisible
+to the audit stream). Reconstructing the timeline required reading the audit
+log, the plugin source, and the frame token — evidence that should be one field.
+
+- [x] `emulator_status` must report `system_running`, `pause_source`
+  (`"mcp"`, `"ui_or_external"`, `"breakpoint_or_watchpoint"`, `"unknown"`),
+  and `last_run_state_change` (UTC timestamp). The server derives the source by
+  comparing the observed run state against the last run-state-affecting action
+  it issued; the plugin exposes the stop reason when the native API provides it.
+  **Delivered 2026-08-25**: `pause_source`/`last_run_state_change` are
+  reported; `breakpoint_or_watchpoint` is reserved for a native stop reason
+  the plugin does not expose yet, so native stops currently resolve to
+  `ui_or_external`.
+- [x] Record externally observed run-state transitions (paused→running,
+  running→paused seen on any call without a corresponding MCP action) in the
+  global audit stream as `run_state_change` events with observed generation and
+  frame token, so UI-initiated pauses stop being invisible.
+  **Delivered 2026-08-25**: external transitions are audited with the observed
+  target generation (never advancing it); the frame token is included when the
+  observing bridge operation provides one (`emulator_status` does not yet).
+- [x] State the relationship between `target_generation` and run state in tool
+  descriptions: generation advances on MCP run-state mutations, but UI-initiated
+  transitions do not claim a generation. Do not silently advance generation on
+  observed external transitions unless the contract is updated and documented
+  together with the audit event. **Delivered 2026-08-25**: documented in
+  `emulator_status` and the CPU-control tool descriptions.
+
+**Acceptance checks:** with the emulator running in the UI and no MCP action,
+`emulator_status` reports `pause_source: "ui_or_external"` and a
+`last_run_state_change` timestamp; the next call after the user pauses in the UI
+shows an audited `run_state_change` with the pre-transition generation; MCP
+`cpu_pause`/`cpu_run` report `"mcp"`; a breakpoint stop reports the stop reason
+when available.
 
 ### P1 - Schema and response contract hardening
 
@@ -258,6 +308,19 @@ agent orchestration and generated clients unnecessarily unreliable.
   `memory_spaces_list` must report real readable and writable capabilities
   instead of unconditionally overwriting permissions with `read` while the
   server exposes `memory_write` for some spaces.
+- [x] `memory_spaces_list` must report each space's bus mapping
+  (`bus_base`/`bus_offset`), because space-relative addresses are otherwise
+  ambiguous (validated 2026-08-25: `memory_dump` on `mem-ram` rejected
+  `0xFF0000` with a bare `out_of_range`, and the correct 0-based domain had to
+  be guessed). Error responses for address-range failures must include the
+  valid range in canonical hex. **Delivered 2026-08-25**: `bus`/`bus_base`/
+  `bus_offset` per space (RAM → `0xFF0000`, Z80 RAM → `0xA00000`, ROM →
+  `0x000000`, VDP buffers explain why they are not linearly mapped) and
+  `out_of_range` errors carry the valid range in canonical hex (plugin and
+  server both).
+- [x] `memory_dump` must return an `effective_address` like `memory_read` does,
+  so a caller can verify where the captured bytes actually began.
+  **Delivered 2026-08-25**: the dump summary reports `effective_address`.
 
 **Acceptance checks:** schema fixtures validate every accepted address form and
 reject a typo such as `adress`; generated JSON-schema clients can call all
@@ -360,6 +423,13 @@ manifest plus linked raw and derived artifacts sharing one capture id.
   `vdp_pixel_info` optionally consume a compatible VDP capture manifest rather
   than performing a new live read. This makes repeated inspection deterministic
   and avoids pausing the game repeatedly.
+- [x] `vdp_sprite_table` must surface chain-vs-table divergence: report the
+  link-chain length next to the entry count and add a warning when the chain
+  implies fewer visible sprites than entries (validated 2026-08-25: chain
+  `[0,5]` implied two hardware-rendered sprites while the frame showed all
+  fifteen entries; the ambiguity is only resolvable with the render-manifest
+  and read-consistency fields above). **Delivered 2026-08-25**:
+  `chain_visible_count`, `table_entry_count`, and `warning` are reported.
 
 **Acceptance checks:** all artifacts from one VDP capture share a capture id
 and frame token; a running title screen does not produce a falsely coherent

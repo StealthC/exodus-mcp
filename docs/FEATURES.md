@@ -46,6 +46,17 @@ and integration tests and exercised live against a running Exodus instance
 - **Consistent reads only.** Searches and diffs run over snapshot artifacts
   (never a live racy scan); timed-buffer VDP reads briefly pause a running
   system, restore it afterwards, and report that in the response.
+- **Honest capture consistency.** Every read tool reports
+  `system_paused_during_read` — whether the handler had to pause a running
+  system to sample (and restored it afterwards) — so an agent can tell a
+  temporally atomic capture from a live, internally inconsistent one without
+  inferring it from the tool name.
+- **Run-state observability.** `emulator_status` reports `pause_source`
+  (`mcp` | `ui_or_external` | `breakpoint_or_watchpoint` | `unknown`) and
+  `last_run_state_change` (UTC). Externally observed transitions (UI pauses,
+  other bridge clients, native stops) land in the audit stream as
+  `run_state_change` events with the observed target generation and never
+  advance it — the generation advances only on successful MCP mutations.
 - **System-specific prefixes.** Tools use clear `m68k_`, `z80_`, and `vdp_`
   prefixes rather than pretending behavior is generic.
 
@@ -54,7 +65,14 @@ and integration tests and exercised live against a running Exodus instance
 - `bridge_status`: plugin version, bridge connectivity, lifecycle, and
   initialization module count over the authenticated named pipe.
 - `emulator_status`: loaded modules, running/paused state, device identity,
-  and the current cartridge (path, file size, padded mapping size).
+  and the current cartridge (path, file size, padded mapping size) plus
+  run-state observability: `pause_source` (`mcp` after an MCP
+  pause/run/step/frame-advance/state-load/rom-load; `ui_or_external` when no
+  MCP run-state action explains the state; `breakpoint_or_watchpoint` when the
+  plugin reports a native stop reason; `unknown` before any observation) and
+  `last_run_state_change` (UTC, or a note that the first observation anchors
+  the timestamp). UI/external transitions are audited as `run_state_change`
+  events without advancing `target_generation`.
 - `target_info`: emulator identity, device summary, and a `target_info.rom`
   summary of the loaded cartridge.
 - Analysis contexts: `context_create`, `context_list`, `context_close` with
@@ -69,12 +87,18 @@ and integration tests and exercised live against a running Exodus instance
 ## Memory and artifacts (Phase 1 and Phase 5)
 
 - `memory_spaces_list`: named address spaces with owner device, size, entry
-  width, permissions, and declared byte order.
+  width, permissions, declared byte order, and the processor bus mapping —
+  `bus`, `bus_base`, `bus_offset` with `bus_address = bus_base + bus_offset +
+  space_relative_address` (RAM `mem-ram` → `0xFF0000`, Z80 RAM `mem-z80-ram` →
+  `0xA00000`, ROM → `0x000000`; VDP buffers explain why they are not linearly
+  mapped instead of guessing). Out-of-range failures include the valid
+  canonical hex range.
 - `memory_read`: bounded inline reads with explicit representation,
-  effective-address echo, and decode validation against the declared byte
-  order.
+  effective-address echo, `system_paused_during_read`, and decode validation
+  against the declared byte order.
 - `memory_dump`: artifact-first range output with hash and direct URL
-  (8 MiB per-call cap).
+  (8 MiB per-call cap); the summary reports `effective_address` and
+  `system_paused_during_read`.
 - `memory_write`: debugger-path writes to CPU bus spaces
   (`SetMemorySpaceByte`) and entry-based memory devices (read-modify-write
   honoring byte order); timed-buffer spaces are refused with
@@ -82,7 +106,9 @@ and integration tests and exercised live against a running Exodus instance
   hardware, and every call is audited.
 - `memory_search`: byte-pattern search over a consistent `memory-snapshot`
   artifact (or an existing dump/snapshot by id) — bounded inline matches plus
-  a full-results artifact.
+  a full-results artifact; reports `system_paused_during_read` when the
+  snapshot's live read paused the system, with a note explaining the flag
+  source when a snapshot is reused.
 - `memory_diff`: cheat-finder comparison between two consistent snapshots.
   Cell widths byte/word/long with explicit byte order (big-endian default)
   and aligned scanning by default; modes `changed`, `unchanged`, `increased`,
@@ -145,7 +171,8 @@ and integration tests and exercised live against a running Exodus instance
   completed-plane geometry.
 - `frame_capture`: the live rendered frame as a PNG artifact with frame/timing
   metadata — liveness (frame token advances while running) and paused
-  determinism (identical hashes) validated.
+  determinism (identical hashes) validated. The frame buffer is read without
+  pausing, so `system_paused_during_read` is always false.
 - `vdp_memory_read`: VRAM, CRAM, and VSRAM through the proven timed-buffer
   path. Raw views (`hexdump`, `array_u8`, `raw_base64`), big-endian
   `array_u16` words, and a decoded CRAM view expanding 9-bit RGB entries into
@@ -153,23 +180,30 @@ and integration tests and exercised live against a running Exodus instance
   `system_paused_during_read` when execution had to be stopped.
 - `vdp_tile_export`: consecutive 8x8 4bpp patterns as a scaled PNG plus a JSON
   pixel-index artifact, colored through a chosen CRAM palette line with
-  optional transparent color 0 (high-nibble-left pixel order).
+  optional transparent color 0 (high-nibble-left pixel order). Reports
+  `coherent_snapshot` and `system_paused_during_read` (true when any chunked
+  read had to pause a running system).
 - `vdp_plane_export`: full unscrolled scroll-plane texture view (A, B, or
   window) rendered from the name table with flip, palette, and priority
-  decoding; reports distinct tiles, priority counts, and a
-  `coherent_snapshot` flag.
+  decoding; reports distinct tiles, priority counts, `coherent_snapshot`, and
+  `system_paused_during_read`.
 - `vdp_palette_export`: CRAM as four 16-color lines into a PNG swatch
-  artifact plus a JSON decode artifact, with nonzero counts per line and the
-  backdrop color inline.
+  artifact plus a JSON decode artifact, with nonzero counts per line, the
+  backdrop color inline, and `system_paused_during_read`.
 - `vdp_sprite_table`: decoded sprite attribute table with positions, cell
   sizes, tile mapping, palette, priority, and a globally accurate link-chain
   walk (termination, cycle, dangling-link, and truncation flags), paged over
-  at most 80 entries.
+  at most 80 entries. Reports `chain_visible_count` (hardware-rendered
+  link-chain length), `table_entry_count` (populated entries), and a `warning`
+  when the chain renders fewer sprites than the table holds (mid-update or
+  stale links), plus `system_paused_during_read`.
 - `vdp_pixel_info`: per-pixel rendering attribution from the VDP full image
   buffer — source layer, name-entry mapping with tile/flip/priority, palette
   row and entry, shadow/highlight state with the resolved 8-bit color, h/v
   counters, and sprite cell data. Full image buffer info is enabled lazily and
-  reported as pending until a frame has rendered with it active.
+  reported as pending until a frame has rendered with it active. Read under
+  the VDP's own lock, never pausing the system (`system_paused_during_read`
+  is always false).
 
 ## Controlled experimentation (Phase 4)
 
@@ -194,7 +228,9 @@ and integration tests and exercised live against a running Exodus instance
   generations before/after (or unknown), ROM identity, originating context,
   control-lock provenance, outcome, structured failures, and created or
   invalidated resource ids, with generation/time/tool/context/control filters,
-  pagination, and retained-window metadata on truncated responses.
+  pagination, and retained-window metadata on truncated responses. Externally
+  observed run-state transitions are recorded here as `run_state_change`
+  events with the observed generation (never advancing it).
 - `context_mutation_log`: the per-context projection of the audit stream
   (target mutations only; lock lifecycle stays global).
 - `state_save`, `state_load`, `state_list`: context-scoped system snapshots
