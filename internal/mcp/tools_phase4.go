@@ -82,10 +82,11 @@ func phase4ToolSpecs() []toolSpec {
 		},
 		{
 			name:        "state_load",
-			description: "Load a previously saved system snapshot back into the emulator. The snapshot must belong to the same analysis context and, in practice, to the same loaded ROM: device state from another cartridge is ignored by Exodus with a logged warning. Restores the snapshot's saved run state exactly; the response reports saved_run_state (recorded at state_save time) and final_run_state, so no defensive pause after a restore is needed. Accepts optional expected_target_generation and control_id.",
+			description: "Load a previously saved system snapshot back into the emulator. The snapshot must belong to the same analysis context and, in practice, to the same loaded ROM: device state from another cartridge is ignored by Exodus with a logged warning. Restores the snapshot's saved run state exactly by default (run_state \"restore\"); the response reports saved_run_state (recorded at state_save time) and final_run_state, so no defensive pause after a restore is needed. Optional run_state \"paused\" or \"running\" forces the restored state through a post-load cpu_control issued inside the same control window (audited as part of this tool); an override failure surfaces with the load already applied, never silently. Accepts optional expected_target_generation and control_id.",
 			schema: objectSchema(map[string]any{
 				"context":                    contextProperty(),
 				"state_id":                   stringProperty("Snapshot id returned by state_save."),
+				"run_state":                  enumProperty("Forced restored run state. restore (default) keeps the snapshot's saved run state; paused/running override it with a post-load cpu_control inside the same control window.", []string{"restore", "paused", "running"}),
 				"expected_target_generation": integerProperty("Optional target generation the caller last observed; fails with target_generation_conflict on mismatch.", 1),
 				"control_id":                 stringProperty("Optional control id from target_control_acquire; required while the control lock is active."),
 			}, []string{"state_id"}),
@@ -465,8 +466,9 @@ func runStateSave(tc toolContext, args json.RawMessage) map[string]any {
 }
 
 type stateLoadArgs struct {
-	Context string `json:"context"`
-	StateID string `json:"state_id"`
+	Context  string `json:"context"`
+	StateID  string `json:"state_id"`
+	RunState string `json:"run_state"`
 	guardArgs
 }
 
@@ -478,6 +480,15 @@ func runStateLoad(tc toolContext, args json.RawMessage) map[string]any {
 	context, failure := resolveContext(tc.server, parsed.Context)
 	if failure != nil {
 		return failureResult(failure, tc.modern)
+	}
+	runState := parsed.RunState
+	switch runState {
+	case "", "restore", "paused", "running":
+	default:
+		return failureResult(&toolFailure{Code: "invalid_params", Message: "run_state must be restore, paused, or running"}, tc.modern)
+	}
+	if runState == "" {
+		runState = "restore"
 	}
 	snapshot, err := tc.server.contexts.States.Get(context.ID, parsed.StateID)
 	if err != nil {
@@ -503,20 +514,58 @@ func runStateLoad(tc toolContext, args json.RawMessage) map[string]any {
 		return failureResult(failure, tc.modern)
 	}
 
-	// state_load restores the saved run state; attribute the echoed state to
-	// MCP so emulator_status derives the pause source.
-	recordStateFromPayload(tc.server, payload, false)
+	// Optional run-state override: a composite mutation that issues a
+	// post-load cpu_control inside the same control window, so the restored
+	// machine lands in the requested run state. The override failure is
+	// observable and never silent: the load itself already applied.
+	finalPayload := payload
+	if runState == "paused" || runState == "running" {
+		action := "pause"
+		if runState == "running" {
+			action = "run"
+		}
+		overridePayload, _, _, overrideFailure := tc.server.executeMutation(tc.ctx, mutationCall{
+			tool:      "state_load",
+			operation: "cpu_control",
+			params:    map[string]string{"action": action},
+			guard:     parsed.guard(),
+			contextID: context.ID,
+			detail: map[string]any{
+				"action": action, "reason": "state_load run_state override", "state_id": snapshot.ID,
+			},
+		})
+		if overrideFailure != nil {
+			return failureResult(&toolFailure{
+				Code:    overrideFailure.Code,
+				Message: "state_load applied, but the run_state override failed: " + overrideFailure.Message,
+				Data: map[string]any{
+					"state_loaded":              true,
+					"state_id":                  snapshot.ID,
+					"requested_run_state":       runState,
+					"final_run_state":           runStateLabelFromBool(payload),
+					"run_state_override_failed": true,
+				},
+			}, tc.modern)
+		}
+		recordStateFromPayload(tc.server, overridePayload, runState == "running")
+		finalPayload = overridePayload
+	} else {
+		// state_load restores the saved run state; attribute the echoed state
+		// to MCP so emulator_status derives the pause source.
+		recordStateFromPayload(tc.server, payload, false)
+	}
 	result := map[string]any{
-		"state_id":        snapshot.ID,
-		"sha256":          snapshot.SHA256,
-		"saved_run_state": snapshot.SavedRunState,
-		"final_run_state": runStateLabelFromBool(payload),
+		"state_id":           snapshot.ID,
+		"sha256":             snapshot.SHA256,
+		"saved_run_state":    snapshot.SavedRunState,
+		"final_run_state":    runStateLabelFromBool(finalPayload),
+		"run_state_override": runState,
 		"capture_consistency": map[string]any{
 			"state": consistencyStateRestored,
 			"note":  "The machine now describes the restored snapshot's instant, not a live capture; observations describe the restored state until the system runs again.",
 		},
 	}
-	for key, value := range payload {
+	for key, value := range finalPayload {
 		result[key] = value
 	}
 	return okResult(stampGenerations(result, before, after), tc.modern)

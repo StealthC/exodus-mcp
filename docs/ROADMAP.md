@@ -75,13 +75,17 @@ end of this section.
   and `vdp_capture` (today separate tools with separate capture ids) so
   cross-domain reconstruction such as sprite attribution or RAM-table lookups
   never mixes emulated instants.
-- [ ] One-shot instrumentation and run-until primitives:
+- [x] One-shot instrumentation and run-until primitives: delivered 2026-08-29 —
   `one_shot: true` (auto-remove on hit) on `cpu_breakpoint_set` and
   `cpu_watchpoint_set`, plus `run_until_breakpoint` / `run_until_watchpoint`
   wrappers that pause on completion and return the stop reason, triggering
   PC/address, hit count, and registers — no persistent armed instrumentation
   or polling left behind (`frame_advance` already provides the `run_frames`
-  equivalent).
+  equivalent). The server proves a fired break by its native hit counter
+  (a positive multiple of the break counter N), removes one-shot instruments
+  through the audited mutation path at the next paused observation, and
+  attributes native stops to their managed instrument so `emulator_status`
+  reports `pause_source: breakpoint_or_watchpoint` without plugin changes.
 - [x] `input_sequence`: delivered 2026-08-29 — atomic multi-step controller
   scheduling: one call holds and releases buttons across N frames per step
   (1-64 steps, 1-60 frames), under exclusive control for the whole window
@@ -105,9 +109,11 @@ end of this section.
   (`saved_run_state`, honest `"unknown"` without an observation), `state_save`
   and `state_list` echo it, and `state_load` reports `saved_run_state` plus
   `final_run_state` — no defensive pause after a restore.
-- [ ] `state_load` run-state override: an explicit `run_state: "restore" |
-  "paused" | "running"` to force the restored state (a composite mutation —
-  post-load cpu_control inside the control window; design needed).
+- [x] `state_load` run-state override: delivered 2026-08-29 — an explicit
+  `run_state: "restore" | "paused" | "running"` to force the restored state
+  (a composite mutation — post-load cpu_control inside the same control
+  window; an override failure surfaces with the load already applied, never
+  silently; the default "restore" keeps the snapshot's saved run state).
 - [ ] VDP command/DMA state decoder: expose the VDP command latch and DMA
   configuration (destination, transfer type, address, mode) as a decoded
   read-only view. Feasibility depends on plugin-side access to the VDP

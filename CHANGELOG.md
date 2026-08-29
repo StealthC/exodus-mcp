@@ -289,6 +289,34 @@ and this project will use [Semantic Versioning](https://semver.org/spec/v2.0.0.h
   and `state_list` echo it, and `state_load` reports `saved_run_state` plus
   `final_run_state` so no defensive pause after a restore is needed (roadmap
   Phase 9).
+- `state_load` run-state override (roadmap Phase 9): `run_state: "restore" |
+  "paused" | "running"` forces the restored state through a post-load
+  `cpu_control` inside the same control window, audited under the
+  `state_load` tool; the response reports `run_state_override` and the final
+  run state, and an override failure surfaces with the load already applied
+  (`state_loaded: true`), never silently.
+- One-shot instrumentation (roadmap Phase 9): `one_shot: true` on
+  `cpu_breakpoint_set` / `cpu_watchpoint_set` auto-removes the instrument
+  through the audited mutation path once its native hit counter proves a
+  break fired (a positive multiple of the break counter N), checked by a
+  housekeeping sweep at the next paused observation; the removal lands in the
+  audit stream (`one_shot_sweep`), a structured debug event records the stop
+  evidence, and `emulator_status` reports `one_shot_removals` plus
+  `pause_source: breakpoint_or_watchpoint`.
+- `run_until_breakpoint` / `run_until_watchpoint` (roadmap Phase 9): one-shot
+  run-to-instrument wrappers under exclusive control for the whole window —
+  arm, run, poll (100 ms, cache bypassed) until the instrument proves fired,
+  then report the stop reason, triggering PC, hit count, registers, watched
+  address/access, and debug event id; the instrument is removed on every exit
+  path (success, foreign-pause preemption `run_until_preempted`, timeout
+  `run_until_timeout` with a 30000 ms default window, cancellation), so no
+  armed instrumentation or polling is left behind.
+- Run-state stop attribution: `emulator_status` now reports
+  `pause_source: breakpoint_or_watchpoint` after any MCP-managed
+  breakpoint/watchpoint stop (the tracker remembers the most recently proven
+  native stop; cleared by any MCP run-state action or running observation),
+  and the `run_state_change` audit entry carries the attribution — no plugin
+  changes required.
 - `build-windows.bat` also installs `exodus-mcp.exe` into the Exodus install
   root (`EXODUS_MCP_EXODUS_DIR`) next to the emulator, so the server can be
   started manually from that folder.

@@ -521,6 +521,54 @@ instance (see [Validation](#validation)).
   code path, so a mismatch is a real emulator nondeterminism signal rather
   than a harness artifact.
 
+## Phase 9 workflow ergonomics (one-shot instrumentation, run-until, state override)
+
+- `one_shot: true` on `cpu_breakpoint_set` / `cpu_watchpoint_set`: the server
+  marks the instrument as one-shot in its resource provenance. Whenever the
+  emulator is observed paused, a housekeeping sweep reads the native
+  breakpoint/watchpoint lists and proves a fired break by the native hit
+  counter (a positive multiple of the break counter N — the core increments
+  on every passing location hit and breaks on multiples of N). A fired
+  one-shot instrument is removed through the audited mutation path
+  (`one_shot_sweep` audit entries with `one_shot_hit` detail), a structured
+  debug event records the stop evidence (resource, CPU, triggering PC from
+  `regs_get`, watched address/access for watchpoints, hit count, generation,
+  frame token), and `emulator_status` reports the removals
+  (`one_shot_removals`) plus the attribution. A one-shot instrument that
+  never fires stays armed until it does or until a ROM reload purges managed
+  resources; non-one-shot fired instruments get the attribution but are never
+  removed.
+- `run_until_breakpoint` / `run_until_watchpoint`: one-shot run-to-instrument
+  wrappers. One call arms the instrument (same conditions/access semantics as
+  the set tools), runs the system under exclusive control for the whole
+  window (caller `control_id` reused, otherwise an internal lock), polls
+  `emulator_status` every 100 ms (cache bypassed) until the instrument proves
+  fired, and reports the stop evidence: `stop_reason`, resource id, `hit_count`,
+  `triggering_pc` (+ hex), registers, `pause_source:
+  breakpoint_or_watchpoint`, watched address/access for watchpoints, the
+  debug `event_id`, and the generation span. The instrument is removed on
+  every exit path — success, foreign-pause preemption
+  (`run_until_preempted` with the observed pause source), timeout
+  (`run_until_timeout`, window default 30000 ms, min 100, cap 120000), or
+  caller cancellation — so no armed instrumentation or polling is left
+  behind.
+- Run-state stop attribution: the tracker now remembers the most recently
+  proven native debugger stop per managed instrument, so `emulator_status`
+  reports `pause_source: breakpoint_or_watchpoint` with a note naming the
+  instrument after any MCP breakpoint/watchpoint stop — without plugin
+  changes (the plugin does not expose a stop reason). The attribution is
+  cleared by any MCP run-state action or by observing the system running
+  again, and the `run_state_change` audit entry carries the attribution.
+- `state_load` `run_state` override: `run_state: "restore" | "paused" |
+  "running"` (default `restore` keeps the snapshot's saved run state, exactly
+  today's contract). `paused`/`running` issue a post-load `cpu_control`
+  inside the same control window, audited under the `state_load` tool with
+  `reason: "state_load run_state override"`; the response reports
+  `run_state_override` and the final run state from the overridden payload.
+  An override failure is observable, never silent: the load already applied,
+  and the error carries `state_loaded: true`, the requested state, and the
+  un-overridden `final_run_state`.
+
 ## Operations
 
 - `GET /metrics`: loopback operator endpoint (outside JSON-RPC) with per-tool `calls`/`errors`/`error_rate`, per-artifact-kind `by_kind`+`total`, and `totals`; backed by `Store.OnPut` and `callTool` accounting.
