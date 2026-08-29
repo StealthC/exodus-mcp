@@ -5,13 +5,13 @@ server, grouped by capability. Planned work is tracked in
 [ROADMAP.md](ROADMAP.md); the [CHANGELOG.md](../CHANGELOG.md) records the
 delivery history.
 
-The MCP server currently exposes **80 analysis tools** spanning the delivered
-roadmap phases 0-8: bridge and context foundations, memory and artifact
+The MCP server currently exposes **83 analysis tools** spanning the delivered
+roadmap phases 0-9: bridge and context foundations, memory and artifact
 access, both processors, VDP graphics, deterministic controlled
 experimentation, advanced analysis, evidence annotations, advanced debugging,
-and deterministic replay. Everything below is covered by unit
-and integration tests and exercised live against a running Exodus instance
-(see [Validation](#validation)).
+deterministic replay, and workflow ergonomics. Everything below is covered by
+unit and integration tests and exercised live against a running Exodus
+instance (see [Validation](#validation)).
 
 ## Cross-cutting behavior
 
@@ -38,7 +38,17 @@ and integration tests and exercised live against a running Exodus instance
   bytes preserve address order.
 - **Flexible address formats.** Address arguments accept `$`-prefixed
   Motorola hex, `0x` hex, Zilog `h`-suffixed hex, and decimal integers; every
-  response echoes the canonical parsed address.
+  response echoes the canonical parsed address. Schemas declare addresses as a
+  shared `oneOf` (JSON integer or supported string notation), and tool
+  arguments are strictly decoded: unknown properties are rejected with
+  `invalid_params` naming the full JSON path (`additionalProperties: false`
+  on every object schema).
+- **Stable response contract.** Every successful `structuredContent` (and
+  legacy `content`) carries `result_type` (the tool name) and
+  `schema_version: "1"`. Address-bearing outputs normalize to numeric
+  `address` plus canonical uppercase `address_hex`, `address_space`,
+  `effective_address`/`effective_address_hex` where translation occurred, and
+  `address_width_bits`/`address_mask_hex` where the space is bus-mapped.
 - **Optimistic concurrency.** Every response carries the process-local
   `target_generation` observed at response completion; every target mutation
   reports `target_generation_before`/`after` and accepts an optional
@@ -96,7 +106,12 @@ and integration tests and exercised live against a running Exodus instance
   plugin reports a native stop reason; `unknown` before any observation) and
   `last_run_state_change` (UTC, or a note that the first observation anchors
   the timestamp). UI/external transitions are audited as `run_state_change`
-  events without advancing `target_generation`.
+  events without advancing `target_generation`. The cartridge is reported even
+  when it was loaded through the Exodus UI instead of MCP: `rom.path_source`
+  distinguishes `mcp_load` (tracked from the bridge `rom_load`) from
+  `loaded_module` (recovered from the loaded program module); a UI-loaded
+  cartridge reports the file-derived `size_bytes` with `padded_size_bytes: 0`
+  (unknown, because only the MCP `rom_load` module creation computes it).
 - `target_info`: emulator identity, device summary, and a `target_info.rom`
   summary of the loaded cartridge.
 - Analysis contexts: `context_create`, `context_list`, `context_close` with
@@ -111,12 +126,14 @@ and integration tests and exercised live against a running Exodus instance
 ## Memory and artifacts (Phase 1 and Phase 5)
 
 - `memory_spaces_list`: named address spaces with owner device, size, entry
-  width, permissions, declared byte order, and the processor bus mapping —
-  `bus`, `bus_base`, `bus_offset` with `bus_address = bus_base + bus_offset +
-  space_relative_address` (RAM `mem-ram` → `0xFF0000`, Z80 RAM `mem-z80-ram` →
-  `0xA00000`, ROM → `0x000000`; VDP buffers explain why they are not linearly
-  mapped instead of guessing). Out-of-range failures include the valid
-  canonical hex range.
+  width, real read/write capabilities, declared byte order, and the processor
+  bus mapping — `bus`, `bus_base`, `bus_offset` with `bus_address = bus_base +
+  bus_offset + space_relative_address` (RAM `mem-ram` → `0xFF0000`, Z80 RAM
+  `mem-z80-ram` → `0xA00000`, ROM → `0x000000`; VDP buffers explain why they
+  are not linearly mapped instead of guessing). Capabilities reflect actual
+  writability: VDP timed buffers and `mem-rom`/`mem-boot-rom` report read-only
+  and `memory_write` rejects them with `write_not_supported`. Out-of-range
+  failures include the valid canonical hex range.
 - `memory_read`: bounded inline reads with explicit representation,
   effective-address echo, `system_paused_during_read`, the standardized
   `capture_consistency` object, and decode validation against the declared
@@ -143,7 +160,11 @@ and integration tests and exercised live against a running Exodus instance
   caller parameters that duplicate provenance are assertions and are rejected
   with `provenance_conflict` on mismatch. Snapshots without provenance
   (legacy) warn as `provenance_unknown` and fall back to caller addressing.
-  Reports `system_paused_during_read` when the snapshot's live read paused the
+  Patterns support explicit wildcards (`??`/`?` nibble/byte masks) and
+  optional power-of-two `alignment`; the result artifact serializes the parsed
+  pattern and masks (`parsed_pattern`, `pattern_mask_hex`) so a search is
+  reproducible, and the exact-byte mode is unchanged. Reports
+  `system_paused_during_read` when the snapshot's live read paused the
   system, with a note explaining the flag source when a snapshot is reused.
 - `memory_diff`: cheat-finder comparison between two consistent snapshots.
   Cell widths byte/word/long with explicit byte order (default big-endian,
@@ -213,15 +234,50 @@ and integration tests and exercised live against a running Exodus instance
   is routed through a temporary on-disk file, tracing is configured with the
   system stopped, and the prior run state is restored (the reproducible
   access-violation crash is resolved; see
-  [TRACE-CRASH-INVESTIGATION.md](TRACE-CRASH-INVESTIGATION.md)). The trace
-  artifact carries capture provenance naming the CPU, its bus address domain,
-  target generation, and ROM identity.
+  [TRACE-CRASH-INVESTIGATION.md](TRACE-CRASH-INVESTIGATION.md)). Returns the
+  human-readable `cpu-trace` text plus a versioned `cpu-trace-jsonl` artifact
+  with one JSON event per executed instruction — CPU, address space, PC in
+  numeric and hex form, opcode bytes, instruction length,
+  mnemonic/operands, cycle position, target generation, capture id, and
+  frame token where available — plus typed `control_flow` facts
+  (fallthrough address, resolved branch/call target, branch-taken state,
+  call/return classification, exception/interrupt marker, confidence) that
+  are `unknown`/nil when the native trace does not provide them, never
+  inferred from disassembly text. Optional filters
+  (`address_range_start`/`address_range_end`, `include_rom`/`include_ram`,
+  `retain_repeated`) are stored in provenance and summary. The artifact
+  carries capture provenance naming the CPU, its bus address domain, target
+  generation, and ROM identity.
 - `cpu_trace_capture_watchpoint`: event-driven trace capture — the system
   runs toward a managed watchpoint (even from a paused state) and the window
-  ends when it fires, reporting the fired watchpoint ids and stop reason.
-- `cpu_coverage_capture`: execution coverage artifact from a bounded trace
-  window — distinct executed addresses, merged consecutive-address spans, and
-  a page histogram, with capture provenance over the requested region.
+  ends when it fires, reporting the fired watchpoint ids and stop reason. The
+  result distinguishes the requested watchpoint firing (with an
+  `event`/`event_id` and `linked_trace_capture_id` pointing at the exact stop
+  event), a different managed resource firing, and timeout. The trace
+  artifacts include the structured `debug-event` for the stop.
+- `cpu_debug_events_list`: bounded forensic event history (100 records) with
+  `offset`/`limit` pagination, `truncated` flag, and `total`. Whenever a
+  managed breakpoint or watchpoint stops execution, a structured
+  `debug-event` artifact records the managed resource id, owner context, CPU,
+  triggering PC, address space, watched effective address, access direction,
+  requested range, hit count, target generation, frame token, and timestamp;
+  access width, value before/after, transferred value, and decoded
+  instruction bytes are reported as `null` with a "not exposed by native API"
+  note rather than presenting zero as data. Counter gaps caused by
+  sampling/truncation are preserved via hit-count monotonicity.
+- `cpu_coverage_capture`: execution coverage artifact (`cpu-coverage/2`)
+  from a bounded trace window — the executed address set with execution
+  counts, instruction-aware basic `blocks` (start/end address, instruction
+  and execution counts, member addresses), and observed `edges`
+  (from/to/count), replacing byte-adjacent span merging: a gap between
+  `0x100` and `0x104` no longer implies separate code merely because
+  instruction starts are not byte-adjacent. The artifact carries capture
+  conditions, ROM identity, address-space requirements, optional filters
+  (`include_rom`/`include_ram`/`retain_repeated` plus
+  `region_start`/`region_end`/`max_entries`), legacy `ranges` for
+  compatibility, and per-section `truncation` facts (`source_events`,
+  `decoded_events`, `unique_addresses`, `blocks`, `edges`) — a trace
+  ring/timeout limit is never reported as complete coverage.
 - Symbols: `symbols_set`, `symbols_list`, `symbols_clear`, scoped to an
   analysis context.
 
@@ -246,6 +302,15 @@ and integration tests and exercised live against a running Exodus instance
   standardized `capture_consistency` object (atomic for a paused timed-buffer
   read); optional `capture_mode: "paused"` makes the sample temporally
   atomic.
+- `vdp_memory_export`: artifact-first binary export of arbitrary
+  VRAM/CRAM/VSRAM ranges — the raw bytes land in an immutable
+  `vdp-memory-export` artifact (application/octet-stream) with SHA-256,
+  size, URL, and the versioned provenance envelope (address domain, byte
+  order, device, target generation, honest `capture_consistency`), so large
+  regions never travel as Base64 through tool responses. Target caps are
+  validated server-side (vram 65536, cram 128, vsram 80; length defaults to
+  the full buffer); optional `capture_mode: "paused"` makes the sample
+  temporally atomic (one explicit pause/resume cycle).
 - `vdp_tile_export`: consecutive 8x8 4bpp patterns as a scaled PNG plus a JSON
   pixel-index artifact, colored through a chosen CRAM palette line with
   optional transparent color 0 (high-nibble-left pixel order). Reports
@@ -277,13 +342,45 @@ and integration tests and exercised live against a running Exodus instance
   reported as pending until a frame has rendered with it active. Read under
   the VDP's own lock, never pausing the system (`system_paused_during_read`
   is always false).
+- `vdp_capture`: one bounded atomic VDP capture. It acquires the capture
+  guard once, reads status/registers, the frame buffer, CRAM, VSRAM, selected
+  VRAM ranges, the sprite table, and scroll data, then restores the prior run
+  state; a `vdp-capture-manifest` links all raw and derived artifacts to one
+  `capture_id` and `frame_token`. Callers select expensive components
+  (`include_frame`/`include_cram`/`include_vsram`/`include_vram` with a
+  131072-byte `vram_length` cap/`include_sprite_table`) and the manifest
+  reports each omitted component with its reason. A `vdp-render-manifest`
+  artifact describes one completed frame: display geometry, plane/window
+  configuration, scroll bases and decoded offsets, palette state, sprite
+  link-chain/display order, visible sprite cell bounds, tile/name-table
+  references, priority data, and renderer assumptions. VDP-specific semantics
+  are preserved in every decoded field (big-endian VRAM words, CRAM 9-bit
+  packing, high-nibble-left tile pixel order, name-entry bits, interlace
+  state). `vdp_tile_export`, `vdp_plane_export`, `vdp_sprite_table`, and
+  `vdp_pixel_info` optionally consume a compatible capture via
+  `vdp_capture_id`, making repeated inspection deterministic (byte-identical
+  reuse, `vdp_capture_reused`) and avoiding repeated pauses.
 
 ## Controlled experimentation (Phase 4)
 
 - `rom_load`: controlled local cartridge replacement that preserves the
   previous running state; MCP-managed breakpoints, watchpoints, and frozen
   cell ranges are purged before the module unloads, with one audited
-  invalidation batch naming every affected resource.
+  invalidation batch naming every affected resource. Reloading the same path
+  is the machine-reset equivalent — the module reload reinitializes the
+  system and purges all managed debug resources; to reset a cartridge loaded
+  through the Exodus UI, read its path from `emulator_status.rom.path`
+  (`path_source: "loaded_module"`) and pass it back here.
+- `target_reset`: the discoverable reset tool — `kind: "hard"` performs the
+  documented same-path cartridge reload described under `rom_load` (module
+  reload reinitializes the system and purges all managed debug resources in
+  one audited batch) using the current cartridge path from `emulator_status`,
+  so a cartridge opened through the Exodus UI resets identically to one
+  loaded via MCP. Reports `reset_source: "hard"`, the run state, and the
+  generation span; with no known cartridge it fails read-only with
+  `no_rom_loaded`. `kind: "soft"` is not delivered (a debugger-driven
+  reset-vector jump is under design); register or memory writes are never a
+  documented reset workaround.
 - Target revision: a process-local `target_generation` starts at 1, advances
   exactly once per successful mutation, and is attached to every response,
   resource, snapshot, and audit record. Ambiguous native failures move the
@@ -309,18 +406,30 @@ and integration tests and exercised live against a running Exodus instance
 - `state_save`, `state_load`, `state_list`: context-scoped system snapshots
   through the emulator's native save-state path (ZIP format), each verified
   with SHA-256 and size and carrying provenance (context, target generation,
-  ROM path and SHA-256, optional control id). `state_save` does not mutate the
-  target; `state_load` does and reports before/after generations plus
-  `capture_consistency.state: "state_restored"` (observations describe the
-  restored instant until the system runs again). Lists flag entries stale for
-  the loaded ROM and generation-mismatched while preserving them for
-  historical analysis.
+  ROM path and SHA-256, optional control id, and `saved_run_state` — the last
+  observed run state at save time, honest `"unknown"` without an
+  observation). `state_save` does not mutate the target; `state_load` does
+  and reports before/after generations, `capture_consistency.state:
+  "state_restored"`, `saved_run_state`, and `final_run_state` (observations
+  describe the restored instant until the system runs again; no defensive
+  pause after a restore is needed). Lists flag entries stale for the loaded
+  ROM and generation-mismatched while preserving them for historical
+  analysis.
 - `frame_advance`: pause, execute exactly N rendered VDP frames, pause —
   reports the final frame token, before/after target generations, and times
   out with a diagnostic when the display is not rendering.
 - `input_set`: press/release of up, down, left, right, a, b, c, start, x, y,
   z, and mode on a controller by player port, through the controller device
   input path.
+- `input_sequence`: atomic multi-step controller scheduling — one call holds
+  the listed buttons on one player port for N frames per step (1-64 steps,
+  1-60 frames each; always down → advance → up so no input state is left
+  behind). Runs under exclusive control for the whole window (caller
+  `control_id` reused, otherwise an internal lock), audits every step, ends
+  paused with every button released (a failed step releases its buttons
+  before returning), and reports per-step frame tokens plus the generation
+  span. Lighter than `deterministic_replay`'s state-save/restore ceremony for
+  reproducible title/menu/gameplay traversal.
 
 ## Advanced analysis (Phase 5)
 
@@ -339,6 +448,14 @@ and integration tests and exercised live against a running Exodus instance
   generation); an unreadable file is reported as such instead of inventing
   file-derived facts. Reference tables in
   [SEGA-HEADER.md](SEGA-HEADER.md).
+- `mega_drive_memory_map`: structured operational Mega Drive memory map that
+  combines the reference bus map with the live target — 7 reference regions
+  (ROM, unmapped, Z80 RAM, YM2612, I/O, VDP ports, Work RAM), each with
+  CPU-visible range, mirrors/mask, backing device, read/write capability,
+  timing caveats, byte order, and I/O semantics, plus live existence
+  cross-checked against `memory_spaces_list`. It is distinct from the generic
+  inventory and never implies every reference region exists on the loaded
+  system.
 - `experiment_run`: operator-authored Python 3 scripts (`.py`) or declarative
   fixtures (`.json`) from the configured scripts directory. Scripts talk to
   the Go server over a bounded JSON-lines duplex and may call only an
@@ -472,6 +589,18 @@ reference harness, in addition to unit and integration tests:
   artifacts from different composite captures fails with
   `incompatible_provenance` unless explicitly allowed; `state_load` reports
   `state_restored`.
+- Atomic VDP capture: `vdp_capture` from a running ROM reports exactly one
+  pause/resume cycle with all artifacts sharing one capture id and frame
+  token; capture reuse (`vdp_capture_id`) makes two derived exports
+  byte-identical without pausing; the render manifest identifies the sprite
+  chain and name-table entries validated against `vdp_pixel_info`; VRAM and
+  CRAM from different frames are never claimed coherent.
+- Structured evidence: a synthetic variable-length 68K sequence forms one
+  instruction-aware coverage block; a conditional branch produces two distinct
+  observed edges across captures; Z80 and M68K trace/coverage artifacts retain
+  their own address spaces; a known RAM write yields its debug event with PC,
+  access direction, effective address, target generation, and linked trace,
+  while a watchpoint timeout produces no synthetic event.
 - Optimistic concurrency: two clients sharing one observed generation produce
   exactly one mutation and one `target_generation_conflict`; an unconditional
   single-agent mutation needs no lease or lock; a held control lock rejects

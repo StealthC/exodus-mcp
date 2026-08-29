@@ -204,6 +204,91 @@ and this project will use [Semantic Versioning](https://semver.org/spec/v2.0.0.h
   (hardware-rendered link-chain length) next to `table_entry_count`
   (populated entries), with a `warning` when the chain renders fewer sprites
   than the table holds (mid-update or stale links).
+- `mega_drive_memory_map`: structured operational Mega Drive memory map
+  combining the reference bus map with the live target — 7 reference regions
+  (ROM, unmapped, Z80 RAM, YM2612, I/O, VDP ports, Work RAM) with CPU-visible
+  range, mirrors/mask, backing device, read/write capability, timing caveats,
+  byte order, and I/O semantics, plus live existence cross-checked against
+  `memory_spaces_list`.
+- `memory_search` wildcard patterns and alignment: `??`/`?` nibble/byte
+  wildcards and optional power-of-two `alignment`, with `parsed_pattern` and
+  `pattern_mask_hex` serialized into the result artifact for reproducibility;
+  the exact-byte mode is unchanged.
+- Schema contract hardening: address arguments share one `oneOf` schema
+  (JSON integer or `$`/`0x`/`h`/decimal strings); tool arguments are strictly
+  decoded — unknown properties are rejected with `invalid_params` naming the
+  full JSON path; every successful response injects `result_type` (tool name)
+  and `schema_version: "1"`; address-bearing outputs normalize to numeric
+  `address`, canonical uppercase `address_hex`, `address_space`,
+  `effective_address`/`effective_address_hex`, and
+  `address_width_bits`/`address_mask_hex` where bus-mapped.
+- `cpu_trace_capture` now also returns a versioned `cpu-trace-jsonl` artifact
+  (application/jsonl) with one JSON event per executed instruction (CPU,
+  address space, PC numeric/hex, opcode bytes, instruction length,
+  mnemonic/operands, cycle position, target generation, capture id, frame
+  token) plus typed `control_flow` facts that are `unknown`/nil when the
+  native trace does not provide them — never inferred from disassembly text.
+  Optional filters (`address_range_start`/`address_range_end`,
+  `include_rom`/`include_ram`, `retain_repeated`) are stored in provenance
+  and summary.
+- `cpu_coverage_capture` now emits `cpu-coverage/2`: instruction-aware basic
+  `blocks` (start/end address, instruction and execution counts, member
+  addresses) and observed `edges` (from/to/count) instead of byte-adjacent
+  span merging, plus capture conditions, ROM identity, address-space
+  requirements, filters, legacy `ranges`, and per-section `truncation` facts —
+  a trace ring/timeout limit is never reported as complete coverage.
+- Forensic debug events: whenever a managed breakpoint or watchpoint stops
+  execution, a structured `debug-event` artifact records the managed resource
+  id, owner context, CPU, triggering PC, address space, watched effective
+  address, access direction, requested range, hit count, target generation,
+  frame token, and timestamp; native-unavailable fields (access width, values
+  before/after, transferred value, decoded instruction bytes) are `null` with
+  a documented note, never zero. `cpu_trace_capture_watchpoint` links its
+  trace artifact to the exact stop event and distinguishes timeout, a
+  different resource firing, and the requested watchpoint firing.
+- `cpu_debug_events_list`: bounded forensic event history (100 records) with
+  `offset`/`limit` pagination, `truncated` flag, `total`, and counter-gap
+  preservation via hit-count monotonicity.
+- `vdp_capture`: one bounded atomic VDP capture under the capture guard —
+  status/registers, frame buffer, CRAM, VSRAM, selected VRAM ranges, sprite
+  table, and scroll data — with component selection (`include_frame`,
+  `include_cram`, `include_vsram`, `include_vram` with a 131072-byte
+  `vram_length` cap, `include_sprite_table`) and a `vdp-capture-manifest`
+  linking all artifacts to one `capture_id` and `frame_token`; a
+  `vdp-render-manifest` artifact carries display geometry, plane/window and
+  scroll configuration, palette state, sprite link-chain/display order,
+  tile/name-table references, and renderer assumptions. VDP semantics are
+  preserved (big-endian VRAM words, CRAM 9-bit packing, high-nibble-left tile
+  pixel order, name-entry bits, interlace state). `vdp_tile_export`,
+  `vdp_plane_export`, `vdp_sprite_table`, and `vdp_pixel_info` accept
+  `vdp_capture_id` for deterministic, pause-free byte-identical reuse.
+- `vdp_memory_export`: artifact-first binary export of arbitrary
+  VRAM/CRAM/VSRAM ranges (roadmap Phase 9) — the raw bytes land in an
+  immutable `vdp-memory-export` artifact (application/octet-stream) with
+  SHA-256, size, URL, and the versioned provenance envelope (address domain,
+  byte order, device, target generation, honest `capture_consistency`).
+  Target caps are validated server-side (vram 65536, cram 128, vsram 80;
+  length defaults to the full buffer); optional `capture_mode: "paused"`
+  makes the sample temporally atomic.
+- `input_sequence`: atomic multi-step controller scheduling (roadmap Phase
+  9) — one call holds the listed buttons on one player port for N frames per
+  step (1-64 steps, 1-60 frames; always down → advance → up), under
+  exclusive control for the whole window (caller `control_id` reused or an
+  internal lock), with per-step frame tokens, per-step audit entries, and
+  release of the failed step's buttons before returning — no input state
+  left behind.
+- `target_reset`: discoverable reset tool (roadmap Phase 9) — `kind: "hard"`
+  performs the documented same-path cartridge reload (module reload
+  reinitializes the system and purges all managed debug resources in one
+  audited batch) using the current cartridge path from `emulator_status`,
+  reporting `reset_source: "hard"`, the run state, and the generation span;
+  with no known cartridge it fails read-only with `no_rom_loaded`. `kind:
+  "soft"` is rejected as not delivered (design pending).
+- State run-state contract: snapshots record `saved_run_state` (the last
+  observed run state, honest `"unknown"` without an observation); `state_save`
+  and `state_list` echo it, and `state_load` reports `saved_run_state` plus
+  `final_run_state` so no defensive pause after a restore is needed (roadmap
+  Phase 9).
 - `build-windows.bat` also installs `exodus-mcp.exe` into the Exodus install
   root (`EXODUS_MCP_EXODUS_DIR`) next to the emulator, so the server can be
   started manually from that folder.
@@ -279,6 +364,33 @@ and this project will use [Semantic Versioning](https://semver.org/spec/v2.0.0.h
   checks and the methodology. Restores the initial state afterwards
   (caller-provided `initial_state_id` or a fresh snapshot of the current
   machine).
+- Documentation sync: `docs/ROADMAP.md` now tracks only remaining work — the
+  delivered P0–P2 interoperability backlog, Phase 7 (advanced debugging), and
+  Phase 8 (deterministic replay) sections were removed and replaced by a
+  delivered-status summary pointing at the feature catalog; the delivered
+  `/metrics` item was dropped from Operations; the former backlog
+  cross-cutting delivery rules now stand as "Delivery rules for remaining
+  phases". `docs/FEATURES.md` gained the missing delivered catalog entries
+  (`mega_drive_memory_map`, `vdp_capture`, `cpu_debug_events_list`, JSONL
+  trace, `cpu-coverage/2` blocks/edges, schema contract hardening, wildcard
+  search) and README now reports the full 80-tool catalog with Phases 7-8
+  delivered.
+- `docs/ROADMAP.md` gains Phase 9 (workflow ergonomics, planned) from the
+  2026-08-29 Chakan reverse-engineering session report: `target_reset`,
+  combined atomic system snapshot, one-shot/run-until instrumentation,
+  `input_sequence`, `vdp_memory_export`, dual-form addresses, the
+  `state_load` run-state contract, and a VDP command/DMA decoder, with the
+  report points already covered elsewhere recorded as not re-adopted.
+- Plugin `emulator_status` now reports the cartridge even when it was loaded
+  through the Exodus UI: the plugin recovers the loaded program module's file
+  path (`rom.path_source: "loaded_module"`), stats `size_bytes` from the file,
+  and keeps `padded_size_bytes` unknown (0) because only the MCP `rom_load`
+  module creation computes it (`mcp_load` tracks bridge-loaded cartridges;
+  `none` when nothing is loaded). Plugin version 0.7.1. `rom_load` and
+  `cpu_run` tool descriptions now document the reset recipe: read
+  `emulator_status.rom.path`, reload the same path with `rom_load` (the
+  module reload reinitializes the system and purges all managed debug
+  resources in one audited batch), then `cpu_run` to resume.
 
 ### Removed
 
@@ -289,6 +401,12 @@ and this project will use [Semantic Versioning](https://semver.org/spec/v2.0.0.h
 
 ### Fixed
 
+- Plugin `_romPath`/`_romSizeBytes`/`_romPaddedSizeBytes` were never
+  initialized in the constructor: `emulator_status` could report garbage
+  sizes before the first MCP `rom_load`. The members now default to
+  empty/zero; a discovered (UI-loaded) cartridge reports `size_bytes` from a
+  file stat and `padded_size_bytes: 0` (unknown) instead of uninitialized
+  memory. Surfaced by the new `loaded_module` discovery path.
 - `cpu_breakpoint_set` echoed `break_counter: 0` instead of the documented
   default `1` when `break_on_counter` was false: the plugin's `ParseUnsigned`
   zeroes its output on an absent parameter, and the default restore only ran

@@ -7,12 +7,14 @@ Mega Drive / Genesis ROM analysis.
 The Go server speaks Streamable HTTP at `/mcp` (normative target MCP
 `2026-07-28`, with a bounded legacy initialization-era layer), and drives a
 single Exodus instance through an authenticated local named pipe into a native
-C++ plugin. Currently **64 analysis tools** cover the phased roadmap from
+C++ plugin. Currently **80 analysis tools** cover the phased roadmap from
 bridge/context foundations through VDP graphics, deterministic controlled
-experimentation, and Phase 5 advanced analysis (ROM header parsing, snapshot
-memory search, watchpoint-triggered tracing, coverage, and scripted
-experiments), with optimistic concurrency (target generations, optional
-exclusive control lock) and a global target audit stream. See the
+experimentation, advanced analysis (ROM header parsing, memory map, snapshot
+memory search, watchpoint-triggered tracing, coverage, scripted experiments),
+evidence annotations, advanced debugging (conditional breakpoints, register
+conditions, backtraces, state diff), and deterministic replay — with optimistic
+concurrency (target generations, optional exclusive control lock), a global
+target audit stream, and versioned capture provenance. See the
 [feature catalog](docs/FEATURES.md) for the delivered
 scope and the [roadmap](docs/ROADMAP.md) for planned work.
 
@@ -55,13 +57,14 @@ modern and legacy dispatchers. An overview by roadmap phase:
 - **Phase 0-1 (bridge & memory):** `bridge_status`, `emulator_status`,
   `target_info`, analysis contexts (`context_create`/`list`/`close`),
   `memory_spaces_list`, `memory_read`, `memory_dump`, `artifact_get`,
-  `artifact_preview`.
+  `artifact_preview`, `artifact_describe`.
 - **Phase 2 (processors):** `m68k_registers`/`z80_registers`, per-CPU
   disassembly and memory reads, `symbols_set`/`list`/`clear`,
   `cpu_trace_capture`, `cpu_coverage_capture`.
 - **Phase 3 (VDP & graphics):** `vdp_status`, `vdp_memory_read` (VRAM/CRAM/
   VSRAM), `vdp_tile_export`, `vdp_plane_export`, `vdp_palette_export`,
-  `vdp_sprite_table`, `vdp_pixel_info`, `frame_capture`.
+  `vdp_sprite_table`, `vdp_pixel_info`, `vdp_capture` (atomic capture with
+  render manifest), `frame_capture`.
 - **Phase 4 (controlled experimentation):** `rom_load`, CPU pause/run/step/
   step-over/step-out, MCP-managed breakpoints and watchpoints, optimistic
   concurrency (`target_generation` on every response, optional
@@ -71,8 +74,17 @@ modern and legacy dispatchers. An overview by roadmap phase:
   `input_set`, `state_save`/`state_load`/`state_list`,
   `context_mutation_log`, `target_audit_log`.
 - **Phase 5 (advanced analysis):** `rom_info` (Sega header + checksum),
-  `memory_search`, `memory_diff` (cheat-finder snapshot comparison),
+  `mega_drive_memory_map`, `memory_search`, `memory_diff` (cheat-finder
+  snapshot comparison), `memory_snapshot_capture`,
   `cpu_trace_capture_watchpoint`, `experiment_run`.
+- **Evidence annotations:** `annotation_create`/`get`/`update`/`delete`,
+  `annotation_list`, `annotation_export`/`import` (observation vs hypothesis,
+  ROM/generation stamping, staleness flags).
+- **Phase 7 (advanced debugging):** symbol-aware disassembly, conditional
+  execution breakpoints, `cpu_register_condition_evaluate`, `m68k_backtrace`,
+  `state_diff`.
+- **Phase 8 (deterministic replay):** `deterministic_replay` (record and
+  verify frame-for-frame determinism of an input sequence).
 
 Every tool response is a bounded summary; high-volume output lands in an
 immutable artifact. See [FEATURES.md](docs/FEATURES.md) for the delivered
@@ -139,15 +151,16 @@ contract are in [native-plugin](native-plugin/README.md).
       initialization compatibility; validated by transport tests.
 - [x] Authenticated named-pipe bridge with capability-gated plugin access and
       serialized command scheduler.
-- [x] Phases 0-4 complete and live-validated against Kid Chameleon (bridge,
+- [x] Phases 0-8 delivered and live-validated against Kid Chameleon: bridge,
       memory, CPUs, symbols, VDP/graphics, optimistic concurrency with target
       generations and the optional control lock, audit stream, mutations,
-      states, breakpoints/watchpoints, frames, input).
-- [x] Phase 5 core: `rom_info`, `memory_search`, `memory_diff`,
-      watchpoint-triggered traces, coverage, `experiment_run`.
+      states, breakpoints/watchpoints, frames, input, evidence annotations,
+      advanced debugging, and deterministic replay.
+- [x] Phase 5 core: `rom_info`, `mega_drive_memory_map`, `memory_search`,
+      `memory_diff`, `memory_snapshot_capture`, `experiment_run`.
 - [ ] Multi-instance orchestration (parallel experiments) — remaining Phase 5
-      item; audio analysis (Phase 6), advanced debugging (Phase 7), and
-      deterministic replay (Phase 8) are planned.
+      item; audio analysis (Phase 6) is planned. Fork-side deferred items and
+      release automation are tracked in the roadmap.
 
 See the [feature catalog](docs/FEATURES.md), the [roadmap](docs/ROADMAP.md),
 and the [changelog](CHANGELOG.md) for the delivery history.
