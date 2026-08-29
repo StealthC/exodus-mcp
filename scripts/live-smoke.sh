@@ -647,6 +647,62 @@ print(s)
 		audit_log=$(tool_call "target_audit_log" "{\"limit\": 20}")
 		audit_count=$(json_get "$audit_log" "len(parsed.get('entries', []))" 2>/dev/null)
 		check "target audit stream is queryable" "[ -n \"\$audit_count\" ] && [ \"\$audit_count\" -ge 3 ]"
+
+		step "Phase 9 quick-wins (input_sequence, vdp_memory_export, target_reset, state contract)"
+		# input_sequence: two steps; ends paused with every button released.
+		seq_result=$(tool_call "input_sequence" '{"player": 1, "steps": [{"buttons": ["a"], "frames": 1}, {"buttons": ["b"], "frames": 2}]}')
+		seq_code=$(json_get "$seq_result" "parsed.get('code', '')" 2>/dev/null)
+		if [ "$seq_code" = "controller_not_found" ]; then
+			echo "SKIP  input_sequence (no controller device in the loaded workspace)"
+		else
+			seq_steps=$(json_get "$seq_result" "parsed.get('steps_completed', -1)" 2>/dev/null)
+			check "input_sequence completes all steps" "[ \"\$seq_steps\" = '2' ]"
+			seq_tokens=$(json_get "$seq_result" "len(parsed.get('frame_tokens', []))" 2>/dev/null)
+			check "input_sequence reports per-step frame tokens" "[ \"\$seq_tokens\" = '2' ]"
+		fi
+		# Re-pause so the export samples a temporally stable buffer.
+		tool_call "cpu_pause" >/dev/null
+
+		# vdp_memory_export: full CRAM buffer as a provenanced artifact.
+		exported=$(tool_call "vdp_memory_export" '{"target": "cram", "address": 0}')
+		export_code=$(json_get "$exported" "parsed.get('code', '')" 2>/dev/null)
+		if [ -n "$export_code" ]; then
+			check "vdp_memory_export CRAM full buffer" false
+		else
+			export_len=$(json_get "$exported" "parsed.get('length', -1)" 2>/dev/null)
+			check "vdp_memory_export CRAM full buffer" "[ \"\$export_len\" = '128' ]"
+			export_kind=$(json_get "$exported" "parsed.get('artifact', {}).get('kind', '')" 2>/dev/null)
+			check "vdp_memory_export artifact kind" "[ \"\$export_kind\" = 'vdp-memory-export' ]"
+		fi
+
+		# target_reset hard: uses the smoke-loaded ROM path and ends running;
+		# re-pause afterwards so the state-contract check samples paused.
+		reset_result=$(tool_call "target_reset" '{"kind": "hard"}')
+		reset_code=$(json_get "$reset_result" "parsed.get('code', '')" 2>/dev/null)
+		if [ -n "$reset_code" ]; then
+			check "target_reset hard resets the loaded ROM" false
+		else
+			reset_source=$(json_get "$reset_result" "parsed.get('reset_source', '')" 2>/dev/null)
+			check "target_reset reports reset_source hard" "[ \"\$reset_source\" = 'hard' ]"
+			reset_running=$(json_get "$reset_result" "str(parsed.get('system_running', False)).lower()" 2>/dev/null)
+			check "target_reset leaves the system running" "[ \"\$reset_running\" = 'true' ]"
+			tool_call "cpu_pause" >/dev/null
+		fi
+
+		# State run-state contract: saved_run_state recorded at save time and
+		# echoed on load alongside final_run_state.
+		contract_saved=$(tool_call "state_save" '{"name": "contract"}')
+		contract_state=$(json_get "$contract_saved" "parsed.get('saved_run_state', '')" 2>/dev/null)
+		check "state_save records saved_run_state" "[ -n \"\$contract_state\" ]"
+		contract_id=$(json_get "$contract_saved" "parsed.get('state_id', '')" 2>/dev/null)
+		if [ -z "$contract_id" ]; then
+			check "state_load reports saved and final run state" false
+		else
+			contract_loaded=$(tool_call "state_load" "{\"state_id\": \"$contract_id\"}")
+			contract_saved2=$(json_get "$contract_loaded" "parsed.get('saved_run_state', '')" 2>/dev/null)
+			contract_final=$(json_get "$contract_loaded" "parsed.get('final_run_state', '')" 2>/dev/null)
+			check "state_load reports saved and final run state" "[ -n \"\$contract_saved2\" ] && [ -n \"\$contract_final\" ]"
+		fi
 	fi
 
 	if [ "$was_running" = "True" ] || [ "$was_running" = "true" ]; then

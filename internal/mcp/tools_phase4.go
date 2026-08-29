@@ -82,7 +82,7 @@ func phase4ToolSpecs() []toolSpec {
 		},
 		{
 			name:        "state_load",
-			description: "Load a previously saved system snapshot back into the emulator. The snapshot must belong to the same analysis context and, in practice, to the same loaded ROM: device state from another cartridge is ignored by Exodus with a logged warning. Accepts optional expected_target_generation and control_id.",
+			description: "Load a previously saved system snapshot back into the emulator. The snapshot must belong to the same analysis context and, in practice, to the same loaded ROM: device state from another cartridge is ignored by Exodus with a logged warning. Restores the snapshot's saved run state exactly; the response reports saved_run_state (recorded at state_save time) and final_run_state, so no defensive pause after a restore is needed. Accepts optional expected_target_generation and control_id.",
 			schema: objectSchema(map[string]any{
 				"context":                    contextProperty(),
 				"state_id":                   stringProperty("Snapshot id returned by state_save."),
@@ -93,7 +93,7 @@ func phase4ToolSpecs() []toolSpec {
 		},
 		{
 			name:        "state_save",
-			description: "Pause the system and save a full machine snapshot (CPU, memory, VDP, audio, and device state) through the emulator's native save-state path. The snapshot is anchored to this analysis context, verified with SHA-256, and can be reloaded with state_load. The snapshot records the observed target generation, ROM, and optional control id as provenance.",
+			description: "Pause the system and save a full machine snapshot (CPU, memory, VDP, audio, and device state) through the emulator's native save-state path. The snapshot is anchored to this analysis context, verified with SHA-256, and can be reloaded with state_load. The snapshot records the observed target generation, ROM, saved run state (last observed: running/paused/unknown), and optional control id as provenance.",
 			schema: objectSchema(map[string]any{
 				"context":    contextProperty(),
 				"name":       stringProperty("Optional short name for the snapshot, such as \"before-boss\"."),
@@ -430,6 +430,7 @@ func runStateSave(tc toolContext, args json.RawMessage) map[string]any {
 		ROMSHA256:        tc.server.romIdentity.romFileFacts(tc.server.currentROMPath()).SHA256,
 		ControlID:        parsed.ControlID,
 		TargetGeneration: generation,
+		SavedRunState:    initialRunStateLabel(tc.server),
 	})
 	tc.server.recordAudit(analysis.AuditEntry{
 		Tool:      "state_save",
@@ -437,10 +438,11 @@ func runStateSave(tc toolContext, args json.RawMessage) map[string]any {
 		ControlID: parsed.ControlID,
 		Outcome:   analysis.OutcomeOK,
 		Detail: map[string]any{
-			"state_id": snapshot.ID,
-			"name":     parsed.Name,
-			"sha256":   digest,
-			"size":     info.Size(),
+			"state_id":        snapshot.ID,
+			"name":            parsed.Name,
+			"sha256":          digest,
+			"size":            info.Size(),
+			"saved_run_state": snapshot.SavedRunState,
 		},
 		Result:      map[string]any{"target_generation": generation},
 		ROMBefore:   snapshot.ROMPath,
@@ -454,6 +456,7 @@ func runStateSave(tc toolContext, args json.RawMessage) map[string]any {
 		"size_bytes":        snapshot.SizeBytes,
 		"sha256":            snapshot.SHA256,
 		"target_generation": generation,
+		"saved_run_state":   snapshot.SavedRunState,
 	}
 	for key, value := range payload {
 		result[key] = value
@@ -504,8 +507,10 @@ func runStateLoad(tc toolContext, args json.RawMessage) map[string]any {
 	// MCP so emulator_status derives the pause source.
 	recordStateFromPayload(tc.server, payload, false)
 	result := map[string]any{
-		"state_id": snapshot.ID,
-		"sha256":   snapshot.SHA256,
+		"state_id":        snapshot.ID,
+		"sha256":          snapshot.SHA256,
+		"saved_run_state": snapshot.SavedRunState,
+		"final_run_state": runStateLabelFromBool(payload),
 		"capture_consistency": map[string]any{
 			"state": consistencyStateRestored,
 			"note":  "The machine now describes the restored snapshot's instant, not a live capture; observations describe the restored state until the system runs again.",
@@ -515,6 +520,20 @@ func runStateLoad(tc toolContext, args json.RawMessage) map[string]any {
 		result[key] = value
 	}
 	return okResult(stampGenerations(result, before, after), tc.modern)
+}
+
+// runStateLabelFromBool renders the plugin's system_running flag as the
+// standardized run-state label, or "unknown" when the payload does not carry
+// it.
+func runStateLabelFromBool(payload map[string]any) string {
+	running, ok := payload["system_running"].(bool)
+	if !ok {
+		return "unknown"
+	}
+	if running {
+		return "running"
+	}
+	return "paused"
 }
 
 func runStateList(tc toolContext, args json.RawMessage) map[string]any {
@@ -543,6 +562,7 @@ func runStateList(tc toolContext, args json.RawMessage) map[string]any {
 			"target_generation":   snapshot.TargetGeneration,
 			"rom_path":            snapshot.ROMPath,
 			"rom_sha256":          snapshot.ROMSHA256,
+			"saved_run_state":     snapshot.SavedRunState,
 			"stale":               stale,
 			"generation_mismatch": snapshot.TargetGeneration != 0 && snapshot.TargetGeneration != currentGen,
 		}

@@ -26,6 +26,11 @@ type Snapshot struct {
 	ROMSHA256        string    `json:"rom_sha256,omitempty"`
 	ControlID        string    `json:"control_id,omitempty"`
 	TargetGeneration uint64    `json:"target_generation"`
+	// SavedRunState is the last observed run state at save time ("running",
+	// "paused", or "unknown" when the server never observed it). state_load
+	// restores it natively and echoes it so callers never need a defensive
+	// pause after a restore.
+	SavedRunState string `json:"saved_run_state,omitempty"`
 }
 
 const maxSnapshotsPerContext = 32
