@@ -30,7 +30,7 @@
 namespace
 {
 const wchar_t* const kPipePrefix = L"\\\\.\\pipe\\";
-const char* const kPluginVersion = "0.7.0";
+const char* const kPluginVersion = "0.7.1";
 const size_t kMaxRequestSize = 64 * 1024;
 const size_t kMaxWriteChunk = 32 * 1024;
 const unsigned long long kMaxReadLength = 8 * 1024 * 1024;
@@ -209,6 +209,125 @@ bool IsSupportedROMPath(const std::wstring& path)
 	return (_wcsicmp(suffix, L".bin") == 0) || (_wcsicmp(suffix, L".gen") == 0) || (_wcsicmp(suffix, L".md") == 0);
 }
 
+// DirectoryFromPath returns the directory portion of a path, or "" when the
+// path has no directory component.
+std::wstring DirectoryFromPath(const std::wstring& path)
+{
+	const size_t separator = path.find_last_of(L"\\/");
+	return (separator == std::wstring::npos) ? std::wstring() : path.substr(0, separator);
+}
+
+// IsRelativePath reports whether path is not an absolute Windows path
+// (drive-letter, UNC, or root-relative).
+bool IsRelativePath(const std::wstring& path)
+{
+	if (path.empty())
+	{
+		return true;
+	}
+	if (path.size() >= 2 && path[1] == L':')
+	{
+		return false;
+	}
+	if (path.size() >= 2 && path[0] == L'\\' && path[1] == L'\\')
+	{
+		return false;
+	}
+	return path[0] != L'\\' && path[0] != L'/';
+}
+
+// ExtractROMPathFromModuleFile recovers the cartridge path embedded in a
+// generated module definition. Both the MCP rom_load bridge and the GUI
+// "Load ROM File..." action build an XML module whose ROM16 device node
+// stores the original ROM path as separate binary data (the tree loader
+// restores it as the node's binary data buffer name).
+bool ExtractROMPathFromModuleFile(const std::wstring& moduleFilePath, std::wstring& romPath)
+{
+	Stream::File moduleFile(Stream::IStream::TextEncoding::UTF8);
+	if (!moduleFile.Open(moduleFilePath, Stream::File::OpenMode::ReadOnly, Stream::File::CreateMode::Open))
+	{
+		return false;
+	}
+	moduleFile.SetTextEncoding(Stream::IStream::TextEncoding::UTF8);
+	moduleFile.ProcessByteOrderMark();
+	HierarchicalStorageTree tree;
+	if (!tree.LoadTree(moduleFile))
+	{
+		return false;
+	}
+	moduleFile.Close();
+
+	std::list<IHierarchicalStorageNode*> pending;
+	pending.push_back(&tree.GetRootNode());
+	for (unsigned int depth = 0; depth < 6 && !pending.empty(); ++depth)
+	{
+		std::list<IHierarchicalStorageNode*> next;
+		for (std::list<IHierarchicalStorageNode*>::const_iterator i = pending.begin(); i != pending.end(); ++i)
+		{
+			IHierarchicalStorageNode* node = *i;
+			if (node->IsAttributePresent(L"BinaryDataPresent") && node->IsAttributePresent(L"SeparateBinaryData"))
+			{
+				std::wstring candidate = node->GetBinaryDataBufferName();
+				if (!candidate.empty() && IsRelativePath(candidate))
+				{
+					const std::wstring moduleDir = DirectoryFromPath(moduleFilePath);
+					if (!moduleDir.empty())
+					{
+						candidate = moduleDir + L"\\" + candidate;
+					}
+				}
+				if (IsSupportedROMPath(candidate))
+				{
+					romPath = candidate;
+					return true;
+				}
+			}
+			const std::list<IHierarchicalStorageNode*> children = node->GetChildList();
+			next.insert(next.end(), children.begin(), children.end());
+		}
+		pending.swap(next);
+	}
+	return false;
+}
+
+// DiscoverLoadedProgramModuleROM recovers the cartridge path of a ROM that
+// was loaded outside the MCP rom_load bridge operation (for example through
+// the Exodus GUI "Load ROM File..." action). The plugin only learns the ROM
+// path from its own BuildROMLoadData, so without this the emulator_status
+// "rom" object reports loaded=false even though a cartridge is running. The
+// loaded program module is either the ROM file itself (direct cartridge
+// load) or a generated module definition embedding the ROM path.
+bool DiscoverLoadedProgramModuleROM(const ISystemExtensionInterface& system, std::wstring& romPath, unsigned long long& romSize)
+{
+	const std::list<unsigned int> moduleIDs = system.GetLoadedModuleIDs();
+	for (std::list<unsigned int>::const_iterator i = moduleIDs.begin(); i != moduleIDs.end(); ++i)
+	{
+		LoadedModuleInfo moduleInfo;
+		if (!system.GetLoadedModuleInfo(*i, moduleInfo) || !moduleInfo.GetIsProgramModule())
+		{
+			continue;
+		}
+		std::wstring candidatePath = moduleInfo.GetModuleFilePath();
+		if (candidatePath.empty())
+		{
+			continue;
+		}
+		if (!IsSupportedROMPath(candidatePath) && !ExtractROMPathFromModuleFile(candidatePath, candidatePath))
+		{
+			continue;
+		}
+		WIN32_FILE_ATTRIBUTE_DATA attributes = {};
+		if (!GetFileAttributesExW(candidatePath.c_str(), GetFileExInfoStandard, &attributes) || (attributes.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY))
+		{
+			continue;
+		}
+		romPath = candidatePath;
+		romSize = (static_cast<unsigned long long>(attributes.nFileSizeHigh) << 32) | attributes.nFileSizeLow;
+		return true;
+	}
+	return false;
+}
+
 bool CreateROMModule(const std::wstring& romPath, std::wstring& modulePath, unsigned long long& romSizeOut, unsigned int& paddedSizeOut)
 {
 	if (!IsSupportedROMPath(romPath))
@@ -280,6 +399,9 @@ ExodusMcpPlugin::ExodusMcpPlugin(const std::wstring& implementationName, const s
 	_loadedModuleCount(0),
 	_bridgeEnabled(false),
 	_romLoaded(false),
+	_romPath(),
+	_romSizeBytes(0),
+	_romPaddedSizeBytes(0),
 	_nextBreakpointID(1),
 	_nextWatchpointID(1),
 	_pixelInfoEnableFrameToken(0)
@@ -969,14 +1091,34 @@ std::string ExodusMcpPlugin::BuildEmulatorStatusData()
 		data += memoryDevice ? "true" : "false";
 		data += "}";
 	}
+	// The plugin tracks the cartridge path only for ROMs loaded through the
+	// MCP rom_load bridge operation. A cartridge loaded through the Exodus UI
+	// (or by any other actor) is recovered from the loaded program module so
+	// emulator_status always reports the running cartridge; path_source states
+	// which mechanism provided it. padded_size_bytes is only known after the
+	// MCP rom_load module creation, so a discovered cartridge reports the
+	// file-derived size and padded_size_bytes stays 0 (unknown).
+	bool romLoaded = _romLoaded;
+	std::wstring romPath = _romPath;
+	unsigned long long romSizeBytes = _romSizeBytes;
+	unsigned long long romPaddedSizeBytes = _romPaddedSizeBytes;
+	std::string romPathSource = "mcp_load";
+	if (!romLoaded)
+	{
+		romLoaded = DiscoverLoadedProgramModuleROM(systemInterface, romPath, romSizeBytes);
+		romPathSource = romLoaded ? "loaded_module" : "none";
+	}
+
 	data += "],\"rom\":{\"loaded\":";
-	data += _romLoaded ? "true" : "false";
+	data += romLoaded ? "true" : "false";
 	data += ",\"size_bytes\":";
-	AppendNumber(data, _romSizeBytes);
+	AppendNumber(data, romSizeBytes);
 	data += ",\"padded_size_bytes\":";
-	AppendNumber(data, _romPaddedSizeBytes);
+	AppendNumber(data, romPaddedSizeBytes);
 	data += ",\"path\":";
-	AppendJsonString(data, _romPath);
+	AppendJsonString(data, romPath);
+	data += ",\"path_source\":";
+	AppendJsonStringAscii(data, romPathSource);
 	data += "}}";
 	return data;
 }

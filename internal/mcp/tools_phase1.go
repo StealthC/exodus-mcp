@@ -108,7 +108,7 @@ func phase1ToolSpecs() []toolSpec {
 		},
 		{
 			name:        "rom_load",
-			description: "Replace the current Mega Drive cartridge with a ROM file visible to Windows. This mutates the running target, preserves its prior run state unless run is true, and purges machine-bound debug resources (breakpoints, watchpoints, freezes) with an audited invalidation. Accepts optional expected_target_generation and control_id; a mismatch fails with target_generation_conflict before any native action.",
+			description: "Replace the current Mega Drive cartridge with a ROM file visible to Windows, or reset the loaded machine. Reloading the SAME path is the machine-reset equivalent: the module reload reinitializes the system and purges all MCP-managed debug resources (breakpoints, watchpoints, freezes) in one audited invalidation batch. To reset a cartridge that was loaded through the Exodus UI, read its path from emulator_status (rom.path, path_source \"loaded_module\") and pass it back here. Preserves the prior run state unless run is true. Accepts optional expected_target_generation and control_id; a mismatch fails with target_generation_conflict before any native action.",
 			schema: objectSchema(map[string]any{
 				"path":                       stringProperty("Absolute Windows path to a .bin, .gen, or .md ROM file."),
 				"run":                        map[string]any{"type": "boolean", "description": "Run the system after the ROM loads, even if it was paused before."},
@@ -144,23 +144,42 @@ func runROMLoad(tc toolContext, args json.RawMessage) map[string]any {
 	if path == "" || strings.ContainsAny(path, "\r\n") {
 		return failureResult(&toolFailure{Code: "invalid_params", Message: "path must be one non-empty Windows file path"}, tc.modern)
 	}
+	payload, before, after, invalidated, failure := performROMLoad(tc, path, parsed.Run, parsed.guard(), "", map[string]any{
+		"path": path,
+		"run":  parsed.Run,
+	}, "rom_load")
+	if failure != nil {
+		return failureResult(failure, tc.modern)
+	}
+	if len(invalidated) > 0 {
+		payload["resources_invalidated"] = invalidated
+	}
+	// rom_load restarts the system in the requested run state; attribute the
+	// echoed state to MCP so emulator_status derives the pause source.
+	recordStateFromPayload(tc.server, payload, false)
+	return okResult(stampGenerations(payload, before, after), tc.modern)
+}
 
+// performROMLoad runs the shared cartridge-reload mutation used by rom_load
+// and target_reset (hard). The module reload reinitializes the system and
+// purges all MCP-managed debug resources (freezes, breakpoints, watchpoints)
+// with one audited invalidation batch. toolName is the calling tool for audit
+// attribution; contextID is the originating analysis context ("" for
+// rom_load, which predates context attribution on this operation).
+func performROMLoad(tc toolContext, path string, run bool, guard mutationGuard, contextID string, detail map[string]any, toolName string) (map[string]any, uint64, uint64, []string, *toolFailure) {
 	// Machine-bound resources (freezes, managed breakpoints, managed
 	// watchpoints) describe the previous cartridge's address map; the plugin
 	// purges its debug resources natively and the server purges the rest,
-	// collecting one audited invalidation batch for the rom_load record.
+	// collecting one audited invalidation batch for the reload record.
 	var invalidated []string
 	payload, before, after, failure := tc.server.executeMutation(tc.ctx, mutationCall{
-		tool:      "rom_load",
+		tool:      toolName,
 		operation: "rom_load",
-		params:    map[string]string{"path": path, "run": strconv.FormatBool(parsed.Run)},
-		guard:     parsed.guard(),
-		contextID: "",
-		detail: map[string]any{
-			"path": path,
-			"run":  parsed.Run,
-		},
-		romAfter: path,
+		params:    map[string]string{"path": path, "run": strconv.FormatBool(run)},
+		guard:     guard,
+		contextID: contextID,
+		detail:    detail,
+		romAfter:  path,
 		prepare: func() *toolFailure {
 			invalidated = nil
 			for _, id := range tc.server.freezes.ids() {
@@ -180,15 +199,9 @@ func runROMLoad(tc toolContext, args json.RawMessage) map[string]any {
 		resources: func() []string { return invalidated },
 	})
 	if failure != nil {
-		return failureResult(failure, tc.modern)
+		return nil, 0, 0, nil, failure
 	}
-	if len(invalidated) > 0 {
-		payload["resources_invalidated"] = invalidated
-	}
-	// rom_load restarts the system in the requested run state; attribute the
-	// echoed state to MCP so emulator_status derives the pause source.
-	recordStateFromPayload(tc.server, payload, false)
-	return okResult(stampGenerations(payload, before, after), tc.modern)
+	return payload, before, after, invalidated, nil
 }
 
 // ----------------------------------------------------------------------------------------------------------------------
@@ -237,6 +250,7 @@ type emulatorStatusRom struct {
 	SizeBytes       uint64 `json:"size_bytes"`
 	PaddedSizeBytes uint64 `json:"padded_size_bytes"`
 	Path            string `json:"path"`
+	PathSource      string `json:"path_source"`
 }
 
 type emulatorStatusData struct {
