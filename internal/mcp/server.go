@@ -454,13 +454,20 @@ func (server *Server) setROMPath(path string) {
 }
 
 // debugResourceMeta is the server-side provenance of one MCP-managed
-// breakpoint or watchpoint; the plugin owns the native resource.
+// breakpoint or watchpoint; the plugin owns the native resource. OneShot
+// marks a server-managed one-shot instrument: the server removes it through
+// the audited mutation path once its native hit counter proves a break fired
+// (roadmap Phase 9). BreakCounter is the N of break_on_counter (1 when the
+// instrument always breaks on every hit); a break fired exactly when
+// hit_count is a positive multiple of it.
 type debugResourceMeta struct {
 	ContextID        string
 	ControlID        string
 	TargetGeneration uint64
 	CreatedAt        time.Time
 	ROMPath          string
+	OneShot          bool
+	BreakCounter     uint64
 }
 
 // debugEvent is one structured breakpoint/watchpoint stop event.

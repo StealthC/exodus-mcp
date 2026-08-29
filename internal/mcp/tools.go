@@ -68,6 +68,7 @@ func buildToolRegistry() []toolSpec {
 	specs = append(specs, inputSequenceToolSpecs()...)
 	specs = append(specs, vdpExportToolSpecs()...)
 	specs = append(specs, resetToolSpecs()...)
+	specs = append(specs, runUntilToolSpecs()...)
 	sort.Slice(specs, func(i, j int) bool { return specs[i].name < specs[j].name })
 	return specs
 }

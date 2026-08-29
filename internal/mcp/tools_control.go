@@ -26,7 +26,7 @@ func controlToolSpecs() []toolSpec {
 		},
 		{
 			name:        "cpu_breakpoint_set",
-			description: "Create an enabled exact-address execution breakpoint owned by this MCP process, recording context provenance. Optional `condition` filters by the processor's program counter (greater/less boundaries, inclusive-free range), and `break_on_counter` pauses only on every Nth hit; `breakpoint_list` reports the native hit counter. Mutates the target: advances the target generation. Accepts optional expected_target_generation and control_id.",
+			description: "Create an enabled exact-address execution breakpoint owned by this MCP process, recording context provenance. Optional `condition` filters by the processor's program counter (greater/less boundaries, inclusive-free range), and `break_on_counter` pauses only on every Nth hit; `breakpoint_list` reports the native hit counter. `one_shot: true` auto-removes the breakpoint through the audited mutation path once a hit proves it fired (checked at the next paused observation), so one-shot instrumentation never stays armed. Mutates the target: advances the target generation. Accepts optional expected_target_generation and control_id.",
 			schema: objectSchema(map[string]any{
 				"cpu":                        enumProperty("Processor to break.", []string{"m68k", "z80"}),
 				"address":                    addressProperty(),
@@ -34,6 +34,7 @@ func controlToolSpecs() []toolSpec {
 				"range_end":                  addressProperty(),
 				"break_on_counter":           booleanProperty("Only pause on every Nth hit instead of every hit; N comes from break_counter."),
 				"break_counter":              integerProperty("Break every Nth hit when break_on_counter is true (default 1).", 1),
+				"one_shot":                   booleanProperty("Remove this breakpoint automatically once a hit proves it fired (default false)."),
 				"context":                    contextProperty(),
 				"expected_target_generation": integerProperty("Optional target generation the caller last observed; fails with target_generation_conflict on mismatch.", 1),
 				"control_id":                 stringProperty("Optional control id from target_control_acquire; required while the control lock is active."),
@@ -53,12 +54,13 @@ func controlToolSpecs() []toolSpec {
 		},
 		{
 			name:        "cpu_watchpoint_set",
-			description: "Create an enabled read and/or write watchpoint owned by this MCP process, recording context provenance. The system pauses when the watched range is accessed. Mutates the target: advances the target generation. Accepts optional expected_target_generation and control_id.",
+			description: "Create an enabled read and/or write watchpoint owned by this MCP process, recording context provenance. The system pauses when the watched range is accessed. `one_shot: true` auto-removes the watchpoint through the audited mutation path once a hit proves it fired (checked at the next paused observation), so one-shot instrumentation never stays armed. Mutates the target: advances the target generation. Accepts optional expected_target_generation and control_id.",
 			schema: objectSchema(map[string]any{
 				"cpu":                        enumProperty("Processor to watch.", []string{"m68k", "z80"}),
 				"address":                    addressProperty(),
 				"length":                     integerProperty("Watched range length in bytes (default 1).", 1),
 				"access":                     enumProperty("Access types that trigger the watchpoint.", []string{"read", "write", "any"}),
+				"one_shot":                   booleanProperty("Remove this watchpoint automatically once a hit proves it fired (default false)."),
 				"context":                    contextProperty(),
 				"expected_target_generation": integerProperty("Optional target generation the caller last observed; fails with target_generation_conflict on mismatch.", 1),
 				"control_id":                 stringProperty("Optional control id from target_control_acquire; required while the control lock is active."),
@@ -185,6 +187,7 @@ type breakpointSetArgs struct {
 	RangeEnd       any     `json:"range_end"`
 	BreakOnCounter bool    `json:"break_on_counter"`
 	BreakCounter   *uint64 `json:"break_counter"`
+	OneShot        bool    `json:"one_shot"`
 	Context        string  `json:"context"`
 	guardArgs
 }
@@ -279,6 +282,8 @@ func runBreakpointSet(tc toolContext, args json.RawMessage) map[string]any {
 			TargetGeneration: after,
 			CreatedAt:        time.Now().UTC(),
 			ROMPath:          tc.server.currentROMPath(),
+			OneShot:          parsed.OneShot,
+			BreakCounter:     breakCounter,
 		})
 	}
 	return okResult(stampGenerations(payload, before, after), tc.modern)
@@ -330,6 +335,7 @@ type watchpointSetArgs struct {
 	Address any     `json:"address"`
 	Length  *uint64 `json:"length"`
 	Access  string  `json:"access"`
+	OneShot bool    `json:"one_shot"`
 	Context string  `json:"context"`
 	guardArgs
 }
@@ -392,6 +398,8 @@ func runWatchpointSet(tc toolContext, args json.RawMessage) map[string]any {
 			TargetGeneration: after,
 			CreatedAt:        time.Now().UTC(),
 			ROMPath:          tc.server.currentROMPath(),
+			OneShot:          parsed.OneShot,
+			BreakCounter:     1,
 		})
 	}
 	return okResult(stampGenerations(payload, before, after), tc.modern)

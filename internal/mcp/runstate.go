@@ -1,6 +1,7 @@
 package mcp
 
 import (
+	"strconv"
 	"sync"
 	"time"
 
@@ -37,6 +38,13 @@ type runStateTracker struct {
 	// when no such action has happened or an external transition followed it,
 	// because a stale MCP expectation must not explain a later external state.
 	mcpSet *bool
+	// stopAttribution is the native debugger stop most recently attributed to
+	// a managed breakpoint or watchpoint (set when the server proves an
+	// instrument fired). It explains a paused observation as
+	// breakpoint_or_watchpoint and is cleared by any MCP run-state action or
+	// by observing the system running again, so a stale stop never explains a
+	// later pause.
+	stopAttribution *stopAttributionInfo
 	// lastChange is when the run state last changed (MCP-caused or observed
 	// externally); zero until the first known transition.
 	lastChange time.Time
@@ -44,10 +52,18 @@ type runStateTracker struct {
 	firstObserved time.Time
 }
 
+// stopAttributionInfo names one managed instrument proven to have fired.
+type stopAttributionInfo struct {
+	Kind       string // "breakpoint" or "watchpoint"
+	ResourceID uint64
+	HitCount   uint64
+}
+
 // setByMCP records a run state produced by a successful target-mutating MCP
 // action (cpu_pause, cpu_run, CPU steps, frame_advance). A state difference
 // here is the mutation's own effect and is already recorded by the mutation
-// audit entry, so no separate run_state_change event is written.
+// audit entry, so no separate run_state_change event is written. An MCP
+// run-state action supersedes any prior debugger-stop attribution.
 func (tracker *runStateTracker) setByMCP(running bool) {
 	tracker.mu.Lock()
 	defer tracker.mu.Unlock()
@@ -62,6 +78,32 @@ func (tracker *runStateTracker) setByMCP(running bool) {
 	}
 	tracker.observed = &running
 	tracker.mcpSet = &running
+	tracker.stopAttribution = nil
+}
+
+// setBreakpointStop records a paused observation attributed to a managed
+// breakpoint or watchpoint proven to have fired (the server checked the
+// native hit counter while the system was paused). The attribution explains
+// the pause as breakpoint_or_watchpoint until a later MCP run-state action or
+// a running observation clears it.
+func (tracker *runStateTracker) setBreakpointStop(kind string, resourceID, hitCount uint64) {
+	tracker.mu.Lock()
+	defer tracker.mu.Unlock()
+	if tracker.observed != nil && *tracker.observed {
+		tracker.lastChange = time.Now().UTC()
+	}
+	tracker.stopAttribution = &stopAttributionInfo{Kind: kind, ResourceID: resourceID, HitCount: hitCount}
+}
+
+// lastBreakpointStop returns the current stop attribution, or nil.
+func (tracker *runStateTracker) lastBreakpointStop() *stopAttributionInfo {
+	tracker.mu.Lock()
+	defer tracker.mu.Unlock()
+	if tracker.stopAttribution == nil {
+		return nil
+	}
+	copy := *tracker.stopAttribution
+	return &copy
 }
 
 // observe records one passive observation of the run state. When the state
@@ -75,6 +117,12 @@ func (tracker *runStateTracker) observe(server *Server, running bool, frameToken
 	first := tracker.firstObserved.IsZero()
 	transition := tracker.observed != nil && *tracker.observed != running
 	external := transition && (tracker.mcpSet == nil || *tracker.mcpSet != running)
+	stop := tracker.stopAttribution
+	if running {
+		// The system ran again; a stale debugger-stop attribution must never
+		// explain a later pause.
+		tracker.stopAttribution = nil
+	}
 	if first {
 		tracker.firstObserved = now
 	}
@@ -92,12 +140,16 @@ func (tracker *runStateTracker) observe(server *Server, running bool, frameToken
 	if !external || server == nil {
 		return
 	}
+	attribution := "external (no MCP run-state action explains the transition)"
+	if !running && stop != nil {
+		attribution = "breakpoint_or_watchpoint (MCP-managed " + stop.Kind + " " + strconv.FormatUint(stop.ResourceID, 10) + " fired with hit count " + strconv.FormatUint(stop.HitCount, 10) + ")"
+	}
 	detail := map[string]any{
 		"event":                      "run_state_change",
 		"system_running":             running,
 		"previous_system_running":    !running,
 		"observed_target_generation": server.target.Generation(),
-		"attribution":                "external (no MCP run-state action explains the transition)",
+		"attribution":                attribution,
 	}
 	if frameToken != nil {
 		detail["frame_token"] = *frameToken
@@ -115,6 +167,9 @@ func (tracker *runStateTracker) observe(server *Server, running bool, frameToken
 func (tracker *runStateTracker) view(running bool) (source, note string) {
 	tracker.mu.Lock()
 	defer tracker.mu.Unlock()
+	if tracker.stopAttribution != nil && !running {
+		return "breakpoint_or_watchpoint", "A native debugger stop was attributed to MCP-managed " + tracker.stopAttribution.Kind + " " + strconv.FormatUint(tracker.stopAttribution.ResourceID, 10) + " (hit count " + strconv.FormatUint(tracker.stopAttribution.HitCount, 10) + ")."
+	}
 	if tracker.mcpSet != nil && *tracker.mcpSet == running {
 		return "mcp", "The observed run state matches the last run-state-affecting MCP action; the change is attributed to MCP."
 	}

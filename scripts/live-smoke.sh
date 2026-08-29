@@ -703,6 +703,86 @@ print(s)
 			contract_final=$(json_get "$contract_loaded" "parsed.get('final_run_state', '')" 2>/dev/null)
 			check "state_load reports saved and final run state" "[ -n \"\$contract_saved2\" ] && [ -n \"\$contract_final\" ]"
 		fi
+
+		step "Phase 9 instrumentation (one-shot, run_until, state_load override)"
+		# run_until_breakpoint at the current PC: the next fetched instruction
+		# hits the breakpoint, so the wrapper must fire deterministically.
+		tool_call "cpu_pause" >/dev/null
+		run_pc=$(json_get "$(tool_call "m68k_registers")" "int(parsed.get('registers', {}).get('pc', 0))" 2>/dev/null)
+		if [ -z "$run_pc" ] || [ "$run_pc" = "0" ]; then
+			check "run_until_breakpoint fires at the target PC" false
+			check "run_until_breakpoint removes its instrument" false
+		else
+			run_result=$(tool_call "run_until_breakpoint" "{\"cpu\": \"m68k\", \"address\": $run_pc, \"timeout_ms\": 20000}")
+			run_reason=$(json_get "$run_result" "parsed.get('stop_reason', '')" 2>/dev/null)
+			check "run_until_breakpoint fires at the target PC" "[ \"\$run_reason\" = 'breakpoint_hit' ]"
+			run_removed=$(json_get "$run_result" "str(parsed.get('instrument_removed', False)).lower()" 2>/dev/null)
+			check "run_until_breakpoint removes its instrument" "[ \"\$run_removed\" = 'true' ]"
+			run_hit=$(json_get "$run_result" "parsed.get('hit_count', 0) >= 1" 2>/dev/null)
+			check "run_until_breakpoint reports the hit count" "[ \"\$run_hit\" = 'true' ]"
+		fi
+		bp_count=$(json_get "$(tool_call "cpu_breakpoint_list")" "len(parsed.get('breakpoints', []))" 2>/dev/null)
+		check "run_until leaves no breakpoint residue" "[ \"\$bp_count\" = '0' ]"
+
+		# run_until_watchpoint on work RAM: the running system writes it
+		# within the window, so the wrapper must stop on the write access.
+		wp_result=$(tool_call "run_until_watchpoint" '{"cpu": "m68k", "address": "0xFF0000", "length": 2, "access": "write", "timeout_ms": 20000}')
+		wp_reason=$(json_get "$wp_result" "parsed.get('stop_reason', '')" 2>/dev/null)
+		check "run_until_watchpoint fires on a RAM write" "[ \"\$wp_reason\" = 'watchpoint_hit' ]"
+		wp_removed=$(json_get "$wp_result" "str(parsed.get('instrument_removed', False)).lower()" 2>/dev/null)
+		check "run_until_watchpoint removes its instrument" "[ \"\$wp_removed\" = 'true' ]"
+		wp_count=$(json_get "$(tool_call "cpu_watchpoint_list")" "len(parsed.get('watchpoints', []))" 2>/dev/null)
+		check "run_until leaves no watchpoint residue" "[ \"\$wp_count\" = '0' ]"
+
+		# The managed stop is attributed: emulator_status reports the source.
+		pause_src=$(json_get "$(tool_call "emulator_status")" "parsed.get('pause_source', '')" 2>/dev/null)
+		check "emulator_status attributes the managed stop" "[ \"\$pause_src\" = 'breakpoint_or_watchpoint' ]"
+
+		# A run_until window that never fires times out and still removes the
+		# armed instrument (address 1 is inside the vector table; it is never
+		# executed as code).
+		timeout_result=$(tool_call "run_until_breakpoint" '{"cpu": "m68k", "address": 1, "timeout_ms": 200}')
+		timeout_code=$(json_get "$timeout_result" "parsed.get('code', '')" 2>/dev/null)
+		check "run_until timeout reports run_until_timeout" "[ \"\$timeout_code\" = 'run_until_timeout' ]"
+		timeout_removed=$(json_get "$timeout_result" "str(parsed.get('instrument_removed', False)).lower()" 2>/dev/null)
+		check "run_until timeout removes its instrument" "[ \"\$timeout_removed\" = 'true' ]"
+
+		# one_shot via cpu_breakpoint_set: the paused-state sweep removes the
+		# fired instrument and emulator_status reports the removal.
+		tool_call "cpu_pause" >/dev/null
+		one_pc=$(json_get "$(tool_call "m68k_registers")" "int(parsed.get('registers', {}).get('pc', 0))" 2>/dev/null)
+		one_set=$(tool_call "cpu_breakpoint_set" "{\"cpu\": \"m68k\", \"address\": $one_pc, \"one_shot\": true}")
+		one_id=$(json_get "$one_set" "int(parsed.get('breakpoint_id', 0))" 2>/dev/null)
+		if [ -z "$one_id" ] || [ "$one_id" = "0" ]; then
+			check "one-shot breakpoint auto-removes on hit" false
+			check "one-shot stop attributed to the instrument" false
+		else
+			tool_call "cpu_run" >/dev/null
+			sleep 1
+			one_status=$(tool_call "emulator_status")
+			one_removals=$(json_get "$one_status" "len(parsed.get('one_shot_removals', []))" 2>/dev/null)
+			check "one-shot breakpoint auto-removes on hit" "[ \"\$one_removals\" = '1' ]"
+			one_src=$(json_get "$one_status" "parsed.get('pause_source', '')" 2>/dev/null)
+			check "one-shot stop attributed to the instrument" "[ \"\$one_src\" = 'breakpoint_or_watchpoint' ]"
+		fi
+
+		# state_load run_state override: a post-load cpu_control inside the
+		# control window forces the restored run state.
+		tool_call "cpu_pause" >/dev/null
+		override_saved=$(tool_call "state_save" '{"name": "override"}')
+		override_id=$(json_get "$override_saved" "parsed.get('state_id', '')" 2>/dev/null)
+		if [ -z "$override_id" ]; then
+			check "state_load run_state override reports the forced state" false
+			check "state_load run_state paused override" false
+		else
+			override_loaded=$(tool_call "state_load" "{\"state_id\": \"$override_id\", \"run_state\": \"running\"}")
+			override_final=$(json_get "$override_loaded" "parsed.get('final_run_state', '')" 2>/dev/null)
+			override_field=$(json_get "$override_loaded" "parsed.get('run_state_override', '')" 2>/dev/null)
+			check "state_load run_state override reports the forced state" "[ \"\$override_final\" = 'running' ] && [ \"\$override_field\" = 'running' ]"
+			override_paused=$(tool_call "state_load" "{\"state_id\": \"$override_id\", \"run_state\": \"paused\"}")
+			override_paused_final=$(json_get "$override_paused" "parsed.get('final_run_state', '')" 2>/dev/null)
+			check "state_load run_state paused override" "[ \"\$override_paused_final\" = 'paused' ]"
+		fi
 	fi
 
 	if [ "$was_running" = "True" ] || [ "$was_running" = "true" ]; then

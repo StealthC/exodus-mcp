@@ -259,6 +259,9 @@ type emulatorStatusData struct {
 	Devices       []deviceInfo      `json:"devices"`
 	Rom           emulatorStatusRom `json:"rom"`
 	StopReason    string            `json:"stop_reason,omitempty"`
+	// OneShotRemovals is set server-side (never from the bridge) when the
+	// paused-state sweep removed fired one-shot instruments during this read.
+	OneShotRemovals []map[string]any `json:"-"`
 }
 
 func fetchEmulatorStatus(tc toolContext) (*emulatorStatusData, *toolFailure) {
@@ -278,6 +281,13 @@ func fetchEmulatorStatus(tc toolContext) (*emulatorStatusData, *toolFailure) {
 		tc.server.setROMPath(status.Rom.Path)
 	} else {
 		tc.server.setROMPath("")
+	}
+	if !status.SystemRunning {
+		// One-shot housekeeping while paused: fired one-shot instruments are
+		// removed through the audited mutation path and every proven native
+		// stop is attributed to its managed instrument, so pause_source can
+		// report breakpoint_or_watchpoint.
+		status.OneShotRemovals = tc.server.sweepDebugInstruments(tc)
 	}
 	// Every passive read of the run state feeds the run-state observation
 	// tracker: externally observed transitions land in the audit stream as
@@ -324,6 +334,10 @@ func runEmulatorStatus(tc toolContext, _ json.RawMessage) map[string]any {
 		result["last_run_state_change"] = lastChange
 	}
 	result["pause_source_note"] = pauseNote
+	if len(status.OneShotRemovals) > 0 {
+		result["one_shot_removals"] = status.OneShotRemovals
+		result["one_shot_note"] = "Fired one-shot instruments were removed through the audited mutation path during this read; see cpu_debug_events_list for the stop evidence."
+	}
 	return okResult(result, tc.modern)
 }
 
