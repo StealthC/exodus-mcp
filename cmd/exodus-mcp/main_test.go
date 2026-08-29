@@ -3,9 +3,41 @@ package main
 import (
 	"net"
 	"net/http"
+	"os"
+	"path/filepath"
 	"testing"
 	"time"
 )
+
+func TestFindExodusBeside(t *testing.T) {
+	dir := t.TempDir()
+	if got := findExodusBeside(dir); got != "" {
+		t.Fatalf("findExodusBeside on empty dir = %q, want \"\"", got)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "exodus.exe"), []byte("binary"), 0o644); err != nil {
+		t.Fatalf("write exodus.exe: %v", err)
+	}
+	if got := findExodusBeside(dir); got != filepath.Join(dir, "exodus.exe") {
+		t.Fatalf("findExodusBeside with lowercase exe = %q, want %q", got, filepath.Join(dir, "exodus.exe"))
+	}
+
+	upperDir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(upperDir, "Exodus.exe"), []byte("binary"), 0o644); err != nil {
+		t.Fatalf("write Exodus.exe: %v", err)
+	}
+	if got := findExodusBeside(upperDir); got != filepath.Join(upperDir, "Exodus.exe") {
+		t.Fatalf("findExodusBeside with capitalized exe = %q, want %q", got, filepath.Join(upperDir, "Exodus.exe"))
+	}
+
+	// A directory named exodus.exe must not be mistaken for the emulator.
+	dirOnly := t.TempDir()
+	if err := os.Mkdir(filepath.Join(dirOnly, "exodus.exe"), 0o755); err != nil {
+		t.Fatalf("mkdir exodus.exe: %v", err)
+	}
+	if got := findExodusBeside(dirOnly); got != "" {
+		t.Fatalf("findExodusBeside with exodus.exe directory = %q, want \"\"", got)
+	}
+}
 
 func TestResolveBaseURLFollowsListenAddress(t *testing.T) {
 	cases := []struct {

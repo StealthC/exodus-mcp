@@ -58,6 +58,16 @@ a new pipe name and capability for that one child process and never logs the
 capability. When that child Exodus process exits, `exodus-mcp` shuts down its
 local HTTP server and exits too.
 
+Bare launch convenience: `build-windows.bat` installs `exodus-mcp.exe` into
+the Exodus install root next to the emulator. When the server is started with
+no bridge configuration at all — no `--exodus`, `--pipe-name`, or
+`--pipe-capability` — it checks for `Exodus.exe` beside its own executable and
+adopts it as the target automatically (working directory: the Exodus root).
+This lets a user or an MCP client that merely points at `exodus-mcp.exe`
+start the whole pair by running that single binary. The detection is skipped
+whenever `--exodus` or either pipe flag is present, so the wrapper launchers
+and explicit standalone attachment keep their current behavior.
+
 The launcher reserves the HTTP port before it starts Exodus. A busy port fails
 without opening Exodus; if the server stops after the child starts, it
 terminates that child rather than leaving an orphaned emulator process.

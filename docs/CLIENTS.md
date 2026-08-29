@@ -74,6 +74,18 @@ To share the entry with the repository, use `--scope project`; Claude Code will
 write the `.mcp.json` file. It asks each user to approve project-scoped servers
 before use.
 
+## Starting the server from the Exodus install
+
+`scripts/build-windows.sh` also copies `exodus-mcp.exe` into the Exodus
+install root (`EXODUS_MCP_EXODUS_DIR`) next to the emulator. Running that
+installed executable with no arguments (double-click or from a terminal)
+detects the `Exodus.exe` beside it and starts the whole pair: the server owns
+the bridge pipe, launches Exodus from that folder, and exposes the same
+`http://127.0.0.1:8768/mcp` endpoint the client configurations above connect
+to. This is the simplest manual load path — no separate launcher or
+`--exodus` argument is needed. Passing `--exodus`, `--pipe-name`, or
+`--pipe-capability` still disables the auto-detection.
+
 ## Recommended first prompt
 
 Use this after the client shows the server as connected:

@@ -204,6 +204,14 @@ and this project will use [Semantic Versioning](https://semver.org/spec/v2.0.0.h
   (hardware-rendered link-chain length) next to `table_entry_count`
   (populated entries), with a `warning` when the chain renders fewer sprites
   than the table holds (mid-update or stale links).
+- `build-windows.bat` also installs `exodus-mcp.exe` into the Exodus install
+  root (`EXODUS_MCP_EXODUS_DIR`) next to the emulator, so the server can be
+  started manually from that folder.
+- Bare-launch auto-detection: when `exodus-mcp.exe` starts with no bridge
+  configuration (`--exodus`, `--pipe-name`, `--pipe-capability` all absent),
+  it checks for `Exodus.exe` beside its own executable and adopts it as the
+  target, launching Exodus from the install root. A plain double-click or an
+  MCP client pointing at the installed exe starts the whole pair.
 
 ### Changed
 

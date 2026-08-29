@@ -1,13 +1,15 @@
 @echo off
 setlocal
 rem Builds the native bridge DLL and the Go MCP server, then installs the DLL
-rem into the Exodus Plugins folder so the next launch picks it up.
+rem into the Exodus Plugins folder and exodus-mcp.exe into the Exodus install
+rem root, so the next launch picks them up.
 rem
 rem Usage: build-windows.bat [--config Debug^|Release] [--plugins <dir>]
 rem
 rem Configuration comes from the environment or .env (see .env.example):
 rem   EXODUS_MCP_EXODUS_DIR    required unless --plugins is passed; Exodus
-rem                            install root used to locate Plugins\
+rem                            install root used to locate Plugins\ and to
+rem                            install exodus-mcp.exe next to the emulator
 rem   EXODUS_MCP_PLUGINS_DIR   optional plugin destination override
 
 for /f %%i in ("%~dp0..\..") do set "ROOT=%%~fi\"
@@ -78,7 +80,18 @@ go build -ldflags "-X main.version=%VERSION%" -o bin\exodus-mcp.exe .\cmd\exodus
 if errorlevel 1 popd & goto go_failed
 popd
 
+rem Ship the server beside the emulator too: a bare exodus-mcp.exe launch
+rem (no --exodus/--pipe-name) adopts the Exodus.exe next to it as its target.
+if not defined EXODUS_MCP_EXODUS_DIR (
+    echo Note: EXODUS_MCP_EXODUS_DIR is not set ^(--plugins override^); exodus-mcp.exe was not installed beside Exodus.
+    goto mcp_copied
+)
+copy /y "%ROOT%bin\exodus-mcp.exe" "%EXODUS_MCP_EXODUS_DIR%\exodus-mcp.exe" >nul
+if errorlevel 1 goto mcp_copy_failed
+:mcp_copied
+
 echo Done. Plugin installed and server built at bin\exodus-mcp.exe (version %VERSION%)
+if defined EXODUS_MCP_EXODUS_DIR echo        Server also installed at %EXODUS_MCP_EXODUS_DIR%\exodus-mcp.exe
 endlocal
 exit /b 0
 
@@ -89,6 +102,11 @@ goto fail
 
 :copy_failed
 echo ERROR: failed to copy the plugin DLL.
+goto fail
+
+:mcp_copy_failed
+echo ERROR: failed to copy exodus-mcp.exe into the Exodus install root.
+echo        Close Exodus and any running exodus-mcp.exe, then retry.
 goto fail
 
 :go_failed

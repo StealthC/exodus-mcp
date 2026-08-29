@@ -61,6 +61,20 @@ func main() {
 		fmt.Fprintln(os.Stdout, version)
 		return
 	}
+
+	// Bare-launch convenience: the Windows build script installs exodus-mcp.exe
+	// into the Exodus install root next to the emulator. When no bridge
+	// configuration was supplied at all (no --exodus, --pipe-name, or
+	// --pipe-capability), adopt the Exodus.exe beside this executable as the
+	// target so a plain double-click or client launch starts the whole pair.
+	setFlags := map[string]bool{}
+	flag.Visit(func(f *flag.Flag) { setFlags[f.Name] = true })
+	if *exodusExecutable == "" && !setFlags["exodus"] && *pipeName == "" && *pipeCapability == "" {
+		if target := detectExodusTarget(); target != "" {
+			*exodusExecutable = target
+			log.Printf("no --exodus given; found %s beside this executable, launching it as the target", target)
+		}
+	}
 	*baseURL = resolveBaseURL(*listen, *baseURL)
 	store, err := artifact.NewStore(*artifactDir)
 	if err != nil {
@@ -159,6 +173,34 @@ func envOrDefault(key, fallback string) string {
 		return value
 	}
 	return fallback
+}
+
+// detectExodusTarget locates the emulator deployed beside exodus-mcp itself.
+// The Windows build script copies exodus-mcp.exe into the Exodus install root,
+// so a bare launch can adopt that Exodus.exe as its target; newExodusCommand
+// already launches it with the emulator's directory as the working directory,
+// where Exodus resolves settings.xml and Data/ from. Returns "" when no
+// emulator sits next to this binary.
+func detectExodusTarget() string {
+	executable, err := os.Executable()
+	if err != nil {
+		log.Printf("exodus auto-detection: cannot locate this executable: %v", err)
+		return ""
+	}
+	return findExodusBeside(filepath.Dir(executable))
+}
+
+// findExodusBeside returns the emulator executable inside dir, or "" when none
+// is present. Windows filesystems are case-insensitive, but both spellings are
+// checked so the detection stays honest on case-sensitive hosts too.
+func findExodusBeside(dir string) string {
+	for _, name := range []string{"exodus.exe", "Exodus.exe"} {
+		candidate := filepath.Join(dir, name)
+		if info, err := os.Stat(candidate); err == nil && !info.IsDir() {
+			return candidate
+		}
+	}
+	return ""
 }
 
 // envDurationOrDefault resolves a duration configuration value the same way,

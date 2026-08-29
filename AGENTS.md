@@ -104,8 +104,10 @@ always go through the wrappers.
 3. **Build**: `./scripts/build-windows.sh` (default `Release | x64`; pass
    `--config Debug` for Debug-CRT work). One command compiles the native
    plugin (`native-plugin/ExodusMcpPlugin.cpp` → `ExodusMcpPlugin.dll`),
-   installs it into the test install (`EXODUS_MCP_EXODUS_DIR`), and builds
-   `bin/exodus-mcp.exe`. Run it in the **foreground** when the build result is
+   installs it into the test install (`EXODUS_MCP_EXODUS_DIR`), builds
+   `bin/exodus-mcp.exe`, and copies it next to the emulator in that install
+   root (a bare `exodus-mcp.exe` launch there auto-adopts `Exodus.exe`).
+   Run it in the **foreground** when the build result is
    needed to continue — do not background it and poll with `sleep`.
    The final line prints the installed version, e.g. `bin\exodus-mcp.exe
    (version v0.1.0-6-gcadc8a1)`. For fork-side emulator changes use
