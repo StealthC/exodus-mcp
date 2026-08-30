@@ -194,7 +194,7 @@ func detectExodusTarget() string {
 // is present. Windows filesystems are case-insensitive, but both spellings are
 // checked so the detection stays honest on case-sensitive hosts too.
 func findExodusBeside(dir string) string {
-	for _, name := range []string{"exodus.exe", "Exodus.exe"} {
+	for _, name := range []string{"Exodus.exe", "exodus.exe"} {
 		candidate := filepath.Join(dir, name)
 		if info, err := os.Stat(candidate); err == nil && !info.IsDir() {
 			return candidate
