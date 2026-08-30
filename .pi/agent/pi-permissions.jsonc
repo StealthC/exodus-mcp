@@ -1,0 +1,12 @@
+{
+  "mcp": {
+    "exodus:*": "allow"
+  },
+
+  "bash": {
+    "bash ./scripts/live-smoke.sh --full": "allow",
+    "bash ./scripts/test.sh": "allow",
+    "bash ./scripts/test.sh --windows-live": "allow",
+     "bash ./scripts/live-smoke.sh --full && bash ./scripts/test.sh && bash ./scripts/test.sh --windows-live": "allow"
+  }
+}
