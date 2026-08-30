@@ -15,11 +15,14 @@ and this project will use [Semantic Versioning](https://semver.org/spec/v2.0.0.h
   fields absent from the pinned SDK remain `null` with explicit observability
   notes; no state is reconstructed from bus writes and no CPU/VDP atomicity is
   claimed.
-- Strict `target_reset` soft-reset contract: `kind: "soft"` is accepted by
-  the schema but returns `unsupported_plugin` until Exodus exposes a safe,
-  thread-serialized reset-vector/peripheral operation. The server deliberately
-  provides no register-write or memory-write fallback. `kind: "hard"` remains
-  unchanged.
+- Native soft-reset capability scaffold: the Exodus fork now exposes version-1
+  `ISystemResetInterface` and a Mega Drive coordinator boundary, and the plugin
+  resolves/serializes that interface only when the loaded fork reports it ready.
+  The coordinator remains intentionally unavailable until the M68000
+  architectural reset-vector fetch observer and RAM/VDP preservation checks are
+  implemented, so `target_reset(kind: "soft")` still fails safely with
+  `unsupported_plugin` and no register-write or memory-write fallback.
+  `kind: "hard"` remains unchanged.
 - Dual-form address ergonomics across address-bearing tools: optional
   `address_space` accepts documented space-relative or processor-bus addresses
   and translates them to the native target domain; responses preserve legacy

@@ -59,6 +59,24 @@ Before committing, add `Third/THIRD_PARTY_PROVENANCE.md` with the original
 download URL and SHA-256 for every archive. Do not include `Third/catch` or
 HTML Help unless tests or documentation builds specifically need them.
 
+## Fork-only native interface policy
+
+Fork changes may add SDK/system/module interfaces that are required by
+`exodus-mcp`, but they must remain small, versioned, and separately
+reviewable. The Mega Drive soft-reset scaffold follows this rule: version-1
+`ISystemResetInterface` lives in `ExodusSDK/SystemInterface`, the
+module-private `IMegaDriveReset` coordinator lives under `Devices/MD1600IO`,
+and `System` owns operation serialization before delegating to the coordinator.
+The coordinator must not advertise readiness until the full native reset-line
+sequence, M68000 architectural vector-fetch observation, and RAM/VDP
+preservation checks are implemented and covered by the Windows build/live
+validation loop. Plugin or Go fallback through debugger register setters,
+memory writes, or ROM reload is prohibited for `kind: "soft"`.
+
+Every fork-side interface or module change must be validated with
+`bash ./scripts/build-fork.sh` before advancing the submodule pin; plugin-only
+changes use `bash ./scripts/build-windows.sh`.
+
 ## Workflow for `StealthC/Exodus`
 
 Create `.github/workflows/build.yml` in the fork:

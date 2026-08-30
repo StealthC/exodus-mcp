@@ -21,8 +21,9 @@ delivered and catalogued in [FEATURES.md](FEATURES.md):
   execution breakpoints, register-condition evaluation, `m68k_backtrace`,
   `state_diff`.
 - Phase 8: deterministic replay (`deterministic_replay`).
-- Phase 9 (partial, 2026-08-29): `target_reset` (hard), `input_sequence`,
-  `vdp_memory_export`, and the `state_load` run-state contract.
+- Phase 9 (partial, 2026-08-30): `target_reset` (hard), `input_sequence`,
+  `vdp_memory_export`, the `state_load` run-state contract, and the native
+  soft-reset interface scaffold in the Exodus fork/plugin.
 - Interoperability backlog P0–P2: artifact provenance
   (`artifact-provenance/2`), honest capture consistency, run-state
   observability, schema contract hardening, structured trace/coverage/
@@ -72,10 +73,13 @@ end of this section.
   audited batch) using the current `emulator_status.rom.path`, and reports
   `reset_source: "hard"`, the run state, and the generation span. The
   discoverable name ends agent guessing (`emulator_reset`/`cpu_reset`).
-- [ ] `target_reset` soft (`kind: "soft"`): blocked pending a safe native
-  reset-vector operation. The server intentionally does not advertise or
-  emulate this with register/memory writes after the native spike exposed no
-  thread-safe reset operation; callers receive `unsupported_plugin`. Register
+- [ ] `target_reset` soft (`kind: "soft"`): blocked pending the remaining safe
+  native reset-vector implementation. The Exodus fork now has the version-1
+  `ISystemResetInterface` and Mega Drive coordinator boundary, and the plugin
+  can discover/serialize it, but the coordinator deliberately reports not ready
+  until the M68000 architectural vector-fetch observer and RAM/VDP preservation
+  checks exist. The server intentionally does not advertise or emulate this
+  with register/memory writes; callers receive `unsupported_plugin`. Register
   or memory writes are never a documented reset workaround.
 - [x] Combined atomic system snapshot: delivered 2026-08-30 as
   `system_snapshot_capture`. It captures named memory ranges, CPU registers,

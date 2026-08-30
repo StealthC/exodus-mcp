@@ -71,13 +71,13 @@ separate Exodus processes, one bridge per instance.
 **Reset boundary.** `target_reset(kind: "hard")` intentionally uses the existing
 same-cartridge module reload path. A soft reset is a separate native capability,
 not a composition of `SetPC`/`SetSP`/`SetSR`, memory writes, or a ROM-vector
-read followed by a debugger jump. The current pinned Exodus fork and plugin do
-not advertise `soft_reset`, so the Go server returns `unsupported_plugin` without
-mutating the target. Delivery of soft reset is blocked until a versioned
-Mega Drive/system interface can coordinate the 68000, Z80/YM2612, VDP, timing,
-run-state restoration, and reset-result metadata inside Exodus's serialized
-execution context. This prevents a partial CPU-only reset from being reported as
-hardware-equivalent.
+read followed by a debugger jump. The pinned fork now contains the versioned `ISystemResetInterface` and Mega
+Drive coordinator boundary, but the capability remains deliberately
+unadvertised until the coordinator can observe the architectural 68000 vector
+fetch and prove RAM/VDP preservation. Until that native implementation is
+completed, the Go server returns `unsupported_plugin` without mutating the
+target. Soft reset is never composed from debugger register setters, memory
+writes, or a ROM-vector read followed by a debugger jump.
 
 These handles are application concepts, not MCP protocol sessions. Modern MCP
 removed protocol-level HTTP sessions in revision `2026-07-28`.

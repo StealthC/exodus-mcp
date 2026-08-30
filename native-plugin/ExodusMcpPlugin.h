@@ -15,11 +15,13 @@ class IS315_5313;
 class IYM2612;
 class ISN76489;
 class ISystemGUIInterface;
+class ISystemResetInterface;
 
-// ExodusMcpPlugin is the persistent native bridge for exodus-mcp. It is
-// read-only in this increment: it never mutates emulator state, loads ROMs,
-// injects input, or runs scripts. Commands are serialized by construction,
-// because a single pipe thread accepts and processes one connection at a time.
+// ExodusMcpPlugin is the persistent native bridge for exodus-mcp. Inspection
+// commands are read-only; state-changing commands are narrowly scoped to
+// explicitly implemented native operations. Commands are serialized by
+// construction, because a single pipe thread accepts and processes one
+// connection at a time.
 class ExodusMcpPlugin : public Extension
 {
 public:
@@ -112,6 +114,7 @@ private:
 	bool BuildFrameAdvanceData(const BridgeRequest& request, std::string& data, std::string& errorCode, std::string& errorMessage);
 	bool BuildInputSetData(const BridgeRequest& request, std::string& data, std::string& errorCode, std::string& errorMessage);
 	bool BuildSoundStatusData(const BridgeRequest& request, std::string& data, std::string& errorCode, std::string& errorMessage);
+	bool BuildSoftResetData(std::string& data, std::string& errorCode, std::string& errorMessage);
 
 	// Emulator inspection helpers
 	std::vector<MemorySpace> BuildSpaceCatalog();
@@ -121,6 +124,7 @@ private:
 	IS315_5313* FindVdp() const;
 	void PurgeManagedDebugState();
 	ISystemGUIInterface* FindSystemGUIInterface() const;
+	ISystemResetInterface* FindSystemResetInterface() const;
 
 	// Formatting helpers
 	static std::string ToUtf8(const std::wstring& value);

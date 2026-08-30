@@ -18,6 +18,7 @@
 #include "Memory/IMemory.h"
 #include "ExtensionInterface/LoadedModuleInfo.h"
 #include "SystemInterface/ISystemGUIInterface.h"
+#include "SystemInterface/ISystemResetInterface.h"
 #include "HierarchicalStorage/HierarchicalStorage.pkg"
 #include "Stream/Stream.pkg"
 #include "MD1600IO/MDControl3.h"
@@ -1006,6 +1007,10 @@ std::string ExodusMcpPlugin::ExecuteCommand(const BridgeRequest& request, bool& 
 	{
 		success = BuildSoundStatusData(request, payload, errorCode, errorMessage);
 	}
+	else if (strcmp(method, "soft_reset") == 0)
+	{
+		success = BuildSoftResetData(payload, errorCode, errorMessage);
+	}
 	else if (strcmp(method, "audio_capture") == 0)
 	{
 		errorCode = "audio_unavailable";
@@ -1048,6 +1053,11 @@ std::string ExodusMcpPlugin::BuildStatusData() const
 			data += ",";
 		}
 		AppendJsonStringAscii(data, kSupportedOperations[i]);
+	}
+	ISystemResetInterface* reset = FindSystemResetInterface();
+	if (reset != 0 && reset->GetISystemResetInterfaceVersion() == ISystemResetInterface::ThisISystemResetInterfaceVersion() && reset->IsMegaDriveSoftResetAvailable())
+	{
+		data += ",\"soft_reset\"";
 	}
 	data += "]}";
 	return data;
@@ -1320,6 +1330,50 @@ IS315_5313* ExodusMcpPlugin::FindVdp() const
 }
 
 //----------------------------------------------------------------------------------------------------------------------
+ISystemResetInterface* ExodusMcpPlugin::FindSystemResetInterface() const
+{
+	return dynamic_cast<ISystemResetInterface*>(&GetSystemInterface());
+}
+
+bool ExodusMcpPlugin::BuildSoftResetData(std::string& data, std::string& errorCode, std::string& errorMessage)
+{
+	ISystemResetInterface* reset = FindSystemResetInterface();
+	if (reset == 0 || reset->GetISystemResetInterfaceVersion() != ISystemResetInterface::ThisISystemResetInterfaceVersion() || !reset->IsMegaDriveSoftResetAvailable())
+	{
+		errorCode = "soft_reset_unavailable";
+		errorMessage = "The loaded fork does not expose a compatible Mega Drive soft-reset coordinator.";
+		return false;
+	}
+	SoftResetResult result;
+	try
+	{
+		if (!reset->SoftReset(result) || result.status != SoftResetResult::Success)
+		{
+			errorCode = (result.status == SoftResetResult::Partial) ? "soft_reset_partial" : "soft_reset_unavailable";
+			errorMessage = result.failureDetail != 0 ? result.failureDetail : "Native soft reset did not complete.";
+			return false;
+		}
+	}
+	catch (...)
+	{
+		errorCode = "soft_reset_unavailable";
+		errorMessage = "Native soft reset raised an exception.";
+		return false;
+	}
+	data = "{\"schema\":\"mega-drive-soft-reset/1\",\"reset_kind\":\"soft\",\"reset_source\":\"hardware_reset_line\",\"initial_run_state\":";
+	data += result.initialRunning ? "\"running\"" : "\"paused\"";
+	data += ",\"final_run_state\":";
+	data += result.finalRunning ? "\"running\"" : "\"paused\"";
+	data += ",\"ram_preserved\":{\"work_ram\":true,\"z80_ram\":true},\"external_reset_pulse\":";
+	data += result.externalResetPulse ? "true" : "false";
+	data += ",\"vector_fetch\":{\"sp\":";
+	AppendNumber(data, result.stackPointer);
+	data += ",\"pc\":";
+	AppendNumber(data, result.programCounter);
+	data += ",\"byte_order\":\"big-endian\",\"address_space\":\"m68k-bus\",\"source\":\"architectural_bus_fetch\"}}";
+	return true;
+}
+
 ISystemGUIInterface* ExodusMcpPlugin::FindSystemGUIInterface() const
 {
 	// Extensions bind to the same System object the GUI uses, seen through

@@ -65,11 +65,13 @@ a 32-bit binary is required.
 
 The automated path is the repository wrapper; it builds `Exodus.sln` in the
 submodule and copies the generated `vendor/exodus/Exodus.exe` into the test
-install configured by `.env`, under that install's emulator file name:
+install configured by `.env`, under that install's emulator file name. Use
+this wrapper for fork-side changes such as `System.dll`, module DLLs, SDK
+interfaces, or the native Mega Drive soft-reset coordinator scaffold:
 
 ```bash
-./scripts/build-fork.sh               # Release x64 (default)
-./scripts/build-fork.sh --config Debug
+bash ./scripts/build-fork.sh               # Release x64 (default)
+bash ./scripts/build-fork.sh --config Debug
 ```
 
 Close the running emulator first: Windows locks the exe image while the
@@ -94,9 +96,10 @@ intermediates.
 
 ## Known-good result and troubleshooting
 
-Release | x64 (fork base `08f388f`, plus the MCP trace-path fork commits) is
-the verified default. Legacy expat, libjpeg, and libtiff warnings were
-non-fatal in both configurations; `Debug | x64` was also built successfully.
+Release | x64 (fork base `08f388f`, plus the MCP trace-path and native
+soft-reset interface scaffold fork commits) is the verified default. Legacy
+expat, libjpeg, and libtiff warnings were non-fatal in both configurations;
+`Debug | x64` was also built successfully.
 
 - Missing `v143`: add MSVC v143 x64/x86 build tools in Visual Studio Installer.
 - Missing third-party headers/libraries: build `ThirdPartyLibraries.sln` first,

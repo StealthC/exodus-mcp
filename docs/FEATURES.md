@@ -408,9 +408,11 @@ is available; unavailable native features are documented explicitly (see
 - `target_reset`: the discoverable reset tool — `kind: "hard"` performs the
   documented same-path cartridge reload described under `rom_load`. A
   `kind: "soft"` request is intentionally rejected with
-  `unsupported_plugin`: the native spike found no safe thread-serialized
-  reset-vector/peripheral operation, so the server never emulates reset with
-  register or memory writes.
+  `unsupported_plugin`: the fork/plugin now contain the versioned native
+  reset-interface scaffold, but it is not advertised until the M68000
+  architectural reset-vector fetch observer and RAM/VDP preservation checks
+  are implemented. The server never emulates reset with register or memory
+  writes.
 - Target revision: a process-local `target_generation` starts at 1, advances
   exactly once per successful mutation, and is attached to every response,
   resource, snapshot, and audit record. Ambiguous native failures move the
@@ -647,8 +649,8 @@ reference harness, in addition to unit and integration tests:
   explicit unavailable command-latch fields.
 - Save/list/load round trip with generation/ROM provenance and stale flags;
   `target_reset(kind: "soft")` is live-verified to fail safely with
-  `unsupported_plugin` on the current fork, without a native action or
-  register/memory-write fallback;
+  `unsupported_plugin` on the current fork/plugin scaffold, without a native
+  action or register/memory-write fallback;
   frame advance and input with a 3-button controller; coverage capture;
   watchpoint-triggered trace capture; ROM header parsing and checksum
   validation.

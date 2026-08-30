@@ -47,18 +47,19 @@ call; the stop event keeps shutdown responsive mid-command.
 | `regs_get` | `cpu=m68k\|z80` | Full register set plus decomposed flags. |
 | `disasm` | `cpu`, `address?`, `count<=256` | Linear-sweep disassembly with raw opcode bytes. |
 | `trace_capture` | `cpu`, `max_entries<=10000`, `timeout_ms` | Ring-buffer trace snapshot restored to prior state afterwards. |
-| `soft_reset` | — | Reserved for the versioned Mega Drive fork reset interface; not advertised by this plugin until the fork can coordinate the reset line and peripherals safely. |
+| `soft_reset` | — | Advertised only when the loaded fork exposes version-1 `ISystemResetInterface` and a ready Mega Drive coordinator; otherwise the bridge returns `soft_reset_unavailable` without mutation. |
 
 Space ids are assigned natively from loaded devices: `<cpu>-bus` for processor
 bus views (declared big-endian for M68K, little-endian for Z80) and
 `mem-<sanitized-instance>` for `IMemory` devices such as work RAM, Z80 RAM,
 VRAM/CRAM/VSRAM buffers, boot ROM, and cartridge ROM.
 
-All access is read-only debugger-path access (the same paths the Exodus debug
-windows use while emulation runs). Responses therefore declare
-`consistency: live`. The plugin never writes memory, injects input, loads
-ROMs, or mutates emulator state; trace capture restores the processor's prior
-trace settings after every capture.
+Read commands use debugger-path access (the same paths the Exodus debug
+windows use while emulation runs) and declare their capture consistency
+explicitly. Mutating commands are exposed only where the native operation is
+implemented and serialized; unsupported capabilities such as Mega Drive soft
+reset remain absent from `status.supported_operations`. Trace capture restores
+the processor's prior trace settings after every capture.
 
 ## Build
 
@@ -73,5 +74,8 @@ msbuild native-plugin\ExodusMcpPlugin.vcxproj /p:Configuration=Debug /p:Platform
 The project references the Extension, GenericAccess, and Processor SDK
 projects, so MSBuild builds those first and links the resulting libs. The DLL
 lands in `vendor/exodus/Assemblies/ExodusMcpPlugin.dll`, which is the
-extensions directory a local Exodus build already scans. Keep the Exodus MIT
-license notice when distributing an Exodus-derived binary.
+extensions directory a local Exodus build already scans. Keep the Exodus MIT license notice when distributing an Exodus-derived binary.
+The `soft_reset` bridge method requires a fork exposing version-1
+`ISystemResetInterface`; this scaffold is present in the fork, but the method is
+not advertised until the native Mega Drive coordinator reports the full reset
+sequence as ready.
