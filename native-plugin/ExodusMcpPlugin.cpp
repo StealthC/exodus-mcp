@@ -45,7 +45,7 @@ const unsigned long long kDefaultTraceTimeoutMs = 5000;
 const unsigned long long kMaxTraceTimeoutMs = 30000;
 const unsigned int kMaxFrameAdvance = 60;
 const unsigned int kMaxInputButtons = 16;
-const char* const kSupportedOperations[] = {"status", "emulator_status", "mem_spaces", "mem_read", "regs_get", "disasm", "cpu_control", "breakpoint_set", "breakpoint_list", "breakpoint_remove", "watchpoint_set", "watchpoint_list", "watchpoint_remove", "vdp_status", "vdp_mem_read", "vdp_pixel_info", "frame_capture", "rom_load", "trace_capture", "mem_write", "state_save", "state_load", "frame_advance", "input_set", "sound_status", "audio_capture"};
+const char* const kSupportedOperations[] = {"status", "emulator_status", "mem_spaces", "mem_read", "regs_get", "disasm", "cpu_control", "breakpoint_set", "breakpoint_list", "breakpoint_remove", "watchpoint_set", "watchpoint_list", "watchpoint_remove", "vdp_status", "vdp_command_dma_status", "vdp_mem_read", "vdp_pixel_info", "frame_capture", "rom_load", "trace_capture", "mem_write", "state_save", "state_load", "frame_advance", "input_set", "sound_status", "audio_capture"};
 const size_t kSupportedOperationCount = sizeof(kSupportedOperations) / sizeof(kSupportedOperations[0]);
 
 // ScreenshotSink collects the RGB 8-bit pixels that S315_5313::GetScreenshot
@@ -957,6 +957,11 @@ std::string ExodusMcpPlugin::ExecuteCommand(const BridgeRequest& request, bool& 
 		payload = BuildVdpStatusData();
 		success = true;
 	}
+	else if (strcmp(method, "vdp_command_dma_status") == 0)
+	{
+		payload = BuildVdpCommandDMAStatusData();
+		success = true;
+	}
 	else if (strcmp(method, "vdp_mem_read") == 0)
 	{
 		success = BuildVDPMemoryReadData(request, payload, errorCode, errorMessage);
@@ -1382,6 +1387,31 @@ std::string ExodusMcpPlugin::BuildVdpStatusData()
 }
 
 //----------------------------------------------------------------------------------------------------------------------
+std::string ExodusMcpPlugin::BuildVdpCommandDMAStatusData()
+{
+	IS315_5313* vdp = FindVdp();
+	if (vdp == 0) return "{\"vdp_found\":false}";
+	std::string data = "{\"vdp_found\":true,\"byte_order\":\"big-endian\",\"address_space\":\"vdp-internal\",\"registers\":[";
+	for (unsigned int location = 0; location < IS315_5313::RegisterCount; ++location)
+	{
+		if (location != 0) data += ",";
+		data += "{\"register\":"; AppendNumber(data, location);
+		data += ",\"value\":"; AppendNumber(data, vdp->GetRegisterData(location)); data += "}";
+	}
+	data += "],\"command_latch\":{\"address\":null,\"address_valid\":null,\"code\":null,\"destination\":null,\"observability\":\"unavailable\",\"note\":\"The pinned IS315_5313 interface does not expose the complete internal command latch.\"},\"dma\":{";
+	data += "\"enabled\":"; data += vdp->RegGetDMAEnabled() ? "true" : "false";
+	data += ",\"active\":"; data += vdp->GetStatusFlagDMA() ? "true" : "false";
+	data += ",\"length_counter\":"; AppendNumber(data, vdp->RegGetDMALengthCounter());
+	data += ",\"source_address\":"; AppendNumber(data, vdp->RegGetDMASourceAddress());
+	data += ",\"source_address_byte1\":"; AppendNumber(data, vdp->RegGetDMASourceAddressByte1());
+	data += ",\"source_address_byte2\":"; AppendNumber(data, vdp->RegGetDMASourceAddressByte2());
+	data += ",\"source_address_byte3\":"; AppendNumber(data, vdp->RegGetDMASourceAddressByte3());
+	data += ",\"transfer_mode_bit1\":"; data += vdp->RegGetDMD1() ? "true" : "false";
+	data += ",\"transfer_mode_bit0\":"; data += vdp->RegGetDMD0() ? "true" : "false";
+	data += ",\"destination\":null,\"remaining_length\":null,\"observability\":\"partial\",\"note\":\"Destination and live remaining length are not separate public fields in the pinned interface.\"},\"capture_consistency\":\"composite_non_atomic\"}";
+	return data;
+}
+
 bool ExodusMcpPlugin::BuildFrameCaptureData(const BridgeRequest& request, std::string& data, std::string& errorCode, std::string& errorMessage)
 {
 	IS315_5313* vdp = FindVdp();

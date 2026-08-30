@@ -59,8 +59,8 @@ func TestTargetResetWithoutROMFailsReadOnly(t *testing.T) {
 	}
 }
 
-// TestTargetResetSoftNotDelivered: kind "soft" is rejected with a clear
-// message before any native action, and unknown kinds are invalid.
+// TestTargetResetSoftRequiresNativeSupport: old plugins reject soft reset
+// before any native action, and unknown kinds remain invalid.
 func TestTargetResetSoftNotDelivered(t *testing.T) {
 	client := &fakeBridgeClient{status: newFakeStatus()}
 	server := newTestServer(t, client)
@@ -68,8 +68,8 @@ func TestTargetResetSoftNotDelivered(t *testing.T) {
 
 	result := postToolCall(t, server, "target_reset", `{"kind":"soft"}`)
 	content := structured(result)
-	if result["isError"] != true || content["code"] != "invalid_params" {
-		t.Fatalf("expected invalid_params for soft: %v", result)
+	if result["isError"] != true || content["code"] != "unsupported_plugin" {
+		t.Fatalf("expected unsupported_plugin for soft: %v", result)
 	}
 	if len(client.recordedCalls) != 0 {
 		t.Fatalf("no native action expected, got %v", client.recordedCalls)

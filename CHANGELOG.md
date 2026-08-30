@@ -9,6 +9,17 @@ and this project will use [Semantic Versioning](https://semver.org/spec/v2.0.0.h
 
 ### Added
 
+- `vdp_command_dma_status`: bounded read-only VDP command/DMA inspection.
+  The native plugin returns the 24 raw VDP registers plus directly exposed DMA
+  enable/status, length, source, and mode fields. Command-latch and other
+  fields absent from the pinned SDK remain `null` with explicit observability
+  notes; no state is reconstructed from bus writes and no CPU/VDP atomicity is
+  claimed.
+- Strict `target_reset` soft-reset contract: `kind: "soft"` is accepted by
+  the schema but returns `unsupported_plugin` until Exodus exposes a safe,
+  thread-serialized reset-vector/peripheral operation. The server deliberately
+  provides no register-write or memory-write fallback. `kind: "hard"` remains
+  unchanged.
 - Dual-form address ergonomics across address-bearing tools: optional
   `address_space` accepts documented space-relative or processor-bus addresses
   and translates them to the native target domain; responses preserve legacy

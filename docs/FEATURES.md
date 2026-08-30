@@ -5,13 +5,14 @@ server, grouped by capability. Planned work is tracked in
 [ROADMAP.md](ROADMAP.md); the [CHANGELOG.md](../CHANGELOG.md) records the
 delivery history.
 
-The MCP server currently exposes **84 analysis tools** spanning the delivered
+The MCP server currently exposes **85 analysis tools** spanning the delivered
 roadmap phases 0-9: bridge and context foundations, memory and artifact
 access, both processors, VDP graphics, deterministic controlled
 experimentation, advanced analysis, evidence annotations, advanced debugging,
-deterministic replay, and workflow ergonomics. Everything below is covered by
-unit and integration tests and exercised live against a running Exodus
-instance (see [Validation](#validation)).
+deterministic replay, and workflow ergonomics. Delivered entries are covered
+by unit and integration tests and exercised live where the native capability
+is available; unavailable native features are documented explicitly (see
+[Validation](#validation)).
 
 ## Cross-cutting behavior
 
@@ -311,6 +312,11 @@ instance (see [Validation](#validation)).
 
 ## VDP and graphics (Phase 3)
 
+- `vdp_command_dma_status`: bounded read-only native view of all 24 VDP
+  registers, directly exposed DMA enable/status, length/source/mode fields,
+  and explicit null/observability metadata for the command latch and DMA
+  destination/remaining fields not exposed by the pinned SDK. It never
+  reconstructs state from bus writes and does not claim CPU/VDP atomicity.
 - `vdp_status`: all 24 registers plus typed decode of display enable,
   extended VRAM, name-table, pattern, and h-scroll-base fields, with
   completed-plane geometry.
@@ -400,15 +406,11 @@ instance (see [Validation](#validation)).
   through the Exodus UI, read its path from `emulator_status.rom.path`
   (`path_source: "loaded_module"`) and pass it back here.
 - `target_reset`: the discoverable reset tool — `kind: "hard"` performs the
-  documented same-path cartridge reload described under `rom_load` (module
-  reload reinitializes the system and purges all managed debug resources in
-  one audited batch) using the current cartridge path from `emulator_status`,
-  so a cartridge opened through the Exodus UI resets identically to one
-  loaded via MCP. Reports `reset_source: "hard"`, the run state, and the
-  generation span; with no known cartridge it fails read-only with
-  `no_rom_loaded`. `kind: "soft"` is not delivered (a debugger-driven
-  reset-vector jump is under design); register or memory writes are never a
-  documented reset workaround.
+  documented same-path cartridge reload described under `rom_load`. A
+  `kind: "soft"` request is intentionally rejected with
+  `unsupported_plugin`: the native spike found no safe thread-serialized
+  reset-vector/peripheral operation, so the server never emulates reset with
+  register or memory writes.
 - Target revision: a process-local `target_generation` starts at 1, advances
   exactly once per successful mutation, and is attached to every response,
   resource, snapshot, and audit record. Ambiguous native failures move the
@@ -641,8 +643,12 @@ reference harness, in addition to unit and integration tests:
   the live frame; tile and plane exports reproducing title-screen art;
   sprite-table chain `[0, 4, 15]` in attract mode; `vdp_pixel_info`
   attribution of border, layer B sky, layer A text/building, and a bottom-row
-  sprite.
+  sprite; `vdp_command_dma_status` live native register/DMA observation with
+  explicit unavailable command-latch fields.
 - Save/list/load round trip with generation/ROM provenance and stale flags;
+  `target_reset(kind: "soft")` is live-verified to fail safely with
+  `unsupported_plugin` on the current fork, without a native action or
+  register/memory-write fallback;
   frame advance and input with a 3-button controller; coverage capture;
   watchpoint-triggered trace capture; ROM header parsing and checksum
   validation.

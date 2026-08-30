@@ -102,6 +102,7 @@ private:
 	static DWORD TraceCaptureGuarded(ExodusMcpPlugin* plugin, const BridgeRequest& request, std::string& data, std::string& errorCode, std::string& errorMessage, bool& success, void** faultingAddress);
 	bool TraceCaptureInner(const BridgeRequest& request, std::string& data, std::string& errorCode, std::string& errorMessage);
 	std::string BuildVdpStatusData();
+	std::string BuildVdpCommandDMAStatusData();
 	bool BuildVDPMemoryReadData(const BridgeRequest& request, std::string& data, std::string& errorCode, std::string& errorMessage);
 	bool BuildVDPPixelInfoData(const BridgeRequest& request, std::string& data, std::string& errorCode, std::string& errorMessage);
 	bool BuildFrameCaptureData(const BridgeRequest& request, std::string& data, std::string& errorCode, std::string& errorMessage);

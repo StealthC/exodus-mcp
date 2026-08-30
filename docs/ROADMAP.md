@@ -48,6 +48,13 @@ structured outputs, mirroring the Phase 3 VDP surface.
   a safe bounded PCM buffer exposed by the native SDK.
 - [ ] Active-note decode: from the recorded or live FM/PSG state, report the
   notes playing per channel (analogy to `vdp_sprite_table`).
+- [ ] VGM or equivalent command-stream capture: investigate exporting a
+  bounded, timestamped YM2612/PSG register-write stream (preferably `.vgm`, or
+  a documented equivalent when the native logger cannot represent the full
+  stream). Preserve chip clocks, wait commands, frame/target provenance, ROM
+  identity, truncation state, and device availability. This would complement
+  WAV capture by enabling deterministic playback and chip-level analysis,
+  without claiming that a register stream is identical to mixed host audio.
 
 ## Phase 9 — Workflow ergonomics (planned)
 
@@ -65,11 +72,11 @@ end of this section.
   audited batch) using the current `emulator_status.rom.path`, and reports
   `reset_source: "hard"`, the run state, and the generation span. The
   discoverable name ends agent guessing (`emulator_reset`/`cpu_reset`).
-- [ ] `target_reset` soft (`kind: "soft"`): a debugger-driven reset-vector
-  jump (re-read the initial SP/PC from the cartridge header and restart
-  execution, RAM preserved like real hardware) whose exact semantics must be
-  designed before delivery. Register or memory writes are never a documented
-  reset workaround.
+- [ ] `target_reset` soft (`kind: "soft"`): blocked pending a safe native
+  reset-vector operation. The server intentionally does not advertise or
+  emulate this with register/memory writes after the native spike exposed no
+  thread-safe reset operation; callers receive `unsupported_plugin`. Register
+  or memory writes are never a documented reset workaround.
 - [x] Combined atomic system snapshot: delivered 2026-08-30 as
   `system_snapshot_capture`. It captures named memory ranges, CPU registers,
   VDP status and selected VDP buffers/frame in one pause window, with a
@@ -116,10 +123,10 @@ end of this section.
   (a composite mutation — post-load cpu_control inside the same control
   window; an override failure surfaces with the load already applied, never
   silently; the default "restore" keeps the snapshot's saved run state).
-- [ ] VDP command/DMA state decoder: expose the VDP command latch and DMA
-  configuration (destination, transfer type, address, mode) as a decoded
-  read-only view. Feasibility depends on plugin-side access to the VDP
-  device's internal command state; confirm before scheduling.
+- [x] VDP command/DMA state decoder: delivered as `vdp_command_dma_status`.
+  DMA registers/status are direct observations from the native interface;
+  command-latch fields and unavailable DMA subfields remain null with explicit
+  observability notes because the pinned SDK does not expose them.
 
 ### Phase 9 report review outcomes (not re-adopted)
 

@@ -68,6 +68,17 @@ are filtered projections.
 A future multi-instance manager can provide actual parallelism by launching
 separate Exodus processes, one bridge per instance.
 
+**Reset boundary.** `target_reset(kind: "hard")` intentionally uses the existing
+same-cartridge module reload path. A soft reset is a separate native capability,
+not a composition of `SetPC`/`SetSP`/`SetSR`, memory writes, or a ROM-vector
+read followed by a debugger jump. The current pinned Exodus fork and plugin do
+not advertise `soft_reset`, so the Go server returns `unsupported_plugin` without
+mutating the target. Delivery of soft reset is blocked until a versioned
+Mega Drive/system interface can coordinate the 68000, Z80/YM2612, VDP, timing,
+run-state restoration, and reset-result metadata inside Exodus's serialized
+execution context. This prevents a partial CPU-only reset from being reported as
+hardware-equivalent.
+
 These handles are application concepts, not MCP protocol sessions. Modern MCP
 removed protocol-level HTTP sessions in revision `2026-07-28`.
 

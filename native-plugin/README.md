@@ -1,8 +1,9 @@
 # Native Exodus MCP bridge
 
 `ExodusMcpPlugin` is the persistent native bridge for Exodus. It is a global
-extension that starts no network listener and performs read-only emulator
-inspection only. When enabled, it accepts authenticated commands over one
+extension that starts no network listener. Most inspection commands are
+read-only; state-changing commands are exposed only where their operation is
+explicitly implemented and serialized. When enabled, it accepts authenticated commands over one
 Windows named pipe and answers with streamed JSON envelopes.
 
 ## Contract
@@ -46,6 +47,7 @@ call; the stop event keeps shutdown responsive mid-command.
 | `regs_get` | `cpu=m68k\|z80` | Full register set plus decomposed flags. |
 | `disasm` | `cpu`, `address?`, `count<=256` | Linear-sweep disassembly with raw opcode bytes. |
 | `trace_capture` | `cpu`, `max_entries<=10000`, `timeout_ms` | Ring-buffer trace snapshot restored to prior state afterwards. |
+| `soft_reset` | — | Reserved for the versioned Mega Drive fork reset interface; not advertised by this plugin until the fork can coordinate the reset line and peripherals safely. |
 
 Space ids are assigned natively from loaded devices: `<cpu>-bus` for processor
 bus views (declared big-endian for M68K, little-endian for Z80) and
