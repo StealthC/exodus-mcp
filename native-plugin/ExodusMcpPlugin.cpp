@@ -1364,12 +1364,24 @@ bool ExodusMcpPlugin::BuildSoftResetData(std::string& data, std::string& errorCo
 	data += result.initialRunning ? "\"running\"" : "\"paused\"";
 	data += ",\"final_run_state\":";
 	data += result.finalRunning ? "\"running\"" : "\"paused\"";
-	data += ",\"ram_preserved\":{\"work_ram\":true,\"z80_ram\":true},\"external_reset_pulse\":";
+	data += ",\"state_changed\":";
+	data += result.stateChanged ? "true" : "false";
+	data += ",\"ram_preserved\":{\"work_ram\":";
+	data += result.workRamPreserved ? "true" : "false";
+	data += ",\"z80_ram\":";
+	data += result.z80RamPreserved ? "true" : "false";
+	data += "},\"vdp_preserved\":";
+	data += result.vdpPreserved ? "true" : "false";
+	data += ",\"external_reset_pulse\":";
 	data += result.externalResetPulse ? "true" : "false";
-	data += ",\"vector_fetch\":{\"sp\":";
+	data += ",\"vector_fetch\":{\"valid\":";
+	data += result.vectorFetchValid ? "true" : "false";
+	data += ",\"sp\":";
 	AppendNumber(data, result.stackPointer);
 	data += ",\"pc\":";
 	AppendNumber(data, result.programCounter);
+	data += ",\"pc_mask\":";
+	AppendNumber(data, result.programCounterMask);
 	data += ",\"byte_order\":\"big-endian\",\"address_space\":\"m68k-bus\",\"source\":\"architectural_bus_fetch\"}}";
 	return true;
 }

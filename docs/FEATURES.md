@@ -1,7 +1,7 @@
 # Features
 
 This catalog lists every feature delivered in the `exodus-mcp` analysis
-server, grouped by capability. Planned work is tracked in
+server, grouped by capability. Only open work is tracked in
 [ROADMAP.md](ROADMAP.md); the [CHANGELOG.md](../CHANGELOG.md) records the
 delivery history.
 
@@ -553,8 +553,18 @@ is available; unavailable native features are documented explicitly (see
   code path, so a mismatch is a real emulator nondeterminism signal rather
   than a harness artifact.
 
-## Phase 9 workflow ergonomics (one-shot instrumentation, run-until, state override)
+## Phase 9 workflow ergonomics (delivered: atomic snapshots, reset, input, exports, instrumentation, and state override)
 
+- `target_reset(kind: "soft")`: native hardware-like reset available only on
+  the compatible fork/plugin pair. It pulses the native M68000/Z80 reset
+  lines without reloading the ROM, fetches SSP/PC through the M68000 reset
+  exception path with big-endian 24-bit bus metadata, preserves the previous
+  running/paused state, and proves Work RAM, Z80 RAM, VDP registers, and
+  exposed VDP buffers before returning success. The result includes
+  `external_reset_pulse`, `vector_fetch`, preservation details, generation
+  before/after, and initial/final run states. Older plugins fail closed with
+  `unsupported_plugin`; native proof failures are exposed as
+  `soft_reset_partial` and never converted to success.
 - `one_shot: true` on `cpu_breakpoint_set` / `cpu_watchpoint_set`: the server
   marks the instrument as one-shot in its resource provenance. Whenever the
   emulator is observed paused, a housekeeping sweep reads the native

@@ -57,9 +57,16 @@ VRAM/CRAM/VSRAM buffers, boot ROM, and cartridge ROM.
 Read commands use debugger-path access (the same paths the Exodus debug
 windows use while emulation runs) and declare their capture consistency
 explicitly. Mutating commands are exposed only where the native operation is
-implemented and serialized; unsupported capabilities such as Mega Drive soft
-reset remain absent from `status.supported_operations`. Trace capture restores
-the processor's prior trace settings after every capture.
+implemented and serialized. Trace capture restores the processor's prior trace
+settings after every capture.
+
+The fork's `soft_reset` operation is hardware-like: it pulses the Mega Drive
+reset lines, runs the M68000 reset exception path (including architectural
+big-endian SSP/PC vector fetches), and reports explicit Work RAM, Z80 RAM, and
+VDP preservation proofs. It is advertised only by a fork build with all of
+those observers available; older Exodus binaries continue to return
+`soft_reset_unavailable` without mutating the target. A failed proof is exposed
+as `soft_reset_partial`, never as a successful reset.
 
 ## Build
 
@@ -76,6 +83,6 @@ projects, so MSBuild builds those first and links the resulting libs. The DLL
 lands in `vendor/exodus/Assemblies/ExodusMcpPlugin.dll`, which is the
 extensions directory a local Exodus build already scans. Keep the Exodus MIT license notice when distributing an Exodus-derived binary.
 The `soft_reset` bridge method requires a fork exposing version-1
-`ISystemResetInterface`; this scaffold is present in the fork, but the method is
-not advertised until the native Mega Drive coordinator reports the full reset
-sequence as ready.
+`ISystemResetInterface` and a ready native Mega Drive coordinator. The bridge
+serializes the reset state, vector metadata, reset pulse, preservation proofs,
+and diagnostic fields; incompatible or incomplete forks fail closed.

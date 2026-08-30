@@ -9,19 +9,27 @@ and this project will use [Semantic Versioning](https://semver.org/spec/v2.0.0.h
 
 ### Added
 
+- Native hardware-like `target_reset(kind: "soft")` for the compatible
+  Exodus fork/plugin pair. The operation pulses M68000/Z80 reset lines,
+  performs architectural SSP/PC vector fetches, preserves the prior run state,
+  verifies Work RAM, Z80 RAM, VDP registers and exposed VDP buffers, and
+  reports generation, preservation, and diagnostic details. Legacy plugins
+  remain unavailable without any register/memory-write fallback.
+- `sound_status`: bounded typed observation of YM2612 and SN76489/PSG state,
+  including FM channels/operators, PSG tones/volumes, DAC and explicit device
+  availability notes.
+- `system_snapshot_capture`: bounded atomic cross-domain capture of named
+  memory ranges, CPU registers, VDP state/buffers, and an optional frame in a
+  single pause window, with a versioned manifest and shared provenance.
 - `vdp_command_dma_status`: bounded read-only VDP command/DMA inspection.
   The native plugin returns the 24 raw VDP registers plus directly exposed DMA
   enable/status, length, source, and mode fields. Command-latch and other
   fields absent from the pinned SDK remain `null` with explicit observability
   notes; no state is reconstructed from bus writes and no CPU/VDP atomicity is
   claimed.
-- Native soft-reset capability scaffold: the Exodus fork now exposes version-1
-  `ISystemResetInterface` and a Mega Drive coordinator boundary, and the plugin
-  resolves/serializes that interface only when the loaded fork reports it ready.
-  The coordinator remains intentionally unavailable until the M68000
-  architectural reset-vector fetch observer and RAM/VDP preservation checks are
-  implemented, so `target_reset(kind: "soft")` still fails safely with
-  `unsupported_plugin` and no register-write or memory-write fallback.
+- The native soft-reset scaffold is now implemented: the fork exposes the
+  version-1 reset interface and executes the native coordinator transaction;
+  the plugin advertises it only when ready and reports full reset metadata.
   `kind: "hard"` remains unchanged.
 - Dual-form address ergonomics across address-bearing tools: optional
   `address_space` accepts documented space-relative or processor-bus addresses
@@ -347,6 +355,11 @@ and this project will use [Semantic Versioning](https://semver.org/spec/v2.0.0.h
 
 ### Changed
 
+- Roadmap cleanup: `docs/ROADMAP.md` now lists only open work. Completed
+  phases and workflow features remain in `docs/FEATURES.md`, while rejected
+  and deferred ideas were removed from the active roadmap. The remaining
+  backlog is multi-instance orchestration, the unfinished audio capture and
+  audio analysis items, safe native soft reset, and release automation.
 - **Breaking:** context leases are removed outright — `context_lease_*`,
   `lease_id`, and `requireLease` no longer exist; ordinary mutations need no
   lease, lock, or generation precondition. There is no legacy compatibility

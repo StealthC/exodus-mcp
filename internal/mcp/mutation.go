@@ -92,8 +92,8 @@ func (server *Server) executeMutation(ctx context.Context, call mutationCall) (m
 		if failure != nil {
 			entry.Failure = &analysis.AuditFailure{Code: failure.Code, Message: failure.Message}
 		}
-		// Resource ids are only meaningful when the mutation actually landed.
-		if outcome == analysis.OutcomeOK && call.resources != nil {
+		// Resource ids are meaningful for successful and partial mutations.
+		if (outcome == analysis.OutcomeOK || outcome == analysis.OutcomePartial) && call.resources != nil {
 			entry.ResourceIDs = call.resources()
 		}
 		server.recordAudit(entry)
@@ -147,6 +147,23 @@ func (server *Server) executeMutation(ctx context.Context, call mutationCall) (m
 		var ambiguous bool
 		payload, commandFailure, ambiguous = server.runCommand(ctx, call.operation, call.params)
 		if commandFailure != nil {
+			if commandFailure.Code == "soft_reset_partial" {
+				// The native coordinator explicitly reports that reset lines were
+				// applied but a proof failed. Treat this as a landed mutation so
+				// generations and managed-resource invalidation remain coherent.
+				afterGen := target.Advance()
+				if call.commit != nil {
+					call.commit()
+				}
+				if commandFailure.Data == nil {
+					commandFailure.Data = map[string]any{}
+				}
+				commandFailure.Data["state_changed"] = true
+				commandFailure.Data["target_generation_before"] = beforeGen
+				commandFailure.Data["target_generation_after"] = afterGen
+				record(analysis.OutcomePartial, &beforeGen, &afterGen, commandFailure, nil)
+				return nil, beforeGen, afterGen, commandFailure
+			}
 			if ambiguous {
 				// The bridge may or may not have executed the command; the
 				// target revision is no longer provable.

@@ -23,15 +23,23 @@ BASE_URL="http://127.0.0.1:8768"
 FULL=0
 while [ $# -gt 0 ]; do
 	case "$1" in
-		--url) BASE_URL="$2"; shift 2 ;;
-		--full) FULL=1; shift ;;
-		*) echo "unknown option: $1"; exit 2 ;;
+	--url)
+		BASE_URL="$2"
+		shift 2
+		;;
+	--full)
+		FULL=1
+		shift
+		;;
+	*)
+		echo "unknown option: $1"
+		exit 2
+		;;
 	esac
 done
 
 failures=0
 step() { printf '\n== %s\n' "$1"; }
-
 
 check() {
 	local label="$1" condition="$2"
@@ -97,7 +105,6 @@ print(json.dumps({'name': sys.argv[1], 'arguments': json.loads(sys.argv[2])}))
 " "$name" "$arguments")") || return 1
 	json_get "$result" "parsed.get('structuredContent', {})" 2>/dev/null
 }
-
 
 # The plugin pipe can lag the HTTP health gate by tens of seconds on Debug
 # builds; wait until the bridge actually answers before driving tools.
@@ -574,8 +581,8 @@ print(s)
 			snapshot_list=$(tool_call "state_list")
 			listing_ids=$(json_get "$snapshot_list" "' '.join(str(s.get('state_id', '')) for s in parsed.get('snapshots', []))" 2>/dev/null)
 			case " $listing_ids " in
-				*" $state_id "*) check "state_list reports the snapshot" true ;;
-				*) check "state_list reports the snapshot" false ;;
+			*" $state_id "*) check "state_list reports the snapshot" true ;;
+			*) check "state_list reports the snapshot" false ;;
 			esac
 			loaded=$(tool_call "state_load" "{\"state_id\": \"$state_id\"}")
 			loaded_flag=$(json_get "$loaded" "str(parsed.get('loaded', False)).lower()" 2>/dev/null)
@@ -629,8 +636,8 @@ print(s)
 						lock_audit=$(tool_call "target_audit_log" "{\"tool\": \"target_control\"}")
 						lock_end_reason=$(json_get "$lock_audit" "' '.join(str(e.get('detail', {}).get('reason', '')) for e in parsed.get('entries', []))" 2>/dev/null)
 						case " $lock_end_reason " in
-							*" experiment_completed "*) check "experiment releases its internal lock" true ;;
-							*) check "experiment releases its internal lock" false ;;
+						*" experiment_completed "*) check "experiment releases its internal lock" true ;;
+						*) check "experiment releases its internal lock" false ;;
 						esac
 					else
 						check "experiment manifest records completion" false
@@ -688,6 +695,30 @@ print(s)
 			check "target_reset leaves the system running" "[ \"\$reset_running\" = 'true' ]"
 			tool_call "cpu_pause" >/dev/null
 		fi
+
+		# target_reset soft: validate native vector and preservation proofs in
+		# both paused and running states.
+		soft_before=$(tool_call "bridge_status")
+		soft_generation_before=$(json_get "$soft_before" "parsed.get('target_generation', -1)" 2>/dev/null)
+		soft_paused=$(tool_call "target_reset" '{"kind": "soft"}')
+		soft_code=$(json_get "$soft_paused" "parsed.get('code', '')" 2>/dev/null)
+		if [ -n "$soft_code" ]; then
+			check "target_reset soft succeeds while paused" false
+		else
+			soft_generation_after=$(json_get "$soft_paused" "parsed.get('target_generation_after', -1)" 2>/dev/null)
+			soft_fetch_valid=$(json_get "$soft_paused" "str(parsed.get('vector_fetch', {}).get('valid', False)).lower()" 2>/dev/null)
+			soft_ram=$(json_get "$soft_paused" "str(parsed.get('ram_preserved', {}).get('work_ram', False) and parsed.get('ram_preserved', {}).get('z80_ram', False)).lower()" 2>/dev/null)
+			soft_vdp=$(json_get "$soft_paused" "str(parsed.get('vdp_preserved', False)).lower()" 2>/dev/null)
+			soft_final=$(json_get "$soft_paused" "parsed.get('final_run_state', '')" 2>/dev/null)
+			check "target_reset soft succeeds while paused" "[ \"$soft_final\" = 'paused' ] && [ \"$soft_fetch_valid\" = 'true' ] && [ \"$soft_ram\" = 'true' ] && [ \"$soft_vdp\" = 'true' ]"
+			check "soft reset advances generation once" "[ \"$soft_generation_after\" -eq $((soft_generation_before + 1)) ]"
+		fi
+		tool_call "cpu_run" >/dev/null
+		soft_running=$(tool_call "target_reset" '{"kind": "soft"}')
+		soft_running_code=$(json_get "$soft_running" "parsed.get('code', '')" 2>/dev/null)
+		soft_running_final=$(json_get "$soft_running" "parsed.get('final_run_state', '')" 2>/dev/null)
+		check "target_reset soft preserves running state" "[ -z \"$soft_running_code\" ] && [ \"$soft_running_final\" = 'running' ]"
+		tool_call "cpu_pause" >/dev/null
 
 		# State run-state contract: saved_run_state recorded at save time and
 		# echoed on load alongside final_run_state.

@@ -9,6 +9,7 @@ import (
 const (
 	OutcomeOK        = "ok"
 	OutcomeFailed    = "failed"       // provable native or local failure, no mutation
+	OutcomePartial   = "partial"      // native operation changed target but proof failed
 	OutcomeConflict  = "conflict"     // generation precondition mismatch, no native action
 	OutcomeHeld      = "control_held" // control-lock precondition mismatch, no native action
 	OutcomeAmbiguous = "ambiguous"    // transport failure; mutation outcome unknown
