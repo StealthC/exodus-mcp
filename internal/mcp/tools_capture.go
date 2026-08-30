@@ -28,6 +28,7 @@ const (
 
 type captureRangeArgs struct {
 	Name         string `json:"name"`
+	Space        string `json:"space"`
 	Address      any    `json:"address"`
 	AddressSpace string `json:"address_space"`
 	Length       uint64 `json:"length"`
@@ -139,6 +140,7 @@ func validateCaptureRanges(ranges []captureRangeArgs, targetSpace string, defaul
 
 type captureRange struct {
 	Name    string
+	Space   string
 	Address uint64
 	Length  uint64
 }

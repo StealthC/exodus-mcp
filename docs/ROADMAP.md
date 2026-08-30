@@ -68,13 +68,12 @@ end of this section.
   execution, RAM preserved like real hardware) whose exact semantics must be
   designed before delivery. Register or memory writes are never a documented
   reset workaround.
-- [ ] Combined atomic system snapshot: one pause window capturing RAM ranges
-  (any address space), CPU registers, VDP status/registers, VRAM/CRAM/VSRAM
-  ranges, the sprite table, and the rendered frame — one capture id, one
-  manifest, one pause/resume cycle. This composes `memory_snapshot_capture`
-  and `vdp_capture` (today separate tools with separate capture ids) so
-  cross-domain reconstruction such as sprite attribution or RAM-table lookups
-  never mixes emulated instants.
+- [x] Combined atomic system snapshot: delivered 2026-08-30 as
+  `system_snapshot_capture`. It captures named memory ranges, CPU registers,
+  VDP status and selected VDP buffers/frame in one pause window, with a
+  `system-snapshot/1` manifest and shared artifact provenance. Sprite-table
+  capture is explicitly unavailable when the native bridge does not expose a
+  raw operation; callers can use `vdp_sprite_table` against the paused state.
 - [x] One-shot instrumentation and run-until primitives: delivered 2026-08-29 —
   `one_shot: true` (auto-remove on hit) on `cpu_breakpoint_set` and
   `cpu_watchpoint_set`, plus `run_until_breakpoint` / `run_until_watchpoint`

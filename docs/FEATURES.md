@@ -5,7 +5,7 @@ server, grouped by capability. Planned work is tracked in
 [ROADMAP.md](ROADMAP.md); the [CHANGELOG.md](../CHANGELOG.md) records the
 delivery history.
 
-The MCP server currently exposes **83 analysis tools** spanning the delivered
+The MCP server currently exposes **84 analysis tools** spanning the delivered
 roadmap phases 0-9: bridge and context foundations, memory and artifact
 access, both processors, VDP graphics, deterministic controlled
 experimentation, advanced analysis, evidence annotations, advanced debugging,
@@ -85,9 +85,14 @@ instance (see [Validation](#validation)).
   VDP exposes them. `memory_snapshot_capture` captures one or more named
   ranges in one pause window (exactly one pause/resume cycle, one capture id,
   one manifest); `memory_read`, `memory_dump`, `vdp_memory_read`, and
-  `frame_capture` accept an optional `capture_mode: "paused"` guard that makes
-  a single sample temporally atomic — the default `"live"` never pauses, so
-  timing-sensitive software is never silently perturbed. Mixing artifacts
+  `system_snapshot_capture` provides the cross-domain atomic form: memory
+  ranges, CPU registers, VDP status/buffers, and an optional frame share one
+  pause window and one `capture_id` in a `system-snapshot/1` manifest;
+  omitted or unavailable components are explicit. `memory_read`,
+  `memory_dump`, `vdp_memory_read`, and `frame_capture` accept an optional
+  `capture_mode: "paused"` guard that makes a single sample temporally atomic
+  — the default `"live"` never pauses, so timing-sensitive software is never
+  silently perturbed. Mixing artifacts
   from different composite captures is rejected by `memory_diff` unless
   explicitly allowed.
 - **Run-state observability.** `emulator_status` reports `pause_source`
@@ -183,6 +188,9 @@ instance (see [Validation](#validation)).
   warning naming both source manifests — a common address origin is never
   fabricated. Reports both capture ids when the snapshots belong to composite
   captures. Bounded inline matches plus a `memory-diff-results` artifact.
+- `system_snapshot_capture`: bounded atomic cross-domain snapshot with a
+  `system-snapshot/1` artifact manifest, shared capture provenance, explicit
+  omitted/unavailable components, and one pause/resume window.
 - `memory_snapshot_capture`: bounded paused composite capture — one or more
   named ranges of one address space are read inside a single pause window
   (the system is paused exactly once when running and restored afterwards;
