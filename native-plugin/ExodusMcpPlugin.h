@@ -12,6 +12,8 @@ class IMemory;
 class IBreakpoint;
 class IWatchpoint;
 class IS315_5313;
+class IYM2612;
+class ISN76489;
 class ISystemGUIInterface;
 
 // ExodusMcpPlugin is the persistent native bridge for exodus-mcp. It is
@@ -108,6 +110,7 @@ private:
 	bool BuildStateLoadData(const BridgeRequest& request, std::string& data, std::string& errorCode, std::string& errorMessage);
 	bool BuildFrameAdvanceData(const BridgeRequest& request, std::string& data, std::string& errorCode, std::string& errorMessage);
 	bool BuildInputSetData(const BridgeRequest& request, std::string& data, std::string& errorCode, std::string& errorMessage);
+	bool BuildSoundStatusData(const BridgeRequest& request, std::string& data, std::string& errorCode, std::string& errorMessage);
 
 	// Emulator inspection helpers
 	std::vector<MemorySpace> BuildSpaceCatalog();

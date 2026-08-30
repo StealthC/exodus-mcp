@@ -217,6 +217,21 @@ instance (see [Validation](#validation)).
   token, run state, consistency, capture time — or the honest
   `provenance_unknown` state) for every produced artifact.
 
+## Audio observability (Phase 6 initial slice)
+
+- `sound_status` reads typed YM2612 and SN76489/PSG state without reconstructing
+  registers from bus writes. It reports raw register snapshots, FM channel and
+  operator envelope/pan/DAC fields, PSG tone/volume/mute fields, device
+  availability, and explicit null/unobservable notes. The result is
+  `sound-status/1` and is a live, non-atomic sample relative to CPU/VDP.
+- `audio_capture` validates duration (maximum 10 seconds), sample rate,
+  channels, and an 8 MiB WAV cap before asking the native bridge for PCM. The
+  response is artifact-first with `audio-capture/1` metadata and
+  `artifact-provenance/2` identifying the mixer and little-endian PCM. The
+  pinned SDK currently has no safe bounded PCM buffer exposed to the extension,
+  so unavailable/incomplete capture returns a diagnostic and never fabricates
+  a silent WAV.
+
 ## Processors, symbols, and execution (Phase 2 and Phase 4 control)
 
 - M68K: `m68k_registers`, `m68k_read_memory`, `m68k_disassemble`,

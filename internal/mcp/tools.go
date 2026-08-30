@@ -70,6 +70,7 @@ func buildToolRegistry() []toolSpec {
 	specs = append(specs, resetToolSpecs()...)
 	specs = append(specs, runUntilToolSpecs()...)
 	specs = append(specs, systemSnapshotToolSpec())
+	specs = append(specs, audioToolSpecs()...)
 	sort.Slice(specs, func(i, j int) bool { return specs[i].name < specs[j].name })
 	return specs
 }

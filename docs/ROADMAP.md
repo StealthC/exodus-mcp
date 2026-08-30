@@ -34,16 +34,18 @@ delivered and catalogued in [FEATURES.md](FEATURES.md):
 
 - [ ] Multi-instance orchestration for real parallel experiments.
 
-## Phase 6 — Audio analysis (planned)
+## Phase 6 — Audio analysis (initial slice)
 
 **Outcome:** an agent can inspect the Mega Drive sound hardware through
 structured outputs, mirroring the Phase 3 VDP surface.
 
-- [ ] `sound_status`: decoded YM2612 and PSG register state (channels,
+- [x] `sound_status`: decoded YM2612 and PSG register state (channels,
   frequency/pitch, envelopes, volumes, panning, DAC), honoring the existing
   byte-order and device-specific interpretation rules.
 - [ ] `audio_capture`: sample a bounded window of the mixed stereo output into
-  a WAV artifact (artifact-first, like `frame_capture`).
+  a WAV artifact (artifact-first, like `frame_capture`). The MCP contract and
+  honest unavailable diagnostics are delivered; completion remains blocked on
+  a safe bounded PCM buffer exposed by the native SDK.
 - [ ] Active-note decode: from the recorded or live FM/PSG state, report the
   notes playing per channel (analogy to `vdp_sprite_table`).
 

@@ -8,6 +8,8 @@
 #include "Processor/IBreakpoint.h"
 #include "Processor/IWatchpoint.h"
 #include "315-5313/IS315_5313.h"
+#include "YM2612/IYM2612.h"
+#include "SN76489/ISN76489.h"
 #include "Memory/TimedBufferIntDevice.h"
 #include "ImageInterface/IImage.h"
 #include "DeviceInterface/IDeviceContext.h"
@@ -43,7 +45,7 @@ const unsigned long long kDefaultTraceTimeoutMs = 5000;
 const unsigned long long kMaxTraceTimeoutMs = 30000;
 const unsigned int kMaxFrameAdvance = 60;
 const unsigned int kMaxInputButtons = 16;
-const char* const kSupportedOperations[] = {"status", "emulator_status", "mem_spaces", "mem_read", "regs_get", "disasm", "cpu_control", "breakpoint_set", "breakpoint_list", "breakpoint_remove", "watchpoint_set", "watchpoint_list", "watchpoint_remove", "vdp_status", "vdp_mem_read", "vdp_pixel_info", "frame_capture", "rom_load", "trace_capture", "mem_write", "state_save", "state_load", "frame_advance", "input_set"};
+const char* const kSupportedOperations[] = {"status", "emulator_status", "mem_spaces", "mem_read", "regs_get", "disasm", "cpu_control", "breakpoint_set", "breakpoint_list", "breakpoint_remove", "watchpoint_set", "watchpoint_list", "watchpoint_remove", "vdp_status", "vdp_mem_read", "vdp_pixel_info", "frame_capture", "rom_load", "trace_capture", "mem_write", "state_save", "state_load", "frame_advance", "input_set", "sound_status", "audio_capture"};
 const size_t kSupportedOperationCount = sizeof(kSupportedOperations) / sizeof(kSupportedOperations[0]);
 
 // ScreenshotSink collects the RGB 8-bit pixels that S315_5313::GetScreenshot
@@ -994,6 +996,16 @@ std::string ExodusMcpPlugin::ExecuteCommand(const BridgeRequest& request, bool& 
 	else if (strcmp(method, "input_set") == 0)
 	{
 		success = BuildInputSetData(request, payload, errorCode, errorMessage);
+	}
+	else if (strcmp(method, "sound_status") == 0)
+	{
+		success = BuildSoundStatusData(request, payload, errorCode, errorMessage);
+	}
+	else if (strcmp(method, "audio_capture") == 0)
+	{
+		errorCode = "audio_unavailable";
+		errorMessage = "The Exodus SDK exposes audio logging configuration but no safe bounded PCM capture buffer to this extension.";
+		success = false;
 	}
 	else
 	{
@@ -3604,5 +3616,30 @@ bool ExodusMcpPlugin::BuildInputSetData(const BridgeRequest& request, std::strin
 	data += ",\"button_count\":";
 	AppendNumber(data, buttons.size());
 	data += "}";
+	return true;
+}
+
+bool ExodusMcpPlugin::BuildSoundStatusData(const BridgeRequest& request, std::string& data, std::string& errorCode, std::string& errorMessage)
+{
+	std::string component = ParamValue(request.params, "component");
+	if (component.empty()) component = "both";
+	if (component != "both" && component != "ym2612" && component != "psg") { errorCode = "invalid_params"; errorMessage = "component must be ym2612, psg, or both"; return false; }
+	IYM2612* ym = 0; ISN76489* psg = 0;
+	const std::list<IDevice*> devices = GetSystemInterface().GetLoadedDevices();
+	for (std::list<IDevice*>::const_iterator i = devices.begin(); i != devices.end(); ++i) { if (!ym && component != "psg") ym = dynamic_cast<IYM2612*>(*i); if (!psg && component != "ym2612") psg = dynamic_cast<ISN76489*>(*i); }
+	data = "{\"component\":"; AppendJsonStringAscii(data, component); data += ",\"byte_order\":\"not-applicable\",\"address_space\":\"device-state\",\"devices\":{\"ym2612\":{\"available\":"; data += ym ? "true" : "false";
+	if (ym) {
+		data += ",\"device\":\"YM2612\",\"registers\":[";
+		for (unsigned int r=0;r<IYM2612::RegisterCountTotal;++r) { if(r)data+=","; data+="{\"register\":"; AppendNumber(data,r); data+=",\"value\":"; AppendNumber(data,ym->GetRegisterData(r)); data+="}"; }
+		data += "],\"channels\":[";
+		for (unsigned int c=0;c<IYM2612::ChannelCount;++c) { if(c)data+=","; data+="{\"channel\":"; AppendNumber(data,c); data+=",\"f_number\":"; AppendNumber(data,ym->GetFrequencyData(c)); data+=",\"block\":"; AppendNumber(data,ym->GetBlockData(c)); data+=",\"algorithm\":"; AppendNumber(data,ym->GetAlgorithmData(c)); data+=",\"feedback\":"; AppendNumber(data,ym->GetFeedbackData(c)); data+=",\"pan\":{\"left\":"; data+=ym->GetOutputLeft(c)?"true":"false"; data+=",\"right\":"; data+=ym->GetOutputRight(c)?"true":"false"; data+="},\"operators\":[";
+			for(unsigned int o=0;o<IYM2612::OperatorCount;++o) { if(o)data+=","; data+="{\"operator\":"; AppendNumber(data,o); data+=",\"key_on\":"; data+=ym->GetKeyState(c,o)?"true":"false"; data+=",\"total_level\":"; AppendNumber(data,ym->GetTotalLevelData(c,o)); data+=",\"detune\":"; AppendNumber(data,ym->GetDetuneData(c,o)); data+=",\"multiple\":"; AppendNumber(data,ym->GetMultipleData(c,o)); data+=",\"envelope\":{"; data+="\"attack_rate\":"; AppendNumber(data,ym->GetAttackRateData(c,o)); data+=",\"decay_rate\":"; AppendNumber(data,ym->GetDecayRateData(c,o)); data+=",\"sustain_rate\":"; AppendNumber(data,ym->GetSustainRateData(c,o)); data+=",\"sustain_level\":"; AppendNumber(data,ym->GetSustainLevelData(c,o)); data+=",\"release_rate\":"; AppendNumber(data,ym->GetReleaseRateData(c,o)); data+="}}"; }
+			data += "]}";
+		}
+		data += "],\"dac\":{\"enabled\":"; data+=ym->GetDACEnabled()?"true":"false"; data+=",\"value\":"; AppendNumber(data,ym->GetDACData()); data+="}";
+	}
+	data += "},\"psg\":{\"available\":"; data += psg ? "true" : "false";
+	if (psg) { data += ",\"device\":\"PSG\",\"channels\":["; for(unsigned int c=0;c<ISN76489::ChannelCount;++c) { if(c)data+=","; data+="{\"channel\":"; AppendNumber(data,c); data+=",\"tone\":"; AppendNumber(data,psg->GetToneRegisterExternal(c)); data+=",\"volume\":"; AppendNumber(data,psg->GetVolumeRegisterExternal(c)); data+=",\"mute\":"; data+=psg->GetVolumeRegisterExternal(c)>=15?"true":"false"; data+="}"; } data += "],\"noise\":{\"mode\":null,\"mode_observable\":false,\"shift_register\":"; AppendNumber(data,psg->GetNoiseShiftRegisterExternal()); data += "}"; }
+	data += "},\"notes\":[\"Raw registers are read-only snapshots.\",\"PSG noise mode is not exposed by the pinned SDK and is reported as null.\"]}}";
 	return true;
 }
