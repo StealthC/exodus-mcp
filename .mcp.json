@@ -1,0 +1,7 @@
+{
+  "mcpServers": {
+    "exodus": {
+      "url": "http://127.0.0.1:8768/mcp"
+    }
+  }
+}
