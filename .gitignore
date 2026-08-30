@@ -16,3 +16,4 @@
 # `python` alias stub runs with this repo as cwd).
 /Python/
 python_install_*.log
+.pi-web/
