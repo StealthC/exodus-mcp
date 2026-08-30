@@ -99,11 +99,12 @@ end of this section.
   validated server-side; byte order, hash, provenance envelope, and honest
   capture consistency) so large regions never travel as Base64 through tool
   responses, lighter than the full `vdp_capture` ceremony.
-- [ ] Address dual-form ergonomics: every address-bearing response echoes the
+- [x] Address dual-form ergonomics: every address-bearing response echoes the
   space-relative and bus addresses when a bus mapping exists
   (`space_address` / `bus_address`), and address inputs accept either form
   with an explicit `address_space` where the space is not implied by the
-  tool.
+  tool. Delivered 2026-08-29 with shared translation, schema exposure,
+  nested range/event annotations, and incompatible-domain validation.
 - [x] `state_load` run-state contract (report): delivered 2026-08-29 —
   snapshots record the last observed run state at save time
   (`saved_run_state`, honest `"unknown"` without an observation), `state_save`

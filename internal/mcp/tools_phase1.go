@@ -451,6 +451,7 @@ type decodeRequest struct {
 type memoryReadArgs struct {
 	Space          string         `json:"space"`
 	Address        any            `json:"address"`
+	AddressSpace   string         `json:"address_space"`
 	Length         uint64         `json:"length"`
 	Representation string         `json:"representation"`
 	Decode         *decodeRequest `json:"decode"`
@@ -507,6 +508,7 @@ func readMemoryValue(tc toolContext, spaceID string, address uint64, length uint
 		"capture_consistency":       captureConsistencyToMap(buildCaptureConsistency(tc.server, payload, false, true, nil, nil)),
 		"representation":            representation,
 	}
+	annotateAddressPair(value, spaceID, address)
 	if width, mask := addressBusWidthMask(spaceID); width != 0 {
 		value["address_width_bits"] = width
 		value["address_mask_hex"] = canonicalHex(mask)
@@ -554,7 +556,7 @@ func runMemoryRead(tc toolContext, args json.RawMessage) map[string]any {
 	if failure = guard.resolve(); failure != nil {
 		return failureResult(failure, tc.modern)
 	}
-	address, failure := parseAddress(parsed.Address)
+	address, failure := resolveAddress(parsed.Address, addressSpaceFromArgs(args), parsed.Space)
 	if failure != nil {
 		return failureResult(failure, tc.modern)
 	}
@@ -643,11 +645,12 @@ func decodeValues(raw []byte, spaceOrder string, decode *decodeRequest) (map[str
 }
 
 type memoryDumpArgs struct {
-	Space       string `json:"space"`
-	Address     any    `json:"address"`
-	Length      uint64 `json:"length"`
-	CaptureMode string `json:"capture_mode"`
-	Context     string `json:"context"`
+	Space        string `json:"space"`
+	Address      any    `json:"address"`
+	AddressSpace string `json:"address_space"`
+	Length       uint64 `json:"length"`
+	CaptureMode  string `json:"capture_mode"`
+	Context      string `json:"context"`
 }
 
 // memoryDumpValue reads the range, stores the artifact with its capture
@@ -706,6 +709,7 @@ func memoryDumpValue(tc toolContext, context *analysis.Context, spaceID string, 
 		"sha256":                    stored.SHA256,
 		"provenance_state":          stored.Provenance.State,
 	}
+	annotateAddressPair(summary, spaceID, address)
 	if width, mask := addressBusWidthMask(spaceID); width != 0 {
 		summary["address_width_bits"] = width
 		summary["address_mask_hex"] = canonicalHex(mask)
@@ -725,7 +729,7 @@ func runMemoryDump(tc toolContext, args json.RawMessage) map[string]any {
 	if failure != nil {
 		return failureResult(failure, tc.modern)
 	}
-	address, failure := parseAddress(parsed.Address)
+	address, failure := resolveAddress(parsed.Address, addressSpaceFromArgs(args), parsed.Space)
 	if failure != nil {
 		return failureResult(failure, tc.modern)
 	}

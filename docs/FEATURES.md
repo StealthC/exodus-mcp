@@ -38,11 +38,16 @@ instance (see [Validation](#validation)).
   bytes preserve address order.
 - **Flexible address formats.** Address arguments accept `$`-prefixed
   Motorola hex, `0x` hex, Zilog `h`-suffixed hex, and decimal integers; every
-  response echoes the canonical parsed address. Schemas declare addresses as a
-  shared `oneOf` (JSON integer or supported string notation), and tool
-  arguments are strictly decoded: unknown properties are rejected with
-  `invalid_params` naming the full JSON path (`additionalProperties: false`
-  on every object schema).
+  response echoes the canonical parsed address. Address-bearing tools also
+  accept an optional `address_space` selecting either a documented
+  space-relative domain or processor bus domain, translating to the target
+  native space and rejecting incompatible domains. Responses preserve legacy
+  address fields and add `space_address`/`bus_address` (and canonical hex
+  forms) wherever a mapping exists, including nested ranges, matches, lines,
+  and debug events. Schemas declare addresses as a shared `oneOf` (JSON
+  integer or supported string notation), and tool arguments are strictly
+  decoded: unknown properties are rejected with `invalid_params` naming the
+  full JSON path (`additionalProperties: false` on every object schema).
 - **Stable response contract.** Every successful `structuredContent` (and
   legacy `content`) carries `result_type` (the tool name) and
   `schema_version: "1"`. Address-bearing outputs normalize to numeric

@@ -211,6 +211,7 @@ type memorySearchArgs struct {
 	Space        string `json:"space"`
 	Pattern      string `json:"pattern"`
 	StartAddress any    `json:"start_address"`
+	AddressSpace string `json:"address_space"`
 	Length       uint64 `json:"length"`
 	MaxMatches   uint64 `json:"max_matches"`
 	SnapshotID   string `json:"snapshot_id"`
@@ -407,7 +408,7 @@ func runMemorySearch(tc toolContext, args json.RawMessage) map[string]any {
 
 	startAddress := uint64(0)
 	if parsed.StartAddress != nil {
-		startAddress, failure = parseAddress(parsed.StartAddress)
+		startAddress, failure = resolveAddress(parsed.StartAddress, addressSpaceFromArgs(args), parsed.Space)
 		if failure != nil {
 			return failureResult(failure, tc.modern)
 		}
@@ -483,11 +484,13 @@ func runMemorySearch(tc toolContext, args json.RawMessage) map[string]any {
 	if source.provenanceNote == "provenance_unknown" {
 		summary["provenance_warning"] = "The searched snapshot has no capture provenance (provenance_unknown, legacy artifact); its address origin cannot be verified and matches are anchored to the caller-provided start address."
 	}
-	return okResult(map[string]any{
+	result := map[string]any{
 		"summary":  summary,
 		"matches":  matches.Inline,
 		"artifact": artifactDescriptor(tc.server, storedResults, context.ID),
-	}, tc.modern)
+	}
+	annotateAddressMap(result, spaceID)
+	return okResult(result, tc.modern)
 }
 
 type searchMatches struct {
@@ -613,6 +616,7 @@ type memoryDiffArgs struct {
 	MinValue                    *uint64 `json:"min_value"`
 	MaxValue                    *uint64 `json:"max_value"`
 	StartAddress                any     `json:"start_address"`
+	AddressSpace                string  `json:"address_space"`
 	MaxMatches                  uint64  `json:"max_matches"`
 	AllowMisaligned             bool    `json:"allow_misaligned"`
 	AllowIncompatibleProvenance bool    `json:"allow_incompatible_provenance"`
@@ -816,7 +820,7 @@ func runMemoryDiff(tc toolContext, args json.RawMessage) map[string]any {
 	}
 	requestedStart := uint64(0)
 	if parsed.StartAddress != nil {
-		requestedStart, failure = parseAddress(parsed.StartAddress)
+		requestedStart, failure = resolveAddress(parsed.StartAddress, addressSpaceFromArgs(args), parsed.Space)
 		if failure != nil {
 			return failureResult(failure, tc.modern)
 		}
@@ -1114,11 +1118,17 @@ func runMemoryDiff(tc toolContext, args json.RawMessage) map[string]any {
 		summary["min_value"] = *parsed.MinValue
 		summary["max_value"] = *parsed.MaxValue
 	}
-	return okResult(map[string]any{
+	result := map[string]any{
 		"summary":  summary,
 		"matches":  matches,
 		"artifact": artifactDescriptor(tc.server, storedResults, context.ID),
-	}, tc.modern)
+	}
+	space := parsed.Space
+	if beforeProvenance != nil && beforeProvenance.AddressSpace != "" {
+		space = beforeProvenance.AddressSpace
+	}
+	annotateAddressMap(result, space)
+	return okResult(result, tc.modern)
 }
 
 // decodeCell reads one cell of the given width from data at offset using the
@@ -1918,6 +1928,7 @@ type coverageCaptureArgs struct {
 	MaxEntries     uint64 `json:"max_entries"`
 	RegionStart    any    `json:"region_start"`
 	RegionEnd      any    `json:"region_end"`
+	AddressSpace   string `json:"address_space"`
 	IncludeROM     *bool  `json:"include_rom"`
 	IncludeRAM     *bool  `json:"include_ram"`
 	RetainRepeated *bool  `json:"retain_repeated"`
@@ -1953,14 +1964,14 @@ func runCpuCoverageCapture(tc toolContext, args json.RawMessage) map[string]any 
 	}
 	regionStart := uint64(0)
 	if parsed.RegionStart != nil {
-		regionStart, failure = parseAddress(parsed.RegionStart)
+		regionStart, failure = resolveAddress(parsed.RegionStart, addressSpaceFromArgs(args), parsed.CPU+"-bus")
 		if failure != nil {
 			return failureResult(failure, tc.modern)
 		}
 	}
 	regionEnd := uint64(0xFFFFFFFF)
 	if parsed.RegionEnd != nil {
-		regionEnd, failure = parseAddress(parsed.RegionEnd)
+		regionEnd, failure = resolveAddress(parsed.RegionEnd, addressSpaceFromArgs(args), parsed.CPU+"-bus")
 		if failure != nil {
 			return failureResult(failure, tc.modern)
 		}
@@ -2093,6 +2104,7 @@ func runCpuCoverageCapture(tc toolContext, args json.RawMessage) map[string]any 
 	} else {
 		coverageDocument["addresses"] = coverage.Addresses[:maxCoverageAddresses]
 	}
+	annotateAddressMap(coverageDocument, coverage.AddressSpace)
 	documentBytes, err := json.Marshal(coverageDocument)
 	if err != nil {
 		return failureResult(&toolFailure{Code: "artifact_error", Message: err.Error()}, tc.modern)

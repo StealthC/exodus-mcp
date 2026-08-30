@@ -39,11 +39,12 @@ func vdpExportToolSpecs() []toolSpec {
 }
 
 type vdpMemoryExportArgs struct {
-	Context     string `json:"context"`
-	Target      string `json:"target"`
-	Address     any    `json:"address"`
-	Length      uint64 `json:"length"`
-	CaptureMode string `json:"capture_mode"`
+	Context      string `json:"context"`
+	Target       string `json:"target"`
+	Address      any    `json:"address"`
+	AddressSpace string `json:"address_space"`
+	Length       uint64 `json:"length"`
+	CaptureMode  string `json:"capture_mode"`
 }
 
 // vdpExportCapForTarget returns the buffer byte cap for one VDP target.
@@ -97,7 +98,7 @@ func runVDPMemoryExport(tc toolContext, args json.RawMessage) map[string]any {
 	if !known {
 		return failureResult(&toolFailure{Code: "invalid_params", Message: "target must be vram, cram, or vsram"}, tc.modern)
 	}
-	address, failure := parseAddress(parsed.Address)
+	address, failure := resolveAddress(parsed.Address, addressSpaceFromArgs(args), "mem-vdp-"+parsed.Target)
 	if failure != nil {
 		return failureResult(failure, tc.modern)
 	}
@@ -159,7 +160,7 @@ func runVDPMemoryExport(tc toolContext, args json.RawMessage) map[string]any {
 		if err != nil {
 			return nil, &toolFailure{Code: "artifact_error", Message: err.Error()}
 		}
-		return map[string]any{
+		result := map[string]any{
 			"target":                    parsed.Target,
 			"address_space":             vdpExportSpaceForTarget(parsed.Target),
 			"address":                   address,
@@ -171,7 +172,9 @@ func runVDPMemoryExport(tc toolContext, args json.RawMessage) map[string]any {
 			"capture_consistency":       captureConsistencyToMap(provenance.CaptureConsistency),
 			"artifact":                  artifactDescriptor(tc.server, stored, context.ID),
 			"sha256":                    stored.SHA256,
-		}, nil
+		}
+		annotateAddressPair(result, vdpExportSpaceForTarget(parsed.Target), address)
+		return result, nil
 	}
 	return withCaptureGuard(tc, guard, export)
 }

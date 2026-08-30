@@ -135,6 +135,51 @@ func TestMemoryDumpReportsEffectiveAddress(t *testing.T) {
 	}
 }
 
+func TestResolveAddressDualForm(t *testing.T) {
+	got, failure := resolveAddress("0xFF0000", "m68k-bus", "mem-ram")
+	if failure != nil || got != 0 {
+		t.Fatalf("bus address did not translate to RAM offset: got %X, failure %v", got, failure)
+	}
+	got, failure = resolveAddress(0, "mem-ram", "m68k-bus")
+	if failure != nil || got != 0xFF0000 {
+		t.Fatalf("RAM offset did not translate to bus address: got %X, failure %v", got, failure)
+	}
+	if _, failure = resolveAddress(0, "z80-bus", "mem-ram"); failure == nil || failure.Code != "invalid_params" {
+		t.Fatalf("incompatible address domains must fail: %v", failure)
+	}
+}
+
+func TestAddressDualFormSchemaAndMemoryResponse(t *testing.T) {
+	var memoryReadSchema map[string]any
+	for _, schema := range toolSchemas() {
+		if schema["name"] != "memory_read" {
+			continue
+		}
+		memoryReadSchema = schema["inputSchema"].(map[string]any)
+	}
+	if _, ok := memoryReadSchema["properties"].(map[string]any)["address_space"]; !ok {
+		t.Fatal("memory_read schema must expose address_space")
+	}
+	client := &fakeBridgeClient{status: newFakeStatus()}
+	client.executeFunc = func(_ context.Context, method string, params map[string]string) (json.RawMessage, error) {
+		if method != "mem_read" {
+			t.Fatalf("unexpected bridge method %s", method)
+		}
+		if params["address"] != "0" {
+			t.Fatalf("translated address = %s, want 0", params["address"])
+		}
+		return json.RawMessage(memReadPayloadPaused([]byte{1, 2}, "big-endian", 0, false)), nil
+	}
+	result := callTool(t, client, "memory_read", `{"space":"mem-ram","address":"0xFF0000","address_space":"m68k-bus","length":2}`)
+	if result["isError"] == true {
+		t.Fatalf("unexpected dual-form read error: %v", result)
+	}
+	content := structured(result)
+	if content["space_address"] != float64(0) || content["bus_address"] != float64(0xFF0000) {
+		t.Fatalf("dual-form response coordinates missing: %v", content)
+	}
+}
+
 func memSpacesPayload() string {
 	return `{"spaces":[
 		{"id":"m68k-bus","kind":"bus","device_instance":"Main 68000","device_display":"Main 68000","size_bytes":16777216,"entry_size_bytes":1,"byte_order":"big-endian"},

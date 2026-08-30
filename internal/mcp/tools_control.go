@@ -183,6 +183,7 @@ func makeRunCPUControlFromArgs(tool, action string) func(toolContext, json.RawMe
 type breakpointSetArgs struct {
 	CPU            string  `json:"cpu"`
 	Address        any     `json:"address"`
+	AddressSpace   string  `json:"address_space"`
 	Condition      string  `json:"condition"`
 	RangeEnd       any     `json:"range_end"`
 	BreakOnCounter bool    `json:"break_on_counter"`
@@ -201,7 +202,7 @@ func runBreakpointSet(tc toolContext, args json.RawMessage) map[string]any {
 	if failure != nil {
 		return failureResult(failure, tc.modern)
 	}
-	address, failure := parseAddress(parsed.Address)
+	address, failure := resolveAddress(parsed.Address, addressSpaceFromArgs(args), parsed.CPU+"-bus")
 	if failure != nil {
 		return failureResult(failure, tc.modern)
 	}
@@ -216,7 +217,7 @@ func runBreakpointSet(tc toolContext, args json.RawMessage) map[string]any {
 		if condition != "range" {
 			return failureResult(&toolFailure{Code: "invalid_params", Message: "range_end applies only to condition=range"}, tc.modern)
 		}
-		if rangeEnd, failure = parseAddress(parsed.RangeEnd); failure != nil {
+		if rangeEnd, failure = resolveAddress(parsed.RangeEnd, addressSpaceFromArgs(args), parsed.CPU+"-bus"); failure != nil {
 			return failureResult(failure, tc.modern)
 		}
 		if rangeEnd <= address {
@@ -267,9 +268,11 @@ func runBreakpointSet(tc toolContext, args json.RawMessage) map[string]any {
 	payload["address"] = address
 	payload["address_hex"] = canonicalHex(address)
 	payload["address_space"] = parsed.CPU + "-bus"
+	annotateAddressPair(payload, parsed.CPU+"-bus", address)
 	if condition == "range" {
 		payload["range_end"] = rangeEnd
 		payload["range_end_hex"] = canonicalHex(rangeEnd)
+		annotateAddressRangePair(payload, "range_end", parsed.CPU+"-bus", rangeEnd)
 	}
 	if width, mask := addressBusWidthMask(parsed.CPU + "-bus"); width != 0 {
 		payload["address_width_bits"] = width
@@ -331,12 +334,13 @@ func runBreakpointRemove(tc toolContext, args json.RawMessage) map[string]any {
 }
 
 type watchpointSetArgs struct {
-	CPU     string  `json:"cpu"`
-	Address any     `json:"address"`
-	Length  *uint64 `json:"length"`
-	Access  string  `json:"access"`
-	OneShot bool    `json:"one_shot"`
-	Context string  `json:"context"`
+	CPU          string  `json:"cpu"`
+	Address      any     `json:"address"`
+	AddressSpace string  `json:"address_space"`
+	Length       *uint64 `json:"length"`
+	Access       string  `json:"access"`
+	OneShot      bool    `json:"one_shot"`
+	Context      string  `json:"context"`
 	guardArgs
 }
 
@@ -349,7 +353,7 @@ func runWatchpointSet(tc toolContext, args json.RawMessage) map[string]any {
 	if failure != nil {
 		return failureResult(failure, tc.modern)
 	}
-	address, failure := parseAddress(parsed.Address)
+	address, failure := resolveAddress(parsed.Address, addressSpaceFromArgs(args), parsed.CPU+"-bus")
 	if failure != nil {
 		return failureResult(failure, tc.modern)
 	}
@@ -387,6 +391,7 @@ func runWatchpointSet(tc toolContext, args json.RawMessage) map[string]any {
 	payload["address"] = address
 	payload["address_hex"] = canonicalHex(address)
 	payload["address_space"] = parsed.CPU + "-bus"
+	annotateAddressPair(payload, parsed.CPU+"-bus", address)
 	if width, mask := addressBusWidthMask(parsed.CPU + "-bus"); width != 0 {
 		payload["address_width_bits"] = width
 		payload["address_mask_hex"] = canonicalHex(mask)
@@ -488,6 +493,8 @@ func runDebugEventsList(tc toolContext, args json.RawMessage) map[string]any {
 			"target_generation":   ev.TargetGeneration,
 			"timestamp":           ev.Timestamp,
 		}
+		annotateAddressRangePair(view, "triggering_pc", ev.AddressSpace, ev.TriggeringPC)
+		annotateAddressRangePair(view, "watched", ev.AddressSpace, ev.WatchedAddress)
 		if ev.FrameToken != nil {
 			view["frame_token"] = *ev.FrameToken
 		}
@@ -514,20 +521,24 @@ func annotateDebugList(payload map[string]any, kind, key, idKey string, server *
 			continue
 		}
 		// Normalize address-bearing fields.
-		if addr, ok := record["address"].(float64); ok {
-			record["address_hex"] = canonicalHex(uint64(addr))
+		if addr, ok := numberAsUint64(record["address"]); ok {
+			record["address_hex"] = canonicalHex(addr)
 			if cpu, ok := record["cpu"].(string); ok && cpu != "" {
 				record["address_space"] = cpu + "-bus"
 			}
 			if space, ok := record["address_space"].(string); ok {
+				annotateAddressPair(record, space, addr)
 				if width, mask := addressBusWidthMask(space); width != 0 {
 					record["address_width_bits"] = width
 					record["address_mask_hex"] = canonicalHex(mask)
 				}
 			}
 		}
-		if rangeEnd, ok := record["range_end"].(float64); ok {
-			record["range_end_hex"] = canonicalHex(uint64(rangeEnd))
+		if rangeEnd, ok := numberAsUint64(record["range_end"]); ok {
+			record["range_end_hex"] = canonicalHex(rangeEnd)
+			if space, ok := record["address_space"].(string); ok {
+				annotateAddressRangePair(record, "range_end", space, rangeEnd)
+			}
 		}
 		id, ok := record[idKey].(float64)
 		if !ok {

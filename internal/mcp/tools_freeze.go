@@ -299,11 +299,12 @@ func freezeToolSpecs() []toolSpec {
 }
 
 type memoryFreezeArgs struct {
-	Context string `json:"context"`
-	Space   string `json:"space"`
-	Address any    `json:"address"`
-	Data    string `json:"data"`
-	DataHex string `json:"data_hex"`
+	Context      string `json:"context"`
+	Space        string `json:"space"`
+	Address      any    `json:"address"`
+	AddressSpace string `json:"address_space"`
+	Data         string `json:"data"`
+	DataHex      string `json:"data_hex"`
 	guardArgs
 }
 
@@ -316,12 +317,12 @@ func runMemoryFreeze(tc toolContext, args json.RawMessage) map[string]any {
 	if failure != nil {
 		return failureResult(failure, tc.modern)
 	}
-	address, failure := parseAddress(parsed.Address)
-	if failure != nil {
-		return failureResult(failure, tc.modern)
-	}
 	if parsed.Space == "" {
 		return failureResult(&toolFailure{Code: "invalid_params", Message: "space must name a space id from memory_spaces_list"}, tc.modern)
+	}
+	address, failure := resolveAddress(parsed.Address, addressSpaceFromArgs(args), parsed.Space)
+	if failure != nil {
+		return failureResult(failure, tc.modern)
 	}
 	bytes, failure := decodeWriteBytes(parsed.Data, parsed.DataHex)
 	if failure != nil {
@@ -398,6 +399,7 @@ func runMemoryFreeze(tc toolContext, args json.RawMessage) map[string]any {
 		"replaced":      replaced,
 		"rewrite_hz":    1 / freezeTickInterval.Seconds(),
 	}
+	annotateAddressPair(result, entry.Space, entry.Address)
 	if width, mask := addressBusWidthMask(entry.Space); width != 0 {
 		result["address_width_bits"] = width
 		result["address_mask_hex"] = canonicalHex(mask)
@@ -420,6 +422,7 @@ func freezeEntryView(entry *freezeEntry) map[string]any {
 		"target_generation": entry.TargetGeneration,
 		"rom_path":          entry.ROMPath,
 	}
+	annotateAddressPair(view, entry.Space, entry.Address)
 	if width, mask := addressBusWidthMask(entry.Space); width != 0 {
 		view["address_width_bits"] = width
 		view["address_mask_hex"] = canonicalHex(mask)

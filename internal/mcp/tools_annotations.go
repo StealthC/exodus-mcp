@@ -228,6 +228,21 @@ func annotationView(server *Server, ann analysis.Annotation) map[string]any {
 		view["end_address"] = *ann.EndAddress
 		view["end_address_hex"] = canonicalHex(*ann.EndAddress)
 	}
+	if ann.Address != nil {
+		annotateAddressPair(view, ann.AddressSpace, *ann.Address)
+		if ann.EndAddress != nil {
+			view["end_space_address"] = *ann.EndAddress
+			view["end_space_address_hex"] = canonicalHex(*ann.EndAddress)
+			if mapping, ok := mdSpaceBusMap[ann.AddressSpace]; ok && mapping.Bus != "" {
+				endBus := *ann.EndAddress
+				if ann.AddressSpace != mapping.Bus+"-bus" {
+					endBus += mapping.BusBase + mapping.BusOffset
+				}
+				view["end_bus_address"] = endBus
+				view["end_bus_address_hex"] = canonicalHex(endBus)
+			}
+		}
+	}
 	if ann.Length != nil {
 		view["length"] = *ann.Length
 	}
@@ -241,6 +256,13 @@ func annotationView(server *Server, ann analysis.Annotation) map[string]any {
 		view["links"] = links
 	}
 	return view
+}
+
+func resolveAnnotationAddress(raw any, addressSpace string) (uint64, *toolFailure) {
+	if strings.TrimSpace(addressSpace) == "" {
+		return parseAddress(raw)
+	}
+	return resolveAddress(raw, addressSpace, addressSpace)
 }
 
 func linksView(links analysis.AnnotationLinks) map[string]any {
@@ -353,7 +375,7 @@ func runAnnotationCreate(tc toolContext, args json.RawMessage) map[string]any {
 		AddressSpace: strings.TrimSpace(parsed.AddressSpace),
 	}
 	if parsed.Address != nil {
-		address, failure := parseAddress(parsed.Address)
+		address, failure := resolveAnnotationAddress(parsed.Address, parsed.AddressSpace)
 		if failure != nil {
 			return failureResult(failure, tc.modern)
 		}
@@ -363,7 +385,7 @@ func runAnnotationCreate(tc toolContext, args json.RawMessage) map[string]any {
 		if ann.Address == nil {
 			return failureResult(&toolFailure{Code: "invalid_params", Message: "end_address requires address"}, tc.modern)
 		}
-		endAddress, failure := parseAddress(parsed.EndAddress)
+		endAddress, failure := resolveAnnotationAddress(parsed.EndAddress, parsed.AddressSpace)
 		if failure != nil {
 			return failureResult(failure, tc.modern)
 		}
@@ -471,13 +493,17 @@ func runAnnotationUpdate(tc toolContext, args json.RawMessage) map[string]any {
 		links := linksFromArgs(*parsed.Links)
 		updates.Links = &links
 	}
-	address, clearAddress, failure := parseAnnotationAddressArg(parsed.Address)
+	updateAddressSpace := ""
+	if parsed.AddressSpace != nil {
+		updateAddressSpace = *parsed.AddressSpace
+	}
+	address, clearAddress, failure := parseAnnotationAddressArg(parsed.Address, updateAddressSpace)
 	if failure != nil {
 		return failureResult(failure, tc.modern)
 	}
 	updates.Address = address
 	updates.ClearAddress = clearAddress
-	endAddress, clearEnd, failure := parseAnnotationAddressArg(parsed.EndAddress)
+	endAddress, clearEnd, failure := parseAnnotationAddressArg(parsed.EndAddress, updateAddressSpace)
 	if failure != nil {
 		return failureResult(failure, tc.modern)
 	}
@@ -495,7 +521,7 @@ func runAnnotationUpdate(tc toolContext, args json.RawMessage) map[string]any {
 // parseAnnotationAddressArg parses the update-form address argument: absent
 // (nil raw) keeps the current value, JSON null clears it, any other flexible
 // address form parses to a new value.
-func parseAnnotationAddressArg(raw json.RawMessage) (*uint64, bool, *toolFailure) {
+func parseAnnotationAddressArg(raw json.RawMessage, addressSpace string) (*uint64, bool, *toolFailure) {
 	if raw == nil {
 		return nil, false, nil
 	}
@@ -507,7 +533,7 @@ func parseAnnotationAddressArg(raw json.RawMessage) (*uint64, bool, *toolFailure
 	if err := json.Unmarshal(trimmed, &value); err != nil {
 		return nil, false, &toolFailure{Code: "invalid_params", Message: "invalid address: " + err.Error()}
 	}
-	address, failure := parseAddress(value)
+	address, failure := resolveAnnotationAddress(value, addressSpace)
 	if failure != nil {
 		return nil, false, failure
 	}

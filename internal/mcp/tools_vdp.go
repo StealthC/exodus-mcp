@@ -136,6 +136,7 @@ const vdpSpriteTableMaxEntries = 80
 type vdpMemoryReadArgs struct {
 	Target         string `json:"target"`
 	Address        any    `json:"address"`
+	AddressSpace   string `json:"address_space"`
 	Length         uint64 `json:"length"`
 	Representation string `json:"representation"`
 	CaptureMode    string `json:"capture_mode"`
@@ -201,6 +202,7 @@ func vdpMemoryReadValue(tc toolContext, target string, address uint64, length ui
 		"system_paused_during_read": pausedDuringRead,
 		"capture_consistency":       captureConsistencyToMap(buildCaptureConsistency(tc.server, payload, false, true, nil, nil)),
 	}
+	annotateAddressPair(value, addressSpace, address)
 	switch representation {
 	case "hexdump":
 		value["hex"] = artifact.HexDump(raw, int64(address))
@@ -230,7 +232,7 @@ func runVDPMemoryRead(tc toolContext, args json.RawMessage) map[string]any {
 	if _, failure = resolveContext(tc.server, parsed.Context); failure != nil {
 		return failureResult(failure, tc.modern)
 	}
-	address, failure := parseAddress(parsed.Address)
+	address, failure := resolveAddress(parsed.Address, addressSpaceFromArgs(args), "mem-vdp-"+parsed.Target)
 	if failure != nil {
 		return failureResult(failure, tc.modern)
 	}
@@ -409,6 +411,7 @@ type vdpCaptureArgs struct {
 	IncludeVSRAM       *bool  `json:"include_vsram"`
 	IncludeVRAM        *bool  `json:"include_vram"`
 	VRAMAddress        any    `json:"vram_address"`
+	AddressSpace       string `json:"address_space"`
 	VRAMLength         uint64 `json:"vram_length"`
 	IncludeSpriteTable *bool  `json:"include_sprite_table"`
 	CaptureMode        string `json:"capture_mode"`
@@ -431,7 +434,7 @@ func runVDPCapture(tc toolContext, args json.RawMessage) map[string]any {
 	includeSprite := parsed.IncludeSpriteTable == nil || *parsed.IncludeSpriteTable
 	vramAddr := uint64(0)
 	if parsed.VRAMAddress != nil {
-		vramAddr, failure = parseAddress(parsed.VRAMAddress)
+		vramAddr, failure = resolveAddress(parsed.VRAMAddress, addressSpaceFromArgs(args), "mem-vdp-vram")
 		if failure != nil {
 			return failureResult(failure, tc.modern)
 		}

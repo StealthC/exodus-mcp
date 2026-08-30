@@ -177,18 +177,21 @@ func backtraceFrame(address, stackAddress uint64, raw []byte, method, confidence
 		"confidence":     confidence,
 		"heuristic_note": note,
 	}
+	annotateAddressPair(frame, disasmSpaceID("m68k"), masked)
 	if name, offset := index.resolve(masked); name != "" {
 		frame["symbol"] = name
 		frame["offset"] = offset
 	}
 	if includeRaw && raw != nil {
-		frame["raw"] = map[string]any{
+		rawView := map[string]any{
 			"stack_address":     stackAddress & m68kBusMask,
 			"stack_address_hex": canonicalHex(stackAddress & m68kBusMask),
 			"bytes_hex":         strings.ToUpper(hex.EncodeToString(raw)),
 			"word":              address, // the 32-bit value read from the slot
 			"word_hex":          canonicalHex(address),
 		}
+		annotateAddressPair(rawView, disasmSpaceID("m68k"), stackAddress&m68kBusMask)
+		frame["raw"] = rawView
 	}
 	return frame
 }

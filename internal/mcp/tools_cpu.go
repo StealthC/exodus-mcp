@@ -88,9 +88,10 @@ func cpuToolSpecs() []toolSpec {
 						"type":                 "object",
 						"additionalProperties": false,
 						"properties": map[string]any{
-							"name":     stringProperty("Symbol label."),
-							"space_id": stringProperty("Address space id from memory_spaces_list."),
-							"address":  addressProperty(),
+							"name":          stringProperty("Symbol label."),
+							"space_id":      stringProperty("Address space id from memory_spaces_list."),
+							"address_space": stringProperty("Optional domain of this symbol address; omitted means space_id."),
+							"address":       addressProperty(),
 						},
 						"required": []string{"name", "address"},
 					},
@@ -150,9 +151,10 @@ func makeRunRegisters(cpu string) func(toolContext, json.RawMessage) map[string]
 }
 
 type disassemblyArgs struct {
-	Address any    `json:"address"`
-	Count   uint64 `json:"count"`
-	Context string `json:"context"`
+	Address      any    `json:"address"`
+	AddressSpace string `json:"address_space"`
+	Count        uint64 `json:"count"`
+	Context      string `json:"context"`
 }
 
 func makeRunDisassembly(cpu string) func(toolContext, json.RawMessage) map[string]any {
@@ -177,7 +179,7 @@ func makeRunDisassembly(cpu string) func(toolContext, json.RawMessage) map[strin
 		}
 		params := map[string]string{"cpu": cpu, "count": strconv.FormatUint(count, 10)}
 		if parsed.Address != nil {
-			address, failure := parseAddress(parsed.Address)
+			address, failure := resolveAddress(parsed.Address, parsed.AddressSpace, disasmSpaceID(cpu))
 			if failure != nil {
 				return failureResult(failure, tc.modern)
 			}
@@ -213,13 +215,15 @@ func normalizeDisassemblyPayload(payload map[string]any, cpu string) {
 		payload["address_space"] = spaceID
 		payload["address_width_bits"] = width
 		payload["address_mask_hex"] = canonicalHex(mask)
+		annotateAddressPair(payload, spaceID, uint64(start))
 	}
 	if lines, ok := payload["lines"].([]any); ok {
 		for _, lineEntry := range lines {
 			if line, ok := lineEntry.(map[string]any); ok {
-				if addr, ok := line["address"].(float64); ok {
-					line["address_hex"] = canonicalHex(uint64(addr))
+				if addr, ok := numberAsUint64(line["address"]); ok {
+					line["address_hex"] = canonicalHex(addr)
 					line["address_space"] = spaceID
+					annotateAddressPair(line, spaceID, addr)
 				}
 			}
 		}
@@ -378,6 +382,7 @@ func annotateDisassemblySymbols(context *analysis.Context, cpu string, payload m
 			"mnemonic":      line.Mnemonic,
 			"operands":      line.Operands,
 		}
+		annotateAddressPair(entry, spaceID, line.Address)
 		if line.Comment != "" {
 			entry["comment"] = line.Comment
 		}
@@ -409,6 +414,7 @@ func annotateDisassemblySymbols(context *analysis.Context, cpu string, payload m
 	payload["address_space"] = spaceID
 	payload["address_width_bits"] = bitWidth
 	payload["address_mask_hex"] = canonicalHex(mask)
+	annotateAddressPair(payload, spaceID, decoded.StartAddress)
 	payload["requested_count"] = decoded.RequestedCount
 	payload["disassembly_method"] = decoded.DisassemblyMethod
 	payload["symbols_annotated"] = applied
@@ -433,7 +439,7 @@ func makeRunCpuMemoryRead(spaceID string) func(toolContext, json.RawMessage) map
 		if failure = guard.resolve(); failure != nil {
 			return failureResult(failure, tc.modern)
 		}
-		address, failure := parseAddress(parsed.Address)
+		address, failure := resolveAddress(parsed.Address, addressSpaceFromArgs(args), spaceID)
 		if failure != nil {
 			return failureResult(failure, tc.modern)
 		}
@@ -450,6 +456,7 @@ type traceCaptureArgs struct {
 	TimeoutMs         uint64 `json:"timeout_ms"`
 	AddressRangeStart any    `json:"address_range_start"`
 	AddressRangeEnd   any    `json:"address_range_end"`
+	AddressSpace      string `json:"address_space"`
 	IncludeROM        *bool  `json:"include_rom"`
 	IncludeRAM        *bool  `json:"include_ram"`
 	RetainRepeated    *bool  `json:"retain_repeated"`
@@ -478,7 +485,7 @@ func runCpuTraceCapture(tc toolContext, args json.RawMessage) map[string]any {
 		timeoutMs = 5000
 	}
 
-	addressRangeStart, addressRangeEnd, filterFailure := parseTraceFilters(parsed)
+	addressRangeStart, addressRangeEnd, filterFailure := parseTraceFilters(parsed, parsed.AddressSpace)
 	if filterFailure != nil {
 		return failureResult(filterFailure, tc.modern)
 	}
@@ -523,17 +530,17 @@ func runCpuTraceCapture(tc toolContext, args json.RawMessage) map[string]any {
 	return okResult(stampGenerations(result, before, after), tc.modern)
 }
 
-func parseTraceFilters(parsed *traceCaptureArgs) (uint64, uint64, *toolFailure) {
+func parseTraceFilters(parsed *traceCaptureArgs, inputSpace string) (uint64, uint64, *toolFailure) {
 	var start, end uint64
 	var err *toolFailure
 	if parsed.AddressRangeStart != nil {
-		start, err = parseAddress(parsed.AddressRangeStart)
+		start, err = resolveAddress(parsed.AddressRangeStart, inputSpace, parsed.CPU+"-bus")
 		if err != nil {
 			return 0, 0, &toolFailure{Code: "invalid_params", Message: "address_range_start: " + err.Message}
 		}
 	}
 	if parsed.AddressRangeEnd != nil {
-		end, err = parseAddress(parsed.AddressRangeEnd)
+		end, err = resolveAddress(parsed.AddressRangeEnd, inputSpace, parsed.CPU+"-bus")
 		if err != nil {
 			return 0, 0, &toolFailure{Code: "invalid_params", Message: "address_range_end: " + err.Message}
 		}
@@ -651,6 +658,16 @@ func traceArtifactsFromPayload(tc toolContext, context *analysis.Context, payloa
 	filters["include_rom"] = includeROM
 	filters["include_ram"] = includeRAM
 	filters["retain_repeated"] = retainRepeated
+	traceAddressSpace := "m68k-bus"
+	if cpu == "z80" {
+		traceAddressSpace = "z80-bus"
+	}
+	if parsed.AddressRangeStart != nil {
+		annotateAddressRangePair(filters, "address_range_start", traceAddressSpace, rangeStart)
+	}
+	if parsed.AddressRangeEnd != nil {
+		annotateAddressRangePair(filters, "address_range_end", traceAddressSpace, rangeEnd)
+	}
 	summary["filters"] = filters
 	summary["schema_version"] = "trace-jsonl/1"
 	delete(payload, "trace_text")
@@ -747,6 +764,7 @@ func buildTraceJSONLEvents(tc toolContext, cpu, traceText string, rangeStart, ra
 			"capture_id":        captureID,
 			"schema_version":    "trace-event/1",
 		}
+		annotateAddressPair(event, addressSpace, pc)
 		if frameToken != nil {
 			event["frame_token"] = *frameToken
 		}
@@ -839,9 +857,10 @@ func isRAMAddress(addr uint64, cpu string) bool {
 // Symbols
 // ----------------------------------------------------------------------------------------------------------------------
 type symbolInput struct {
-	Name    string `json:"name"`
-	SpaceID string `json:"space_id"`
-	Address any    `json:"address"`
+	Name         string `json:"name"`
+	SpaceID      string `json:"space_id"`
+	AddressSpace string `json:"address_space"`
+	Address      any    `json:"address"`
 }
 
 type symbolsSetArgs struct {
@@ -860,14 +879,34 @@ func runSymbolsSet(tc toolContext, args json.RawMessage) map[string]any {
 	}
 	prepared := make([]storedSymbolInput, 0, len(parsed.Symbols))
 	for index, symbol := range parsed.Symbols {
-		address, failure := parseAddress(symbol.Address)
+		spaceID := symbol.SpaceID
+		inputSpace := symbol.AddressSpace
+		if spaceID == "" {
+			// Untyped symbols historically annotate both CPU buses. Preserve
+			// that behavior; only translate when the caller supplied a domain.
+			var address uint64
+			if inputSpace == "" {
+				address, failure = parseAddress(symbol.Address)
+			} else {
+				address, failure = resolveAddress(symbol.Address, inputSpace, inputSpace)
+			}
+			if failure != nil {
+				return failureResult(&toolFailure{Code: "invalid_params", Message: fmt.Sprintf("symbols[%d].address: %s", index, failure.Message)}, tc.modern)
+			}
+			prepared = append(prepared, storedSymbolInput{Name: symbol.Name, SpaceID: spaceID, Address: address})
+			continue
+		}
+		if inputSpace == "" {
+			inputSpace = spaceID
+		}
+		address, failure := resolveAddress(symbol.Address, inputSpace, spaceID)
 		if failure != nil {
 			return failureResult(&toolFailure{
 				Code:    "invalid_params",
 				Message: fmt.Sprintf("symbols[%d].address: %s", index, failure.Message),
 			}, tc.modern)
 		}
-		prepared = append(prepared, storedSymbolInput{Name: symbol.Name, SpaceID: symbol.SpaceID, Address: address})
+		prepared = append(prepared, storedSymbolInput{Name: symbol.Name, SpaceID: spaceID, Address: address})
 	}
 	written, err := context.Symbols.Set(toStoreSymbols(prepared))
 	if err != nil {
@@ -912,6 +951,7 @@ func runSymbolsList(tc toolContext, args json.RawMessage) map[string]any {
 			"address_hex":   canonicalHex(symbol.Address),
 			"address_space": symbol.SpaceID,
 		}
+		annotateAddressPair(view, symbol.SpaceID, symbol.Address)
 		if width, mask := addressBusWidthMask(symbol.SpaceID); width != 0 {
 			view["address_width_bits"] = width
 			view["address_mask_hex"] = canonicalHex(mask)

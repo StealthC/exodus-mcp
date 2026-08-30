@@ -27,15 +27,17 @@ const (
 )
 
 type captureRangeArgs struct {
-	Name    string `json:"name"`
-	Address any    `json:"address"`
-	Length  uint64 `json:"length"`
+	Name         string `json:"name"`
+	Address      any    `json:"address"`
+	AddressSpace string `json:"address_space"`
+	Length       uint64 `json:"length"`
 }
 
 type memorySnapshotCaptureArgs struct {
-	Space   string             `json:"space"`
-	Ranges  []captureRangeArgs `json:"ranges"`
-	Context string             `json:"context"`
+	Space        string             `json:"space"`
+	AddressSpace string             `json:"address_space"`
+	Ranges       []captureRangeArgs `json:"ranges"`
+	Context      string             `json:"context"`
 	guardArgs
 }
 
@@ -44,7 +46,8 @@ func memorySnapshotCaptureSpec() toolSpec {
 		name:        "memory_snapshot_capture",
 		description: "Capture one or more named ranges of one address space as a temporally atomic snapshot: pauses the system once if it is running, reads every range while paused (never the per-range live read loop), restores the prior run state, and links all raw range artifacts plus a capture manifest to one stable capture id. The response reports exactly one pause/resume cycle when the system was running (zero when it was already paused), the target generation span, initial/final run states, and frame tokens when the VDP exposes them. Runs under exclusive control for the full window (a caller-provided active control_id is reused, otherwise an internal lock is acquired and released). A paused capture can perturb real-time behavior; a live capture would be internally inconsistent across ranges. Accepts optional expected_target_generation and control_id.",
 		schema: objectSchema(map[string]any{
-			"space": stringProperty("Address space id from memory_spaces_list; every range shares it."),
+			"space":         stringProperty("Address space id from memory_spaces_list; every range shares it."),
+			"address_space": stringProperty("Optional default domain for every supplied range address; omitted means space."),
 			"ranges": map[string]any{
 				"type":        "array",
 				"description": fmt.Sprintf("Named ranges to capture (1-%d, total bytes capped at %d).", captureMaxRanges, dumpCapBytes),
@@ -52,9 +55,10 @@ func memorySnapshotCaptureSpec() toolSpec {
 					"type":                 "object",
 					"additionalProperties": false,
 					"properties": map[string]any{
-						"name":    stringProperty(fmt.Sprintf("Unique range label (max %d characters, letters/digits/_/-).", captureMaxRangeNameLen)),
-						"address": addressProperty(),
-						"length":  integerProperty("Byte length between 1 and the dump cap.", 1),
+						"name":          stringProperty(fmt.Sprintf("Unique range label (max %d characters, letters/digits/_/-).", captureMaxRangeNameLen)),
+						"address":       addressProperty(),
+						"address_space": stringProperty("Optional domain of this range address; omitted means the capture space."),
+						"length":        integerProperty("Byte length between 1 and the dump cap.", 1),
 					},
 					"required": []string{"name", "address", "length"},
 				},
@@ -71,7 +75,7 @@ func memorySnapshotCaptureSpec() toolSpec {
 
 // validateCaptureRanges enforces the bounded range contract: unique labels,
 // per-range length limits, and a total byte cap.
-func validateCaptureRanges(ranges []captureRangeArgs) ([]captureRange, *toolFailure) {
+func validateCaptureRanges(ranges []captureRangeArgs, targetSpace string, defaultInputSpace string) ([]captureRange, *toolFailure) {
 	if len(ranges) < 1 || len(ranges) > captureMaxRanges {
 		return nil, &toolFailure{
 			Code:    "invalid_params",
@@ -104,7 +108,11 @@ func validateCaptureRanges(ranges []captureRangeArgs) ([]captureRange, *toolFail
 			}
 		}
 		seen[name] = true
-		address, failure := parseAddress(entry.Address)
+		inputSpace := entry.AddressSpace
+		if inputSpace == "" {
+			inputSpace = defaultInputSpace
+		}
+		address, failure := resolveAddress(entry.Address, inputSpace, targetSpace)
 		if failure != nil {
 			return nil, &toolFailure{
 				Code:    "invalid_params",
@@ -152,7 +160,7 @@ func runMemorySnapshotCapture(tc toolContext, args json.RawMessage) map[string]a
 	if space == "" {
 		return failureResult(&toolFailure{Code: "invalid_params", Message: "space must name a space id from memory_spaces_list"}, tc.modern)
 	}
-	ranges, failure := validateCaptureRanges(parsed.Ranges)
+	ranges, failure := validateCaptureRanges(parsed.Ranges, parsed.Space, parsed.AddressSpace)
 	if failure != nil {
 		return failureResult(failure, tc.modern)
 	}
@@ -267,7 +275,7 @@ func runMemorySnapshotCapture(tc toolContext, args json.RawMessage) map[string]a
 		if err != nil {
 			return failureResult(&toolFailure{Code: "artifact_error", Message: err.Error()}, tc.modern)
 		}
-		readRanges = append(readRanges, map[string]any{
+		rangeResult := map[string]any{
 			"name":                  entry.Name,
 			"space":                 space,
 			"address_space":         space,
@@ -277,7 +285,9 @@ func runMemorySnapshotCapture(tc toolContext, args json.RawMessage) map[string]a
 			"effective_address_hex": canonicalHex(uint64(rawEffectiveAddress(payload))),
 			"byte_length":           len(raw),
 			"artifact":              artifactDescriptor(tc.server, stored, context.ID),
-		})
+		}
+		annotateAddressPair(rangeResult, space, entry.Address)
+		readRanges = append(readRanges, rangeResult)
 	}
 
 	// Restore the prior run state.

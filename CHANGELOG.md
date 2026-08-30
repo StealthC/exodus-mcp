@@ -9,6 +9,11 @@ and this project will use [Semantic Versioning](https://semver.org/spec/v2.0.0.h
 
 ### Added
 
+- Dual-form address ergonomics across address-bearing tools: optional
+  `address_space` accepts documented space-relative or processor-bus addresses
+  and translates them to the native target domain; responses preserve legacy
+  fields while adding `space_address`/`bus_address` coordinate pairs,
+  including nested ranges, matches, disassembly lines, and debug events.
 - Standardized `capture_consistency` object on every state-observing tool
   (`live` | `paused` | `atomic` | `state_restored` | `composite_non_atomic`)
   with execution paused/resumed facts, observed initial/final run states, and

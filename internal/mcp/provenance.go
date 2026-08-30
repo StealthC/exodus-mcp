@@ -21,9 +21,11 @@ import (
 var mdSpaceDevice = map[string]string{
 	"m68k-bus":            "68000 CPU bus",
 	"mem-ram":             "68000 work RAM",
+	"m68k-ram":            "68000 work RAM",
 	"mem-rom":             "cartridge ROM",
 	"mem-boot-rom":        "boot ROM",
 	"mem-z80-ram":         "Z80 RAM (68K window)",
+	"z80-ram":             "Z80 RAM",
 	"z80-bus":             "Z80 CPU bus",
 	"mem-vdp-vram":        "VDP VRAM",
 	"mem-vdp-cram":        "VDP CRAM",
@@ -41,6 +43,13 @@ func provenanceEnvelopeView(provenance artifact.Provenance) map[string]any {
 	var view map[string]any
 	if err := json.Unmarshal(encoded, &view); err != nil {
 		return map[string]any{"artifact_schema": artifact.ProvenanceSchema, "state": artifact.ProvenanceStateUnknown}
+	}
+	space, _ := view["address_space"].(string)
+	if start, ok := numberAsUint64(view["start_address"]); ok {
+		annotateAddressRangePair(view, "start", space, start)
+	}
+	if effective, ok := numberAsUint64(view["effective_address"]); ok {
+		annotateAddressRangePair(view, "effective", space, effective)
 	}
 	return view
 }

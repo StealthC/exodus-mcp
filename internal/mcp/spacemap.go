@@ -59,11 +59,23 @@ var mdSpaceBusMap = map[string]spaceBusMapping{
 		BusOffset: 0,
 		Note:      "Boot ROM occupies the start of the 68000 bus window.",
 	},
+	"m68k-ram": {
+		Bus:       "m68k",
+		BusBase:   0xFF0000,
+		BusOffset: 0,
+		Note:      "68000 work RAM occupies 0xFF0000-0xFFFFFF on the M68K bus; this alias is space-relative.",
+	},
 	"mem-z80-ram": {
 		Bus:       "m68k",
 		BusBase:   0xA00000,
 		BusOffset: 0,
 		Note:      "Z80 RAM is the 68K-visible window at 0xA00000 into the Z80 address space; the space itself is 0-based.",
+	},
+	"z80-ram": {
+		Bus:       "z80",
+		BusBase:   0,
+		BusOffset: 0,
+		Note:      "Z80 work RAM is a 0-based space-relative view of the Z80 bus.",
 	},
 	"z80-bus": {
 		Bus:       "z80",

@@ -72,6 +72,7 @@ func runUntilToolSpecs() []toolSpec {
 type runUntilBreakpointArgs struct {
 	CPU            string  `json:"cpu"`
 	Address        any     `json:"address"`
+	AddressSpace   string  `json:"address_space"`
 	Condition      string  `json:"condition"`
 	RangeEnd       any     `json:"range_end"`
 	BreakOnCounter bool    `json:"break_on_counter"`
@@ -82,12 +83,13 @@ type runUntilBreakpointArgs struct {
 }
 
 type runUntilWatchpointArgs struct {
-	CPU       string  `json:"cpu"`
-	Address   any     `json:"address"`
-	Length    *uint64 `json:"length"`
-	Access    string  `json:"access"`
-	TimeoutMs *uint64 `json:"timeout_ms"`
-	Context   string  `json:"context"`
+	CPU          string  `json:"cpu"`
+	Address      any     `json:"address"`
+	AddressSpace string  `json:"address_space"`
+	Length       *uint64 `json:"length"`
+	Access       string  `json:"access"`
+	TimeoutMs    *uint64 `json:"timeout_ms"`
+	Context      string  `json:"context"`
 	guardArgs
 }
 
@@ -103,7 +105,7 @@ func runRunUntilBreakpoint(tc toolContext, args json.RawMessage) map[string]any 
 	if parsed.CPU != "m68k" && parsed.CPU != "z80" {
 		return failureResult(&toolFailure{Code: "invalid_params", Message: "cpu must be m68k or z80"}, tc.modern)
 	}
-	address, failure := parseAddress(parsed.Address)
+	address, failure := resolveAddress(parsed.Address, addressSpaceFromArgs(args), parsed.CPU+"-bus")
 	if failure != nil {
 		return failureResult(failure, tc.modern)
 	}
@@ -118,7 +120,7 @@ func runRunUntilBreakpoint(tc toolContext, args json.RawMessage) map[string]any 
 		if condition != "range" {
 			return failureResult(&toolFailure{Code: "invalid_params", Message: "range_end applies only to condition=range"}, tc.modern)
 		}
-		if rangeEnd, failure = parseAddress(parsed.RangeEnd); failure != nil {
+		if rangeEnd, failure = resolveAddress(parsed.RangeEnd, addressSpaceFromArgs(args), parsed.CPU+"-bus"); failure != nil {
 			return failureResult(failure, tc.modern)
 		}
 		if rangeEnd <= address {
@@ -182,7 +184,7 @@ func runRunUntilWatchpoint(tc toolContext, args json.RawMessage) map[string]any 
 	if parsed.CPU != "m68k" && parsed.CPU != "z80" {
 		return failureResult(&toolFailure{Code: "invalid_params", Message: "cpu must be m68k or z80"}, tc.modern)
 	}
-	address, failure := parseAddress(parsed.Address)
+	address, failure := resolveAddress(parsed.Address, addressSpaceFromArgs(args), parsed.CPU+"-bus")
 	if failure != nil {
 		return failureResult(failure, tc.modern)
 	}
@@ -470,6 +472,7 @@ func runUntilSuccess(tc toolContext, plan runUntilPlan, id uint64, stop *stopAtt
 		"elapsed_ms":         elapsed,
 		"note":               "The system is paused at the instrument's stop; call cpu_run to resume.",
 	}
+	annotateAddressRangePair(result, "triggering_pc", plan.cpu+"-bus", pc)
 	if payload, failure := server.executeCommand(tc.ctx, "regs_get", map[string]string{"cpu": plan.cpu}); failure == nil {
 		if registers, ok := payload["registers"].(map[string]any); ok {
 			result["registers"] = registers
@@ -484,6 +487,7 @@ func runUntilSuccess(tc toolContext, plan runUntilPlan, id uint64, stop *stopAtt
 			result["watched_address_hex"] = canonicalHex(event.WatchedAddress)
 			result["access_direction"] = event.AccessDirection
 			result["requested_length"] = event.RequestedLength
+			annotateAddressRangePair(result, "watched", event.AddressSpace, event.WatchedAddress)
 		}
 	}
 	return okResult(stampGenerations(result, plan.generationBefore, server.target.Generation()), tc.modern)

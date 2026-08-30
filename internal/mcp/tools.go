@@ -202,6 +202,15 @@ func failureResult(failure *toolFailure, modern bool) map[string]any {
 // Schema helpers
 // ----------------------------------------------------------------------------------------------------------------------
 func objectSchema(properties map[string]any, required []string) map[string]any {
+	// Address-bearing tools share one optional input domain. Keeping this in
+	// the common schema builder prevents a newly added address-bearing tool
+	// from silently omitting the dual-form field.
+	for _, key := range []string{"address", "start_address", "end_address", "range_end", "address_range_start", "address_range_end", "region_start", "region_end", "stack_address", "vram_address"} {
+		if _, exists := properties[key]; exists {
+			properties["address_space"] = stringProperty("Optional domain of the supplied address. Use a documented space id (space-relative) or its processor bus id; omitted means the tool's target space.")
+			break
+		}
+	}
 	schema := map[string]any{"type": "object", "properties": properties, "additionalProperties": false}
 	if len(required) > 0 {
 		schema["required"] = required
@@ -231,7 +240,7 @@ func booleanProperty(description string) map[string]any {
 
 func addressProperty() map[string]any {
 	return map[string]any{
-		"description": "Address as an integer, 0x hex, $ Motorola hex, or h-suffixed Zilog hex.",
+		"description": "Address as an integer, 0x hex, $ Motorola hex, or h-suffixed Zilog hex. Use the sibling address_space field to select a documented space-relative or processor-bus domain; omitted means the tool's target space.",
 		"oneOf": []map[string]any{
 			{"type": "integer", "minimum": 0},
 			{"type": "string", "pattern": "^(\\$[0-9a-fA-F]+|[0-9a-fA-F]+[hH]|0[xX][0-9a-fA-F]+|[0-9]+)$"},
@@ -392,6 +401,151 @@ func structFieldMap(typ reflect.Type) map[string]reflect.Type {
 	return out
 }
 
+// addressSpaceFromArgs returns the optional domain of address-bearing input.
+// It is read separately from typed argument structs so older handlers remain
+// source-compatible while all address-bearing tools can accept the shared
+// address_space field.
+func addressSpaceFromArgs(raw json.RawMessage) string {
+	var fields map[string]json.RawMessage
+	if json.Unmarshal(raw, &fields) != nil {
+		return ""
+	}
+	var space string
+	_ = json.Unmarshal(fields["address_space"], &space)
+	return strings.TrimSpace(space)
+}
+
+// resolveAddress converts an address expressed in inputSpace to targetSpace.
+// Bus domains (m68k-bus/z80-bus) are absolute; memory domains are relative
+// and use their documented bus mapping. An omitted input domain means the
+// target's native space-relative form.
+func resolveAddress(raw any, inputSpace, targetSpace string) (uint64, *toolFailure) {
+	value, failure := parseAddress(raw)
+	if failure != nil {
+		return 0, failure
+	}
+	inputSpace = strings.TrimSpace(inputSpace)
+	targetSpace = strings.TrimSpace(targetSpace)
+	if inputSpace == "" || inputSpace == targetSpace {
+		return value, nil
+	}
+	input, inputOK := mdSpaceBusMap[inputSpace]
+	target, targetOK := mdSpaceBusMap[targetSpace]
+	if !inputOK || !targetOK || input.Bus == "" || target.Bus == "" || input.Bus != target.Bus {
+		return 0, &toolFailure{Code: "invalid_params", Message: fmt.Sprintf("address_space %q is incompatible with target space %q; use a documented %s bus or target space", inputSpace, targetSpace, targetSpace)}
+	}
+	bus := value
+	if inputSpace != input.Bus+"-bus" {
+		base := input.BusBase + input.BusOffset
+		if value > ^uint64(0)-base {
+			return 0, &toolFailure{Code: "invalid_params", Message: fmt.Sprintf("address %s overflows the %s bus mapping", canonicalHex(value), inputSpace)}
+		}
+		bus = base + value
+	}
+	if targetSpace == target.Bus+"-bus" {
+		return bus, nil
+	}
+	base := target.BusBase + target.BusOffset
+	if bus < base {
+		return 0, &toolFailure{Code: "invalid_params", Message: fmt.Sprintf("address %s in %s is outside target space %q", canonicalHex(value), inputSpace, targetSpace)}
+	}
+	return bus - base, nil
+}
+
+// annotateAddressPair adds both coordinate systems without replacing the
+// existing address/address_hex compatibility fields.
+func annotateAddressPair(value map[string]any, space string, address uint64) {
+	mapping, ok := mdSpaceBusMap[space]
+	if !ok || mapping.Bus == "" {
+		return
+	}
+	bus := address
+	if space != mapping.Bus+"-bus" {
+		base := mapping.BusBase + mapping.BusOffset
+		if address > ^uint64(0)-base {
+			return
+		}
+		bus = base + address
+	}
+	value["space_address"] = address
+	value["space_address_hex"] = canonicalHex(address)
+	value["bus_address"] = bus
+	value["bus_address_hex"] = canonicalHex(bus)
+}
+
+// annotateAddressMap recursively annotates address-bearing response objects.
+// Objects carrying address_space explicitly are authoritative; otherwise the
+// supplied default space is used. Existing fields are preserved.
+func annotateAddressMap(value map[string]any, defaultSpace string) {
+	space := defaultSpace
+	if candidate, ok := value["address_space"].(string); ok && candidate != "" {
+		space = candidate
+	} else if candidate, ok := value["space_id"].(string); ok && candidate != "" {
+		space = candidate
+	}
+	if address, ok := numberAsUint64(value["address"]); ok {
+		annotateAddressPair(value, space, address)
+	}
+	if start, ok := numberAsUint64(value["start_address"]); ok {
+		annotateAddressRangePair(value, "start", space, start)
+	}
+	if end, ok := numberAsUint64(value["end_address"]); ok {
+		annotateAddressRangePair(value, "end", space, end)
+	}
+	if stack, ok := numberAsUint64(value["stack_address"]); ok {
+		annotateAddressRangePair(value, "stack", space, stack)
+	}
+	for _, child := range value {
+		switch nested := child.(type) {
+		case map[string]any:
+			annotateAddressMap(nested, space)
+		case []any:
+			for _, item := range nested {
+				if object, ok := item.(map[string]any); ok {
+					annotateAddressMap(object, space)
+				}
+			}
+		}
+	}
+}
+
+func annotateAddressRangePair(value map[string]any, prefix, space string, address uint64) {
+	mapping, ok := mdSpaceBusMap[space]
+	if !ok || mapping.Bus == "" {
+		return
+	}
+	bus := address
+	if space != mapping.Bus+"-bus" {
+		base := mapping.BusBase + mapping.BusOffset
+		if address > ^uint64(0)-base {
+			return
+		}
+		bus = base + address
+	}
+	value[prefix+"_space_address"] = address
+	value[prefix+"_space_address_hex"] = canonicalHex(address)
+	value[prefix+"_bus_address"] = bus
+	value[prefix+"_bus_address_hex"] = canonicalHex(bus)
+}
+
+func numberAsUint64(value any) (uint64, bool) {
+	switch number := value.(type) {
+	case uint64:
+		return number, true
+	case uint:
+		return uint64(number), true
+	case int:
+		return uint64(number), number >= 0
+	case float64:
+		return uint64(number), number >= 0 && number == float64(uint64(number))
+	case json.Number:
+		parsed, err := strconv.ParseUint(string(number), 10, 64)
+		return parsed, err == nil
+	default:
+		return 0, false
+	}
+}
+
 // parseAddress accepts integral JSON numbers or the roadmap address string
 // formats: decimal, 0x-prefixed hex, $-prefixed Motorola hex, and Zilog
 // h-suffixed hex such as "C000h".
@@ -402,6 +556,26 @@ func parseAddress(raw any) (uint64, *toolFailure) {
 			return 0, &toolFailure{Code: "invalid_params", Message: "address must be a non-negative integer"}
 		}
 		return uint64(value), nil
+	case int:
+		if value < 0 {
+			return 0, &toolFailure{Code: "invalid_params", Message: "address must be a non-negative integer"}
+		}
+		return uint64(value), nil
+	case int64:
+		if value < 0 {
+			return 0, &toolFailure{Code: "invalid_params", Message: "address must be a non-negative integer"}
+		}
+		return uint64(value), nil
+	case uint:
+		return uint64(value), nil
+	case uint64:
+		return value, nil
+	case json.Number:
+		parsed, err := strconv.ParseUint(string(value), 10, 64)
+		if err != nil {
+			return 0, &toolFailure{Code: "invalid_params", Message: "address must be a non-negative integer"}
+		}
+		return parsed, nil
 	case string:
 		if parsed, ok := parseFlexibleNumber(value); ok {
 			return parsed, nil
