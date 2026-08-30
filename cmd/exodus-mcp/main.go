@@ -194,10 +194,25 @@ func detectExodusTarget() string {
 // is present. Windows filesystems are case-insensitive, but both spellings are
 // checked so the detection stays honest on case-sensitive hosts too.
 func findExodusBeside(dir string) string {
-	for _, name := range []string{"Exodus.exe", "exodus.exe"} {
-		candidate := filepath.Join(dir, name)
-		if info, err := os.Stat(candidate); err == nil && !info.IsDir() {
-			return candidate
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return ""
+	}
+
+	// Enumerating the directory preserves the spelling stored by the
+	// filesystem. This matters on Windows, where os.Stat accepts either case
+	// but returns the spelling used in the lookup path rather than the actual
+	// directory entry name.
+	for _, preferred := range []string{"Exodus.exe", "exodus.exe"} {
+		for _, entry := range entries {
+			if entry.Name() == preferred && !entry.IsDir() {
+				return filepath.Join(dir, entry.Name())
+			}
+		}
+	}
+	for _, entry := range entries {
+		if strings.EqualFold(entry.Name(), "Exodus.exe") && !entry.IsDir() {
+			return filepath.Join(dir, entry.Name())
 		}
 	}
 	return ""
