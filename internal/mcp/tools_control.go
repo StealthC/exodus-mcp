@@ -80,11 +80,17 @@ func controlToolSpecs() []toolSpec {
 		},
 		{
 			name:        "cpu_debug_events_list",
-			description: "List structured breakpoint/watchpoint stop events (bounded history, pagination, artifact spillover). Each event includes managed resource id, owner context, CPU, triggering PC, address_space, watched address, access direction, hit count, target_generation, frame_token, timestamp, and provenance. History preserves counter gaps and identifies dropped records via truncated flag and total count.",
+			description: "List structured breakpoint/watchpoint stop events with pagination and filters. Each event includes the managed resource id, owner context, CPU, triggering PC, address_space, watched address, access direction, hit count, target_generation, frame_token, timestamps, repeat count, and provenance. History is bounded (100 retained events): the response's history object states the capacity, how many records were recorded, how many the cap dropped, the retained id span, and whether the retained history is complete, so a gap is never inferred from a short list. A repeated observation of the same paused hit (same resource, counter value, direction, and PC) is folded into the existing event and counted in repeat_count instead of creating a duplicate; a resumed CPU increments the native counter on the next hit and records a new event.",
 			schema: objectSchema(map[string]any{
-				"offset":  integerProperty("Pagination offset (default 0).", 0),
-				"limit":   integerProperty("Pagination limit (default 20, cap 100).", 1),
-				"context": contextProperty(),
+				"offset":        integerProperty("Pagination offset within the filtered set (default 0).", 0),
+				"limit":         integerProperty("Pagination limit (default 20, cap 100).", 1),
+				"resource_kind": enumProperty("Filter by resource kind.", []string{"breakpoint", "watchpoint", "any"}),
+				"resource_id":   integerProperty("Filter by managed resource id.", 1),
+				"cpu":           enumProperty("Filter by processor.", []string{"m68k", "z80"}),
+				"direction":     enumProperty("Filter by access direction.", []string{"read", "write", "execute", "any"}),
+				"event_id_min":  integerProperty("Only events with an id at or above this value.", 1),
+				"event_id_max":  integerProperty("Only events with an id at or below this value.", 1),
+				"context":       contextProperty(),
 			}, nil),
 			run: runDebugEventsList,
 		},
@@ -452,9 +458,15 @@ func runWatchpointRemove(tc toolContext, args json.RawMessage) map[string]any {
 }
 
 type debugEventsListArgs struct {
-	Offset  uint64 `json:"offset"`
-	Limit   uint64 `json:"limit"`
-	Context string `json:"context"`
+	Offset       uint64 `json:"offset"`
+	Limit        uint64 `json:"limit"`
+	ResourceKind string `json:"resource_kind"`
+	ResourceID   uint64 `json:"resource_id"`
+	CPU          string `json:"cpu"`
+	Direction    string `json:"direction"`
+	EventIDMin   uint64 `json:"event_id_min"`
+	EventIDMax   uint64 `json:"event_id_max"`
+	Context      string `json:"context"`
 }
 
 func runDebugEventsList(tc toolContext, args json.RawMessage) map[string]any {
@@ -462,7 +474,8 @@ func runDebugEventsList(tc toolContext, args json.RawMessage) map[string]any {
 	if failure != nil {
 		return failureResult(failure, tc.modern)
 	}
-	if _, failure = resolveContext(tc.server, parsed.Context); failure != nil {
+	context, failure := resolveContext(tc.server, parsed.Context)
+	if failure != nil {
 		return failureResult(failure, tc.modern)
 	}
 	offset := int(parsed.Offset)
@@ -473,7 +486,20 @@ func runDebugEventsList(tc toolContext, args json.RawMessage) map[string]any {
 	if limit > 100 {
 		limit = 100
 	}
-	events, total, truncated := tc.server.listDebugEvents(offset, limit)
+	filter := debugEventFilter{
+		ResourceKind: parsed.ResourceKind,
+		ResourceID:   parsed.ResourceID,
+		CPU:          parsed.CPU,
+		Direction:    parsed.Direction,
+		EventIDMin:   parsed.EventIDMin,
+		EventIDMax:   parsed.EventIDMax,
+		// A managed stop belongs to the context that created its instrument;
+		// filtering by the caller's context keeps unrelated instrumentation out
+		// of an analysis record.
+		ContextID: context.ID,
+	}
+	events, total, truncated := tc.server.listDebugEvents(filter, offset, limit)
+	history := tc.server.debugEventHistory()
 	views := make([]map[string]any, 0, len(events))
 	for _, ev := range events {
 		view := map[string]any{
@@ -498,6 +524,12 @@ func runDebugEventsList(tc toolContext, args json.RawMessage) map[string]any {
 		if ev.FrameToken != nil {
 			view["frame_token"] = *ev.FrameToken
 		}
+		view["first_seen_at"] = ev.FirstSeenAt
+		view["last_seen_at"] = ev.LastSeenAt
+		view["repeat_count"] = ev.RepeatCount
+		if ev.RunState != "" {
+			view["run_state"] = ev.RunState
+		}
 		views = append(views, view)
 	}
 	return okResult(map[string]any{
@@ -506,7 +538,23 @@ func runDebugEventsList(tc toolContext, args json.RawMessage) map[string]any {
 		"offset":    offset,
 		"limit":     limit,
 		"truncated": truncated,
-		"note":      "History is bounded to 100 events; gaps may exist due to truncation; check truncated and total for pagination.",
+		"history":   history,
+		"filters": map[string]any{
+			"resource_kind": filter.ResourceKind,
+			"resource_id":   filter.ResourceID,
+			"cpu":           filter.CPU,
+			"direction":     filter.Direction,
+			"event_id_min":  filter.EventIDMin,
+			"event_id_max":  filter.EventIDMax,
+			"context_id":    filter.ContextID,
+		},
+		"semantics": map[string]any{
+			"stop":      "A hit that fired pauses the CPU; the event's hit_count is the native watchpoint counter at that observation.",
+			"resume":    "After cpu_run the CPU can reach the watched range again; the next confirmed hit increments the counter and records a new event.",
+			"duplicate": "Re-observing the same paused hit (same resource, counter value, direction, and PC) increases repeat_count; it is not a second access.",
+			"gap":       "history.dropped counts records the 100-event cap evicted; history.complete is false whenever records are gone.",
+		},
+		"note": "History is bounded to 100 retained events. Use history.dropped/history.complete to decide whether the retained list is a complete record, and page with offset/limit over the filtered set.",
 	}, tc.modern)
 }
 

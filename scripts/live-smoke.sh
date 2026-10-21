@@ -53,12 +53,14 @@ check() {
 
 json_get() {
 	# json_get <json text> <python expression over parsed>
-	python3 -c "
+	# Feed JSON on stdin rather than argv: the modern tools/list catalog can
+	# exceed the OS per-argument limit as the tool catalog grows.
+	printf '%s' "$1" | python3 -c "
 import json, sys
-parsed = json.loads(sys.argv[1])
+parsed = json.load(sys.stdin)
 value = $2
 print(json.dumps(value) if not isinstance(value, str) else value)
-" "$1"
+"
 }
 
 rpc_call() {
@@ -815,6 +817,51 @@ print(s)
 			check "state_load run_state paused override" "[ \"\$override_paused_final\" = 'paused' ]"
 		fi
 	fi
+
+	step "Continuous trace session (non-pausing)"
+	# A session arms the engine's own trace writer for short windows without
+	# pausing the CPU, accumulates events server-side, and restores the prior
+	# trace flags on stop. The caps here are deliberately small: the probe must
+	# leave no large segment files behind.
+	tool_call "cpu_run" >/dev/null
+	session_start=$(tool_call "trace_session_start" '{"cpu": "m68k", "window_ms": 100, "interval_ms": 300, "max_duration_ms": 20000, "max_total_bytes": 8388608, "max_segments": 16, "access_capture": "ranges", "watches": [{"address": "0xFF0000", "length": 8, "access": "any"}]}')
+	session_id=$(json_get "$session_start" "parsed.get('session', {}).get('id', '')" 2>/dev/null)
+	check "trace session starts" "[ -n \"\$session_id\" ]"
+	session_watches=$(json_get "$session_start" "parsed.get('native', {}).get('armed_watches', 0)" 2>/dev/null)
+	check "trace session arms its read/write range" "[ -n \"\$session_watches\" ] && [ \"\$session_watches\" -ge 1 ]"
+	session_access_mode=$(json_get "$session_start" "str(parsed.get('session', {}).get('config', {}).get('access_capture', ''))" 2>/dev/null)
+	check "trace session enables per-access capture" "[ \"\$session_access_mode\" = 'ranges' ]"
+	session_access_supported=$(json_get "$session_start" "parsed.get('native', {}).get('access', {}).get('mode', '')" 2>/dev/null)
+	check "native access stream is reported" "[ \"\$session_access_supported\" = 'ranges' ]"
+	sleep 2
+	session_events=$(tool_call "trace_session_events" '{"kind": "execute", "limit": 5}')
+	session_count=$(json_get "$session_events" "parsed.get('session', {}).get('totals', {}).get('execute', 0)" 2>/dev/null)
+	session_malformed=$(json_get "$session_events" "parsed.get('loss', {}).get('malformed_lines', -1)" 2>/dev/null)
+	check "trace session accumulates execution events" "[ -n \"\$session_count\" ] && [ \"\$session_count\" -ge 1 ]"
+	check "trace session parses every line" "[ \"\$session_malformed\" = '0' ]"
+	# Per-access records: the watched range is written by the game loop, so a
+	# short session must produce per-occurrence read/write records with a
+	# monotonic sequence and no loss beyond what the session reports.
+	access_events=$(tool_call "trace_session_events" '{"kind": "write", "limit": 5}')
+	access_total=$(json_get "$access_events" "parsed.get('session', {}).get('totals', {}).get('write', 0)" 2>/dev/null)
+	access_gaps=$(json_get "$access_events" "parsed.get('loss', {}).get('access_sequence_gaps', -1)" 2>/dev/null)
+	access_malformed=$(json_get "$access_events" "parsed.get('loss', {}).get('access_malformed_lines', -1)" 2>/dev/null)
+	access_direction=$(json_get "$access_events" "','.join(sorted({e.get('direction','') for e in parsed.get('events', [])}))" 2>/dev/null)
+	check "per-access write records are captured" "[ -n \"\$access_total\" ] && [ \"\$access_total\" -ge 1 ]"
+	check "per-access records parse cleanly" "[ \"\$access_malformed\" = '0' ]"
+	check "per-access sequence has no gaps in a short run" "[ \"\$access_gaps\" = '0' ]"
+	check "per-access direction filter returns writes only" "[ -z \"\$access_direction\" ] || [ \"\$access_direction\" = 'write' ]"
+	session_running=$(tool_call "emulator_status")
+	session_running_flag=$(json_get "$session_running" "str(parsed.get('system_running', False)).lower()" 2>/dev/null)
+	check "trace session never pauses the CPU" "[ \"\$session_running_flag\" = 'true' ]"
+	session_stop=$(tool_call "trace_session_stop" '{}')
+	session_state=$(json_get "$session_stop" "parsed.get('session', {}).get('state', '')" 2>/dev/null)
+	session_restored=$(json_get "$session_stop" "str(parsed.get('native', {}).get('trace_flags_restored', False)).lower()" 2>/dev/null)
+	session_deleted=$(json_get "$session_stop" "str(parsed.get('native', {}).get('deleted_segments', False)).lower()" 2>/dev/null)
+	check "trace session stops" "[ \"\$session_state\" = 'stopped' ]"
+	check "trace session restores trace flags" "[ \"\$session_restored\" = 'true' ]"
+	check "trace session deletes its segments" "[ \"\$session_deleted\" = 'true' ]"
+	tool_call "cpu_pause" >/dev/null
 
 	if [ "$was_running" = "True" ] || [ "$was_running" = "true" ]; then
 		tool_call "cpu_run" >/dev/null

@@ -5,11 +5,13 @@ server, grouped by capability. Only open work is tracked in
 [ROADMAP.md](ROADMAP.md); the [CHANGELOG.md](../CHANGELOG.md) records the
 delivery history.
 
-The MCP server currently exposes **85 analysis tools** spanning the delivered
-roadmap phases 0-9: bridge and context foundations, memory and artifact
+The MCP server currently exposes **94 analysis tools** spanning the delivered
+roadmap phases 0-10: bridge and context foundations, memory and artifact
 access, both processors, VDP graphics, deterministic controlled
 experimentation, advanced analysis, evidence annotations, advanced debugging,
-deterministic replay, and workflow ergonomics. Delivered entries are covered
+deterministic replay, workflow ergonomics, per-occurrence trace sessions with
+restart recovery, and continuous trace sessions.
+Delivered entries are covered
 by unit and integration tests and exercised live where the native capability
 is available; unavailable native features are documented explicitly (see
 [Validation](#validation)).
@@ -284,16 +286,24 @@ is available; unavailable native features are documented explicitly (see
   `event`/`event_id` and `linked_trace_capture_id` pointing at the exact stop
   event), a different managed resource firing, and timeout. The trace
   artifacts include the structured `debug-event` for the stop.
-- `cpu_debug_events_list`: bounded forensic event history (100 records) with
-  `offset`/`limit` pagination, `truncated` flag, and `total`. Whenever a
-  managed breakpoint or watchpoint stops execution, a structured
-  `debug-event` artifact records the managed resource id, owner context, CPU,
-  triggering PC, address space, watched effective address, access direction,
-  requested range, hit count, target generation, frame token, and timestamp;
-  access width, value before/after, transferred value, and decoded
-  instruction bytes are reported as `null` with a "not exposed by native API"
-  note rather than presenting zero as data. Counter gaps caused by
-  sampling/truncation are preserved via hit-count monotonicity.
+- `cpu_debug_events_list`: bounded forensic event history (100 retained
+  records) with `offset`/`limit` pagination over the filtered set, filters
+  (`resource_kind`, `resource_id`, `cpu`, `direction`, `event_id_min/max`, and
+  the caller's context), and an explicit `history` object — capacity, retained,
+  recorded, dropped, retained id span, and `complete` — so a gap is never
+  inferred from a short list. Whenever a managed breakpoint or watchpoint stops
+  execution, a structured `debug-event` artifact records the managed resource
+  id, owner context, CPU, triggering PC, address space, watched effective
+  address, access direction, requested range, hit count, target generation,
+  frame token, timestamps, and provenance. Stop/resume semantics are explicit: a
+  breaking hit pauses the CPU and increments the native counter once; while the
+  CPU stays paused a repeated observation of the same resource, counter value,
+  direction, and PC is folded into the same event (`repeat_count`,
+  `last_seen_at`), and a resumed CPU produces a new counter value and therefore
+  a new event. Access width, value before/after, and transferred value for
+  *paused watchpoint stops* remain `null` with a "not exposed by native API"
+  note rather than presenting zero as data — per-occurrence values come from a
+  trace session with `access_capture`, not from the pause path.
 - `cpu_coverage_capture`: execution coverage artifact (`cpu-coverage/2`)
   from a bounded trace window — the executed address set with execution
   counts, instruction-aware basic `blocks` (start/end address, instruction
@@ -553,6 +563,65 @@ is available; unavailable native features are documented explicitly (see
   code path, so a mismatch is a real emulator nondeterminism signal rather
   than a harness artifact.
 
+## Continuous trace sessions (Phase 10)
+
+A session keeps capturing while the emulator keeps running: no pause, no
+per-call round trip, and a bounded, queryable event record afterwards. The
+full native capability investigation, capture modes, and deferred fork work are
+documented in [TRACE-SESSIONS.md](TRACE-SESSIONS.md).
+
+- `trace_session_start`: arms a persistent trace session for one processor.
+  `mode: "sampled"` traces `window_ms` (default 100) of every `interval_ms`
+  (default 10 000) and leaves the CPU untouched in between; `mode:
+  "continuous"` traces every instruction and only rotates the segment file
+  every `segment_ms`. Optional `watches` arm non-breaking read/write
+  watchpoints whose hit counters are sampled. `access_capture: "ranges"`
+  additionally records **per-occurrence read/write events** inside those ranges
+  — native filtering means out-of-range accesses are never written — with a
+  monotonic engine sequence, cycle, PC, direction, width, transferred value, an
+  optional pre-write value when captured, and a same-instant register snapshot
+  (`access_include_registers`, default true for ranges). `max_duration_ms`,
+  `max_total_bytes`, `max_segments`, and `access_max_bytes` bound the native
+  side (auto-stop and eviction are reported, never silent) while `max_events`
+  bounds the server-side store. Every start response carries a `volume` object
+  with the limits in force, the estimated bytes for the configured duration and
+  duty cycle, and the measured bytes/second the estimate derives from, so a
+  128 MiB / ten-minute audit is a deliberate choice. `start_guard: "quiet"`
+  stops the system for the configuration calls only and restores it; the default
+  `"none"` arms capture on the running CPU.
+- `trace_session_status`: drains both native streams into the bounded event
+  store and reports the configuration, limits, native counters, segment tables,
+  access-stream counters, watch counter deltas, per-kind totals, and the explicit
+  loss object.
+- `trace_session_events`: bounded inline events plus a per-address execution
+  histogram, filtered by `kind`, `direction`, address/PC/cycle/sequence range,
+  and effective value (`value_equals`, `value_min`/`value_max`,
+  `previous_equals`); effective-value filters select records without ever
+  dropping a raw event from the store. Optional `trace-session-event/1` /
+  `trace-session-access/1` JSONL artifact with full `artifact-provenance/2`
+  metadata, plus ROM-hash-bound symbol resolution of access PCs.
+- `trace_session_stop`: final drain of both streams, disable the writers,
+  restore the processor's prior trace flags, delete the session's watchpoints
+  and segment files, and report the final totals, watch counters, and loss;
+  exports JSONL by default.
+- `trace_session_recover`: lists or loads durable `manifest.json` records from
+  this or a previous MCP server process. A manifest carries the configuration,
+  the limits in force, the cartridge SHA-256, per-stream parse counters, the loss
+  object, and the artifact ids; recovery reloads a recorded event file into a
+  stopped read-only view and installs it only when no live session is active.
+
+Honest boundaries stated in every response: execution events are the engine's
+own per-instruction trace lines (full fidelity inside a capture window,
+unfiltered because the engine cannot filter natively); access events are
+per-occurrence records whose value semantics are stated (`value_state: "read" |
+"written"`), and a write's pre-write value is reported only when the engine
+captured it (`previous_known`); access records carry cycle and emulated time but
+no per-record VDP frame token; every filter applies after capture; and any loss
+(dropped events, malformed or truncated lines, evicted undrained segments, holes
+in the access sequence) is reported with `loss.complete: false`. Symbols are
+bound to the cartridge SHA-256 they were recorded against and resolution is
+suppressed when a different ROM is loaded.
+
 ## Phase 9 workflow ergonomics (delivered: atomic snapshots, reset, input, exports, instrumentation, and state override)
 
 - `target_reset(kind: "soft")`: native hardware-like reset available only on
@@ -657,6 +726,20 @@ reference harness, in addition to unit and integration tests:
   attribution of border, layer B sky, layer A text/building, and a bottom-row
   sprite; `vdp_command_dma_status` live native register/DMA observation with
   explicit unavailable command-latch fields.
+- Continuous trace sessions: unit and tool tests cover the native trace format,
+  the per-access record contract (direction, width, boundary addresses,
+  previous-value availability, register order), bounded store with loss
+  accounting, access sequence gaps, effective-value filters, manifest round trip
+  and recovery, aggregate watch samples, and artifact export. A native unit test
+  (`native-plugin/tests/memory_access_log_test.cpp`, run by
+  `scripts/native-test.sh` and `scripts/test.sh`) compiles the engine's own
+  record formatter with the host compiler and validates the encoding rules. The
+  live loop exercises a session on the running emulator
+  (`live-smoke.sh --full`), confirming capture without a pause, native access
+  capture with no sequence gaps, segment draining, and trace-flag restoration on
+  stop. The CPU-core integration of the access hook is validated by building the
+  fork and by that live loop; it is not covered by the native unit test, which
+  links only the format header.
 - Save/list/load round trip with generation/ROM provenance and stale flags;
   `target_reset(kind: "soft")` is live-verified to fail safely with
   `unsupported_plugin` on the current fork/plugin scaffold, without a native

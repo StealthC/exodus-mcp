@@ -19,6 +19,7 @@ import (
 	"github.com/StealthC/exodus-mcp/internal/artifact"
 	"github.com/StealthC/exodus-mcp/internal/bridge"
 	"github.com/StealthC/exodus-mcp/internal/experiment"
+	"github.com/StealthC/exodus-mcp/internal/tracing"
 )
 
 const (
@@ -87,13 +88,23 @@ type Server struct {
 	watchpoints map[uint64]debugResourceMeta
 
 	// debugEvents is the bounded history of breakpoint/watchpoint stop events.
-	debugEventsMu sync.Mutex
-	debugEvents   []debugEvent
-	nextEventID   uint64
+	// debugEventsTotal counts every recorded observation for the process (not
+	// counting duplicates folded into an existing event) and
+	// debugEventsDropped counts records the capacity cap evicted, so a reader
+	// can see a gap instead of inferring completeness from the slice length.
+	debugEventsMu      sync.Mutex
+	debugEvents        []debugEvent
+	debugEventsTotal   uint64
+	debugEventsDropped uint64
+	nextEventID        uint64
 
 	// statesDir anchors context-scoped system snapshots; empty means
 	// os.TempDir()/exodus-mcp/states.
 	statesDir string
+
+	// traceSessionsDir anchors durable trace-session manifests; empty means
+	// os.TempDir()/exodus-mcp/trace-sessions.
+	traceSessionsDir string
 
 	// experiments runs operator-authored scripts and fixtures; nil means the
 	// experiment_run tool is disabled.
@@ -110,6 +121,10 @@ type Server struct {
 	// metrics accumulates per-tool call/error counts and per-artifact-kind
 	// counts for the /metrics endpoint.
 	metrics *metricsStore
+
+	// traces owns the single active-or-retained continuous trace session and
+	// its bounded server-side event store.
+	traces *tracing.Registry
 
 	statusMu      sync.Mutex
 	statusExpires time.Time
@@ -140,6 +155,7 @@ func NewServer(version string, client bridge.Client, store *artifact.Store, cont
 		runState:    &runStateTracker{},
 		romIdentity: newROMIdentityProvider(),
 		metrics:     newMetricsStore(),
+		traces:      tracing.NewRegistry(),
 	}
 	// Artifact creation is observed at the store so producers (including the
 	// experiment runner, which shares the store) do not need per-call plumbing.
@@ -426,6 +442,8 @@ func commandTimeout(operation string) time.Duration {
 	switch operation {
 	case "rom_load", "state_save", "state_load", "frame_advance", "trace_capture", "soft_reset":
 		return 60 * time.Second
+	case "trace_session_start", "trace_session_drain", "trace_session_stop":
+		return 30 * time.Second
 	case "mem_read":
 		return 30 * time.Second
 	default:
@@ -444,6 +462,16 @@ func (server *Server) currentROMPath() string {
 	server.romPathMu.Lock()
 	defer server.romPathMu.Unlock()
 	return server.romPath
+}
+
+// currentROMSHA256 returns the loaded cartridge's SHA-256, or "" when no
+// readable cartridge is loaded. A caller must never treat "" as a match.
+func (server *Server) currentROMSHA256() string {
+	facts := server.romIdentity.romFileFacts(server.currentROMPath())
+	if !facts.SHA256Available {
+		return ""
+	}
+	return facts.SHA256
 }
 
 // setROMPath records the currently loaded ROM path.
@@ -471,6 +499,15 @@ type debugResourceMeta struct {
 }
 
 // debugEvent is one structured breakpoint/watchpoint stop event.
+//
+// Stop/resume and duplicate-hit semantics: a breaking watchpoint increments its
+// native hit counter once per confirmed access and then pauses the CPU. While
+// the CPU stays paused no further access can occur, so repeated observations of
+// the same resource, hit count, direction, and triggering PC are the same event,
+// not new hits: they are folded into RepeatCount with LastSeenAt updated. A
+// resumed CPU (cpu_run) produces a new counter value on the next confirmed hit
+// and therefore a new event. Events whose counter value cannot be proven are
+// never synthesized.
 type debugEvent struct {
 	ID               uint64
 	ResourceKind     string
@@ -486,7 +523,13 @@ type debugEvent struct {
 	TargetGeneration uint64
 	FrameToken       *uint64
 	Timestamp        time.Time
-	ControlFlow      map[string]any // placeholder for future
+	// FirstSeenAt and LastSeenAt bracket a folded duplicate observation.
+	FirstSeenAt time.Time
+	LastSeenAt  time.Time
+	RepeatCount uint64
+	// RunState is the observed CPU run state when the event was recorded.
+	RunState    string
+	ControlFlow map[string]any // placeholder for future
 }
 
 func (server *Server) trackDebugResource(kind string, id uint64, meta debugResourceMeta) {
@@ -555,24 +598,126 @@ func (server *Server) purgeDebugResources() {
 
 const maxDebugEvents = 100
 
+// pushDebugEvent records one stop observation, folding a repeat of the same
+// paused hit (same resource, hit count, direction, and PC) into the existing
+// event instead of creating a duplicate record.
 func (server *Server) pushDebugEvent(event debugEvent) uint64 {
 	server.debugEventsMu.Lock()
 	defer server.debugEventsMu.Unlock()
+	now := time.Now().UTC()
+	for index := len(server.debugEvents) - 1; index >= 0; index-- {
+		existing := &server.debugEvents[index]
+		if existing.ResourceKind != event.ResourceKind || existing.ResourceID != event.ResourceID {
+			continue
+		}
+		if existing.HitCount == event.HitCount && existing.TriggeringPC == event.TriggeringPC &&
+			existing.AccessDirection == event.AccessDirection && existing.WatchedAddress == event.WatchedAddress {
+			existing.RepeatCount++
+			existing.LastSeenAt = now
+			return existing.ID
+		}
+		// Only the most recent event of this resource can be a duplicate.
+		break
+	}
 	server.nextEventID++
 	event.ID = server.nextEventID
-	event.Timestamp = time.Now().UTC()
+	event.Timestamp = now
+	if event.RunState == "" {
+		// The server's observed run state at record time; never inferred from
+		// the resource kind.
+		event.RunState = server.runStateString()
+	}
+	event.FirstSeenAt = now
+	event.LastSeenAt = now
+	event.RepeatCount = 0
+	server.debugEventsTotal++
 	server.debugEvents = append(server.debugEvents, event)
 	if len(server.debugEvents) > maxDebugEvents {
-		// Keep the most recent
-		server.debugEvents = server.debugEvents[len(server.debugEvents)-maxDebugEvents:]
+		dropped := len(server.debugEvents) - maxDebugEvents
+		server.debugEventsDropped += uint64(dropped)
+		server.debugEvents = server.debugEvents[dropped:]
 	}
 	return event.ID
 }
 
-func (server *Server) listDebugEvents(offset, limit int) ([]debugEvent, int, bool) {
+// debugEventFilter selects retained stop events. Every field is optional; an
+// empty filter matches everything.
+type debugEventFilter struct {
+	ResourceKind string
+	ResourceID   uint64
+	ContextID    string
+	CPU          string
+	Direction    string
+	EventIDMin   uint64
+	EventIDMax   uint64
+}
+
+func (filter debugEventFilter) matches(event debugEvent) bool {
+	if filter.ResourceKind != "" && filter.ResourceKind != "any" && event.ResourceKind != filter.ResourceKind {
+		return false
+	}
+	if filter.ResourceID != 0 && event.ResourceID != filter.ResourceID {
+		return false
+	}
+	if filter.ContextID != "" && event.ContextID != filter.ContextID {
+		return false
+	}
+	if filter.CPU != "" && event.CPU != filter.CPU {
+		return false
+	}
+	if filter.Direction != "" && event.AccessDirection != filter.Direction {
+		return false
+	}
+	if filter.EventIDMin != 0 && event.ID < filter.EventIDMin {
+		return false
+	}
+	if filter.EventIDMax != 0 && event.ID > filter.EventIDMax {
+		return false
+	}
+	return true
+}
+
+// debugEventHistory is the explicit completeness statement of the retained
+// history: capacity, records recorded, records dropped, and the id span.
+type debugEventHistory struct {
+	Capacity   int    `json:"capacity"`
+	Retained   int    `json:"retained"`
+	Recorded   uint64 `json:"recorded"`
+	Dropped    uint64 `json:"dropped"`
+	FirstEvent uint64 `json:"first_event_id,omitempty"`
+	LastEvent  uint64 `json:"last_event_id,omitempty"`
+	Complete   bool   `json:"complete"`
+}
+
+func (server *Server) debugEventHistory() debugEventHistory {
 	server.debugEventsMu.Lock()
 	defer server.debugEventsMu.Unlock()
-	total := len(server.debugEvents)
+	history := debugEventHistory{
+		Capacity: maxDebugEvents,
+		Retained: len(server.debugEvents),
+		Recorded: server.debugEventsTotal,
+		Dropped:  server.debugEventsDropped,
+		Complete: server.debugEventsDropped == 0,
+	}
+	if len(server.debugEvents) > 0 {
+		history.FirstEvent = server.debugEvents[0].ID
+		history.LastEvent = server.debugEvents[len(server.debugEvents)-1].ID
+	}
+	return history
+}
+
+// listDebugEvents returns the retained events matching the filter, in capture
+// order, with pagination over the filtered set.
+func (server *Server) listDebugEvents(filter debugEventFilter, offset, limit int) ([]debugEvent, int, bool) {
+	server.debugEventsMu.Lock()
+	defer server.debugEventsMu.Unlock()
+	matched := make([]debugEvent, 0, len(server.debugEvents))
+	for _, event := range server.debugEvents {
+		if filter.matches(event) {
+			matched = append(matched, event)
+		}
+	}
+	total := len(matched)
 	if offset < 0 {
 		offset = 0
 	}
@@ -583,11 +728,8 @@ func (server *Server) listDebugEvents(offset, limit int) ([]debugEvent, int, boo
 		limit = total - offset
 	}
 	end := offset + limit
-	if end > total {
-		end = total
-	}
-	out := make([]debugEvent, end-offset)
-	copy(out, server.debugEvents[offset:end])
+	out := make([]debugEvent, limit)
+	copy(out, matched[offset:end])
 	truncated := end < total
 	return out, total, truncated
 }
@@ -604,9 +746,39 @@ func (server *Server) debugEventByID(id uint64) *debugEvent {
 	return nil
 }
 
+// retireTraceSession marks the current session stopped because the native side
+// no longer captures (cartridge reload, module swap, or a native stop). The
+// accumulated events stay queryable; the loss note explains why nothing more
+// will arrive.
+func (server *Server) retireTraceSession(reason string) *tracing.Session {
+	session := server.traces.Current()
+	if session == nil || session.Stopped {
+		return nil
+	}
+	session.MarkStopped()
+	session.AddLoss(0, 0, 0, []string{"The native trace session stopped because " + reason + "; events accumulated before that remain queryable."})
+	return session
+}
+
 // SetStatesDir overrides the directory that anchors system snapshots.
 func (server *Server) SetStatesDir(dir string) {
 	server.statesDir = dir
+}
+
+// SetTraceSessionsDir overrides the directory that anchors durable trace
+// session manifests.
+func (server *Server) SetTraceSessionsDir(dir string) {
+	server.traceSessionsDir = dir
+}
+
+// TraceSessionsDir returns the directory that anchors durable trace session
+// manifests; the default sits beside the snapshot store in the server's
+// temporary workspace.
+func (server *Server) TraceSessionsDir() string {
+	if server.traceSessionsDir != "" {
+		return server.traceSessionsDir
+	}
+	return filepath.Join(os.TempDir(), "exodus-mcp", "trace-sessions")
 }
 
 // SetExperimentRunner installs the experiment runner backing experiment_run;

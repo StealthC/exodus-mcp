@@ -47,6 +47,10 @@ call; the stop event keeps shutdown responsive mid-command.
 | `regs_get` | `cpu=m68k\|z80` | Full register set plus decomposed flags. |
 | `disasm` | `cpu`, `address?`, `count<=256` | Linear-sweep disassembly with raw opcode bytes. |
 | `trace_capture` | `cpu`, `max_entries<=10000`, `timeout_ms` | Ring-buffer trace snapshot restored to prior state afterwards. |
+| `trace_session_start` | `cpu`, `mode`, `disassemble`, `window_ms`, `interval_ms`, `segment_ms`, `max_duration_ms`, `max_total_bytes`, `max_segments`, `start_guard`, `session_id`, `watch_count`, `watch<N>_address/_length/_access`, `access_capture=off\|ranges\|all`, `access_include_registers`, `access_max_bytes` | Arms a continuous trace session: bounded capture windows written to `%TEMP%\exodus-mcp\trace-sessions\...`, non-breaking read/write watchpoints, optional per-occurrence access records in `access-NNNNNN.log` segments, auto-stop and retention enforced by a monitor thread. |
+| `trace_session_status` | — | Session state, segment tables for both streams, capture/eviction counters, access-record counters, and watch counter deltas. Releases a session's watchpoints if the session ended without a stop command. |
+| `trace_session_drain` | `stream=trace\|access`, `max_bytes<=8 MiB`, `seal` | Returns the oldest undrained sealed segment of the selected stream in chunks with a per-stream persistent cursor; `seal=true` closes the open segments first. |
+| `trace_session_stop` | `delete_segments` | Disables the writer, restores the processor's prior trace flags, releases the session's watchpoints, deletes segment files, and reports the final table. |
 | `soft_reset` | — | Advertised only when the loaded fork exposes version-1 `ISystemResetInterface` and a ready Mega Drive coordinator; otherwise the bridge returns `soft_reset_unavailable` without mutation. |
 
 Space ids are assigned natively from loaded devices: `<cpu>-bus` for processor
@@ -58,7 +62,31 @@ Read commands use debugger-path access (the same paths the Exodus debug
 windows use while emulation runs) and declare their capture consistency
 explicitly. Mutating commands are exposed only where the native operation is
 implemented and serialized. Trace capture restores the processor's prior trace
-settings after every capture.
+settings after every capture. Trace sessions restore the same flags on stop and
+additionally report the prior values they observed.
+
+### Per-access capture
+
+`access_capture` selects the fork's per-occurrence read/write log. `ranges`
+records every access inside the configured watch ranges (the ranges are
+evaluated natively in the processor access path, so an out-of-range access costs
+one comparison and is never written) and `all` records every access of the
+processor, which is only viable for short windows. Each record is one
+tab-separated ASCII line, documented in
+`vendor/exodus/ExodusSDK/Processor/MemoryAccessLog.h`:
+
+```text
+sequence  cycle  R|W  location  value  previous  width_bits  pc  registers
+```
+
+`sequence` is monotonic for the life of the emulator process (holes mean lost
+records), `previous` is `-` when the engine did not capture a pre-write value,
+and `registers` is a comma-separated same-instant snapshot in the processor's
+documented order (`-` when register capture is disabled). Records are buffered
+per instruction and written on the engine's commit boundary, so a rolled-back
+instruction leaves nothing behind. The access stream has its own segments,
+cursor, retention cap (`access_max_bytes`), eviction counters, and notes, and it
+shares the trace stream's window boundaries.
 
 The fork's `soft_reset` operation is hardware-like: it pulses the Mega Drive
 reset lines, runs the M68000 reset exception path (including architectural

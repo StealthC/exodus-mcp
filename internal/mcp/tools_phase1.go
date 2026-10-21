@@ -194,6 +194,10 @@ func performROMLoad(tc toolContext, path string, run bool, guard mutationGuard, 
 			server := tc.server
 			server.freezes.purge()
 			server.purgeDebugResources()
+			// The plugin stops a live trace session while the cartridge's
+			// module unloads, so the server must report the same end instead of
+			// presenting a dead session as live.
+			server.retireTraceSession("the cartridge was reloaded, which stops native capture")
 			server.setROMPath(path)
 		},
 		resources: func() []string { return invalidated },

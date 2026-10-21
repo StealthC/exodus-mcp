@@ -10,11 +10,16 @@ import (
 
 var errInvalidSymbol = errors.New("symbol name must not be empty")
 
-// Symbol binds one name to an address inside an address space.
+// Symbol binds one name to an address inside an address space. ROMSHA256 binds
+// the symbol to the cartridge it was derived from: a symbol recorded while a
+// ROM was loaded is never applied to a different cartridge, because equal
+// addresses in two ROMs are unrelated code. An empty ROMSHA256 is an explicitly
+// unbound (ROM-independent) symbol, which resolution reports separately.
 type Symbol struct {
-	Name    string `json:"name"`
-	SpaceID string `json:"space_id,omitempty"`
-	Address uint64 `json:"address"`
+	Name      string `json:"name"`
+	SpaceID   string `json:"space_id,omitempty"`
+	Address   uint64 `json:"address"`
+	ROMSHA256 string `json:"rom_sha256,omitempty"`
 }
 
 // Store is one context's symbol table with upsert semantics.
@@ -38,7 +43,7 @@ func (store *Store) Set(symbols []Symbol) (int, error) {
 		if symbol.Name == "" {
 			return 0, errInvalidSymbol
 		}
-		prepared = append(prepared, Symbol{Name: symbol.Name, SpaceID: symbol.SpaceID, Address: symbol.Address})
+		prepared = append(prepared, Symbol{Name: symbol.Name, SpaceID: symbol.SpaceID, Address: symbol.Address, ROMSHA256: symbol.ROMSHA256})
 	}
 	store.mu.Lock()
 	defer store.mu.Unlock()
@@ -67,6 +72,34 @@ func (store *Store) List(prefix string) []Symbol {
 		return symbols[i].Name < symbols[j].Name
 	})
 	return symbols
+}
+
+// ListForROM returns every symbol that may be applied to a cartridge with the
+// given SHA-256: symbols bound to that cartridge plus unbound symbols. A symbol
+// bound to a different cartridge is suppressed, never silently remapped.
+func (store *Store) ListForROM(prefix, romSHA256 string) []Symbol {
+	bound := store.List(prefix)
+	applicable := make([]Symbol, 0, len(bound))
+	for _, symbol := range bound {
+		if symbol.ROMSHA256 != "" && symbol.ROMSHA256 != romSHA256 {
+			continue
+		}
+		applicable = append(applicable, symbol)
+	}
+	return applicable
+}
+
+// CountBound reports how many symbols are bound to a ROM hash.
+func (store *Store) CountBound() int {
+	store.mu.RLock()
+	defer store.mu.RUnlock()
+	bound := 0
+	for _, symbol := range store.byName {
+		if symbol.ROMSHA256 != "" {
+			bound++
+		}
+	}
+	return bound
 }
 
 // Clear removes every symbol and reports how many were removed.

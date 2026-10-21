@@ -7,7 +7,71 @@ and this project will use [Semantic Versioning](https://semver.org/spec/v2.0.0.h
 
 ## [Unreleased]
 
-_No unreleased changes._
+### Added
+
+- Per-occurrence memory access capture (fork change): the processor access path
+  now records every observed read/write behind an atomic flag, with the engine's
+  monotonic sequence, cycle counter, issuing PC, direction, width, transferred
+  value, a pre-write value field (reserved by the format; this fork reports it
+  as unavailable rather than faking it), and an optional same-instant register
+  snapshot (D0-D7/A0-A7/SR/PC for the M68000; A/F/B/C/D/E/H/L plus alternates,
+  IX/IY/SP/PC for the Z80). Records are buffered per instruction and written on
+  the engine's commit boundary, so a rolled-back instruction never leaves
+  records behind. Up to 16 inclusive address ranges are evaluated natively, so
+  out-of-range accesses cost one comparison and are never written.
+- `trace_session_start` gains `access_capture` (`off`/`ranges`/`all`),
+  `access_include_registers`, and `access_max_bytes`, and returns a `volume`
+  contract (limits in force, estimated bytes for the configured duration and
+  duty cycle, measured bytes/second, access estimate) before capture starts.
+- `trace_session_events` gains the access stream: `direction`,
+  `value_equals`/`value_min`/`value_max`/`previous_equals` effective-value
+  filters (which never drop raw events), `pc_start`/`pc_end`,
+  `sequence_min`/`sequence_max`, and ROM-hash-bound symbol resolution of access
+  PCs. Access events use the `trace-session-access/1` JSONL schema.
+- `trace_session_drain` accepts `stream: "trace" | "access"`; the access stream
+  has its own native cursor, retention cap, counters, and loss accounting.
+- `trace_session_recover`: durable `trace-session-manifest/1` manifests survive
+  an MCP server restart. A manifest records the configuration, the limits that
+  were in force, the cartridge SHA-256, per-stream parse counters, the complete
+  loss object, the last access sequence, and the artifacts produced; recovery
+  reloads a recorded event file into a stopped read-only view (installable only
+  when no live session is active) and never claims more than survived.
+- Access-sequence gaps are explicit loss: holes in the engine's monotonic access
+  sequence are counted in `loss.access_sequence_gaps` with bounded
+  `expected..observed` samples, and they mark `loss.complete: false`.
+- `cpu_debug_events_list` now reports an explicit `history` object (capacity,
+  retained, recorded, dropped, id span, complete), supports filters
+  (`resource_kind`, `resource_id`, `cpu`, `direction`, `event_id_min/max`, and
+  the caller's context), and folds a repeated observation of the same paused hit
+  into the existing event (`repeat_count`, `last_seen_at`) with documented
+  stop/resume/duplicate semantics.
+- Symbols are bound to the cartridge SHA-256 recorded at `symbols_set` time.
+  Disassembly, backtrace, and access-event PC resolution suppress symbols from a
+  different ROM and report `rom_hash_mismatch` instead of applying foreign names.
+- `scripts/native-test.sh` and `native-plugin/tests/memory_access_log_test.cpp`:
+  native unit tests for the access-log record contract (direction, width,
+  boundary addresses, 64-bit sequence rendering, previous-value availability,
+  register-snapshot cap), run by `scripts/test.sh`.
+
+### Changed
+
+- Continuous trace sessions: `trace_session_start`, `trace_session_status`,
+  `trace_session_events`, and `trace_session_stop`. A session keeps capturing
+  while the emulator runs — sampled windows (`window_ms` of every
+  `interval_ms`, the default) or continuous capture — and accumulates bounded
+  events in the server process for later query and export, without pausing the
+  CPU. Execution events are the engine's own per-instruction trace lines (PC,
+  opcode text, cycle, emulated time); optional non-breaking watchpoints report
+  aggregate read/write hit counters per configured range. The native side
+  segments its trace output, auto-stops at `max_duration_ms`, enforces
+  `max_total_bytes`/`max_segments` retention, and reports evictions; the server
+  bounds its event ring, address histogram, and watch samples, and every
+  response carries an explicit `loss` object with `loss.complete`. JSONL
+  export uses `trace-session-event/1` with full `artifact-provenance/2`
+  metadata. Native per-access read/write records, natively filtered access
+  ranges, durable manifests, and recovery are delivered (above); execution
+  trace filtering and per-record frame tokens remain fork work and are
+  documented in [docs/TRACE-SESSIONS.md](docs/TRACE-SESSIONS.md).
 
 ## [0.2.0] - 2026-08-30
 

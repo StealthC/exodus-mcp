@@ -33,7 +33,7 @@
 namespace
 {
 const wchar_t* const kPipePrefix = L"\\\\.\\pipe\\";
-const char* const kPluginVersion = "0.7.1";
+const char* const kPluginVersion = "0.8.0";
 const size_t kMaxRequestSize = 64 * 1024;
 const size_t kMaxWriteChunk = 32 * 1024;
 const unsigned long long kMaxReadLength = 8 * 1024 * 1024;
@@ -46,7 +46,7 @@ const unsigned long long kDefaultTraceTimeoutMs = 5000;
 const unsigned long long kMaxTraceTimeoutMs = 30000;
 const unsigned int kMaxFrameAdvance = 60;
 const unsigned int kMaxInputButtons = 16;
-const char* const kSupportedOperations[] = {"status", "emulator_status", "mem_spaces", "mem_read", "regs_get", "disasm", "cpu_control", "breakpoint_set", "breakpoint_list", "breakpoint_remove", "watchpoint_set", "watchpoint_list", "watchpoint_remove", "vdp_status", "vdp_command_dma_status", "vdp_mem_read", "vdp_pixel_info", "frame_capture", "rom_load", "trace_capture", "mem_write", "state_save", "state_load", "frame_advance", "input_set", "sound_status", "audio_capture"};
+const char* const kSupportedOperations[] = {"status", "emulator_status", "mem_spaces", "mem_read", "regs_get", "disasm", "cpu_control", "breakpoint_set", "breakpoint_list", "breakpoint_remove", "watchpoint_set", "watchpoint_list", "watchpoint_remove", "vdp_status", "vdp_command_dma_status", "vdp_mem_read", "vdp_pixel_info", "frame_capture", "rom_load", "trace_capture", "trace_session_start", "trace_session_status", "trace_session_drain", "trace_session_stop", "mem_write", "state_save", "state_load", "frame_advance", "input_set", "sound_status", "audio_capture"};
 const size_t kSupportedOperationCount = sizeof(kSupportedOperations) / sizeof(kSupportedOperations[0]);
 
 // ScreenshotSink collects the RGB 8-bit pixels that S315_5313::GetScreenshot
@@ -407,12 +407,48 @@ ExodusMcpPlugin::ExodusMcpPlugin(const std::wstring& implementationName, const s
 	_romPaddedSizeBytes(0),
 	_nextBreakpointID(1),
 	_nextWatchpointID(1),
-	_pixelInfoEnableFrameToken(0)
-{ }
+	_pixelInfoEnableFrameToken(0),
+	_traceSessionStopEvent(0),
+	_traceSessionThread(0),
+	_traceSessionActive(false),
+	_traceSessionCapturing(false),
+	_traceSessionDisassemble(true),
+	_traceSessionWindowMs(0),
+	_traceSessionIntervalMs(0),
+	_traceSessionSegmentMs(0),
+	_traceSessionMaxDurationMs(0),
+	_traceSessionMaxTotalBytes(0),
+	_traceSessionMaxSegments(0),
+	_traceSessionStartedTick(0),
+	_traceSessionWindowStartTick(0),
+	_traceSessionIntervalStartTick(0),
+	_traceSessionSegmentStartTick(0),
+	_traceSessionWindowsStarted(0),
+	_traceSessionWindowsCompleted(0),
+	_traceSessionBytesWritten(0),
+	_traceSessionEvictedSegments(0),
+	_traceSessionEvictedBytes(0),
+	_traceSessionEvictedUnread(0),
+	_traceSessionNextSegment(0),
+	_traceSessionDrainSegment(1),
+	_traceSessionDrainOffset(0),
+	_traceSessionAutoStopped(false),
+	_traceSessionPriorEnabled(false),
+	_traceSessionPriorDisassemble(false),
+	_traceSessionPriorFile(false),
+	_traceSessionSetupPause(false),
+	_traceSessionSetupPausedSystem(false),
+	_traceSessionWatchesArmed(false),
+	_traceSessionWatchesReleased(false),
+	_traceSessionProcessor(0)
+{
+	InitializeCriticalSection(&_traceSessionLock);
+}
 
 ExodusMcpPlugin::~ExodusMcpPlugin()
 {
 	StopBridge();
+	DeleteCriticalSection(&_traceSessionLock);
 }
 
 // Debug-CRT reports (assertions, invalid parameters) must never surface as
@@ -475,9 +511,20 @@ bool ExodusMcpPlugin::StartBridge()
 	{
 		return false;
 	}
+	// The trace session monitor thread reuses one manual-reset event across
+	// sessions; the plugin owns it for its whole life.
+	_traceSessionStopEvent = CreateEventW(0, TRUE, FALSE, 0);
+	if (_traceSessionStopEvent == 0)
+	{
+		CloseHandle(_stopEvent);
+		_stopEvent = 0;
+		return false;
+	}
 	_pipeThread = CreateThread(0, 0, PipeThreadEntry, this, 0, 0);
 	if (_pipeThread == 0)
 	{
+		CloseHandle(_traceSessionStopEvent);
+		_traceSessionStopEvent = 0;
 		CloseHandle(_stopEvent);
 		_stopEvent = 0;
 		return false;
@@ -488,6 +535,9 @@ bool ExodusMcpPlugin::StartBridge()
 
 void ExodusMcpPlugin::StopBridge()
 {
+	// A live trace session must stop before the plugin tears down: it holds
+	// engine trace flags, a monitor thread, and armed watchpoints.
+	ShutdownTraceSession();
 	if (_stopEvent != 0)
 	{
 		SetEvent(_stopEvent);
@@ -502,6 +552,11 @@ void ExodusMcpPlugin::StopBridge()
 	{
 		CloseHandle(_stopEvent);
 		_stopEvent = 0;
+	}
+	if (_traceSessionStopEvent != 0)
+	{
+		CloseHandle(_traceSessionStopEvent);
+		_traceSessionStopEvent = 0;
 	}
 	_bridgeEnabled = false;
 }
@@ -983,6 +1038,22 @@ std::string ExodusMcpPlugin::ExecuteCommand(const BridgeRequest& request, bool& 
 	{
 		success = BuildTraceCaptureData(request, payload, errorCode, errorMessage);
 	}
+	else if (strcmp(method, "trace_session_start") == 0)
+	{
+		success = BuildTraceSessionStartData(request, payload, errorCode, errorMessage);
+	}
+	else if (strcmp(method, "trace_session_status") == 0)
+	{
+		success = BuildTraceSessionStatusData(request, payload, errorCode, errorMessage);
+	}
+	else if (strcmp(method, "trace_session_drain") == 0)
+	{
+		success = BuildTraceSessionDrainData(request, payload, errorCode, errorMessage);
+	}
+	else if (strcmp(method, "trace_session_stop") == 0)
+	{
+		success = BuildTraceSessionStopData(request, payload, errorCode, errorMessage);
+	}
 	else if (strcmp(method, "mem_write") == 0)
 	{
 		success = BuildMemoryWriteData(request, payload, errorCode, errorMessage);
@@ -1300,6 +1371,10 @@ unsigned int ExodusMcpPlugin::TypedGetPC(const std::string& cpu, IProcessor& tar
 //----------------------------------------------------------------------------------------------------------------------
 void ExodusMcpPlugin::PurgeManagedDebugState()
 {
+	// A trace session holds a processor pointer and armed watchpoints; it must
+	// stop before the module that owns them unloads.
+	ShutdownTraceSession();
+
 	// Processor-owned debug objects die with the loaded module. Every managed
 	// breakpoint and watchpoint must be deleted before a ROM swap unloads the
 	// current module, otherwise the managed maps would hold dangling pointers.
@@ -3267,6 +3342,1646 @@ bool ExodusMcpPlugin::TraceCaptureInner(const BridgeRequest& request, std::strin
 	AppendJsonStringAscii(data, traceText);
 	data += "}";
 	return true;
+}
+
+//----------------------------------------------------------------------------------------------------------------------
+// Continuous trace sessions
+//
+// A trace session keeps the engine's own per-instruction trace writer active
+// in bounded windows and rotates its output file into sealed segments. The
+// system is never paused for capture: in sampled mode the trace flag is armed
+// for window_ms of every interval_ms, in continuous mode it stays armed and
+// only the segment file rotates. A monitor thread owns the arm/seal state
+// machine so a session can never outlive its configured duration or disk cap,
+// even when the MCP server stops polling.
+//
+// The in-memory trace ring is deliberately never touched: unpacking
+// Marshal::Ret<std::vector<TraceLogEntry>> across the extension boundary
+// crashed this plugin (see docs/TRACE-CRASH-INVESTIGATION.md), so every byte
+// reaches the server through the on-disk trace file format.
+//----------------------------------------------------------------------------------------------------------------------
+namespace
+{
+const unsigned int kTraceSessionMaxWatches = 16;
+const unsigned long long kTraceSessionMinDrainBytes = 4096;
+const unsigned long long kTraceSessionMaxDrainBytes = 8 * 1024 * 1024;
+const unsigned long long kTraceSessionSegmentBoundaryFlushMs = 8;
+
+// TickNow/TickElapsed keep session timing wrap-safe on the 32-bit system tick
+// the rest of this plugin already uses (the target SDK version does not
+// declare GetTickCount64).
+unsigned long long TickNow()
+{
+	return (unsigned long long)GetTickCount();
+}
+
+unsigned long long TickElapsed(unsigned long long now, unsigned long long start)
+{
+	return (unsigned long long)((DWORD)now - (DWORD)start);
+}
+
+std::string BoolText(bool value)
+{
+	return value ? "true" : "false";
+}
+
+std::string ULongText(unsigned long long value)
+{
+	std::string text;
+	AppendNumber(text, value);
+	return text;
+}
+
+unsigned long long FileSizeOrZero(const std::wstring& path)
+{
+	WIN32_FILE_ATTRIBUTE_DATA attributes = {};
+	if (!GetFileAttributesExW(path.c_str(), GetFileExInfoStandard, &attributes) || (attributes.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY))
+	{
+		return 0;
+	}
+	return (static_cast<unsigned long long>(attributes.nFileSizeHigh) << 32) | attributes.nFileSizeLow;
+}
+
+bool TraceSegmentFileExists(const std::wstring& path)
+{
+	WIN32_FILE_ATTRIBUTE_DATA attributes = {};
+	if (!GetFileAttributesExW(path.c_str(), GetFileExInfoStandard, &attributes))
+	{
+		return false;
+	}
+	return (attributes.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) == 0;
+}
+
+std::wstring TraceSegmentPath(const std::wstring& directory, unsigned int index)
+{
+	wchar_t name[64] = {0};
+	swprintf_s(name, 64, L"\\segment-%06u.log", index);
+	return directory + std::wstring(name);
+}
+
+std::wstring TraceSegmentPathWithPrefix(const std::wstring& directory, const wchar_t* prefix, unsigned int index)
+{
+	wchar_t name[64] = {0};
+	swprintf_s(name, 64, L"\\%s-%06u.log", prefix, index);
+	return directory + std::wstring(name);
+}
+
+// PurgeStaleTraceSessionDirectories removes session directories left behind by
+// a crashed or killed emulator. Only directories older than 24 hours are
+// touched, so a concurrently running instance can never lose a live session.
+void PurgeStaleTraceSessionDirectories(const std::wstring& sessionsDirectory)
+{
+	const std::wstring pattern = sessionsDirectory + L"\\*";
+	WIN32_FIND_DATAW entry = {};
+	HANDLE find = FindFirstFileW(pattern.c_str(), &entry);
+	if (find == INVALID_HANDLE_VALUE)
+	{
+		return;
+	}
+	SYSTEMTIME now = {};
+	FILETIME nowFileTime = {};
+	GetSystemTime(&now);
+	SystemTimeToFileTime(&now, &nowFileTime);
+	ULONGLONG nowValue = ((ULONGLONG)nowFileTime.dwHighDateTime << 32) | nowFileTime.dwLowDateTime;
+	const ULONGLONG staleAge = 24ULL * 60ULL * 60ULL * 10000000ULL;
+	do
+	{
+		if ((entry.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) == 0 || entry.cFileName[0] == L'.')
+		{
+			continue;
+		}
+		const ULONGLONG written = ((ULONGLONG)entry.ftLastWriteTime.dwHighDateTime << 32) | entry.ftLastWriteTime.dwLowDateTime;
+		if (nowValue <= written || (nowValue - written) < staleAge)
+		{
+			continue;
+		}
+		const std::wstring directory = sessionsDirectory + L"\\" + entry.cFileName;
+		const std::wstring files = directory + L"\\*";
+		WIN32_FIND_DATAW file = {};
+		HANDLE fileFind = FindFirstFileW(files.c_str(), &file);
+		if (fileFind != INVALID_HANDLE_VALUE)
+		{
+			do
+			{
+				if ((file.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) == 0)
+				{
+					DeleteFileW((directory + L"\\" + file.cFileName).c_str());
+				}
+			} while (FindNextFileW(fileFind, &file));
+			FindClose(fileFind);
+		}
+		RemoveDirectoryW(directory.c_str());
+	} while (FindNextFileW(find, &entry));
+	FindClose(find);
+}
+
+// ReadSegmentBytes copies up to maxBytes from offset of one sealed segment.
+// Segments are only read after the engine closed its handle, so an ordinary
+// shared read is safe and never contends with the CPU worker.
+bool ReadSegmentBytes(const std::wstring& path, unsigned long long offset, unsigned long long maxBytes, std::string& output, unsigned long long& totalBytes)
+{
+	output.clear();
+	totalBytes = FileSizeOrZero(path);
+	if (offset > totalBytes)
+	{
+		return false;
+	}
+	HANDLE file = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ, 0, OPEN_EXISTING, 0, 0);
+	if (file == INVALID_HANDLE_VALUE)
+	{
+		return false;
+	}
+	LARGE_INTEGER position = {};
+	position.QuadPart = (LONGLONG)offset;
+	bool ok = SetFilePointerEx(file, position, 0, FILE_BEGIN) != 0;
+	if (ok)
+	{
+		unsigned long long remaining = totalBytes - offset;
+		if (remaining > maxBytes)
+		{
+			remaining = maxBytes;
+		}
+		output.resize((size_t)remaining);
+		DWORD read = 0;
+		ok = (remaining == 0) || ((ReadFile(file, &output[0], (DWORD)remaining, &read, 0) != 0) && (read == (DWORD)remaining));
+		if (!ok)
+		{
+			output.clear();
+		}
+	}
+	CloseHandle(file);
+	return ok;
+}
+}
+
+//----------------------------------------------------------------------------------------------------------------------
+void ExodusMcpPlugin::NoteTraceSessionLocked(const std::string& note)
+{
+	// Notes are diagnostics, not data: keep the list short and unique so a
+	// long session cannot grow it without limit.
+	if (_traceSessionNotes.size() >= 32)
+	{
+		return;
+	}
+	for (size_t index = 0; index < _traceSessionNotes.size(); ++index)
+	{
+		if (_traceSessionNotes[index] == note)
+		{
+			return;
+		}
+	}
+	_traceSessionNotes.push_back(note);
+}
+
+//----------------------------------------------------------------------------------------------------------------------
+bool ExodusMcpPlugin::BuildTraceSessionStartData(const BridgeRequest& request, std::string& data, std::string& errorCode, std::string& errorMessage)
+{
+	const std::string cpu = ParamValue(request.params, "cpu");
+	bool validName = false;
+	IProcessor* processor = FindProcessor(cpu, validName);
+	if (!validName)
+	{
+		errorCode = "invalid_params";
+		errorMessage = "cpu must be m68k or z80";
+		return false;
+	}
+	if (processor == 0)
+	{
+		errorCode = "cpu_not_found";
+		errorMessage = "No " + cpu + " processor is present in the loaded target";
+		return false;
+	}
+	if (_traceSessionStopEvent == 0)
+	{
+		errorCode = "trace_session_failed";
+		errorMessage = "The bridge stop event is not available; the plugin lifecycle is not ready for a trace session";
+		return false;
+	}
+
+	std::string mode = ParamValue(request.params, "mode");
+	if (mode != "continuous")
+	{
+		mode = "sampled";
+	}
+	const bool disassemble = ParamValue(request.params, "disassemble") != "false";
+	const std::string startGuard = (ParamValue(request.params, "start_guard") == "quiet") ? "quiet" : "none";
+	std::string sessionID = ParamValue(request.params, "session_id");
+	if (sessionID.empty())
+	{
+		sessionID = "trs_native_" + ULongText(TickNow());
+	}
+
+	unsigned long long windowMs = 100;
+	unsigned long long intervalMs = 10000;
+	unsigned long long segmentMs = 250;
+	unsigned long long maxDurationMs = 600000;
+	unsigned long long maxTotalBytes = 128 * 1024 * 1024;
+	unsigned long long maxSegments = 128;
+	ParseUnsigned(ParamValue(request.params, "window_ms"), windowMs);
+	ParseUnsigned(ParamValue(request.params, "interval_ms"), intervalMs);
+	ParseUnsigned(ParamValue(request.params, "segment_ms"), segmentMs);
+	ParseUnsigned(ParamValue(request.params, "max_duration_ms"), maxDurationMs);
+	ParseUnsigned(ParamValue(request.params, "max_total_bytes"), maxTotalBytes);
+	ParseUnsigned(ParamValue(request.params, "max_segments"), maxSegments);
+	if (windowMs < 10) { windowMs = 10; }
+	if (windowMs > 5000) { windowMs = 5000; }
+	if (intervalMs < windowMs) { intervalMs = windowMs; }
+	if (intervalMs > 60000) { intervalMs = 60000; }
+	if (segmentMs < 50) { segmentMs = 50; }
+	if (segmentMs > 60000) { segmentMs = 60000; }
+	if (maxDurationMs < 1000) { maxDurationMs = 1000; }
+	if (maxDurationMs > 3600000) { maxDurationMs = 3600000; }
+	if (maxTotalBytes < 1024 * 1024) { maxTotalBytes = 1024 * 1024; }
+	if (maxTotalBytes > 1024ULL * 1024ULL * 1024ULL) { maxTotalBytes = 1024ULL * 1024ULL * 1024ULL; }
+	if (maxSegments < 2) { maxSegments = 2; }
+	if (maxSegments > 1024) { maxSegments = 1024; }
+
+	// Per-access read/write capture. "ranges" reuses the configured observation
+	// ranges as native access filters (the engine evaluates them in the access
+	// path, so out-of-range accesses are never written); "all" records every
+	// access and is only viable for short windows at a filtered call site.
+	std::string accessMode = ParamValue(request.params, "access_capture");
+	if (accessMode != "ranges" && accessMode != "all")
+	{
+		accessMode = "off";
+	}
+	bool accessIncludeRegisters = accessMode == "ranges";
+	const std::string accessIncludeParam = ParamValue(request.params, "access_include_registers");
+	if (accessIncludeParam == "true")
+	{
+		accessIncludeRegisters = true;
+	}
+	else if (accessIncludeParam == "false")
+	{
+		accessIncludeRegisters = false;
+	}
+	unsigned long long accessMaxBytes = 64ULL * 1024ULL * 1024ULL;
+	if (!ParamValue(request.params, "access_max_bytes").empty())
+	{
+		ParseUnsigned(ParamValue(request.params, "access_max_bytes"), accessMaxBytes);
+	}
+	if (accessMaxBytes < 1024 * 1024) { accessMaxBytes = 1024 * 1024; }
+	if (accessMaxBytes > 1024ULL * 1024ULL * 1024ULL) { accessMaxBytes = 1024ULL * 1024ULL * 1024ULL; }
+
+	struct PendingWatch
+	{
+		unsigned long long address;
+		unsigned long long length;
+		std::string access;
+	};
+	std::vector<PendingWatch> pendingWatches;
+	unsigned long long watchCount = 0;
+	ParseUnsigned(ParamValue(request.params, "watch_count"), watchCount);
+	if (watchCount > kTraceSessionMaxWatches)
+	{
+		watchCount = kTraceSessionMaxWatches;
+	}
+	const unsigned long long addressMask = processor->GetAddressBusMask();
+	for (unsigned long long index = 0; index < watchCount; ++index)
+	{
+		char prefix[32] = {0};
+		sprintf_s(prefix, sizeof(prefix), "watch%llu_", index);
+		const std::string base(prefix);
+		PendingWatch watch;
+		watch.length = 1;
+		watch.access = ParamValue(request.params, (base + "access").c_str());
+		if (watch.access != "read" && watch.access != "write")
+		{
+			watch.access = "any";
+		}
+		if (!ParseUnsigned(ParamValue(request.params, (base + "address").c_str()), watch.address))
+		{
+			errorCode = "invalid_params";
+			errorMessage = "watch address " + ULongText(index) + " must be an unsigned integer";
+			return false;
+		}
+		ParseUnsigned(ParamValue(request.params, (base + "length").c_str()), watch.length);
+		if (watch.length == 0)
+		{
+			watch.length = 1;
+		}
+		if ((watch.address > addressMask) || (watch.length - 1) > (addressMask - watch.address))
+		{
+			errorCode = "invalid_params";
+			errorMessage = "watch " + ULongText(index) + " is outside the selected processor address bus";
+			return false;
+		}
+		if (watch.length > 1 && watch.address == 0)
+		{
+			// Exodus expresses a range as strict greater-than/less-than bounds,
+			// so a range starting at 0 cannot be represented natively.
+			errorCode = "invalid_params";
+			errorMessage = "watch " + ULongText(index) + " with length > 1 must not start at address 0 (Exodus range conditions cannot express it)";
+			return false;
+		}
+		pendingWatches.push_back(watch);
+	}
+	if (accessMode == "ranges" && pendingWatches.empty())
+	{
+		errorCode = "invalid_params";
+		errorMessage = "access_capture \"ranges\" needs at least one watch range to filter on";
+		return false;
+	}
+
+	// Reap a finished monitor thread before starting a new one.
+	ReapTraceSessionThread();
+
+	std::string replacedSessionID;
+	bool setupPausedSystem = false;
+	EnterCriticalSection(&_traceSessionLock);
+	if (_traceSessionActive)
+	{
+		replacedSessionID = _traceSessionID;
+		FinishTraceSessionLocked("replaced");
+	}
+	if (_traceSessionWatchesArmed)
+	{
+		ReleaseTraceSessionWatchesLocked();
+	}
+	// Segment files of the retired session are no longer readable through
+	// this session; delete them so a long-lived server never accumulates
+	// trace output on disk.
+	DeleteTraceSessionFilesLocked();
+
+	if (processor->IsTraceFileLoggingEnabled())
+	{
+		LeaveCriticalSection(&_traceSessionLock);
+		errorCode = "trace_busy";
+		errorMessage = "The processor trace log is already routed to a file (a trace_capture is in flight); retry when it finishes";
+		return false;
+	}
+
+	// Build the session directory under the per-user temp path.
+	wchar_t tempPath[MAX_PATH] = {0};
+	if (GetTempPathW(MAX_PATH, tempPath) == 0)
+	{
+		LeaveCriticalSection(&_traceSessionLock);
+		errorCode = "trace_session_failed";
+		errorMessage = "Could not resolve the temporary directory for trace segments";
+		return false;
+	}
+	const std::wstring baseDirectory = std::wstring(tempPath) + L"exodus-mcp";
+	CreateDirectoryW(baseDirectory.c_str(), 0);
+	const std::wstring sessionsDirectory = baseDirectory + L"\\trace-sessions";
+	CreateDirectoryW(sessionsDirectory.c_str(), 0);
+	PurgeStaleTraceSessionDirectories(sessionsDirectory);
+	wchar_t sessionDirectoryName[64] = {0};
+	swprintf_s(sessionDirectoryName, 64, L"\\%u-%llu", (unsigned int)GetCurrentProcessId(), TickNow());
+	const std::wstring sessionDirectory = sessionsDirectory + sessionDirectoryName;
+	if (!CreateDirectoryW(sessionDirectory.c_str(), 0) && GetLastError() != ERROR_ALREADY_EXISTS)
+	{
+		LeaveCriticalSection(&_traceSessionLock);
+		errorCode = "trace_session_failed";
+		errorMessage = "Could not create the trace session directory";
+		return false;
+	}
+
+	// Reset the session state machine.
+	ResetEvent(_traceSessionStopEvent);
+	_traceSessionID = sessionID;
+	_traceSessionCPU = cpu;
+	_traceSessionMode = mode;
+	_traceSessionDisassemble = disassemble;
+	_traceSessionWindowMs = windowMs;
+	_traceSessionIntervalMs = intervalMs;
+	_traceSessionSegmentMs = segmentMs;
+	_traceSessionMaxDurationMs = maxDurationMs;
+	_traceSessionMaxTotalBytes = maxTotalBytes;
+	_traceSessionMaxSegments = (unsigned int)maxSegments;
+	_traceSessionStartedTick = TickNow();
+	_traceSessionWindowStartTick = 0;
+	_traceSessionIntervalStartTick = _traceSessionStartedTick;
+	_traceSessionSegmentStartTick = 0;
+	_traceSessionWindowsStarted = 0;
+	_traceSessionWindowsCompleted = 0;
+	_traceSessionBytesWritten = 0;
+	_traceSessionEvictedSegments = 0;
+	_traceSessionEvictedBytes = 0;
+	_traceSessionEvictedUnread = 0;
+	_traceSessionNextSegment = 0;
+	_traceSessionDrainSegment = 1;
+	_traceSessionDrainOffset = 0;
+	_traceSessionStopReason.clear();
+	_traceSessionAutoStopped = false;
+	_traceSessionSetupPause = false;
+	_traceSessionSetupPausedSystem = false;
+	_traceSessionProcessor = processor;
+	_traceSessionDir = sessionDirectory;
+	_traceSessionSegments.clear();
+	_traceSessionWatches.clear();
+	_traceSessionNotes.clear();
+	_traceSessionWatchesArmed = false;
+	_traceSessionWatchesReleased = false;
+	_traceSessionAccessEnabled = false;
+	_traceSessionAccessMode = accessMode;
+	_traceSessionAccessIncludeRegisters = accessIncludeRegisters;
+	_traceSessionAccessMaxBytes = accessMaxBytes;
+	_traceSessionAccessRecords = 0;
+	_traceSessionAccessFailures = 0;
+	_traceSessionAccessBytesWritten = 0;
+	_traceSessionAccessEvictedSegments = 0;
+	_traceSessionAccessEvictedBytes = 0;
+	_traceSessionAccessEvictedUnread = 0;
+	_traceSessionAccessNextSegment = 0;
+	_traceSessionAccessDrainSegment = 1;
+	_traceSessionAccessDrainOffset = 0;
+	_traceSessionAccessSegments.clear();
+	_traceSessionActive = true;
+	_traceSessionCapturing = false;
+	_traceSessionPriorEnabled = processor->GetTraceEnabled();
+	_traceSessionPriorDisassemble = processor->GetTraceDisassemble();
+	_traceSessionPriorFile = processor->IsTraceFileLoggingEnabled();
+
+	// "quiet" is the conservative alternative to arming the trace writer on a
+	// running CPU: it stops the system for the configuration calls only and
+	// restores the prior run state immediately afterwards.
+	setupPausedSystem = (startGuard == "quiet") && GetSystemInterface().SystemRunning();
+	if (setupPausedSystem)
+	{
+		_traceSessionSetupPause = true;
+		_traceSessionSetupPausedSystem = true;
+		GetSystemInterface().StopSystem();
+	}
+
+	processor->SetTraceDisassemble(disassemble);
+	unsigned int armedWatches = 0;
+	for (size_t index = 0; index < pendingWatches.size(); ++index)
+	{
+		IWatchpoint* watchpoint = processor->CreateWatchpoint();
+		if (watchpoint == 0 || !processor->LockWatchpoint(watchpoint))
+		{
+			NoteTraceSessionLocked("One read/write observation range could not be armed; its counters are unavailable.");
+			continue;
+		}
+		watchpoint->SetEnabled(true);
+		watchpoint->SetLogEvent(false);
+		// A non-breaking watchpoint only counts hits: execution is never
+		// paused, which is the whole point of a continuous session.
+		watchpoint->SetBreakEvent(false);
+		watchpoint->SetOnRead(pendingWatches[index].access == "read" || pendingWatches[index].access == "any");
+		watchpoint->SetOnWrite(pendingWatches[index].access == "write" || pendingWatches[index].access == "any");
+		watchpoint->SetLocationMask(processor->GetAddressBusMask());
+		if (pendingWatches[index].length == 1)
+		{
+			watchpoint->SetLocationCondition(IWatchpoint::Condition::Equal);
+			watchpoint->SetLocationConditionData1((unsigned int)pendingWatches[index].address);
+		}
+		else
+		{
+			watchpoint->SetLocationCondition(IWatchpoint::Condition::GreaterAndLess);
+			watchpoint->SetLocationConditionData1((unsigned int)(pendingWatches[index].address - 1));
+			watchpoint->SetLocationConditionData2((unsigned int)(pendingWatches[index].address + pendingWatches[index].length));
+		}
+		const unsigned long long watchpointID = _nextWatchpointID++;
+		watchpoint->SetName(L"MCP trace session watch " + std::to_wstring(watchpointID));
+		TraceSessionWatch watch;
+		watch.watchpointID = watchpointID;
+		watch.cpu = cpu;
+		watch.address = pendingWatches[index].address;
+		watch.length = pendingWatches[index].length;
+		watch.access = pendingWatches[index].access;
+		watch.baselineHits = watchpoint->GetHitCounter();
+		watch.lastReportedHits = watch.baselineHits;
+		watch.lost = false;
+		_managedWatchpoints[watchpointID].processor = processor;
+		_managedWatchpoints[watchpointID].watchpoint = watchpoint;
+		_managedWatchpoints[watchpointID].cpu = cpu;
+		_managedWatchpoints[watchpointID].address = watch.address;
+		_managedWatchpoints[watchpointID].length = watch.length;
+		_managedWatchpoints[watchpointID].access = (watch.access == "read") ? "read" : ((watch.access == "write") ? "write" : "any");
+		processor->UnlockWatchpoint(watchpoint);
+		_traceSessionWatches.push_back(watch);
+		++armedWatches;
+	}
+	_traceSessionWatchesArmed = !_traceSessionWatches.empty();
+
+	// Arm the per-access read/write log before the trace writer so the first
+	// capture window already contains access records.
+	if (_traceSessionAccessMode != "off")
+	{
+		// The engine evaluates these ranges inside the access path, so an
+		// out-of-range access costs one comparison and is never written.
+		std::vector<unsigned int> accessRanges;
+		if (_traceSessionAccessMode == "ranges")
+		{
+			for (size_t index = 0; index < pendingWatches.size(); ++index)
+			{
+				const unsigned long long startAddress = pendingWatches[index].address;
+				unsigned long long endAddress = startAddress + pendingWatches[index].length - 1;
+				if (endAddress > addressMask)
+				{
+					endAddress = addressMask;
+				}
+				accessRanges.push_back((unsigned int)startAddress);
+				accessRanges.push_back((unsigned int)endAddress);
+			}
+		}
+		processor->SetMemoryAccessLogOptions(_traceSessionAccessIncludeRegisters, accessRanges.empty()? 0: &accessRanges[0], (unsigned int)(accessRanges.size() / 2));
+		processor->ResetMemoryAccessLogCounters();
+		RotateTraceSessionAccessSegmentLocked();
+		if (_traceSessionAccessSegments.empty() || !TraceSegmentFileExists(_traceSessionAccessSegments.back().path))
+		{
+			NoteTraceSessionLocked("The per-access read/write log could not be created; execution tracing continues without it.");
+			_traceSessionAccessEnabled = false;
+			DeleteTraceSessionAccessFilesLocked();
+		}
+		else
+		{
+			_traceSessionAccessEnabled = true;
+		}
+	}
+
+	// Open the first segment and arm the trace writer.
+	RotateTraceSessionSegmentLocked(false);
+	processor->SetTraceEnabled(true);
+	if (_traceSessionSegments.empty() || !TraceSegmentFileExists(_traceSessionSegments.back().path))
+	{
+		processor->SetTraceEnabled(false);
+		if (setupPausedSystem)
+		{
+			GetSystemInterface().RunSystem();
+		}
+		FinishTraceSessionLocked("segment_open_failed");
+		NoteTraceSessionLocked("The engine could not create the first trace segment file; check that the temporary directory is writable.");
+		DeleteTraceSessionFilesLocked();
+		LeaveCriticalSection(&_traceSessionLock);
+		errorCode = "trace_session_failed";
+		errorMessage = "Could not create the first trace segment file";
+		return false;
+	}
+	if (_traceSessionMode == "sampled")
+	{
+		_traceSessionWindowStartTick = TickNow();
+		_traceSessionIntervalStartTick = _traceSessionWindowStartTick;
+	}
+	if (setupPausedSystem)
+	{
+		GetSystemInterface().RunSystem();
+	}
+
+	_traceSessionThread = CreateThread(0, 0, TraceSessionThreadEntry, this, 0, 0);
+	if (_traceSessionThread == 0)
+	{
+		FinishTraceSessionLocked("thread_failed");
+		NoteTraceSessionLocked("The trace session monitor thread could not be created; the session did not start.");
+		LeaveCriticalSection(&_traceSessionLock);
+		errorCode = "trace_session_failed";
+		errorMessage = "Could not create the trace session monitor thread";
+		return false;
+	}
+
+	std::string status = BuildTraceSessionStatusJsonLocked(false);
+	status.erase(status.size() - 1);
+	status += ",\"replaced_session_id\":";
+	AppendJsonStringAscii(status, replacedSessionID);
+	status += ",\"armed_watches\":";
+	AppendNumber(status, armedWatches);
+	status += "}";
+	LeaveCriticalSection(&_traceSessionLock);
+	data = status;
+	return true;
+}
+
+//----------------------------------------------------------------------------------------------------------------------
+DWORD WINAPI ExodusMcpPlugin::TraceSessionThreadEntry(void* parameter)
+{
+	static_cast<ExodusMcpPlugin*>(parameter)->TraceSessionThread();
+	return 0;
+}
+
+void ExodusMcpPlugin::TraceSessionThread()
+{
+	while (WaitForSingleObject(_traceSessionStopEvent, 0) != WAIT_OBJECT_0)
+	{
+		unsigned long long waitMs = 10;
+		bool closeWindow = false;
+		bool openWindow = false;
+		bool rotateSegment = false;
+		EnterCriticalSection(&_traceSessionLock);
+		if (!_traceSessionActive)
+		{
+			LeaveCriticalSection(&_traceSessionLock);
+			break;
+		}
+		IProcessor* processor = _traceSessionProcessor;
+		bool validName = false;
+		IProcessor* located = FindProcessor(_traceSessionCPU, validName);
+		if (!validName || located != processor)
+		{
+			// The processor went away (module unload). Drop the pointer before
+			// FinishTraceSessionLocked so it never dereferences freed memory.
+			_traceSessionProcessor = 0;
+			FinishTraceSessionLocked("processor_unavailable");
+			NoteTraceSessionLocked("The traced processor is no longer present; the session stopped without restoring its trace flags.");
+			LeaveCriticalSection(&_traceSessionLock);
+			break;
+		}
+		const unsigned long long now = TickNow();
+		const unsigned long long elapsed = TickElapsed(now, _traceSessionStartedTick);
+		if (_traceSessionMaxDurationMs != 0 && elapsed >= _traceSessionMaxDurationMs)
+		{
+			FinishTraceSessionLocked("duration_limit");
+			LeaveCriticalSection(&_traceSessionLock);
+			break;
+		}
+		if (_traceSessionMode == "continuous")
+		{
+			if (_traceSessionCapturing && TickElapsed(now, _traceSessionSegmentStartTick) >= _traceSessionSegmentMs)
+			{
+				rotateSegment = true;
+			}
+			waitMs = 25;
+		}
+		else if (_traceSessionCapturing)
+		{
+			const unsigned long long age = TickElapsed(now, _traceSessionWindowStartTick);
+			if (age >= _traceSessionWindowMs)
+			{
+				closeWindow = true;
+			}
+			else
+			{
+				waitMs = _traceSessionWindowMs - age;
+				if (waitMs > 10)
+				{
+					waitMs = 10;
+				}
+			}
+		}
+		else
+		{
+			const unsigned long long idle = TickElapsed(now, _traceSessionIntervalStartTick);
+			if (idle >= _traceSessionIntervalMs)
+			{
+				openWindow = true;
+			}
+			else
+			{
+				waitMs = _traceSessionIntervalMs - idle;
+				if (waitMs > 10)
+				{
+					waitMs = 10;
+				}
+			}
+		}
+		LeaveCriticalSection(&_traceSessionLock);
+
+		if (closeWindow)
+		{
+			// Stop generating entries first, then let one commit interval flush
+			// the engine's pending per-opcode entries before the file closes.
+			EnterCriticalSection(&_traceSessionLock);
+			if (_traceSessionActive && _traceSessionProcessor != 0)
+			{
+				_traceSessionProcessor->SetTraceEnabled(false);
+			}
+			LeaveCriticalSection(&_traceSessionLock);
+			WaitForSingleObject(_traceSessionStopEvent, (DWORD)kTraceSessionSegmentBoundaryFlushMs);
+			EnterCriticalSection(&_traceSessionLock);
+			if (_traceSessionActive && _traceSessionCapturing)
+			{
+				SealTraceSessionSegmentLocked(true);
+			}
+			LeaveCriticalSection(&_traceSessionLock);
+			continue;
+		}
+		if (openWindow)
+		{
+			EnterCriticalSection(&_traceSessionLock);
+			if (_traceSessionActive && !_traceSessionCapturing)
+			{
+				RotateTraceSessionSegmentLocked(true);
+				if (_traceSessionProcessor != 0)
+				{
+					_traceSessionProcessor->SetTraceEnabled(true);
+				}
+				_traceSessionWindowStartTick = TickNow();
+				_traceSessionIntervalStartTick = _traceSessionWindowStartTick;
+			}
+			LeaveCriticalSection(&_traceSessionLock);
+			continue;
+		}
+		if (rotateSegment)
+		{
+			EnterCriticalSection(&_traceSessionLock);
+			if (_traceSessionActive && _traceSessionCapturing)
+			{
+				RotateTraceSessionSegmentLocked(true);
+			}
+			LeaveCriticalSection(&_traceSessionLock);
+			continue;
+		}
+		if (waitMs > 0)
+		{
+			WaitForSingleObject(_traceSessionStopEvent, (DWORD)waitMs);
+		}
+	}
+}
+
+//----------------------------------------------------------------------------------------------------------------------
+void ExodusMcpPlugin::FinishTraceSessionLocked(const std::string& stopReason)
+{
+	if (!_traceSessionActive)
+	{
+		_traceSessionStopReason = stopReason;
+		return;
+	}
+	IProcessor* processor = _traceSessionProcessor;
+	if (processor != 0)
+	{
+		if (_traceSessionAccessEnabled)
+		{
+			// Flush and close the access segment before the trace flags are
+			// restored, so the final records are on disk and the file is
+			// readable by a later drain.
+			SealTraceSessionAccessSegmentLocked();
+		}
+		processor->SetTraceEnabled(false);
+		if (_traceSessionCapturing)
+		{
+			SealTraceSessionSegmentLocked(true);
+		}
+		processor->SetTraceDisassemble(_traceSessionPriorDisassemble);
+		processor->SetTraceFileLoggingEnabled(_traceSessionPriorFile);
+		processor->SetTraceEnabled(_traceSessionPriorEnabled);
+	}
+	_traceSessionActive = false;
+	_traceSessionCapturing = false;
+	_traceSessionStopReason = stopReason;
+	if (stopReason == "duration_limit")
+	{
+		_traceSessionAutoStopped = true;
+	}
+	if (_traceSessionStopEvent != 0)
+	{
+		SetEvent(_traceSessionStopEvent);
+	}
+}
+
+//----------------------------------------------------------------------------------------------------------------------
+void ExodusMcpPlugin::SealTraceSessionSegmentLocked(bool closeFile)
+{
+	if (closeFile && _traceSessionProcessor != 0)
+	{
+		// Closing the trace file flushes the engine's pending entries.
+		_traceSessionProcessor->SetTraceFileLoggingEnabled(false);
+	}
+	if (!_traceSessionSegments.empty())
+	{
+		TraceSessionSegment& segment = _traceSessionSegments.back();
+		if (!segment.sealed)
+		{
+			segment.sealed = true;
+			segment.bytes = FileSizeOrZero(segment.path);
+			_traceSessionBytesWritten += segment.bytes;
+			_traceSessionWindowsCompleted++;
+		}
+	}
+	_traceSessionCapturing = false;
+	EvictTraceSessionSegmentsLocked();
+	// The access stream follows the trace windows, so a sealed window also
+	// seals its access segment: the two streams share one time boundary.
+	if (_traceSessionAccessEnabled)
+	{
+		SealTraceSessionAccessSegmentLocked();
+	}
+}
+
+//----------------------------------------------------------------------------------------------------------------------
+void ExodusMcpPlugin::RotateTraceSessionSegmentLocked(bool rotateAccessStream)
+{
+	if (_traceSessionProcessor == 0 || _traceSessionDir.empty())
+	{
+		return;
+	}
+	const unsigned int index = ++_traceSessionNextSegment;
+	const std::wstring path = TraceSegmentPath(_traceSessionDir, index);
+	const std::string utf8Path = ToUtf8(path);
+	// SetTraceLoggingFilePath takes the engine debug mutex, so a rotation
+	// cannot interleave with a trace commit: the previous file is closed and
+	// flushed before the new one opens, and no entry is lost.
+	if (!_traceSessionProcessor->SetTraceFileLoggingPathAscii(utf8Path.c_str()))
+	{
+		NoteTraceSessionLocked("A trace segment path could not be set; capture continues in the previous segment.");
+		return;
+	}
+	if (!_traceSessionProcessor->IsTraceFileLoggingEnabled())
+	{
+		_traceSessionProcessor->SetTraceFileLoggingEnabled(true);
+	}
+	if (!_traceSessionSegments.empty())
+	{
+		TraceSessionSegment& previous = _traceSessionSegments.back();
+		if (!previous.sealed)
+		{
+			previous.sealed = true;
+			previous.bytes = FileSizeOrZero(previous.path);
+			_traceSessionBytesWritten += previous.bytes;
+			_traceSessionWindowsCompleted++;
+		}
+	}
+	TraceSessionSegment segment;
+	segment.index = index;
+	segment.path = path;
+	segment.bytes = 0;
+	segment.sealed = false;
+	_traceSessionSegments.push_back(segment);
+	_traceSessionSegmentStartTick = TickNow();
+	_traceSessionCapturing = true;
+	_traceSessionWindowsStarted++;
+	EvictTraceSessionSegmentsLocked();
+	if (rotateAccessStream && _traceSessionAccessEnabled)
+	{
+		RotateTraceSessionAccessSegmentLocked();
+	}
+}
+
+//----------------------------------------------------------------------------------------------------------------------
+void ExodusMcpPlugin::EvictTraceSessionSegmentsLocked()
+{
+	// Retention is enforced on sealed segments only; the open segment is
+	// always kept because the engine is writing to it.
+	while (true)
+	{
+		unsigned long long sealedBytes = 0;
+		unsigned int sealedCount = 0;
+		size_t oldestSealed = (size_t)-1;
+		for (size_t index = 0; index < _traceSessionSegments.size(); ++index)
+		{
+			if (!_traceSessionSegments[index].sealed)
+			{
+				continue;
+			}
+			sealedBytes += _traceSessionSegments[index].bytes;
+			++sealedCount;
+			if (oldestSealed == (size_t)-1)
+			{
+				oldestSealed = index;
+			}
+		}
+		if (sealedCount == 0 || (sealedCount <= _traceSessionMaxSegments && sealedBytes <= _traceSessionMaxTotalBytes))
+		{
+			return;
+		}
+		if (oldestSealed == (size_t)-1)
+		{
+			return;
+		}
+		const TraceSessionSegment victim = _traceSessionSegments[oldestSealed];
+		if (victim.index >= _traceSessionDrainSegment)
+		{
+			_traceSessionEvictedUnread++;
+			NoteTraceSessionLocked("The retention cap evicted segment " + ULongText(victim.index) + " before it was drained; its events are unrecoverable.");
+		}
+		_traceSessionEvictedSegments++;
+		_traceSessionEvictedBytes += victim.bytes;
+		DeleteFileW(victim.path.c_str());
+		_traceSessionSegments.erase(_traceSessionSegments.begin() + (long)oldestSealed);
+		if (_traceSessionDrainSegment <= victim.index)
+		{
+			_traceSessionDrainSegment = victim.index + 1;
+			_traceSessionDrainOffset = 0;
+		}
+	}
+}
+
+//----------------------------------------------------------------------------------------------------------------------
+bool ExodusMcpPlugin::HasSealedTraceSessionSegmentLocked(unsigned int fromSegment) const
+{
+	for (size_t index = 0; index < _traceSessionSegments.size(); ++index)
+	{
+		const TraceSessionSegment& segment = _traceSessionSegments[index];
+		if (segment.sealed && segment.index >= fromSegment)
+		{
+			return true;
+		}
+	}
+	return false;
+}
+
+//----------------------------------------------------------------------------------------------------------------------
+void ExodusMcpPlugin::SealTraceSessionAccessSegmentLocked()
+{
+	if (_traceSessionProcessor != 0)
+	{
+		// Disabling the log flushes the engine's pending records and closes the
+		// handle, so a sealed access segment is never read while the CPU worker
+		// still writes to it.
+		_traceSessionProcessor->SetMemoryAccessLogEnabled(false);
+	}
+	if (!_traceSessionAccessSegments.empty())
+	{
+		TraceSessionSegment& segment = _traceSessionAccessSegments.back();
+		if (!segment.sealed)
+		{
+			segment.sealed = true;
+			segment.bytes = FileSizeOrZero(segment.path);
+			_traceSessionAccessBytesWritten += segment.bytes;
+		}
+	}
+	EvictTraceSessionAccessSegmentsLocked();
+}
+
+//----------------------------------------------------------------------------------------------------------------------
+void ExodusMcpPlugin::RotateTraceSessionAccessSegmentLocked()
+{
+	if (_traceSessionProcessor == 0 || _traceSessionDir.empty())
+	{
+		return;
+	}
+	if (!_traceSessionAccessSegments.empty())
+	{
+		_traceSessionProcessor->SetMemoryAccessLogEnabled(false);
+		TraceSessionSegment& previous = _traceSessionAccessSegments.back();
+		if (!previous.sealed)
+		{
+			previous.sealed = true;
+			previous.bytes = FileSizeOrZero(previous.path);
+			_traceSessionAccessBytesWritten += previous.bytes;
+		}
+	}
+	const unsigned int index = ++_traceSessionAccessNextSegment;
+	const std::wstring path = TraceSegmentPathWithPrefix(_traceSessionDir, L"access", index);
+	if (!_traceSessionProcessor->SetMemoryAccessLogPathAscii(ToUtf8(path).c_str()))
+	{
+		NoteTraceSessionLocked("A per-access log segment path could not be set; access capture stays in the previous segment.");
+		return;
+	}
+	_traceSessionProcessor->SetMemoryAccessLogEnabled(true);
+	TraceSessionSegment segment;
+	segment.index = index;
+	segment.path = path;
+	segment.bytes = 0;
+	segment.sealed = false;
+	_traceSessionAccessSegments.push_back(segment);
+	EvictTraceSessionAccessSegmentsLocked();
+}
+
+//----------------------------------------------------------------------------------------------------------------------
+void ExodusMcpPlugin::EvictTraceSessionAccessSegmentsLocked()
+{
+	// Same retention contract as the trace stream: only sealed segments are
+	// victims, and an evicted segment that was never drained is counted so the
+	// server can report the gap instead of pretending the record is complete.
+	while (true)
+	{
+		unsigned long long sealedBytes = 0;
+		unsigned int sealedCount = 0;
+		size_t oldestSealed = (size_t)-1;
+		for (size_t index = 0; index < _traceSessionAccessSegments.size(); ++index)
+		{
+			if (!_traceSessionAccessSegments[index].sealed)
+			{
+				continue;
+			}
+			sealedBytes += _traceSessionAccessSegments[index].bytes;
+			++sealedCount;
+			if (oldestSealed == (size_t)-1)
+			{
+				oldestSealed = index;
+			}
+		}
+		if (sealedCount == 0 || (sealedCount <= _traceSessionMaxSegments && sealedBytes <= _traceSessionAccessMaxBytes))
+		{
+			return;
+		}
+		if (oldestSealed == (size_t)-1)
+		{
+			return;
+		}
+		const TraceSessionSegment victim = _traceSessionAccessSegments[oldestSealed];
+		if (victim.index >= _traceSessionAccessDrainSegment)
+		{
+			_traceSessionAccessEvictedUnread++;
+			NoteTraceSessionLocked("The access-log retention cap evicted access segment " + ULongText(victim.index) + " before it was drained; those access records are unrecoverable.");
+		}
+		_traceSessionAccessEvictedSegments++;
+		_traceSessionAccessEvictedBytes += victim.bytes;
+		DeleteFileW(victim.path.c_str());
+		_traceSessionAccessSegments.erase(_traceSessionAccessSegments.begin() + (long)oldestSealed);
+		if (_traceSessionAccessDrainSegment <= victim.index)
+		{
+			_traceSessionAccessDrainSegment = victim.index + 1;
+			_traceSessionAccessDrainOffset = 0;
+		}
+	}
+}
+
+//----------------------------------------------------------------------------------------------------------------------
+bool ExodusMcpPlugin::HasSealedTraceSessionAccessSegmentLocked(unsigned int fromSegment) const
+{
+	for (size_t index = 0; index < _traceSessionAccessSegments.size(); ++index)
+	{
+		const TraceSessionSegment& segment = _traceSessionAccessSegments[index];
+		if (segment.sealed && segment.index >= fromSegment)
+		{
+			return true;
+		}
+	}
+	return false;
+}
+
+//----------------------------------------------------------------------------------------------------------------------
+void ExodusMcpPlugin::DeleteTraceSessionAccessFilesLocked()
+{
+	for (size_t index = 0; index < _traceSessionAccessSegments.size(); ++index)
+	{
+		DeleteFileW(_traceSessionAccessSegments[index].path.c_str());
+	}
+	_traceSessionAccessSegments.clear();
+	_traceSessionAccessDrainSegment = 1;
+	_traceSessionAccessDrainOffset = 0;
+	_traceSessionAccessNextSegment = 0;
+}
+
+//----------------------------------------------------------------------------------------------------------------------
+void ExodusMcpPlugin::AppendTraceSessionAccessJsonLocked(std::string& data)
+{
+	if (_traceSessionProcessor != 0)
+	{
+		// Only read the engine's counters while the traced processor is still
+		// present: a module unload frees it before the monitor thread notices.
+		bool validName = false;
+		IProcessor* located = FindProcessor(_traceSessionCPU, validName);
+		if (validName && located == _traceSessionProcessor)
+		{
+			_traceSessionAccessRecords = _traceSessionProcessor->GetMemoryAccessLogRecordCount();
+			_traceSessionAccessFailures = _traceSessionProcessor->GetMemoryAccessLogFailureCount();
+		}
+	}
+	unsigned long long sealedBytes = 0;
+	unsigned int openSegment = 0;
+	std::string segments;
+	bool first = true;
+	for (size_t index = 0; index < _traceSessionAccessSegments.size(); ++index)
+	{
+		const TraceSessionSegment& segment = _traceSessionAccessSegments[index];
+		const unsigned long long bytes = segment.sealed? segment.bytes: FileSizeOrZero(segment.path);
+		if (segment.sealed)
+		{
+			sealedBytes += segment.bytes;
+		}
+		else
+		{
+			openSegment = segment.index;
+		}
+		if (!first)
+		{
+			segments += ",";
+		}
+		first = false;
+		segments += "{\"index\":";
+		AppendNumber(segments, segment.index);
+		segments += ",\"bytes\":";
+		AppendNumber(segments, bytes);
+		segments += ",\"sealed\":";
+		segments += BoolText(segment.sealed);
+		segments += ",\"drained\":";
+		segments += BoolText(segment.index < _traceSessionAccessDrainSegment);
+		segments += "}";
+	}
+	data += ",\"access\":{\"enabled\":";
+	data += BoolText(_traceSessionAccessEnabled);
+	data += ",\"mode\":";
+	AppendJsonStringAscii(data, _traceSessionAccessMode);
+	data += ",\"include_registers\":";
+	data += BoolText(_traceSessionAccessIncludeRegisters);
+	data += ",\"max_total_bytes\":";
+	AppendNumber(data, _traceSessionAccessMaxBytes);
+	data += ",\"records\":";
+	AppendNumber(data, _traceSessionAccessRecords);
+	data += ",\"failures\":";
+	AppendNumber(data, _traceSessionAccessFailures);
+	data += ",\"bytes_written\":";
+	AppendNumber(data, _traceSessionAccessBytesWritten);
+	data += ",\"sealed_bytes\":";
+	AppendNumber(data, sealedBytes);
+	data += ",\"evicted_segments\":";
+	AppendNumber(data, _traceSessionAccessEvictedSegments);
+	data += ",\"evicted_bytes\":";
+	AppendNumber(data, _traceSessionAccessEvictedBytes);
+	data += ",\"evicted_unread_segments\":";
+	AppendNumber(data, _traceSessionAccessEvictedUnread);
+	data += ",\"open_segment\":";
+	AppendNumber(data, openSegment);
+	data += ",\"drain\":{\"next_segment\":";
+	AppendNumber(data, _traceSessionAccessDrainSegment);
+	data += ",\"next_offset\":";
+	AppendNumber(data, _traceSessionAccessDrainOffset);
+	data += "},\"segments\":[";
+	data += segments;
+	data += "]}";
+}
+
+//----------------------------------------------------------------------------------------------------------------------
+bool ExodusMcpPlugin::DrainTraceSessionStreamLocked(const std::vector<TraceSessionSegment>& segments, unsigned int& drainSegment, unsigned long long& drainOffset, unsigned long long maxBytes, std::string& encoded, unsigned int& segmentIndex, unsigned long long& offset, unsigned long long& segmentBytes, unsigned long long& readBytes, bool& done, bool& readFailure)
+{
+	const TraceSessionSegment* chosen = 0;
+	for (size_t index = 0; index < segments.size(); ++index)
+	{
+		const TraceSessionSegment& segment = segments[index];
+		if (!segment.sealed || segment.index < drainSegment)
+		{
+			continue;
+		}
+		chosen = &segment;
+		break;
+	}
+	offset = drainOffset;
+	readBytes = 0;
+	segmentBytes = 0;
+	done = true;
+	readFailure = false;
+	if (chosen == 0)
+	{
+		return true;
+	}
+	segmentIndex = chosen->index;
+	std::string bytes;
+	if (!ReadSegmentBytes(chosen->path, offset, maxBytes, bytes, segmentBytes))
+	{
+		readFailure = true;
+		return false;
+	}
+	readBytes = bytes.size();
+	if (readBytes > 0)
+	{
+		encoded = Base64Encode((const unsigned char*)bytes.data(), bytes.size());
+	}
+	if (offset + readBytes >= segmentBytes)
+	{
+		drainSegment = chosen->index + 1;
+		drainOffset = 0;
+	}
+	else
+	{
+		drainOffset = offset + readBytes;
+	}
+	for (size_t index = 0; index < segments.size(); ++index)
+	{
+		if (segments[index].sealed && segments[index].index >= drainSegment)
+		{
+			done = false;
+			break;
+		}
+	}
+	return true;
+}
+
+//----------------------------------------------------------------------------------------------------------------------
+void ExodusMcpPlugin::AppendTraceSessionWatchesJsonLocked(std::string& data, bool consumeDeltas)
+{
+	data += ",\"watches\":[";
+	bool first = true;
+	for (size_t index = 0; index < _traceSessionWatches.size(); ++index)
+	{
+		TraceSessionWatch& watch = _traceSessionWatches[index];
+		unsigned long long hits = watch.lastReportedHits;
+		bool released = false;
+		std::map<unsigned long long, ManagedWatchpoint>::iterator found = _managedWatchpoints.find(watch.watchpointID);
+		if (found == _managedWatchpoints.end())
+		{
+			// Either the plugin released the watchpoint on purpose (stop or
+			// post-stop cleanup) or the engine dropped it (module unload).
+			released = _traceSessionWatchesReleased;
+			watch.lost = !released;
+		}
+		else if (found->second.processor != 0 && found->second.processor->LockWatchpoint(found->second.watchpoint))
+		{
+			hits = found->second.watchpoint->GetHitCounter();
+			found->second.processor->UnlockWatchpoint(found->second.watchpoint);
+			watch.lost = false;
+		}
+		else
+		{
+			watch.lost = true;
+		}
+		unsigned long long delta = 0;
+		if (hits >= watch.lastReportedHits)
+		{
+			delta = hits - watch.lastReportedHits;
+		}
+		else
+		{
+			// The engine counter is 32-bit; report the wrapped difference.
+			delta = (0x100000000ULL - watch.lastReportedHits) + hits;
+		}
+		if (!first)
+		{
+			data += ",";
+		}
+		first = false;
+		data += "{\"watchpoint_id\":";
+		AppendNumber(data, watch.watchpointID);
+		data += ",\"cpu\":";
+		AppendJsonStringAscii(data, watch.cpu);
+		data += ",\"address\":";
+		AppendNumber(data, watch.address);
+		data += ",\"length\":";
+		AppendNumber(data, watch.length);
+		data += ",\"access\":";
+		AppendJsonStringAscii(data, watch.access);
+		data += ",\"hits\":";
+		AppendNumber(data, hits);
+		data += ",\"delta\":";
+		AppendNumber(data, delta);
+		unsigned long long hitsSinceStart = 0;
+		if (hits >= watch.baselineHits)
+		{
+			hitsSinceStart = hits - watch.baselineHits;
+		}
+		else
+		{
+			hitsSinceStart = (0x100000000ULL - watch.baselineHits) + hits;
+		}
+		data += ",\"hits_since_start\":";
+		AppendNumber(data, hitsSinceStart);
+		data += ",\"lost\":";
+		data += BoolText(watch.lost);
+		data += ",\"released\":";
+		data += BoolText(released);
+		data += "}";
+		if (consumeDeltas)
+		{
+			watch.lastReportedHits = hits;
+		}
+	}
+	data += "]";
+}
+
+//----------------------------------------------------------------------------------------------------------------------
+std::string ExodusMcpPlugin::BuildTraceSessionStatusJsonLocked(bool consumeWatchDeltas)
+{
+	const unsigned long long now = TickNow();
+	const unsigned long long elapsed = (_traceSessionStartedTick == 0) ? 0 : TickElapsed(now, _traceSessionStartedTick);
+	std::string data = "{\"active\":";
+	data += BoolText(_traceSessionActive);
+	data += ",\"capturing\":";
+	data += BoolText(_traceSessionCapturing);
+	data += ",\"session_id\":";
+	AppendJsonStringAscii(data, _traceSessionID);
+	data += ",\"cpu\":";
+	AppendJsonStringAscii(data, _traceSessionCPU);
+	data += ",\"mode\":";
+	AppendJsonStringAscii(data, _traceSessionMode);
+	data += ",\"disassemble\":";
+	data += BoolText(_traceSessionDisassemble);
+	data += ",\"window_ms\":";
+	AppendNumber(data, _traceSessionWindowMs);
+	data += ",\"interval_ms\":";
+	AppendNumber(data, _traceSessionIntervalMs);
+	data += ",\"segment_ms\":";
+	AppendNumber(data, _traceSessionSegmentMs);
+	data += ",\"max_duration_ms\":";
+	AppendNumber(data, _traceSessionMaxDurationMs);
+	data += ",\"max_total_bytes\":";
+	AppendNumber(data, _traceSessionMaxTotalBytes);
+	data += ",\"max_segments\":";
+	AppendNumber(data, _traceSessionMaxSegments);
+	data += ",\"elapsed_ms\":";
+	AppendNumber(data, elapsed);
+	data += ",\"windows_started\":";
+	AppendNumber(data, _traceSessionWindowsStarted);
+	data += ",\"windows_completed\":";
+	AppendNumber(data, _traceSessionWindowsCompleted);
+	data += ",\"bytes_written\":";
+	AppendNumber(data, _traceSessionBytesWritten);
+	data += ",\"evicted_segments\":";
+	AppendNumber(data, _traceSessionEvictedSegments);
+	data += ",\"evicted_bytes\":";
+	AppendNumber(data, _traceSessionEvictedBytes);
+	data += ",\"evicted_unread_segments\":";
+	AppendNumber(data, _traceSessionEvictedUnread);
+	data += ",\"stop_reason\":";
+	AppendJsonStringAscii(data, _traceSessionStopReason);
+	data += ",\"auto_stopped\":";
+	data += BoolText(_traceSessionAutoStopped);
+	data += ",\"setup_pause\":{\"guarded\":";
+	data += BoolText(_traceSessionSetupPause);
+	data += ",\"system_was_running\":";
+	data += BoolText(_traceSessionSetupPausedSystem);
+	data += "}";
+	data += ",\"trace_flags_restored\":";
+	data += _traceSessionActive ? "false" : "true";
+	data += ",\"drain\":{\"next_segment\":";
+	AppendNumber(data, _traceSessionDrainSegment);
+	data += ",\"next_offset\":";
+	AppendNumber(data, _traceSessionDrainOffset);
+	data += "}";
+	unsigned int openSegment = 0;
+	unsigned long long sealedBytes = 0;
+	data += ",\"segments\":[";
+	bool first = true;
+	for (size_t index = 0; index < _traceSessionSegments.size(); ++index)
+	{
+		const TraceSessionSegment& segment = _traceSessionSegments[index];
+		const unsigned long long bytes = segment.sealed ? segment.bytes : FileSizeOrZero(segment.path);
+		if (segment.sealed)
+		{
+			sealedBytes += segment.bytes;
+		}
+		else
+		{
+			openSegment = segment.index;
+		}
+		if (!first)
+		{
+			data += ",";
+		}
+		first = false;
+		data += "{\"index\":";
+		AppendNumber(data, segment.index);
+		data += ",\"bytes\":";
+		AppendNumber(data, bytes);
+		data += ",\"sealed\":";
+		data += BoolText(segment.sealed);
+		data += ",\"drained\":";
+		data += BoolText(segment.index < _traceSessionDrainSegment);
+		data += "}";
+	}
+	data += "]";
+	data += ",\"open_segment\":";
+	AppendNumber(data, openSegment);
+	data += ",\"sealed_bytes\":";
+	AppendNumber(data, sealedBytes);
+	data += ",\"notes\":[";
+	for (size_t index = 0; index < _traceSessionNotes.size(); ++index)
+	{
+		if (index != 0)
+		{
+			data += ",";
+		}
+		AppendJsonStringAscii(data, _traceSessionNotes[index]);
+	}
+	data += "]";
+	AppendTraceSessionWatchesJsonLocked(data, consumeWatchDeltas);
+	AppendTraceSessionAccessJsonLocked(data);
+	data += "}";
+	return data;
+}
+
+//----------------------------------------------------------------------------------------------------------------------
+bool ExodusMcpPlugin::BuildTraceSessionStatusData(const BridgeRequest&, std::string& data, std::string&, std::string&)
+{
+	EnterCriticalSection(&_traceSessionLock);
+	// Read the counters while the watchpoints are still armed, then release
+	// them: the session ended without a stop command (duration limit or a lost
+	// processor) and no instrumentation may stay armed.
+	data = BuildTraceSessionStatusJsonLocked(true);
+	if (!_traceSessionActive && _traceSessionWatchesArmed)
+	{
+		ReleaseTraceSessionWatchesLocked();
+	}
+	LeaveCriticalSection(&_traceSessionLock);
+	return true;
+}
+
+//----------------------------------------------------------------------------------------------------------------------
+bool ExodusMcpPlugin::BuildTraceSessionDrainData(const BridgeRequest& request, std::string& data, std::string& errorCode, std::string& errorMessage)
+{
+	unsigned long long maxBytes = 1024 * 1024;
+	if (!ParamValue(request.params, "max_bytes").empty())
+	{
+		ParseUnsigned(ParamValue(request.params, "max_bytes"), maxBytes);
+	}
+	if (maxBytes < kTraceSessionMinDrainBytes)
+	{
+		maxBytes = kTraceSessionMinDrainBytes;
+	}
+	if (maxBytes > kTraceSessionMaxDrainBytes)
+	{
+		maxBytes = kTraceSessionMaxDrainBytes;
+	}
+	const bool sealFirst = ParamValue(request.params, "seal") == "true";
+	const bool accessStream = ParamValue(request.params, "stream") == "access";
+
+	EnterCriticalSection(&_traceSessionLock);
+	bool sealedNow = false;
+	if (sealFirst && _traceSessionActive && _traceSessionCapturing)
+	{
+		// Seal the open segment so freshly written entries are readable. The
+		// same boundary flush as the monitor thread keeps the engine's pending
+		// entries from being discarded with the closing file.
+		if (_traceSessionProcessor != 0)
+		{
+			_traceSessionProcessor->SetTraceEnabled(false);
+		}
+		Sleep((DWORD)kTraceSessionSegmentBoundaryFlushMs);
+		if (_traceSessionMode == "continuous")
+		{
+			RotateTraceSessionSegmentLocked(true);
+		}
+		else
+		{
+			SealTraceSessionSegmentLocked(true);
+		}
+		sealedNow = true;
+	}
+
+	std::string encoded;
+	unsigned int segmentIndex = 0;
+	unsigned long long offset = accessStream? _traceSessionAccessDrainOffset: _traceSessionDrainOffset;
+	unsigned long long segmentBytes = 0;
+	unsigned long long readBytes = 0;
+	bool done = true;
+	bool readFailure = false;
+	if (accessStream)
+	{
+		DrainTraceSessionStreamLocked(_traceSessionAccessSegments, _traceSessionAccessDrainSegment, _traceSessionAccessDrainOffset, maxBytes, encoded, segmentIndex, offset, segmentBytes, readBytes, done, readFailure);
+	}
+	else
+	{
+		DrainTraceSessionStreamLocked(_traceSessionSegments, _traceSessionDrainSegment, _traceSessionDrainOffset, maxBytes, encoded, segmentIndex, offset, segmentBytes, readBytes, done, readFailure);
+	}
+	if (readFailure)
+	{
+		NoteTraceSessionLocked((accessStream? "Access segment ": "Segment ") + ULongText(segmentIndex) + " could not be read; the drain cursor was left in place.");
+	}
+
+	data = "{\"session_id\":";
+	AppendJsonStringAscii(data, _traceSessionID);
+	data += ",\"stream\":";
+	AppendJsonStringAscii(data, accessStream? "access": "trace");
+	data += ",\"segment_index\":";
+	AppendNumber(data, segmentIndex);
+	data += ",\"offset\":";
+	AppendNumber(data, offset);
+	data += ",\"bytes\":";
+	AppendNumber(data, readBytes);
+	data += ",\"segment_bytes\":";
+	AppendNumber(data, segmentBytes);
+	data += ",\"done\":";
+	data += BoolText(done);
+	data += ",\"sealed_now\":";
+	data += BoolText(sealedNow);
+	data += ",\"read_failed\":";
+	data += BoolText(readFailure);
+	data += ",\"evicted_segments\":";
+	AppendNumber(data, accessStream? _traceSessionAccessEvictedSegments: _traceSessionEvictedSegments);
+	data += ",\"evicted_bytes\":";
+	AppendNumber(data, accessStream? _traceSessionAccessEvictedBytes: _traceSessionEvictedBytes);
+	data += ",\"evicted_unread_segments\":";
+	AppendNumber(data, accessStream? _traceSessionAccessEvictedUnread: _traceSessionEvictedUnread);
+	data += ",\"notes\":[";
+	for (size_t index = 0; index < _traceSessionNotes.size(); ++index)
+	{
+		if (index != 0)
+		{
+			data += ",";
+		}
+		AppendJsonStringAscii(data, _traceSessionNotes[index]);
+	}
+	data += "],\"data\":";
+	AppendJsonStringAscii(data, encoded);
+	data += "}";
+	LeaveCriticalSection(&_traceSessionLock);
+
+	if (readFailure)
+	{
+		errorCode = "trace_segment_unreadable";
+		errorMessage = "The requested trace segment could not be read from disk";
+		return false;
+	}
+	return true;
+}
+
+//----------------------------------------------------------------------------------------------------------------------
+bool ExodusMcpPlugin::BuildTraceSessionStopData(const BridgeRequest& request, std::string& data, std::string& errorCode, std::string& errorMessage)
+{
+	(void)errorCode;
+	(void)errorMessage;
+	const bool deleteSegments = ParamValue(request.params, "delete_segments") != "false";
+	const bool wasActive = _traceSessionActive;
+
+	// Stop the state machine first so the monitor thread cannot arm the trace
+	// writer again while the handle is being torn down.
+	EnterCriticalSection(&_traceSessionLock);
+	if (_traceSessionActive)
+	{
+		FinishTraceSessionLocked("stopped");
+	}
+	LeaveCriticalSection(&_traceSessionLock);
+
+	ReapTraceSessionThread();
+
+	EnterCriticalSection(&_traceSessionLock);
+	// Snapshot first: the final view must read the real watch counters and the
+	// segment table the session produced, even though both are torn down right
+	// afterwards. The release then marks the watches as released, not lost.
+	std::string status = BuildTraceSessionStatusJsonLocked(true);
+	if (_traceSessionWatchesArmed)
+	{
+		ReleaseTraceSessionWatchesLocked();
+	}
+	if (deleteSegments)
+	{
+		DeleteTraceSessionFilesLocked();
+	}
+	status.erase(status.size() - 1);
+	const bool watchesReleased = !_traceSessionWatches.empty();
+	status += ",\"deleted_segments\":";
+	status += BoolText(deleteSegments);
+	status += ",\"watches_released\":";
+	status += BoolText(watchesReleased);
+	status += ",\"stopped_now\":";
+	status += BoolText(wasActive);
+	status += "}";
+	LeaveCriticalSection(&_traceSessionLock);
+	data = status;
+	return true;
+}
+
+//----------------------------------------------------------------------------------------------------------------------
+void ExodusMcpPlugin::ReleaseTraceSessionWatchesLocked()
+{
+	// The managed-watchpoint map is owned by the pipe thread (and by the
+	// teardown paths that run after the monitor thread stopped), so this
+	// helper must never run on the monitor thread.
+	for (size_t index = 0; index < _traceSessionWatches.size(); ++index)
+	{
+		TraceSessionWatch& watch = _traceSessionWatches[index];
+		std::map<unsigned long long, ManagedWatchpoint>::iterator found = _managedWatchpoints.find(watch.watchpointID);
+		if (found == _managedWatchpoints.end())
+		{
+			continue;
+		}
+		if (found->second.processor != 0)
+		{
+			found->second.processor->DeleteWatchpoint(found->second.watchpoint);
+		}
+		_managedWatchpoints.erase(found);
+	}
+	_traceSessionWatchesArmed = false;
+	_traceSessionWatchesReleased = !_traceSessionWatches.empty();
+}
+
+//----------------------------------------------------------------------------------------------------------------------
+void ExodusMcpPlugin::DeleteTraceSessionFilesLocked()
+{
+	DeleteTraceSessionAccessFilesLocked();
+	for (size_t index = 0; index < _traceSessionSegments.size(); ++index)
+	{
+		DeleteFileW(_traceSessionSegments[index].path.c_str());
+	}
+	_traceSessionSegments.clear();
+	if (!_traceSessionDir.empty())
+	{
+		RemoveDirectoryW(_traceSessionDir.c_str());
+		_traceSessionDir.clear();
+	}
+	_traceSessionDrainSegment = 1;
+	_traceSessionDrainOffset = 0;
+	_traceSessionNextSegment = 0;
+}
+
+//----------------------------------------------------------------------------------------------------------------------
+void ExodusMcpPlugin::ReapTraceSessionThread()
+{
+	HANDLE thread = 0;
+	EnterCriticalSection(&_traceSessionLock);
+	thread = _traceSessionThread;
+	_traceSessionThread = 0;
+	LeaveCriticalSection(&_traceSessionLock);
+	if (thread == 0)
+	{
+		return;
+	}
+	if (_traceSessionStopEvent != 0)
+	{
+		SetEvent(_traceSessionStopEvent);
+	}
+	if (WaitForSingleObject(thread, 5000) == WAIT_TIMEOUT)
+	{
+		// The monitor thread only performs short, bounded work per iteration;
+		// a timeout means it is stuck inside engine code. Never close a handle
+		// to a running thread: leak it rather than risk undefined behavior.
+		return;
+	}
+	CloseHandle(thread);
+}
+
+//----------------------------------------------------------------------------------------------------------------------
+void ExodusMcpPlugin::ShutdownTraceSession()
+{
+	EnterCriticalSection(&_traceSessionLock);
+	const bool active = _traceSessionActive;
+	if (active)
+	{
+		FinishTraceSessionLocked("shutdown");
+	}
+	LeaveCriticalSection(&_traceSessionLock);
+	ReapTraceSessionThread();
+	EnterCriticalSection(&_traceSessionLock);
+	if (_traceSessionWatchesArmed)
+	{
+		ReleaseTraceSessionWatchesLocked();
+	}
+	DeleteTraceSessionFilesLocked();
+	_traceSessionID.clear();
+	_traceSessionCPU.clear();
+	_traceSessionNotes.clear();
+	_traceSessionProcessor = 0;
+	LeaveCriticalSection(&_traceSessionLock);
 }
 
 //----------------------------------------------------------------------------------------------------------------------

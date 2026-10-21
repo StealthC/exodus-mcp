@@ -189,7 +189,7 @@ func makeRunDisassembly(cpu string) func(toolContext, json.RawMessage) map[strin
 		if failure != nil {
 			return failureResult(failure, tc.modern)
 		}
-		if annotated, ok := annotateDisassemblySymbols(context, cpu, payload); ok {
+		if annotated, ok := annotateDisassemblySymbols(context, cpu, tc.server.currentROMSHA256(), payload); ok {
 			payload = annotated
 		} else {
 			normalizeDisassemblyPayload(payload, cpu)
@@ -339,7 +339,7 @@ func parseHexRun(run string) (uint64, bool) {
 // literals that resolved), plus top-level `symbols_annotated` and
 // `annotation_method` fields. Annotation is best-effort: an unparseable
 // payload is passed through unchanged.
-func annotateDisassemblySymbols(context *analysis.Context, cpu string, payload map[string]any) (map[string]any, bool) {
+func annotateDisassemblySymbols(context *analysis.Context, cpu, romSHA256 string, payload map[string]any) (map[string]any, bool) {
 	encoded, err := json.Marshal(payload)
 	if err != nil {
 		return payload, false
@@ -357,7 +357,7 @@ func annotateDisassemblySymbols(context *analysis.Context, cpu string, payload m
 	mask := disasmSymbolMask(cpu)
 	spaceID := disasmSpaceID(cpu)
 	byAddress := make(map[uint64]string)
-	for _, symbol := range context.Symbols.List("") {
+	for _, symbol := range context.Symbols.ListForROM("", romSHA256) {
 		if symbol.SpaceID != "" && symbol.SpaceID != spaceID {
 			continue
 		}
@@ -908,11 +908,23 @@ func runSymbolsSet(tc toolContext, args json.RawMessage) map[string]any {
 		}
 		prepared = append(prepared, storedSymbolInput{Name: symbol.Name, SpaceID: spaceID, Address: address})
 	}
-	written, err := context.Symbols.Set(toStoreSymbols(prepared))
+	romSHA256 := tc.server.currentROMSHA256()
+	bound := toStoreSymbols(prepared, romSHA256)
+	written, err := context.Symbols.Set(bound)
 	if err != nil {
 		return failureResult(&toolFailure{Code: "invalid_params", Message: err.Error()}, tc.modern)
 	}
-	return okResult(map[string]any{"upserted": written}, tc.modern)
+	result := map[string]any{
+		"upserted":   written,
+		"rom_sha256": romSHA256,
+		"rom_bound":  romSHA256 != "",
+	}
+	if romSHA256 == "" {
+		result["note"] = "No readable cartridge was loaded, so these symbols are unbound and apply to any target; reload the ROM and set them again to bind them to a specific cartridge hash."
+	} else {
+		result["note"] = "These symbols are bound to the loaded cartridge's SHA-256 and are suppressed when a different ROM is loaded."
+	}
+	return okResult(result, tc.modern)
 }
 
 type storedSymbolInput struct {
@@ -921,10 +933,12 @@ type storedSymbolInput struct {
 	Address uint64
 }
 
-func toStoreSymbols(inputs []storedSymbolInput) []symbols.Symbol {
+// toStoreSymbols converts parsed input to stored symbols, stamping each with the
+// cartridge identity it was recorded against.
+func toStoreSymbols(inputs []storedSymbolInput, romSHA256 string) []symbols.Symbol {
 	prepared := make([]symbols.Symbol, 0, len(inputs))
 	for _, input := range inputs {
-		prepared = append(prepared, symbols.Symbol{Name: input.Name, SpaceID: input.SpaceID, Address: input.Address})
+		prepared = append(prepared, symbols.Symbol{Name: input.Name, SpaceID: input.SpaceID, Address: input.Address, ROMSHA256: romSHA256})
 	}
 	return prepared
 }
@@ -941,15 +955,17 @@ func runSymbolsList(tc toolContext, args json.RawMessage) map[string]any {
 	if failure != nil {
 		return failureResult(failure, tc.modern)
 	}
-	symbols := context.Symbols.List(parsed.Filter)
-	views := make([]map[string]any, 0, len(symbols))
-	for _, symbol := range symbols {
+	stored := context.Symbols.List(parsed.Filter)
+	views := make([]map[string]any, 0, len(stored))
+	for _, symbol := range stored {
 		view := map[string]any{
 			"name":          symbol.Name,
 			"space_id":      symbol.SpaceID,
 			"address":       symbol.Address,
 			"address_hex":   canonicalHex(symbol.Address),
 			"address_space": symbol.SpaceID,
+			"rom_sha256":    symbol.ROMSHA256,
+			"rom_bound":     symbol.ROMSHA256 != "",
 		}
 		annotateAddressPair(view, symbol.SpaceID, symbol.Address)
 		if width, mask := addressBusWidthMask(symbol.SpaceID); width != 0 {
@@ -958,7 +974,12 @@ func runSymbolsList(tc toolContext, args json.RawMessage) map[string]any {
 		}
 		views = append(views, view)
 	}
-	return okResult(map[string]any{"symbols": views, "count": len(views)}, tc.modern)
+	return okResult(map[string]any{
+		"symbols":           views,
+		"count":             len(views),
+		"rom_sha256":        tc.server.currentROMSHA256(),
+		"rom_bound_symbols": context.Symbols.CountBound(),
+	}, tc.modern)
 }
 
 func runSymbolsClear(tc toolContext, args json.RawMessage) map[string]any {

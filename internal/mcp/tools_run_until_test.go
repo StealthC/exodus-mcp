@@ -391,7 +391,7 @@ func TestOneShotBreakpointSetAndSweepEndToEnd(t *testing.T) {
 	if len(sweeps) != 1 {
 		t.Fatalf("expected one one_shot_sweep entry, got %d", len(sweeps))
 	}
-	events, _, _ := server.listDebugEvents(0, 100)
+	events, _, _ := server.listDebugEvents(debugEventFilter{}, 0, 100)
 	if len(events) != 1 || events[0].ResourceKind != "breakpoint" || events[0].ResourceID != 1 {
 		t.Fatalf("expected one breakpoint debug event: %+v", events)
 	}

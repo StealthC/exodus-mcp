@@ -94,6 +94,23 @@ The first command generates third-party `.lib` files. The second generates
 `Exodus.exe`, `System.dll`, module DLLs in `Assemblies/`, and `x64/`
 intermediates.
 
+## Native unit tests that need no emulator
+
+The per-access log format is produced by the fork and parsed by the Go server,
+so its encoding rules are covered natively without launching Exodus:
+
+```bash
+bash ./scripts/native-test.sh
+```
+
+It compiles `native-plugin/tests/memory_access_log_test.cpp` against
+`vendor/exodus/ExodusSDK/Processor/MemoryAccessLog.h` with the host compiler and
+checks direction, width, boundary addresses, 64-bit sequence rendering,
+previous-value availability, and the register-snapshot cap. `scripts/test.sh`
+runs it with the Linux gates. It proves the record contract, not the CPU cores:
+the access-path integration itself is validated by building the fork and by
+`live-smoke.sh --full`.
+
 ## Known-good result and troubleshooting
 
 Release | x64 (fork base `08f388f`, plus the MCP trace-path and native

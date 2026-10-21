@@ -24,6 +24,25 @@ mirroring the VDP surface.
   capture, preserving chip clocks, wait commands, frame/target provenance,
   ROM identity, truncation state, and device availability.
 
+## Phase 10 — Continuous trace sessions
+
+Delivered: per-occurrence read/write records with native range filtering,
+same-instant register snapshots, monotonic access sequence with explicit gap
+loss, effective-value filters that keep raw events, durable manifests with
+restart recovery, and ROM-hash-bound symbol resolution. See
+[TRACE-SESSIONS.md](TRACE-SESSIONS.md).
+
+- [ ] Pre-write (old) values for write records: the write hook runs before the
+  bus write, so `previous_known` is false today. The follow-up captures the
+  pre-write value in the M68000/Z80 write paths behind an opt-in flag using the
+  cores' existing `TransparentReadMemory` helpers, with width and address-error
+  cases handled explicitly.
+- [ ] Native trace address filtering so a session does not pay disassembly and
+  disk cost for out-of-range instructions.
+- [ ] Per-access frame tokens: access records carry cycle and emulated time; a
+  per-record VDP frame token would need a frame counter readable from the
+  processor access hook.
+
 ## Phase 9 — Workflow ergonomics
 
 ## Operations

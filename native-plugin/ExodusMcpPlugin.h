@@ -69,6 +69,26 @@ private:
 		const char* access;
 	};
 
+	struct TraceSessionSegment
+	{
+		unsigned int index;
+		std::wstring path;
+		unsigned long long bytes;
+		bool sealed;
+	};
+
+	struct TraceSessionWatch
+	{
+		unsigned long long watchpointID;
+		std::string cpu;
+		unsigned long long address;
+		unsigned long long length;
+		std::string access;
+		unsigned long long baselineHits;
+		unsigned long long lastReportedHits;
+		bool lost;
+	};
+
 	// Bridge lifecycle
 	bool LoadBridgeConfiguration();
 	bool StartBridge();
@@ -103,6 +123,31 @@ private:
 	bool BuildTraceCaptureData(const BridgeRequest& request, std::string& data, std::string& errorCode, std::string& errorMessage);
 	static DWORD TraceCaptureGuarded(ExodusMcpPlugin* plugin, const BridgeRequest& request, std::string& data, std::string& errorCode, std::string& errorMessage, bool& success, void** faultingAddress);
 	bool TraceCaptureInner(const BridgeRequest& request, std::string& data, std::string& errorCode, std::string& errorMessage);
+	bool BuildTraceSessionStartData(const BridgeRequest& request, std::string& data, std::string& errorCode, std::string& errorMessage);
+	bool BuildTraceSessionStatusData(const BridgeRequest& request, std::string& data, std::string& errorCode, std::string& errorMessage);
+	bool BuildTraceSessionDrainData(const BridgeRequest& request, std::string& data, std::string& errorCode, std::string& errorMessage);
+	bool BuildTraceSessionStopData(const BridgeRequest& request, std::string& data, std::string& errorCode, std::string& errorMessage);
+	static DWORD WINAPI TraceSessionThreadEntry(void* parameter);
+	void TraceSessionThread();
+	void FinishTraceSessionLocked(const std::string& stopReason);
+	void SealTraceSessionSegmentLocked(bool closeFile);
+	void RotateTraceSessionSegmentLocked(bool rotateAccessStream);
+	void EvictTraceSessionSegmentsLocked();
+	bool HasSealedTraceSessionSegmentLocked(unsigned int fromSegment) const;
+	void SealTraceSessionAccessSegmentLocked();
+	void RotateTraceSessionAccessSegmentLocked();
+	void EvictTraceSessionAccessSegmentsLocked();
+	bool HasSealedTraceSessionAccessSegmentLocked(unsigned int fromSegment) const;
+	void DeleteTraceSessionAccessFilesLocked();
+	void AppendTraceSessionAccessJsonLocked(std::string& data);
+	bool DrainTraceSessionStreamLocked(const std::vector<TraceSessionSegment>& segments, unsigned int& drainSegment, unsigned long long& drainOffset, unsigned long long maxBytes, std::string& encoded, unsigned int& segmentIndex, unsigned long long& offset, unsigned long long& segmentBytes, unsigned long long& readBytes, bool& done, bool& readFailure);
+	std::string BuildTraceSessionStatusJsonLocked(bool consumeWatchDeltas);
+	void AppendTraceSessionWatchesJsonLocked(std::string& data, bool consumeDeltas);
+	void NoteTraceSessionLocked(const std::string& note);
+	void ReleaseTraceSessionWatchesLocked();
+	void DeleteTraceSessionFilesLocked();
+	void ShutdownTraceSession();
+	void ReapTraceSessionThread();
 	std::string BuildVdpStatusData();
 	std::string BuildVdpCommandDMAStatusData();
 	bool BuildVDPMemoryReadData(const BridgeRequest& request, std::string& data, std::string& errorCode, std::string& errorMessage);
@@ -153,6 +198,72 @@ private:
 	std::map<unsigned long long, ManagedBreakpoint> _managedBreakpoints;
 	unsigned long long _nextWatchpointID;
 	unsigned int _pixelInfoEnableFrameToken;
+
+	// Continuous trace session state. The lock guards the session state
+	// machine shared by the pipe thread (start/status/drain/stop) and the
+	// monitor thread that arms and seals segments; the processor trace calls
+	// it protects are the same ones trace_capture uses.
+	CRITICAL_SECTION _traceSessionLock;
+	HANDLE _traceSessionStopEvent;
+	HANDLE _traceSessionThread;
+	bool _traceSessionActive;
+	bool _traceSessionCapturing;
+	std::string _traceSessionID;
+	std::string _traceSessionCPU;
+	std::string _traceSessionMode;
+	bool _traceSessionDisassemble;
+	unsigned long long _traceSessionWindowMs;
+	unsigned long long _traceSessionIntervalMs;
+	unsigned long long _traceSessionSegmentMs;
+	unsigned long long _traceSessionMaxDurationMs;
+	unsigned long long _traceSessionMaxTotalBytes;
+	unsigned int _traceSessionMaxSegments;
+	unsigned long long _traceSessionStartedTick;
+	unsigned long long _traceSessionWindowStartTick;
+	unsigned long long _traceSessionIntervalStartTick;
+	unsigned long long _traceSessionSegmentStartTick;
+	unsigned long long _traceSessionWindowsStarted;
+	unsigned long long _traceSessionWindowsCompleted;
+	unsigned long long _traceSessionBytesWritten;
+	unsigned long long _traceSessionEvictedSegments;
+	unsigned long long _traceSessionEvictedBytes;
+	unsigned long long _traceSessionEvictedUnread;
+	unsigned int _traceSessionNextSegment;
+	unsigned int _traceSessionDrainSegment;
+	unsigned long long _traceSessionDrainOffset;
+	std::string _traceSessionStopReason;
+	bool _traceSessionAutoStopped;
+	bool _traceSessionPriorEnabled;
+	bool _traceSessionPriorDisassemble;
+	bool _traceSessionPriorFile;
+	bool _traceSessionSetupPause;
+	bool _traceSessionSetupPausedSystem;
+	bool _traceSessionWatchesArmed;
+	bool _traceSessionWatchesReleased;
+	IProcessor* _traceSessionProcessor;
+	std::wstring _traceSessionDir;
+	std::vector<TraceSessionSegment> _traceSessionSegments;
+	std::vector<TraceSessionWatch> _traceSessionWatches;
+	std::vector<std::string> _traceSessionNotes;
+
+	// Per-access read/write capture. The engine writes one line per observed
+	// access into rotated segments of its own; the plugin never sees individual
+	// records, only sealed files it drains, so a CPU running at full speed can
+	// never block on the bridge.
+	bool _traceSessionAccessEnabled;
+	std::string _traceSessionAccessMode;
+	bool _traceSessionAccessIncludeRegisters;
+	unsigned long long _traceSessionAccessMaxBytes;
+	unsigned long long _traceSessionAccessRecords;
+	unsigned long long _traceSessionAccessFailures;
+	unsigned long long _traceSessionAccessBytesWritten;
+	unsigned long long _traceSessionAccessEvictedSegments;
+	unsigned long long _traceSessionAccessEvictedBytes;
+	unsigned long long _traceSessionAccessEvictedUnread;
+	unsigned int _traceSessionAccessNextSegment;
+	unsigned int _traceSessionAccessDrainSegment;
+	unsigned long long _traceSessionAccessDrainOffset;
+	std::vector<TraceSessionSegment> _traceSessionAccessSegments;
 	std::map<unsigned long long, ManagedWatchpoint> _managedWatchpoints;
 };
 

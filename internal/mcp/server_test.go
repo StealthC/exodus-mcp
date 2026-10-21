@@ -198,6 +198,8 @@ func TestToolsListDeterministicAndComplete(t *testing.T) {
 		"target_control_renew", "target_control_status",
 		"target_info", "z80_disassemble", "z80_read_memory", "z80_registers",
 		"emulator_status",
+		"trace_session_start", "trace_session_status", "trace_session_events", "trace_session_stop",
+		"trace_session_recover",
 	}
 	listed := first
 	for _, name := range expected {

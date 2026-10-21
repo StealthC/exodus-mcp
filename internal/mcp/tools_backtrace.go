@@ -101,9 +101,9 @@ type backtraceSymbolIndex struct {
 	sorted    []symbols.Symbol
 }
 
-func buildBacktraceSymbolIndex(context *analysis.Context) *backtraceSymbolIndex {
+func buildBacktraceSymbolIndex(context *analysis.Context, romSHA256 string) *backtraceSymbolIndex {
 	index := &backtraceSymbolIndex{byAddress: map[uint64]string{}}
-	for _, symbol := range context.Symbols.List("") {
+	for _, symbol := range context.Symbols.ListForROM("", romSHA256) {
 		if symbol.SpaceID != "" && symbol.SpaceID != disasmSpaceID("m68k") {
 			continue
 		}
@@ -239,7 +239,7 @@ func runBacktrace(tc toolContext, args json.RawMessage) map[string]any {
 	usp, _ := registerValue(registers, "usp")
 	ssp, _ := registerValue(registers, "ssp")
 
-	symbolsIndex := buildBacktraceSymbolIndex(context)
+	symbolsIndex := buildBacktraceSymbolIndex(context, tc.server.currentROMSHA256())
 
 	// readWord reads one big-endian 32-bit slot through the M68K bus and
 	// reports whether the plugin had to pause a running system for the read.

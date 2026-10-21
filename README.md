@@ -7,14 +7,16 @@ Mega Drive / Genesis ROM analysis.
 The Go server speaks Streamable HTTP at `/mcp` (normative target MCP
 `2026-07-28`, with a bounded legacy initialization-era layer), and drives a
 single Exodus instance through an authenticated local named pipe into a native
-C++ plugin. Currently **80 analysis tools** cover the phased roadmap from
+C++ plugin. Currently **94 analysis tools** cover the phased roadmap from
 bridge/context foundations through VDP graphics, deterministic controlled
 experimentation, advanced analysis (ROM header parsing, memory map, snapshot
 memory search, watchpoint-triggered tracing, coverage, scripted experiments),
 evidence annotations, advanced debugging (conditional breakpoints, register
-conditions, backtraces, state diff), and deterministic replay — with optimistic
-concurrency (target generations, optional exclusive control lock), a global
-target audit stream, and versioned capture provenance. See the
+conditions, backtraces, state diff), deterministic replay, and continuous trace
+sessions with per-occurrence read/write capture, durable manifests, and restart
+recovery — with optimistic concurrency (target generations, optional exclusive
+control lock), a global target audit stream, and versioned capture provenance.
+See the
 [feature catalog](docs/FEATURES.md) for the delivered
 scope and the [roadmap](docs/ROADMAP.md) for planned work.
 
@@ -85,6 +87,12 @@ modern and legacy dispatchers. An overview by roadmap phase:
   `state_diff`.
 - **Phase 8 (deterministic replay):** `deterministic_replay` (record and
   verify frame-for-frame determinism of an input sequence).
+- **Phase 10 (continuous trace sessions):** `trace_session_start`,
+  `trace_session_status`, `trace_session_events`, `trace_session_stop` —
+  sampled or continuous instruction capture while the emulator keeps running,
+  with bounded server-side accumulation, read/write observation counters,
+  explicit loss reporting, and JSONL export. See
+  [TRACE-SESSIONS.md](docs/TRACE-SESSIONS.md) for the native limits.
 
 Every tool response is a bounded summary; high-volume output lands in an
 immutable artifact. See [FEATURES.md](docs/FEATURES.md) for the delivered
@@ -117,7 +125,7 @@ decoded. VDP data is reported with device-specific interpretation metadata.
 ```text
 cmd/exodus-mcp/       Go server entry point
 internal/             Go packages (mcp dispatcher, bridge client, analysis,
-                      artifact store, experiment runner, symbols)
+                      artifact store, experiment runner, symbols, tracing)
 native-plugin/        C++ Exodus extension (ExodusMcpPlugin.dll)
 docs/                 architecture, build, protocol, and CI documents
 scripts/              WSL build/run wrappers, live smoke, experiment fixtures
