@@ -37,8 +37,11 @@ Consequences that shape the API:
    cannot filter them, so every executed instruction inside the window is
    written. Untraced windows are unavoidable at realistic CPU speeds.
 2. Access records are per occurrence: a value, PC, width, direction, and cycle
-   belong to that access and are never inferred. With `access_capture:
-   "ranges"`, volume is bounded by watched traffic rather than by CPU speed.
+   belong to that access and are never inferred. A range matches any byte
+   touched by an access, not only its starting address. For example, a word
+   access at `0xFFFB48` overlaps the monitored GotFlag byte at `0xFFFB49`.
+   With `access_capture: "ranges"`, volume is bounded by watched traffic rather
+   than by CPU speed.
 3. The **previous value of a write** is reported only when the engine captured
    it. This fork does not perform a pre-write transparent read, so
    `previous_known` is `false` and the field is absent rather than guessed.

@@ -144,6 +144,20 @@ void TestBoundaryAddresses()
 	}
 }
 
+void TestAccessRangeOverlap()
+{
+	// GotFlag is at odd address 0xFFFB49. A word write beginning at 0xFFFB48
+	// touches that byte and must be retained by a one-byte monitored range.
+	Check(MemoryAccessRangeOverlapsAccess(0xFFFB49, 0xFFFB49, 0xFFFB48, 16),
+		"a word access starting before the watched byte overlaps it");
+	Check(MemoryAccessRangeOverlapsAccess(0xFFFB48, 0xFFFB48, 0xFFFB48, 16),
+		"a word access overlaps its first byte");
+	Check(!MemoryAccessRangeOverlapsAccess(0xFFFB4A, 0xFFFB4A, 0xFFFB48, 16),
+		"a word access does not overlap the following byte");
+	Check(!MemoryAccessRangeOverlapsAccess(0xFFFB49, 0xFFFB49, 0xFFFB48, 8),
+		"a byte access at the preceding address does not overlap the watched byte");
+}
+
 void TestLargeValues()
 {
 	MemoryAccessLogRecord record = MakeRecord();
@@ -189,6 +203,7 @@ int main()
 	TestWriteRecordWithPreviousAndRegisters();
 	TestWidthEncoding();
 	TestBoundaryAddresses();
+	TestAccessRangeOverlap();
 	TestLargeValues();
 	TestRegisterCap();
 	if (failures != 0)

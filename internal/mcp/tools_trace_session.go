@@ -26,11 +26,12 @@ import (
 //   - Execution events are per-instruction and come from the engine's own
 //     trace file: full fidelity inside a capture window, sampled across
 //     windows in "sampled" mode.
-//   - Read/write events are aggregate hit counters of non-breaking
-//     watchpoints. The engine exposes no per-access record, so no value, PC,
-//     or per-access timestamp is claimed.
-//   - Native address filtering does not exist: address filters are applied
-//     when events are retained/exported, not when the engine writes them.
+//   - Read/write observation ranges can use non-breaking watchpoint counters
+//     and, when access_capture is "ranges" or "all", native per-access records
+//     with PC, cycle, transferred value, width, and optional registers.
+//   - The execution trace has no native address filter. Access-capture ranges
+//     are filtered natively, including accesses whose byte width overlaps a
+//     watched byte; event-query filters are applied to retained records.
 
 const (
 	traceSessionDefaultWindowMs      = 100
@@ -69,7 +70,7 @@ func traceSessionToolSpecs() []toolSpec {
 	return []toolSpec{
 		{
 			name:        "trace_session_start",
-			description: "Start a persistent, non-pausing trace session. The native plugin keeps the processor trace file enabled for a configurable window inside each interval (mode sampled, default) or continuously (mode continuous, rotate only by segment age), writing sealed segment files that this server drains into a bounded event store. The system is never paused: capture windows arm the engine's own trace writer, and read/write observation ranges use non-breaking watchpoints whose hit counters are sampled. Execution events are per executed instruction (PC, opcode text, cycle, and the engine's nanosecond timestamp); read/write events are aggregate hit counts per watched range, because the engine exposes no per-access record. The session auto-stops at max_duration_ms, keeps at most max_segments/max_total_bytes on disk (evictions are reported as loss), and starting a new session retires the previous one. Accepts optional expected_target_generation and control_id.",
+			description: "Start a persistent, non-pausing trace session. The native plugin captures execution trace lines in sampled windows (default) or continuously, and can also record each read/write access. Set access_capture to \"ranges\" to record individual accesses overlapping the configured watches, or \"all\" to record every access; the default \"off\" keeps only aggregate watch counters. Per-access records include monotonic sequence, cycle, PC, direction, width, transferred value, and (by default for ranges) a same-instant register snapshot. Access ranges are filtered natively; execution-trace address filters are post-capture. The session auto-stops at max_duration_ms and enforces segment/event/byte caps with explicit loss reporting. Starting a new session retires the previous one. Accepts optional expected_target_generation and control_id.",
 			schema: objectSchema(map[string]any{
 				"cpu":             enumProperty("Processor to trace.", []string{"m68k", "z80"}),
 				"mode":            enumProperty("sampled (default) captures window_ms of every interval_ms and leaves the engine untouched in between; continuous keeps the trace writer enabled and rotates only by segment_ms.", []string{"sampled", "continuous"}),
@@ -84,7 +85,7 @@ func traceSessionToolSpecs() []toolSpec {
 				"start_guard":     enumProperty("Configuration guard. \"none\" (default) arms tracing while the system keeps running; \"quiet\" stops the system for the configuration calls and restores the prior run state (a sub-millisecond pause, reported as a pause in the response).", []string{"none", "quiet"}),
 				"watches": map[string]any{
 					"type":        "array",
-					"description": fmt.Sprintf("Read/write observation ranges (max %d). Each arms a non-breaking watchpoint: hits are counted, execution is never paused, and no per-access value or PC is recorded.", traceSessionMaxWatches),
+					"description": fmt.Sprintf("Read/write address ranges (max %d). Non-breaking watchpoint counters are always sampled. With access_capture=\"ranges\", every access whose byte width overlaps a watched byte is recorded individually; execution is never paused.", traceSessionMaxWatches),
 					"items": map[string]any{
 						"type":                 "object",
 						"additionalProperties": false,
@@ -97,7 +98,7 @@ func traceSessionToolSpecs() []toolSpec {
 					},
 					"maxItems": traceSessionMaxWatches,
 				},
-				"access_capture":             enumProperty("Per-occurrence read/write capture. \"off\" (default) records only aggregate watch counters; \"ranges\" records every access inside the configured watch ranges (the engine filters natively, so out-of-range accesses are never written); \"all\" records every access of the processor and is only viable for short windows. Access records carry sequence, cycle, PC, direction, width, transferred value, and an optional same-instant register snapshot.", []string{"off", "ranges", "all"}),
+				"access_capture":             enumProperty("Per-occurrence read/write capture. \"off\" (default) records only aggregate watch counters; \"ranges\" records every access whose transferred byte width overlaps a configured watch range (native filtering); \"all\" records every access of the processor and is only viable for short windows. Access records carry sequence, cycle, PC, direction, width, transferred value, and an optional same-instant register snapshot.", []string{"off", "ranges", "all"}),
 				"access_include_registers":   booleanProperty("Capture a same-instant register snapshot with every access record (default true for ranges, false for all)."),
 				"access_max_bytes":           integerProperty(fmt.Sprintf("Retention cap for per-access segment files (default %d, range %d-%d); exceeding it evicts the oldest sealed access segments and reports the loss.", traceSessionDefaultAccessBytes, traceSessionMinAccessBytes, traceSessionMaxAccessBytes), 1),
 				"address_space":              stringProperty("Optional domain shared by the watch addresses; omitted means the traced processor bus."),
@@ -121,7 +122,7 @@ func traceSessionToolSpecs() []toolSpec {
 		},
 		{
 			name:        "trace_session_events",
-			description: "Query the accumulated events of the trace session: bounded inline events, a per-address execution histogram, aggregate read/write watch counters, and an optional JSONL artifact with every retained event matching the filters. Filters (kind, address range, cycle range) are applied to retained events; address filtering happens after capture because the engine cannot filter natively. Runs the same drain as trace_session_status first (unless collect=false). Never pauses the system.",
+			description: "Query accumulated trace-session data: bounded execution events and histogram, aggregate watch-counter samples, and—when access_capture was set to \"ranges\" or \"all\"—individual read/write access events with PC, cycle, width, value, and optional registers. Filters and optional JSONL export operate on retained events; access ranges are filtered natively, while execution-address filters are post-capture. Drains native segments first unless collect=false. Never pauses the system.",
 			schema: objectSchema(map[string]any{
 				"kind":                   enumProperty("Event kind to select.", []string{"execute", "read", "write", "any"}),
 				"address_range_start":    addressProperty(),
