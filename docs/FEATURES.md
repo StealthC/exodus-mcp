@@ -760,82 +760,64 @@ claim to the exact test function or smoke-script check that proves it.
 ## Deterministic replay (Phase 8)
 
 - `deterministic_replay`: record and replay one declarative input sequence
-  from the same saved state under exclusive control to verify frame-for-frame
-  determinism. Each step holds the listed buttons down on a player port for N
-  frames (`input_set` down, `frame_advance`×N, `input_set` up; frames 1-60,
-  up to 64 steps). The tool runs the sequence **three** times from the same
-  state — capturing per-step VDP frame tokens, per-step M68K register samples
-  and the final registers (pc/a7/d0) for every run — restores the initial state
-  afterwards (caller-provided `initial_state_id`, or a fresh snapshot of the
-  current machine), and reports `deterministic` true/false with named checks
-  plus a `replay-manifest/4` artifact recording all runs, the checks, and the
-  methodology. All runs share one code path, so a gating mismatch is a real
-  emulator nondeterminism signal rather than a harness artifact. The VDP render
-  counter is not part of a saved state and is never reset by `state_load`, so
-  absolute tokens are not comparable across the restore: every step is compared
-  as a delta from a `frame_token_baseline` captured at the start of its own run.
-  A target that is **running when the call arrives is paused before the first
-  restore**, not after it: a pause issued after the restore lets the machine
-  execute between `state_load` and the pause, so run 1 would observe frames run
-  2 never gets and a deterministic target would be reported as
-  nondeterministic (the reported defect, covered by
-  `TestDeterministicReplayRunningTargetStaysDeterministic`). Because of that
-  ordering, `pause_resume_cycle` and the per-run `initial_run_state_verified`
-  are informational: `initial_run_state_verified` is true only when the
-  machine was already paused before the run changed anything, and a run the
-  tool had to pause still reports `paused_start_confirmed` true and does not
-  weaken the verdict. Every restore that precedes stepping ends paused, and a
-  pause or run state the native echo cannot verify is reported, not assumed.
-  The final restore reloads the initial state and leaves the target in the run
-  state observed before the call (`run_state_restored`: `restored` when a
-  running target was resumed, `already_paused`, or
-  `resume_skipped_initial_run_state_unknown` when the server never observed
-  it).
-- `deterministic_replay` discards a warm-up pass. A target that was stopped to
-  enter the window still carries state the emulator does not restore (the
-  render counter is proven not to be restored, and flags/cycle remainders are
-  candidates), which can shift the first post-load instruction boundary. Run 1
-  is therefore reported with `warmup: true` and `warmup_note`, its differences
-  land in `warmup_divergences` (never in `divergences`, `diverged_step`, the
-  checks, or `unproven`), and `warmup_restore_fidelity` /
-  `warmup_restore_fidelity_fields` compare the run_1 and run_2 fingerprints —
-  the direct measure of that residual state. **Only run_2 vs run_3 decide the
-  verdict** (`runs_compared`), so `run1`/`run2` inside `diverged_step` and
-  `divergences` mean run_2 and run_3; the same divergence shape inside
-  `warmup_divergences` means run_1 and run_2 (the live finding this addresses
-  was a one-count `m68k_d0` skew in the first run after a stop, covered by
-  `TestDeterministicReplayWarmupAbsorbsFirstRunSkew`).
-- `deterministic_replay` splits frame-level from register-level evidence,
-  because `state_load` is not bit-exact on this emulator. Each run fingerprints
-  the state its restore produced before any input (`restore_fingerprints`,
-  keyed by phase): M68K pc/a7/d0, the condition codes when the register payload
-  exposes them (`ccr`, or sr's low five bits), and the absolute render token.
-  `restore_fidelity_compare` lists the fields actually compared, so a build
-  without condition codes is visible instead of assumed; `restore_fidelity` is
-  `exact` when all compared fields agree, `not_exact` when any differs (with
-  `restore_fidelity_fields` naming them), and `unverified` when a register
-  fingerprint could not be read. **Frame evidence always gates**: the per-step
-  frame-token deltas and the frames advanced count against the verdict
-  regardless of fidelity. **Register evidence gates only when the restore was
-  proven exact**: on a `not_exact`/`unverified` restore `register_comparison` is
-  `advisory`, the observed register differences are listed in
-  `advisory_divergences` with both values and the step, and they do not accuse
-  the input sequence — a restore that lands an instruction boundary off would
-  otherwise be reported as sequence nondeterminism (covered by
-  `TestDeterministicReplayAdvisoryRegistersWhenRestoreIsNotExact`,
-  `TestDeterministicReplayCCRDifferenceDemotesRegisters` for the flag-only gap,
-  `TestDeterministicReplayGatesOnRunsTwoAndThree` for a genuine run_2/run_3
-  register divergence, and
-  `TestDeterministicReplayFrameDriftBetweenRunsTwoAndThree` for the frame axis
-  always gating). `determinism_scope` states what a verdict covers:
-  `frame_and_register` when the register axis gates, `frame_only` when it is
-  advisory. The render token is recorded in every fingerprint but excluded from
-  the fidelity comparison because it is never restored: its per-step deltas are
-  what the replay compares. A gating difference is reported
-  in `diverged_step` (`step`, `field`, `run1`, `run2`) when it belongs to one
-  step and in `divergences` otherwise, and an axis that could not be read (a
-  missing token, an unreadable register set, a counter that wrapped) is listed
-  in `unproven` and never counted as a match.
+  from the same saved state under exclusive control to verify **frame-for-frame
+  determinism of the input sequence**. Each step holds the listed buttons down on
+  a player port for N frames (`input_set` down, `frame_advance`×N, `input_set`
+  up; frames 1-60, up to 64 steps). The tool runs the sequence twice from the
+  same state — capturing per-step VDP frame tokens, per-step M68K register
+  samples and the final registers (pc/a7/d0) for every run — restores the
+  initial state afterwards (caller-provided `initial_state_id`, or a fresh
+  snapshot of the current machine), and reports `deterministic` true/false with
+  named checks plus a `replay-manifest/5` artifact recording every run, the
+  checks, and the methodology. The VDP render counter is not part of a saved
+  state and is never reset by `state_load`, so absolute tokens are not
+  comparable across the restore: every step is compared as a delta from a
+  `frame_token_baseline` captured at the start of its own run.
+- `deterministic_replay` gates on the **frame axis only** by default:
+  `frame_token_deltas_match`, `frames_advanced_match` and
+  `initial_run_state_paused` are the checks that decide `deterministic`, and
+  `determinism_scope` is `frame_only`. Register evidence is reported but
+  **advisory** (`register_evidence: "advisory"`, `register_evidence_note`): this
+  target's `state_load` is not instruction-exact — the render counter is
+  demonstrably not restored, and a mid-sequence `m68k_d0` ±1 skew appears even
+  when the start fingerprints (`restore_fingerprints`: pc/a7/d0, `ccr`, render
+  token) and the frame deltas are identical. Those differences go to
+  `advisory_divergences` with both values and the step, so nothing is hidden,
+  but they never accuse the input sequence (covered by
+  `TestDeterministicReplayRegistersAreAdvisoryByDefault`). `strict: true` is
+  opt-in for a target with instruction-exact save states: register differences
+  gate again (`register_evidence: "gating"`,
+  `determinism_scope: "frame_and_register"`, gating checks, `diverged_step` from
+  run_1/run_2) and is expected to report nondeterminism on the current build
+  (`TestDeterministicReplayStrictGatesRegisters`). The frame axis fails in both
+  modes (`TestDeterministicReplayFrameDeltaDivergenceFailsInBothModes`).
+  `restore_fidelity` / `restore_fidelity_fields` / `restore_fidelity_compare`
+  remain report-only evidence of how closely the compared restores matched, so
+  a stored manifest still explains what the emulator delivered.
+- `deterministic_replay` can add a discarded warm-up pass with `warmup: true`:
+  the sequence then runs three times, run_1 is reported with `warmup: true`,
+  `warmup_note`, `warmup_divergences` and `warmup_restore_fidelity*`, and the
+  verdict compares run_2 vs run_3 (`runs_compared`). It is off by default: live
+  validation showed the residual state after a stop also reaches run_2/run_3, so
+  the warm-up does not make register evidence stable and it costs one extra pass
+  (covered by `TestDeterministicReplayWarmupAbsorbsFirstRunSkew`).
+- `deterministic_replay` keeps the paused-start guarantee: a target that is
+  **running when the call arrives is paused before the first restore**, not
+  after it, so run 1 does not observe frames run 2 never gets
+  (`TestDeterministicReplayRunningTargetStaysDeterministic`). Because of that
+  ordering `pause_resume_cycle` and the per-run `initial_run_state_verified` are
+  informational: `initial_run_state_verified` is true only when the machine was
+  already paused before the run changed anything, and a run the tool had to
+  pause still reports `paused_start_confirmed` true. Every restore that precedes
+  stepping ends paused, a pause or run state the native echo cannot verify is
+  reported rather than assumed, and the final restore reloads the initial state
+  and leaves the target in the run state observed before the call
+  (`run_state_restored`: `restored` when a running target was resumed,
+  `already_paused`, or `resume_skipped_initial_run_state_unknown`). An axis that
+  could not be read is listed in `unproven` (gating) or `advisory_unproven`
+  (advisory) and never counted as a match; a gating difference is reported in
+  `diverged_step` (`step`, `field`, `run1`, `run2`) when it belongs to one step
+  and in `divergences` otherwise.
 
 ## Continuous trace sessions (Phase 10)
 

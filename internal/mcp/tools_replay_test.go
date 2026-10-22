@@ -46,6 +46,10 @@ type replayFakeConfig struct {
 	registerDrift bool
 	// registerDriftLoad selects the restore whose samples drift (default 2).
 	registerDriftLoad int
+	// registerDriftD0 adds to d0 on the same restore, modelling the reported
+	// live skew: an identical start fingerprint with a one-count d0 difference
+	// after the steps.
+	registerDriftD0 uint64
 	// restoreBiasLoad selects the restore whose machine state is off by biasPC
 	// and biasD0 bytes and whose condition codes are xored with biasCCR; 0
 	// disables it. This models a state_load that is not bit-exact: the machine
@@ -164,6 +168,9 @@ func replayFake(config replayFakeConfig) *fakeBridgeClient {
 			}
 			if config.registerDrift && loads == driftLoad(config.registerDriftLoad) && advances > 0 {
 				pc += 0x100
+			}
+			if config.registerDriftD0 != 0 && loads == driftLoad(config.registerDriftLoad) && advances > 0 {
+				d0 += config.registerDriftD0
 			}
 			conditionCodes := fmt.Sprintf(`,"ccr":%d`, ccr)
 			if config.omitCCR {
@@ -325,7 +332,8 @@ func TestDeterministicReplayDoesNotDependOnTokenReset(t *testing.T) {
 
 // TestDeterministicReplayReportsDivergedStep injects a per-step difference in a
 // compared run and asserts the response names the step and both observed values.
-// run1/run2 in the divergence are the compared phases run_2 and run_3.
+// run1/run2 in the divergence are the compared phases (run_1 and run_2 by
+// default).
 func TestDeterministicReplayReportsDivergedStep(t *testing.T) {
 	content := replayContent(t, replayFake(replayFakeConfig{startToken: 10, frameDriftStep: 1, frameDriftFrames: 2}),
 		`{"steps":[{"inputs":{"1":["a"]},"frames":2},{"inputs":{"1":["b"]},"frames":1}]}`)
@@ -339,8 +347,8 @@ func TestDeterministicReplayReportsDivergedStep(t *testing.T) {
 	if diverged["step"] != float64(1) || diverged["field"] != "frame_token_delta" {
 		t.Fatalf("diverged_step = %v, want step 1 / frame_token_delta", diverged)
 	}
-	if diverged["run1"] != float64(5) || diverged["run2"] != float64(3) {
-		t.Fatalf("diverged_step values = run_2 %v run_3 %v, want 5 and 3", diverged["run1"], diverged["run2"])
+	if diverged["run1"] != float64(3) || diverged["run2"] != float64(5) {
+		t.Fatalf("diverged_step values = run_1 %v run_2 %v, want 3 and 5", diverged["run1"], diverged["run2"])
 	}
 	checks := replayChecks(content)
 	if check := checks["frame_token_deltas_match"]; check == nil || check["passed"] != false {
@@ -355,37 +363,151 @@ func TestDeterministicReplayReportsDivergedStep(t *testing.T) {
 	}
 }
 
-// TestDeterministicReplayRegistersAttributeDivergenceToStep injects a CPU-state
-// difference that leaves the frame count untouched. The two restores are
-// identical, so the register axis gates and the difference is a real verdict.
-func TestDeterministicReplayRegistersAttributeDivergenceToStep(t *testing.T) {
-	content := replayContent(t, replayFake(replayFakeConfig{registerDrift: true}),
-		`{"steps":[{"inputs":{"1":["a"]},"frames":1}]}`)
+// TestDeterministicReplayFrameDeltaDivergenceFailsInBothModes proves the frame
+// axis is what the verdict certifies: a different number of frames advanced fails
+// with and without strict.
+func TestDeterministicReplayFrameDeltaDivergenceFailsInBothModes(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		strict bool
+		scope  string
+	}{
+		{"default", false, "frame_only"},
+		{"strict", true, "frame_and_register"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			arguments := `{"steps":[{"inputs":{"1":["a"]},"frames":2}]}`
+			if tc.strict {
+				arguments = `{"steps":[{"inputs":{"1":["a"]},"frames":2}],"strict":true}`
+			}
+			content := replayContent(t, replayFake(replayFakeConfig{frameDriftStep: 0, frameDriftFrames: 2}), arguments)
+			if content["deterministic"] != false {
+				t.Fatalf("deterministic = %v, want false", content["deterministic"])
+			}
+			if content["determinism_scope"] != tc.scope {
+				t.Fatalf("determinism_scope = %v, want %v", content["determinism_scope"], tc.scope)
+			}
+			diverged, ok := content["diverged_step"].(map[string]any)
+			if !ok || diverged["field"] != "frame_token_delta" {
+				t.Fatalf("diverged_step = %v, want a frame_token_delta divergence", content["diverged_step"])
+			}
+			if checks := replayChecks(content); checks["frame_token_deltas_match"]["passed"] != false || checks["frame_token_deltas_match"]["gating"] != true {
+				t.Fatalf("frame_token_deltas_match = %v, want a failed gating check", checks["frame_token_deltas_match"])
+			}
+		})
+	}
+}
+
+// TestDeterministicReplayRegistersAreAdvisoryByDefault is the regression test
+// for the fourth live finding: the same restored image produces frame-identical
+// runs whose M68K samples differ by one count (d0 255 vs 256) even when the start
+// fingerprints match. Register equality is not a property this emulator delivers,
+// so the default verdict is frame-level and the register difference is reported
+// as advisory evidence.
+func TestDeterministicReplayRegistersAreAdvisoryByDefault(t *testing.T) {
+	content := replayContent(t, replayFake(replayFakeConfig{registerDriftD0: 1}),
+		`{"steps":[{"inputs":{"1":["a"]},"frames":3}]}`)
+
+	if content["deterministic"] != true {
+		t.Fatalf("deterministic = %v, want true (the frames match): %v", content["deterministic"], content)
+	}
+	if content["determinism_scope"] != "frame_only" {
+		t.Fatalf("determinism_scope = %v, want frame_only", content["determinism_scope"])
+	}
+	if content["register_evidence"] != "advisory" {
+		t.Fatalf("register_evidence = %v, want advisory", content["register_evidence"])
+	}
+	if note, _ := content["register_evidence_note"].(string); !strings.Contains(note, "not instruction-exact") {
+		t.Fatalf("register_evidence_note does not explain the advisory axis: %q", note)
+	}
+	if content["strict"] != false || content["warmup"] != false {
+		t.Fatalf("strict = %v warmup = %v, want the default modes", content["strict"], content["warmup"])
+	}
+	if compared, _ := content["runs_compared"].([]any); len(compared) != 2 || compared[0] != "run_1" || compared[1] != "run_2" {
+		t.Fatalf("runs_compared = %v, want [run_1 run_2]", content["runs_compared"])
+	}
+	if _, exists := content["run_3"]; exists {
+		t.Fatalf("run_3 present without warmup: %v", content["run_3"])
+	}
+	if _, exists := content["warmup_divergences"]; exists {
+		t.Fatalf("warmup_divergences present without warmup: %v", content["warmup_divergences"])
+	}
+	// The difference must not be a gating divergence, but it must stay visible
+	// with both values and the step.
+	if divergences, exists := content["divergences"]; exists {
+		t.Fatalf("divergences = %v, want none: register evidence is advisory by default", divergences)
+	}
+	if _, exists := content["diverged_step"]; exists {
+		t.Fatalf("diverged_step reported for advisory register evidence: %v", content["diverged_step"])
+	}
+	advisories, _ := content["advisory_divergences"].([]any)
+	if len(advisories) == 0 {
+		t.Fatalf("advisory_divergences missing: %v", content)
+	}
+	found := false
+	for _, entry := range advisories {
+		divergence, _ := entry.(map[string]any)
+		if divergence["field"] != "step_registers.m68k_d0" || divergence["step"] != float64(0) {
+			continue
+		}
+		found = true
+		if first, ok := divergence["run1"].(float64); !ok || first != 3 {
+			t.Fatalf("advisory d0 run1 = %v, want 3", divergence["run1"])
+		}
+		if second, ok := divergence["run2"].(float64); !ok || second != 4 {
+			t.Fatalf("advisory d0 run2 = %v, want 4", divergence["run2"])
+		}
+	}
+	if !found {
+		t.Fatalf("advisory_divergences do not name step_registers.m68k_d0 at step 0: %v", advisories)
+	}
+	checks := replayChecks(content)
+	for _, name := range []string{"frame_token_deltas_match", "frames_advanced_match", "initial_run_state_paused"} {
+		if checks[name]["passed"] != true || checks[name]["gating"] != true {
+			t.Fatalf("%s = %v, want a passed gating check", name, checks[name])
+		}
+	}
+	for _, name := range []string{"step_registers_match", "final_registers_match"} {
+		if checks[name]["passed"] != false || checks[name]["gating"] != false {
+			t.Fatalf("%s = %v, want a failed advisory check", name, checks[name])
+		}
+	}
+}
+
+// TestDeterministicReplayStrictGatesRegisters proves the opt-in: with strict the
+// same d0 skew is a gating divergence, which is what a target with
+// instruction-exact save states would be expected to deliver.
+func TestDeterministicReplayStrictGatesRegisters(t *testing.T) {
+	content := replayContent(t, replayFake(replayFakeConfig{registerDriftD0: 1}),
+		`{"steps":[{"inputs":{"1":["a"]},"frames":3}],"strict":true}`)
 	if content["deterministic"] != false {
-		t.Fatalf("deterministic = %v, want false: %v", content["deterministic"], content)
+		t.Fatalf("deterministic = %v, want false under strict", content["deterministic"])
 	}
-	if content["restore_fidelity"] != "exact" || content["register_comparison"] != "gating" {
-		t.Fatalf("restore_fidelity = %v register_comparison = %v, want exact/gating", content["restore_fidelity"], content["register_comparison"])
+	if content["strict"] != true || content["register_evidence"] != "gating" {
+		t.Fatalf("strict = %v register_evidence = %v, want true/gating", content["strict"], content["register_evidence"])
 	}
-	if advisories, _ := content["advisory_divergences"].([]any); len(advisories) != 0 {
-		t.Fatalf("advisory_divergences = %v, want none for an exact restore", advisories)
+	if content["determinism_scope"] != "frame_and_register" {
+		t.Fatalf("determinism_scope = %v, want frame_and_register", content["determinism_scope"])
 	}
 	diverged, ok := content["diverged_step"].(map[string]any)
 	if !ok {
 		t.Fatalf("diverged_step missing: %v", content)
 	}
-	if diverged["field"] != "step_registers.m68k_pc" || diverged["step"] != float64(0) {
-		t.Fatalf("diverged_step = %v, want step 0 / step_registers.m68k_pc", diverged)
+	if diverged["field"] != "step_registers.m68k_d0" || diverged["step"] != float64(0) {
+		t.Fatalf("diverged_step = %v, want step 0 / step_registers.m68k_d0", diverged)
 	}
 	if diverged["run1"] == diverged["run2"] {
 		t.Fatalf("diverged_step reports identical values: %v", diverged)
 	}
 	checks := replayChecks(content)
-	if checks["frame_token_deltas_match"]["passed"] != true {
-		t.Fatalf("frame_token_deltas_match = %v, want true (the drift leaves the token deltas intact)", checks["frame_token_deltas_match"])
+	if checks["step_registers_match"]["gating"] != true || checks["step_registers_match"]["passed"] != false {
+		t.Fatalf("step_registers_match = %v, want a failed gating check", checks["step_registers_match"])
 	}
-	if checks["final_registers_match"]["passed"] != false || checks["final_registers_match"]["gating"] != true {
-		t.Fatalf("final_registers_match = %v, want a failed gating check", checks["final_registers_match"])
+	if checks["frame_token_deltas_match"]["passed"] != true {
+		t.Fatalf("frame_token_deltas_match = %v, want true (the frames match)", checks["frame_token_deltas_match"])
+	}
+	if advisories, _ := content["advisory_divergences"].([]any); len(advisories) != 0 {
+		t.Fatalf("advisory_divergences = %v, want none under strict", advisories)
 	}
 }
 
@@ -396,7 +518,7 @@ func TestDeterministicReplayRegistersAttributeDivergenceToStep(t *testing.T) {
 // sequence nondeterminism. The difference must stay visible as advisory
 // evidence instead of failing the verdict.
 func TestDeterministicReplayAdvisoryRegistersWhenRestoreIsNotExact(t *testing.T) {
-	content := replayContent(t, replayFake(replayFakeConfig{restoreBiasLoad: 3, biasPC: 4}),
+	content := replayContent(t, replayFake(replayFakeConfig{restoreBiasLoad: 2, biasPC: 4}),
 		`{"steps":[{"inputs":{"1":["a"]},"frames":2}]}`)
 
 	if content["deterministic"] != true {
@@ -405,8 +527,8 @@ func TestDeterministicReplayAdvisoryRegistersWhenRestoreIsNotExact(t *testing.T)
 	if content["restore_fidelity"] != "not_exact" {
 		t.Fatalf("restore_fidelity = %v, want not_exact", content["restore_fidelity"])
 	}
-	if content["register_comparison"] != "advisory" {
-		t.Fatalf("register_comparison = %v, want advisory", content["register_comparison"])
+	if content["register_evidence"] != "advisory" {
+		t.Fatalf("register_evidence = %v, want advisory", content["register_evidence"])
 	}
 	fields, _ := content["restore_fidelity_fields"].([]any)
 	if len(fields) != 1 || fields[0] != "m68k_pc" {
@@ -438,8 +560,8 @@ func TestDeterministicReplayAdvisoryRegistersWhenRestoreIsNotExact(t *testing.T)
 	// The fingerprints that justify the advisory comparison travel with the
 	// response, both values included.
 	fingerprints, _ := content["restore_fingerprints"].(map[string]any)
-	firstFingerprint, _ := fingerprints["run_2"].(map[string]any)
-	secondFingerprint, _ := fingerprints["run_3"].(map[string]any)
+	firstFingerprint, _ := fingerprints["run_1"].(map[string]any)
+	secondFingerprint, _ := fingerprints["run_2"].(map[string]any)
 	if firstFingerprint["m68k_pc"] == secondFingerprint["m68k_pc"] {
 		t.Fatalf("restore_fingerprints = %v, want differing pc values", fingerprints)
 	}
@@ -461,13 +583,13 @@ func TestDeterministicReplayAdvisoryRegistersWhenRestoreIsNotExact(t *testing.T)
 // frame axis always counts: an inexact restore never excuses a different
 // number of frames advanced.
 func TestDeterministicReplayFrameDriftGatesEvenWhenRestoreIsNotExact(t *testing.T) {
-	content := replayContent(t, replayFake(replayFakeConfig{restoreBiasLoad: 3, biasPC: 4, frameDriftStep: 0, frameDriftFrames: 2}),
+	content := replayContent(t, replayFake(replayFakeConfig{restoreBiasLoad: 2, biasPC: 4, frameDriftStep: 0, frameDriftFrames: 2}),
 		`{"steps":[{"inputs":{"1":["a"]},"frames":2}]}`)
 	if content["deterministic"] != false {
 		t.Fatalf("deterministic = %v, want false", content["deterministic"])
 	}
-	if content["restore_fidelity"] != "not_exact" || content["register_comparison"] != "advisory" {
-		t.Fatalf("restore_fidelity = %v register_comparison = %v, want not_exact/advisory", content["restore_fidelity"], content["register_comparison"])
+	if content["restore_fidelity"] != "not_exact" || content["register_evidence"] != "advisory" {
+		t.Fatalf("restore_fidelity = %v register_evidence = %v, want not_exact/advisory", content["restore_fidelity"], content["register_evidence"])
 	}
 	diverged, ok := content["diverged_step"].(map[string]any)
 	if !ok || diverged["field"] != "frame_token_delta" {
@@ -489,7 +611,7 @@ func TestDeterministicReplayFrameDriftGatesEvenWhenRestoreIsNotExact(t *testing.
 // observations, never failures.
 func TestDeterministicReplayWarmupAbsorbsFirstRunSkew(t *testing.T) {
 	content := replayContent(t, replayFake(replayFakeConfig{restoreBiasLoad: 1, biasD0: 1}),
-		`{"steps":[{"inputs":{"1":["a"]},"frames":3}]}`)
+		`{"steps":[{"inputs":{"1":["a"]},"frames":3}],"warmup":true}`)
 
 	if content["deterministic"] != true {
 		t.Fatalf("deterministic = %v, want true: %v", content["deterministic"], content)
@@ -538,11 +660,11 @@ func TestDeterministicReplayWarmupAbsorbsFirstRunSkew(t *testing.T) {
 	if compared, _ := content["runs_compared"].([]any); len(compared) != 2 || compared[0] != "run_2" || compared[1] != "run_3" {
 		t.Fatalf("runs_compared = %v, want [run_2 run_3]", content["runs_compared"])
 	}
-	if content["restore_fidelity"] != "exact" || content["register_comparison"] != "gating" {
-		t.Fatalf("restore_fidelity = %v register_comparison = %v, want exact/gating for runs 2 and 3", content["restore_fidelity"], content["register_comparison"])
+	if content["restore_fidelity"] != "exact" || content["register_evidence"] != "advisory" {
+		t.Fatalf("restore_fidelity = %v register_evidence = %v, want exact/advisory for runs 2 and 3", content["restore_fidelity"], content["register_evidence"])
 	}
-	if content["determinism_scope"] != "frame_and_register" {
-		t.Fatalf("determinism_scope = %v, want frame_and_register", content["determinism_scope"])
+	if content["determinism_scope"] != "frame_only" {
+		t.Fatalf("determinism_scope = %v, want frame_only", content["determinism_scope"])
 	}
 	for key, want := range map[string]bool{"run_1": true, "run_2": false, "run_3": false} {
 		if run := replayRun(t, content, key); run["warmup"] != want {
@@ -554,9 +676,9 @@ func TestDeterministicReplayWarmupAbsorbsFirstRunSkew(t *testing.T) {
 // TestDeterministicReplayGatesOnRunsTwoAndThree asserts a difference between the
 // compared runs is a genuine nondeterminism verdict, named with run 2 and run 3
 // values.
-func TestDeterministicReplayGatesOnRunsTwoAndThree(t *testing.T) {
+func TestDeterministicReplayWarmupStrictGatesOnTheComparedPasses(t *testing.T) {
 	content := replayContent(t, replayFake(replayFakeConfig{registerDrift: true, registerDriftLoad: 3}),
-		`{"steps":[{"inputs":{"1":["a"]},"frames":1}]}`)
+		`{"steps":[{"inputs":{"1":["a"]},"frames":1}],"warmup":true,"strict":true}`)
 	if content["deterministic"] != false {
 		t.Fatalf("deterministic = %v, want false: %v", content["deterministic"], content)
 	}
@@ -587,7 +709,7 @@ func TestDeterministicReplayGatesOnRunsTwoAndThree(t *testing.T) {
 // observations.
 func TestDeterministicReplayFrameDriftBetweenRunsTwoAndThree(t *testing.T) {
 	content := replayContent(t, replayFake(replayFakeConfig{frameDriftStep: 0, frameDriftFrames: 2, frameDriftLoad: 3}),
-		`{"steps":[{"inputs":{"1":["a"]},"frames":2}]}`)
+		`{"steps":[{"inputs":{"1":["a"]},"frames":2}],"warmup":true}`)
 	if content["deterministic"] != false {
 		t.Fatalf("deterministic = %v, want false", content["deterministic"])
 	}
@@ -606,8 +728,8 @@ func TestDeterministicReplayFrameDriftBetweenRunsTwoAndThree(t *testing.T) {
 // TestDeterministicReplayCCRDifferenceDemotesRegisters covers the flag gap the
 // pc/a7/d0 fingerprint cannot see: a condition-code difference between the
 // compared restores must demote the register axis to advisory.
-func TestDeterministicReplayCCRDifferenceDemotesRegisters(t *testing.T) {
-	content := replayContent(t, replayFake(replayFakeConfig{restoreBiasLoad: 3, biasCCR: 0x01}),
+func TestDeterministicReplayCCRDifferenceIsReportedInTheFingerprint(t *testing.T) {
+	content := replayContent(t, replayFake(replayFakeConfig{restoreBiasLoad: 2, biasCCR: 0x01}),
 		`{"steps":[{"inputs":{"1":["a"]},"frames":2}]}`)
 	if content["deterministic"] != true {
 		t.Fatalf("deterministic = %v, want true (the frames match): %v", content["deterministic"], content)
@@ -621,12 +743,12 @@ func TestDeterministicReplayCCRDifferenceDemotesRegisters(t *testing.T) {
 	if compared, _ := content["restore_fidelity_compare"].([]any); len(compared) != 4 || compared[3] != "ccr" {
 		t.Fatalf("restore_fidelity_compare = %v, want pc/a7/d0 plus ccr", compared)
 	}
-	if content["register_comparison"] != "advisory" || content["determinism_scope"] != "frame_only" {
-		t.Fatalf("register_comparison = %v determinism_scope = %v, want advisory/frame_only", content["register_comparison"], content["determinism_scope"])
+	if content["register_evidence"] != "advisory" || content["determinism_scope"] != "frame_only" {
+		t.Fatalf("register_evidence = %v determinism_scope = %v, want advisory/frame_only", content["register_evidence"], content["determinism_scope"])
 	}
 	fingerprints, _ := content["restore_fingerprints"].(map[string]any)
-	first, _ := fingerprints["run_2"].(map[string]any)
-	second, _ := fingerprints["run_3"].(map[string]any)
+	first, _ := fingerprints["run_1"].(map[string]any)
+	second, _ := fingerprints["run_2"].(map[string]any)
 	if first["ccr"] == second["ccr"] {
 		t.Fatalf("restore_fingerprints = %v, want differing ccr values", fingerprints)
 	}
@@ -689,32 +811,48 @@ func TestDeterministicReplayUnreadableTokenIsNotProven(t *testing.T) {
 	}
 }
 
-// TestDeterministicReplayUnreadableRegistersAreNotProven covers the register
-// axis of the same rule.
-func TestDeterministicReplayUnreadableRegistersAreNotProven(t *testing.T) {
+// TestDeterministicReplayUnreadableRegistersAreAdvisoryByDefault covers the
+// register axis of the unproven rule after the default became frame-level: an
+// unreadable register sample never fails a frame verdict, but it is reported and
+// it gates again under strict.
+func TestDeterministicReplayUnreadableRegistersAreAdvisoryByDefault(t *testing.T) {
 	content := replayContent(t, replayFake(replayFakeConfig{unreadableRegisters: true}),
 		`{"steps":[{"inputs":{"1":["a"]},"frames":1}]}`)
-	if content["deterministic"] != false {
-		t.Fatalf("deterministic = %v, want false when registers are unreadable", content["deterministic"])
+	if content["deterministic"] != true {
+		t.Fatalf("deterministic = %v, want true: unreadable register data is advisory by default", content["deterministic"])
 	}
-	unproven, _ := content["unproven"].([]any)
-	if len(unproven) < 2 {
-		t.Fatalf("unproven = %v, want per-run register reasons", unproven)
+	if content["restore_fidelity"] != "unverified" || content["register_evidence"] != "advisory" {
+		t.Fatalf("restore_fidelity = %v register_evidence = %v, want unverified/advisory", content["restore_fidelity"], content["register_evidence"])
+	}
+	advisoryUnproven, _ := content["advisory_unproven"].([]any)
+	if len(advisoryUnproven) < 2 {
+		t.Fatalf("advisory_unproven = %v, want per-run register reasons", advisoryUnproven)
+	}
+	if gating, _ := content["unproven"].([]any); len(gating) != 0 {
+		t.Fatalf("unproven = %v, want none on the frame axis", gating)
 	}
 	checks := replayChecks(content)
-	if checks["step_registers_match"]["passed"] != false || checks["final_registers_match"]["passed"] != false {
-		t.Fatalf("register checks = %v / %v, want both failed", checks["step_registers_match"], checks["final_registers_match"])
+	if checks["frame_token_deltas_match"]["passed"] != true || checks["frame_token_deltas_match"]["gating"] != true {
+		t.Fatalf("frame_token_deltas_match = %v, want a passed gating check", checks["frame_token_deltas_match"])
 	}
-	if checks["frame_token_deltas_match"]["passed"] != true {
-		t.Fatalf("frame_token_deltas_match = %v, want true (tokens stay readable)", checks["frame_token_deltas_match"])
+	for _, name := range []string{"step_registers_match", "final_registers_match"} {
+		if checks[name]["passed"] != false || checks[name]["gating"] != false {
+			t.Fatalf("%s = %v, want a failed advisory check", name, checks[name])
+		}
 	}
-	// An unreadable fingerprint cannot prove the restore was exact, so the
-	// register axis is advisory and the verdict fails on the unproven data.
-	if content["restore_fidelity"] != "unverified" || content["register_comparison"] != "advisory" {
-		t.Fatalf("restore_fidelity = %v register_comparison = %v, want unverified/advisory", content["restore_fidelity"], content["register_comparison"])
+
+	// The same fixture under strict must fail: register data that cannot be read
+	// is never counted as a match when registers gate.
+	strict := replayContent(t, replayFake(replayFakeConfig{unreadableRegisters: true}),
+		`{"steps":[{"inputs":{"1":["a"]},"frames":1}],"strict":true}`)
+	if strict["deterministic"] != false {
+		t.Fatalf("deterministic = %v, want false under strict", strict["deterministic"])
 	}
-	if checks["step_registers_match"]["gating"] != false {
-		t.Fatalf("step_registers_match = %v, want a non-gating check", checks["step_registers_match"])
+	if unproven, _ := strict["unproven"].([]any); len(unproven) == 0 {
+		t.Fatalf("unproven = %v, want the unreadable register reasons under strict", strict["unproven"])
+	}
+	if strictChecks := replayChecks(strict); strictChecks["step_registers_match"]["gating"] != true {
+		t.Fatalf("step_registers_match = %v, want a gating check under strict", strictChecks["step_registers_match"])
 	}
 }
 
@@ -784,14 +922,14 @@ func TestDeterministicReplayRunningTargetStaysDeterministic(t *testing.T) {
 			}
 		}
 	}
-	if len(loads) != 4 {
-		t.Fatalf("state_load calls = %d, want 4 (initial, two between runs, final)", len(loads))
+	if len(loads) != 3 {
+		t.Fatalf("state_load calls = %d, want 3 (initial, between runs, final)", len(loads))
 	}
 	if len(pauses) != 1 || pauses[0] > loads[0] {
 		t.Fatalf("pause calls = %v, want exactly one before the first state_load at call %d", pauses, loads[0])
 	}
-	if len(resumes) != 1 || resumes[0] < loads[3] {
-		t.Fatalf("run calls = %v, want exactly one after the final state_load at call %d", resumes, loads[3])
+	if len(resumes) != 1 || resumes[0] < loads[2] {
+		t.Fatalf("run calls = %v, want exactly one after the final state_load at call %d", resumes, loads[2])
 	}
 	// The target must be left in the run state it had before the call.
 	if content["entry_run_state"] != "running" {
@@ -940,7 +1078,7 @@ func TestDeterministicReplayManifestRecordsBaselines(t *testing.T) {
 	if err := json.Unmarshal(raw, &manifest); err != nil {
 		t.Fatalf("decode manifest: %v", err)
 	}
-	if manifest["schema_version"] != "replay-manifest/4" {
+	if manifest["schema_version"] != "replay-manifest/5" {
 		t.Fatalf("schema_version = %v, want replay-manifest/4", manifest["schema_version"])
 	}
 	if manifest["frame_token_comparison"] != "per_step_delta_from_run_baseline" {
@@ -966,43 +1104,42 @@ func TestDeterministicReplayManifestRecordsBaselines(t *testing.T) {
 	if manifest["run_state_restored"] != "already_paused" || manifest["resumed_after_restore"] != false {
 		t.Fatalf("manifest run_state_restored = %v resumed_after_restore = %v, want already_paused/false", manifest["run_state_restored"], manifest["resumed_after_restore"])
 	}
-	// The manifest must carry the restore-fidelity split, so a stored artifact
-	// explains why a register difference did or did not count.
-	if manifest["restore_fidelity"] != "exact" || manifest["register_comparison"] != "gating" {
-		t.Fatalf("manifest restore_fidelity = %v register_comparison = %v, want exact/gating", manifest["restore_fidelity"], manifest["register_comparison"])
+	// The manifest must carry the mode contract and the register evidence, so a
+	// stored artifact explains what the verdict certified.
+	if manifest["restore_fidelity"] != "exact" || manifest["register_evidence"] != "advisory" {
+		t.Fatalf("manifest restore_fidelity = %v register_evidence = %v, want exact/advisory", manifest["restore_fidelity"], manifest["register_evidence"])
+	}
+	if manifest["strict"] != false || manifest["warmup"] != false {
+		t.Fatalf("manifest strict = %v warmup = %v, want the default modes", manifest["strict"], manifest["warmup"])
+	}
+	if note, _ := manifest["register_evidence_note"].(string); !strings.Contains(note, "strict") {
+		t.Fatalf("manifest register_evidence_note does not point at strict: %q", note)
 	}
 	if advisories, ok := manifest["advisory_divergences"].([]any); !ok || len(advisories) != 0 {
 		t.Fatalf("manifest advisory_discoveries = %v, want an empty array", manifest["advisory_divergences"])
 	}
 	fingerprints, _ := manifest["restore_fingerprints"].(map[string]any)
-	if first, _ := fingerprints["run_2"].(map[string]any); first["m68k_pc"] == nil {
+	if first, _ := fingerprints["run_1"].(map[string]any); first["m68k_pc"] == nil {
 		t.Fatalf("manifest restore_fingerprints = %v, want both fingerprints", fingerprints)
 	}
 	if note, _ := manifest["restore_fidelity_note"].(string); !strings.Contains(note, "excluded") {
 		t.Fatalf("manifest restore_fidelity_note does not explain the token exclusion: %q", note)
 	}
-	// The manifest records the three-pass protocol and which passes decided the
-	// verdict.
-	if manifest["warmup"] != true {
-		t.Fatalf("manifest warmup = %v, want true", manifest["warmup"])
+	// The manifest records the two-pass default and which passes decided the
+	// verdict; the warm-up fields exist only when the mode was requested.
+	if compared, _ := manifest["runs_compared"].([]any); len(compared) != 2 || compared[0] != "run_1" || compared[1] != "run_2" {
+		t.Fatalf("manifest runs_compared = %v, want [run_1 run_2]", manifest["runs_compared"])
 	}
-	if note, _ := manifest["warmup_note"].(string); !strings.Contains(note, "warm-up pass") {
-		t.Fatalf("manifest warmup_note does not explain the warm-up: %q", note)
-	}
-	if run3, ok := manifest["run_3"].(map[string]any); !ok || run3["phase"] != "run_3" {
-		t.Fatalf("manifest run_3 = %v, want the third pass", manifest["run_3"])
-	}
-	if compared, _ := manifest["runs_compared"].([]any); len(compared) != 2 || compared[0] != "run_2" || compared[1] != "run_3" {
-		t.Fatalf("manifest runs_compared = %v, want [run_2 run_3]", manifest["runs_compared"])
-	}
-	if manifest["determinism_scope"] != "frame_and_register" {
-		t.Fatalf("manifest determinism_scope = %v, want frame_and_register", manifest["determinism_scope"])
+	if manifest["determinism_scope"] != "frame_only" {
+		t.Fatalf("manifest determinism_scope = %v, want frame_only", manifest["determinism_scope"])
 	}
 	if fields, _ := manifest["restore_fidelity_compare"].([]any); len(fields) != 4 || fields[3] != "ccr" {
 		t.Fatalf("manifest restore_fidelity_compare = %v, want pc/a7/d0 plus ccr", fields)
 	}
-	if warmup, ok := manifest["warmup_divergences"].([]any); !ok || len(warmup) != 0 {
-		t.Fatalf("manifest warmup_divergences = %v, want an empty array", manifest["warmup_divergences"])
+	for _, absent := range []string{"run_3", "warmup_note", "warmup_divergences", "warmup_restore_fidelity"} {
+		if value, exists := manifest[absent]; exists {
+			t.Fatalf("manifest carries %s = %v without warmup", absent, value)
+		}
 	}
 	// The artifact envelope must not claim a live sample of a paused window.
 	provenance := mustMap(t, mustMap(t, descriptor["provenance"], "artifact provenance")["capture_consistency"], "capture consistency")
