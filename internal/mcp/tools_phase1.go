@@ -543,7 +543,7 @@ func readMemoryValue(tc toolContext, spaceID string, address uint64, length uint
 
 // readMemory renders one inline read, honoring the optional capture guard.
 func readMemory(tc toolContext, spaceID string, address uint64, length uint64, representation string, decode *decodeRequest, guard captureGuard) map[string]any {
-	return withCaptureGuard(tc, guard, func() (map[string]any, *toolFailure) {
+	return withCaptureGuard(tc, guard, func(*captureWindow) (map[string]any, *toolFailure) {
 		return readMemoryValue(tc, spaceID, address, length, representation, decode)
 	})
 }
@@ -741,7 +741,7 @@ func runMemoryDump(tc toolContext, args json.RawMessage) map[string]any {
 	if failure = guard.resolve(); failure != nil {
 		return failureResult(failure, tc.modern)
 	}
-	return withCaptureGuard(tc, guard, func() (map[string]any, *toolFailure) {
+	return withCaptureGuard(tc, guard, func(*captureWindow) (map[string]any, *toolFailure) {
 		return memoryDumpValue(tc, context, parsed.Space, address, parsed.Length)
 	})
 }

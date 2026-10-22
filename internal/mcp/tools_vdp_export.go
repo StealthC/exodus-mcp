@@ -123,7 +123,7 @@ func runVDPMemoryExport(tc toolContext, args json.RawMessage) map[string]any {
 	if failure = guard.resolve(); failure != nil {
 		return failureResult(failure, tc.modern)
 	}
-	export := func() (map[string]any, *toolFailure) {
+	export := func(*captureWindow) (map[string]any, *toolFailure) {
 		payload, failure := tc.server.executeCommand(tc.ctx, "vdp_mem_read", map[string]string{
 			"target":  parsed.Target,
 			"address": fmt.Sprintf("%d", address),

@@ -260,7 +260,7 @@ func runVDPMemoryRead(tc toolContext, args json.RawMessage) map[string]any {
 	if failure = guard.resolve(); failure != nil {
 		return failureResult(failure, tc.modern)
 	}
-	return withCaptureGuard(tc, guard, func() (map[string]any, *toolFailure) {
+	return withCaptureGuard(tc, guard, func(*captureWindow) (map[string]any, *toolFailure) {
 		return vdpMemoryReadValue(tc, parsed.Target, address, length, representation)
 	})
 }
@@ -400,7 +400,7 @@ func runFrameCapture(tc toolContext, args json.RawMessage) map[string]any {
 	if failure = guard.resolve(); failure != nil {
 		return failureResult(failure, tc.modern)
 	}
-	return withCaptureGuard(tc, guard, func() (map[string]any, *toolFailure) {
+	return withCaptureGuard(tc, guard, func(*captureWindow) (map[string]any, *toolFailure) {
 		return frameCaptureValue(tc, context)
 	})
 }
@@ -450,7 +450,7 @@ func runVDPCapture(tc toolContext, args json.RawMessage) map[string]any {
 	if failure = guard.resolve(); failure != nil {
 		return failureResult(failure, tc.modern)
 	}
-	return withCaptureGuard(tc, guard, func() (map[string]any, *toolFailure) {
+	return withCaptureGuard(tc, guard, func(*captureWindow) (map[string]any, *toolFailure) {
 		return vdpCaptureValue(tc, context, includeFrame, includeCRAM, includeVSRAM, includeVRAM, vramAddr, vramLen, includeSprite)
 	})
 }
