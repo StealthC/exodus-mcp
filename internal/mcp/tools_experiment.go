@@ -237,13 +237,12 @@ func experimentFailure(err error) *toolFailure {
 // full artifact.Artifact record.
 func experimentArtifactView(ref experiment.ArtifactRef, server *Server, contextID string) map[string]any {
 	descriptor := map[string]any{
-		"id":           ref.ID,
-		"kind":         ref.Kind,
-		"mime_type":    ref.MimeType,
-		"size_bytes":   ref.SizeBytes,
-		"sha256":       ref.SHA256,
-		"url":          fmt.Sprintf("%s/artifacts/%s?context=%s", server.baseURL, ref.ID, contextID),
-		"resource_uri": "exodus://artifacts/" + ref.ID,
+		"id":         ref.ID,
+		"kind":       ref.Kind,
+		"mime_type":  ref.MimeType,
+		"size_bytes": ref.SizeBytes,
+		"sha256":     ref.SHA256,
+		"url":        fmt.Sprintf("%s/artifacts/%s?context=%s", server.baseURL, ref.ID, contextID),
 	}
 	// Script artifacts have no capture provenance; report honestly.
 	descriptor["provenance"] = provenanceUnknownView()

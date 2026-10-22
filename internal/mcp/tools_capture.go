@@ -272,6 +272,7 @@ func runMemorySnapshotCapture(tc toolContext, args json.RawMessage) map[string]a
 	}
 	window.Consistency = atomicConsistency
 	readRanges := make([]map[string]any, 0, len(ranges))
+	captureComponents := make([]artifact.CaptureComponent, 0, len(ranges))
 	for _, entry := range ranges {
 		params := map[string]string{
 			"space":   space,
@@ -317,6 +318,7 @@ func runMemorySnapshotCapture(tc toolContext, args json.RawMessage) map[string]a
 		}
 		annotateAddressPair(rangeResult, space, entry.Address)
 		readRanges = append(readRanges, rangeResult)
+		captureComponents = append(captureComponents, captureComponentFromProvenance("memory:"+entry.Name, stored))
 	}
 
 	// Restore the prior run state and complete the window object once; the
@@ -398,6 +400,21 @@ func runMemorySnapshotCapture(tc toolContext, args json.RawMessage) map[string]a
 	// durable artifact and the response never describe different windows.
 	tc.server.store.FinalizeCaptureConsistency(window.ids(), atomicConsistency)
 	restampCaptureProvenance(result, view, atomicConsistency.State)
+	// The manifest and every range artifact now exist: index the capture so
+	// capture_get can resolve it later without this response.
+	generation := generationBefore
+	if failure := registerCapture(tc.server.store, artifact.Capture{
+		CaptureID:        captureID,
+		ContextID:        context.ID,
+		ProducerTool:     "memory_snapshot_capture",
+		ManifestArtifact: storedManifest.ID,
+		Components:       captureComponents,
+		FrameToken:       window.InitialToken,
+		TargetGeneration: &generation,
+		CreatedAt:        capturedAt,
+	}); failure != nil {
+		return failureResult(failure, tc.modern)
+	}
 	return okResult(stampGenerations(result, generationBefore, generationAfter), tc.modern)
 }
 

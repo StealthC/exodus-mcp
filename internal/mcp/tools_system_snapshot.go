@@ -168,6 +168,22 @@ func runSystemSnapshot(tc toolContext, args json.RawMessage) map[string]any {
 	window.Consistency = consistency
 	components := map[string]any{}
 	artifacts := []map[string]any{}
+	captureComponents := []artifact.CaptureComponent{}
+	var captureFrameToken *uint64
+	// markSkipped records a component the producer did not capture, in the
+	// manifest and in the capture index, so capture_get lists it instead of
+	// hiding it.
+	markSkipped := func(name string, unavailable bool, reason string) {
+		entry := map[string]any{"omitted": true}
+		if unavailable {
+			entry = map[string]any{"unavailable": true}
+		}
+		if reason != "" {
+			entry["reason"] = reason
+		}
+		components[name] = entry
+		captureComponents = append(captureComponents, omittedCaptureComponent(name, !unavailable, unavailable, reason))
+	}
 	fail := func(f *toolFailure) map[string]any {
 		window.closeWindow(tc, resume)
 		if f.Data == nil {
@@ -195,6 +211,7 @@ func runSystemSnapshot(tc toolContext, args json.RawMessage) map[string]any {
 		d := artifactDescriptor(tc.server, a, ctx.ID)
 		components[name] = d
 		artifacts = append(artifacts, d)
+		captureComponents = append(captureComponents, captureComponentFromProvenance(name, a))
 		return nil
 	}
 	addRaw := func(name, kind, space string, addr uint64, raw []byte, payload map[string]any) *toolFailure {
@@ -207,6 +224,7 @@ func runSystemSnapshot(tc toolContext, args json.RawMessage) map[string]any {
 		d := artifactDescriptor(tc.server, a, ctx.ID)
 		components[name] = d
 		artifacts = append(artifacts, d)
+		captureComponents = append(captureComponents, captureComponentFromProvenance(name, a))
 		return nil
 	}
 	for _, r := range ranges {
@@ -234,21 +252,21 @@ func runSystemSnapshot(tc toolContext, args json.RawMessage) map[string]any {
 			return fail(f)
 		}
 	} else {
-		components["m68k_registers"] = map[string]any{"omitted": true, "reason": "include_m68k_registers=false"}
+		markSkipped("m68k_registers", false, "include_m68k_registers=false")
 	}
 	if systemBool(p.IncludeZ80, true) {
 		if f := readJSON("z80_registers", "regs_get", map[string]string{"cpu": "z80"}, "system-z80-registers"); f != nil {
 			return fail(f)
 		}
 	} else {
-		components["z80_registers"] = map[string]any{"omitted": true}
+		markSkipped("z80_registers", false, "include_z80_registers=false")
 	}
 	if systemBool(p.IncludeVDPStatus, true) {
 		if f := readJSON("vdp_status", "vdp_status", nil, "system-vdp-status"); f != nil {
 			return fail(f)
 		}
 	} else {
-		components["vdp_status"] = map[string]any{"omitted": true}
+		markSkipped("vdp_status", false, "include_vdp_status=false")
 	}
 	for _, spec := range []struct {
 		name, target string
@@ -264,15 +282,15 @@ func runSystemSnapshot(tc toolContext, args json.RawMessage) map[string]any {
 				return fail(f)
 			}
 		} else {
-			components[spec.name] = map[string]any{"omitted": true, "reason": "not requested"}
+			markSkipped(spec.name, false, "not requested")
 		}
 	}
 	if systemBool(p.IncludeSpriteTable, true) {
 		// The native bridge does not expose a raw sprite-table operation. Do not
 		// substitute a status read and label it as sprite data.
-		components["sprite_table"] = map[string]any{"unavailable": true, "reason": "the native bridge does not expose sprite-table capture; use vdp_sprite_table after this manifest"}
+		markSkipped("sprite_table", true, "the native bridge does not expose sprite-table capture; use vdp_sprite_table after this manifest")
 	} else {
-		components["sprite_table"] = map[string]any{"omitted": true, "reason": "include_sprite_table=false"}
+		markSkipped("sprite_table", false, "include_sprite_table=false")
 	}
 	if systemBool(p.IncludeFrame, true) {
 		payload, f := tc.server.executeCommand(tc.ctx, "frame_capture", nil)
@@ -307,8 +325,12 @@ func runSystemSnapshot(tc toolContext, args json.RawMessage) map[string]any {
 		d := artifactDescriptor(tc.server, a, ctx.ID)
 		components["frame"] = d
 		artifacts = append(artifacts, d)
+		captureComponents = append(captureComponents, captureComponentFromProvenance("frame", a))
+		if t != 0 {
+			captureFrameToken = &t
+		}
 	} else {
-		components["frame"] = map[string]any{"omitted": true}
+		markSkipped("frame", false, "include_frame=false")
 	}
 	// Keep the renderer-facing relationship explicit and bounded. This is a
 	// derived artifact, not a second read window.
@@ -351,5 +373,21 @@ func runSystemSnapshot(tc toolContext, args json.RawMessage) map[string]any {
 	// complete its stored provenance, then re-stamp the response views.
 	tc.server.store.FinalizeCaptureConsistency(window.ids(), consistency)
 	restampCaptureProvenance(result, view, consistency.State)
+	// Every component and the manifest now exist: index the capture so
+	// capture_get resolves it without this response.
+	generation := genBefore
+	if failure := registerCapture(tc.server.store, artifact.Capture{
+		CaptureID:        captureID,
+		ContextID:        ctx.ID,
+		ProducerTool:     "system_snapshot_capture",
+		ManifestArtifact: stored.ID,
+		SchemaVersion:    systemSnapshotSchema,
+		Components:       captureComponents,
+		FrameToken:       captureFrameToken,
+		TargetGeneration: &generation,
+		CreatedAt:        at,
+	}); failure != nil {
+		return failureResult(failure, tc.modern)
+	}
 	return okResult(stampGenerations(result, genBefore, genAfter), tc.modern)
 }

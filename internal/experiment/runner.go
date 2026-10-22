@@ -486,13 +486,12 @@ func (runner *Runner) runPython(ctx context.Context, request RunRequest, result 
 				ref := runner.refOf(stored)
 				result.Artifacts = append(result.Artifacts, ref)
 				reply := map[string]any{
-					"id":           ref.ID,
-					"kind":         ref.Kind,
-					"mime_type":    ref.MimeType,
-					"size_bytes":   ref.SizeBytes,
-					"sha256":       ref.SHA256,
-					"url":          runner.artifactURL(request.ContextID, ref.ID),
-					"resource_uri": "exodus://artifacts/" + ref.ID,
+					"id":         ref.ID,
+					"kind":       ref.Kind,
+					"mime_type":  ref.MimeType,
+					"size_bytes": ref.SizeBytes,
+					"sha256":     ref.SHA256,
+					"url":        runner.artifactURL(request.ContextID, ref.ID),
 				}
 				if err := writeMessage(resultMessage{Type: messageResult, ID: published.ID, OK: true, Value: reply}); err != nil {
 					exitWhileReplying(result, waitCh, stdout)

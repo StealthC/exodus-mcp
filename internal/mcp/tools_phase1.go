@@ -3,6 +3,7 @@ package mcp
 import (
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strconv"
 	"strings"
@@ -16,21 +17,38 @@ func phase1ToolSpecs() []toolSpec {
 	return []toolSpec{
 		{
 			name:        "artifact_get",
-			description: "Return metadata plus the direct loopback download URL for one artifact. Raw bytes are never placed in this response.",
+			description: "Return one artifact's metadata, provenance envelope, and direct loopback download URL (raw bytes are never placed in this response): artifact id, kind, MIME type, size, SHA-256, created_at, expires_at (null when retention is unlimited), the payload's own schema_version when it declares one, and the capture_id when the artifact belongs to a capture. include selects the metadata and provenance sections (both by default).",
 			schema: objectSchema(map[string]any{
-				"artifact_id": stringProperty("Opaque artifact id returned by a producing tool."),
-				"context":     contextProperty(),
+				"artifact_id": stringProperty("Opaque artifact id returned by a producing tool or artifact_list."),
+				"include": map[string]any{
+					"type":        "array",
+					"description": "Sections to return; omitted means both. \"metadata\" adds the metadata block, \"provenance\" adds the typed provenance envelope.",
+					"items":       map[string]any{"type": "string", "enum": []string{"metadata", "provenance"}},
+				},
+				"context": contextProperty(),
 			}, []string{"artifact_id"}),
 			run: runArtifactGet,
 		},
 		{
 			name:        "artifact_describe",
-			description: "Return the full typed provenance envelope of one artifact: address domain (space, requested and effective addresses in decimal and canonical hex, byte length, byte order, raw-byte ordering), owning device, target generation, ROM identity, frame token, CPU run state, capture consistency, and capture time. Artifacts whose producer attached no capture metadata are reported honestly with the provenance_unknown state instead of invented fields.",
+			description: "DEPRECATED: use artifact_get with include [\"metadata\",\"provenance\"], which returns the same payload. Returns the full typed provenance envelope of one artifact: address domain (space, requested and effective addresses in decimal and canonical hex, byte length, byte order, raw-byte ordering), owning device, target generation, ROM identity, frame token, CPU run state, capture consistency, and capture time. Artifacts whose producer attached no capture metadata are reported honestly with the provenance_unknown state instead of invented fields.",
 			schema: objectSchema(map[string]any{
-				"artifact_id": stringProperty("Opaque artifact id returned by a producing tool."),
+				"artifact_id": stringProperty("Opaque artifact id returned by a producing tool or artifact_list."),
 				"context":     contextProperty(),
 			}, []string{"artifact_id"}),
 			run: runArtifactDescribe,
+		},
+		{
+			name:        "artifact_list",
+			description: "Enumerate the artifacts one analysis context holds, newest discovery for a new session or a lost response. Each descriptor carries artifact_id, kind, mime_type, size_bytes, sha256, created_at, expires_at (null when retention is unlimited), schema_version when the payload declares one, capture_id when the artifact belongs to a capture, and the direct download URL. Filters by kind and capture_id; pages by cursor/limit (default 50, cap 200) and reports total, returned, has_more, and next_cursor (null on the last page).",
+			schema: objectSchema(map[string]any{
+				"kind":       stringProperty("Exact artifact kind to list, for example \"memory-dump\" or \"vdp-capture-manifest\"."),
+				"capture_id": stringProperty("Only artifacts carrying this capture id, including a capture's manifest and its components."),
+				"cursor":     stringProperty("next_cursor from a previous artifact_list call; omitted starts at the first page."),
+				"limit":      integerProperty(fmt.Sprintf("Page size between 1 and %d (default %d).", artifact.MaxListLimit, artifact.DefaultListLimit), 1),
+				"context":    contextProperty(),
+			}, nil),
+			run: runArtifactList,
 		},
 		{
 			name:        "artifact_preview",
@@ -754,51 +772,115 @@ func runMemoryDump(tc toolContext, args json.RawMessage) map[string]any {
 // ----------------------------------------------------------------------------------------------------------------------
 // Artifacts
 // ----------------------------------------------------------------------------------------------------------------------
+
+// artifactDetailIncludeMetadata and artifactDetailIncludeProvenance are the
+// include tokens artifact_get accepts; both are on by default so a bare call
+// returns the merged artifact_describe payload.
+const (
+	artifactDetailIncludeMetadata   = "metadata"
+	artifactDetailIncludeProvenance = "provenance"
+)
+
 type artifactRefArgs struct {
-	ArtifactID string `json:"artifact_id"`
-	Context    string `json:"context"`
+	ArtifactID string   `json:"artifact_id"`
+	Context    string   `json:"context"`
+	Include    []string `json:"include"`
 }
 
+// artifactIncludeSelection resolves the include argument into two switches.
+// An empty list means both sections; an unknown token is rejected instead of
+// silently ignored.
+func artifactIncludeSelection(include []string) (metadata bool, provenance bool, failure *toolFailure) {
+	if len(include) == 0 {
+		return true, true, nil
+	}
+	for _, token := range include {
+		switch token {
+		case artifactDetailIncludeMetadata:
+			metadata = true
+		case artifactDetailIncludeProvenance:
+			provenance = true
+		default:
+			return false, false, &toolFailure{
+				Code:    "invalid_params",
+				Message: "include accepts \"metadata\" and \"provenance\"; omit it to receive both",
+				Data:    map[string]any{"value": token, "allowed": []string{artifactDetailIncludeMetadata, artifactDetailIncludeProvenance}},
+			}
+		}
+	}
+	return metadata, provenance, nil
+}
+
+// artifactSummaryView renders one artifact as a discovery descriptor: the facts a
+// client needs to decide whether to fetch it, including its retention. Listing
+// and capture resolution share it so one artifact always describes itself the
+// same way.
+func artifactSummaryView(server *Server, stored artifact.Artifact, contextID string) map[string]any {
+	view := map[string]any{
+		"artifact_id":      stored.ID,
+		"kind":             stored.Kind,
+		"mime_type":        stored.MimeType,
+		"size_bytes":       stored.SizeBytes,
+		"sha256":           stored.SHA256,
+		"created_at":       stored.CreatedAt,
+		"expires_at":       nil,
+		"url":              fmt.Sprintf("%s/artifacts/%s?context=%s", server.baseURL, stored.ID, contextID),
+		"provenance_state": artifact.ProvenanceStateUnknown,
+	}
+	if expiry := server.store.ExpiresAt(stored.CreatedAt); expiry != nil {
+		view["expires_at"] = *expiry
+	}
+	if stored.SchemaVersion != "" {
+		view["schema_version"] = stored.SchemaVersion
+	}
+	if stored.Provenance != nil {
+		view["provenance_state"] = stored.Provenance.State
+		if stored.Provenance.CaptureID != "" {
+			view["capture_id"] = stored.Provenance.CaptureID
+		}
+	}
+	return view
+}
+
+// artifactMetadataView is the artifactSummaryView metadata block of artifact_get:
+// the same facts, plus the owning context.
+func artifactMetadataView(server *Server, stored artifact.Artifact, contextID string) map[string]any {
+	view := artifactSummaryView(server, stored, contextID)
+	view["context_id"] = stored.ContextID
+	return view
+}
+
+// artifactRetrievalView is the stable download hint returned with artifact_get.
+func artifactRetrievalView() map[string]string {
+	return map[string]string{
+		"hint":  "Fetch the URL directly with curl or a script; HTTP byte ranges are supported. Use artifact_preview for a bounded in-context view.",
+		"range": "Range: bytes=<start>-<end>",
+	}
+}
+
+// runArtifactGet returns one artifact's metadata, provenance envelope, and direct
+// download URL. Raw bytes are never placed in this response.
 func runArtifactGet(tc toolContext, args json.RawMessage) map[string]any {
-	parsed, failure := decodeArgs[artifactRefArgs](args)
-	if failure != nil {
-		return failureResult(failure, tc.modern)
-	}
-	context, failure := resolveContext(tc.server, parsed.Context)
-	if failure != nil {
-		return failureResult(failure, tc.modern)
-	}
-	stored, err := tc.server.store.Metadata(parsed.ArtifactID, context.ID)
-	if err != nil {
-		return failureResult(&toolFailure{Code: "unknown_artifact", Message: err.Error()}, tc.modern)
-	}
-	return okResult(map[string]any{
-		"artifact": artifactDescriptor(tc.server, stored, context.ID),
-		"retrieval": map[string]string{
-			"hint":  "Fetch the URL directly with curl or a script; HTTP byte ranges are supported. Use artifact_preview for a bounded in-context view.",
-			"range": "Range: bytes=<start>-<end>",
-		},
-	}, tc.modern)
+	return artifactDetailResult(tc, args, false)
 }
 
-type artifactPreviewArgs struct {
-	ArtifactID string `json:"artifact_id"`
-	Offset     uint64 `json:"offset"`
-	Length     uint64 `json:"length"`
-	Mode       string `json:"mode"`
-	Context    string `json:"context"`
-}
-
-// runArtifactDescribe returns the full typed provenance envelope of one
-// artifact: the versioned envelope when the producer attached one, or the
-// honest provenance_unknown state for legacy artifacts. It never downloads
-// or previews bytes; artifact_preview stays the bounded byte-oriented view.
 func runArtifactDescribe(tc toolContext, args json.RawMessage) map[string]any {
+	return artifactDetailResult(tc, args, true)
+}
+
+// artifactDetailResult implements artifact_get and its deprecated alias. Both
+// return one payload so a caller can switch tools without re-reading fields;
+// the alias adds a deprecation note.
+func artifactDetailResult(tc toolContext, args json.RawMessage, deprecatedAlias bool) map[string]any {
 	parsed, failure := decodeArgs[artifactRefArgs](args)
 	if failure != nil {
 		return failureResult(failure, tc.modern)
 	}
 	context, failure := resolveContext(tc.server, parsed.Context)
+	if failure != nil {
+		return failureResult(failure, tc.modern)
+	}
+	wantMetadata, wantProvenance, failure := artifactIncludeSelection(parsed.Include)
 	if failure != nil {
 		return failureResult(failure, tc.modern)
 	}
@@ -807,21 +889,127 @@ func runArtifactDescribe(tc toolContext, args json.RawMessage) map[string]any {
 		return failureResult(&toolFailure{Code: "unknown_artifact", Message: err.Error()}, tc.modern)
 	}
 	result := map[string]any{
-		"artifact_id": stored.ID,
-		"kind":        stored.Kind,
-		"created_at":  stored.CreatedAt,
-		"sha256":      stored.SHA256,
-		"retrieval": map[string]string{
-			"hint":  "Fetch the URL directly with curl or a script; HTTP byte ranges are supported. Use artifact_preview for a bounded in-context view.",
-			"range": "Range: bytes=<start>-<end>",
-		},
+		"artifact_id":      stored.ID,
+		"kind":             stored.Kind,
+		"mime_type":        stored.MimeType,
+		"size_bytes":       stored.SizeBytes,
+		"sha256":           stored.SHA256,
+		"created_at":       stored.CreatedAt,
+		"expires_at":       nil,
+		"provenance_state": artifact.ProvenanceStateUnknown,
+		"artifact":         artifactDescriptor(tc.server, stored, context.ID),
+		"retrieval":        artifactRetrievalView(),
 	}
-	if stored.Provenance != nil {
-		result["provenance"] = provenanceEnvelopeView(*stored.Provenance)
-	} else {
-		result["provenance"] = provenanceUnknownView()
+	if expiry := tc.server.store.ExpiresAt(stored.CreatedAt); expiry != nil {
+		result["expires_at"] = *expiry
+	}
+	if stored.SchemaVersion != "" {
+		result["schema_version"] = stored.SchemaVersion
+	}
+	if wantMetadata {
+		result["metadata"] = artifactMetadataView(tc.server, stored, context.ID)
+	}
+	if wantProvenance {
+		if stored.Provenance != nil {
+			result["provenance"] = provenanceEnvelopeView(*stored.Provenance)
+			result["provenance_state"] = stored.Provenance.State
+			if stored.Provenance.CaptureID != "" {
+				result["capture_id"] = stored.Provenance.CaptureID
+			}
+		} else {
+			result["provenance"] = provenanceUnknownView()
+		}
+	}
+	if deprecatedAlias {
+		result["deprecated"] = map[string]any{
+			"code":             "artifact_describe_deprecated",
+			"replacement_tool": "artifact_get",
+			"replacement_args": map[string]any{"include": []string{artifactDetailIncludeMetadata, artifactDetailIncludeProvenance}},
+			"message":          "artifact_describe is a deprecated alias of artifact_get{include:[\"metadata\",\"provenance\"]} and returns the same payload. It stays available for one release and is removed afterwards.",
+		}
 	}
 	return okResult(result, tc.modern)
+}
+
+// ----------------------------------------------------------------------------------------------------------------------
+// Artifact listing (roadmap issue #10)
+// ----------------------------------------------------------------------------------------------------------------------
+type artifactListArgs struct {
+	Kind      string `json:"kind"`
+	CaptureID string `json:"capture_id"`
+	Cursor    string `json:"cursor"`
+	Limit     uint64 `json:"limit"`
+	Context   string `json:"context"`
+}
+
+// runArtifactList enumerates the artifacts of one analysis context so a new
+// session can discover what already exists instead of copying ids out of earlier
+// responses. Retention is part of every descriptor, so an expiry is visible
+// before a download fails.
+func runArtifactList(tc toolContext, args json.RawMessage) map[string]any {
+	parsed, failure := decodeArgs[artifactListArgs](args)
+	if failure != nil {
+		return failureResult(failure, tc.modern)
+	}
+	context, failure := resolveContext(tc.server, parsed.Context)
+	if failure != nil {
+		return failureResult(failure, tc.modern)
+	}
+	if parsed.CaptureID != "" && !artifact.ValidCaptureID(parsed.CaptureID) {
+		return failureResult(&toolFailure{Code: "invalid_params", Message: "capture_id must be a capture id issued by a capture tool (cap_...)"}, tc.modern)
+	}
+	limit := int(parsed.Limit)
+	if limit <= 0 {
+		limit = artifact.DefaultListLimit
+	}
+	if limit > artifact.MaxListLimit {
+		limit = artifact.MaxListLimit
+	}
+	page, err := tc.server.store.List(artifact.ListQuery{
+		ContextID: context.ID,
+		Kind:      parsed.Kind,
+		CaptureID: parsed.CaptureID,
+		Cursor:    parsed.Cursor,
+		Limit:     limit,
+	})
+	if err != nil {
+		code := "artifact_error"
+		if errors.Is(err, artifact.ErrInvalidCursor) {
+			code = "invalid_params"
+		}
+		return failureResult(&toolFailure{Code: code, Message: err.Error()}, tc.modern)
+	}
+	views := make([]map[string]any, 0, len(page.Artifacts))
+	for _, stored := range page.Artifacts {
+		views = append(views, artifactSummaryView(tc.server, stored, context.ID))
+	}
+	result := map[string]any{
+		"artifacts":   views,
+		"returned":    len(views),
+		"total":       page.Total,
+		"has_more":    page.HasMore,
+		"next_cursor": nil,
+		"context_id":  context.ID,
+		"limit":       limit,
+	}
+	if page.NextCursor != "" {
+		result["next_cursor"] = page.NextCursor
+	}
+	if parsed.Kind != "" {
+		result["kind"] = parsed.Kind
+	}
+	if parsed.CaptureID != "" {
+		result["capture_id"] = parsed.CaptureID
+	}
+	return okResult(result, tc.modern)
+}
+
+type artifactPreviewArgs struct {
+	ArtifactID string `json:"artifact_id"`
+	Offset     uint64 `json:"offset"`
+	Length     uint64 `json:"length"`
+	Mode       string `json:"mode"`
+	Context    string `json:"context"`
 }
 
 func runArtifactPreview(tc toolContext, args json.RawMessage) map[string]any {

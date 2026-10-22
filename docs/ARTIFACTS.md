@@ -37,11 +37,17 @@ Tools that can produce significant output return a descriptor built by
     "size_bytes": 1124059,
     "sha256": "...",
     "url": "http://127.0.0.1:8768/artifacts/art_01J...?context=default",
-    "resource_uri": "exodus://artifacts/art_01J...",
     "provenance_state": "complete",
     "provenance": { "artifact_schema": "artifact-provenance/2", "...": "..." }
   }
 }
+```
+
+Descriptors carry no `resource_uri`. Earlier revisions advertised
+`exodus://artifacts/<id>`, but the server never implemented an MCP `resources`
+endpoint, so the URI promised a retrieval path that did not exist. Dropping the
+field is the honest option (roadmap issue #10); the loopback `url` is the only
+served path, and `artifact_list` is the discovery path.
 ```
 
 The exact response is MCP `structuredContent` where the negotiated protocol
@@ -84,7 +90,7 @@ declares one fixed order and the result points back to that declaration.
 | Summary | Agent reasoning in context | Small, sanitized text or JSON |
 | Preview | Inspect a bounded portion | Explicit byte/line/token cap |
 | Direct URL | Scripts, `curl`, binary parsers | Full bytes, HTTP `Range` supported |
-| MCP resource | Discovery and small safe content | Bounded preview or metadata |
+| Listing (`artifact_list`) | Discovery of what a context already holds | Page of 50, cap 200 |
 | Derived artifact | Sanitized CSV/JSON/text/image from raw data | Tool-specific cap |
 
 Tools should expose an explicit output preference such as `output: "summary"`,
@@ -118,12 +124,59 @@ The endpoint never accepts filesystem paths, glob patterns, or arbitrary URLs.
 IDs are server-generated, capability-like values and artifacts are scoped to
 their analysis context.
 
+## Discovery and capture resolution
+
+Two tools make the store addressable without the original responses (roadmap
+issues #2 and #10):
+
+- `artifact_list{context, kind, capture_id, cursor, limit}` returns the artifacts
+  of one context in creation order, filtered by exact `kind` or by the
+  `capture_id` an artifact's provenance carries. Every descriptor reports
+  `artifact_id`, `kind`, `mime_type`, `size_bytes`, `sha256`, `created_at`,
+  `expires_at` (`null` when retention is unlimited), `schema_version` when the
+  payload declares one inside itself, `capture_id` when applicable, the download
+  `url`, and `provenance_state`. The response reports `total`, `returned`,
+  `has_more`, and `next_cursor` (`null` on the last page).
+- `capture_get{capture_id}` resolves a capture issued by
+  `memory_snapshot_capture`, `system_snapshot_capture`, or `vdp_capture` to the
+  tool that produced it, the target generation and frame token observed at
+  capture time, the manifest artifact (descriptor plus its parsed document when
+  it is bounded JSON), and one entry per component: artifact id, kind, MIME type,
+  size, hash, address domain, captured range, download URL, and whether the
+  component was omitted or unavailable and why. Components whose bytes retention
+  already removed report `available: false` instead of a dead URL.
+
+Both indexes are persisted. The artifact index lives in
+`<artifact-dir>/artifact-index.json` (`artifact-index/1`), is rewritten
+atomically on every write, and is loaded by `artifact.NewStore`, so a restarted
+server reopens the artifacts it wrote. Files no index entry claims are still
+removed at startup, so a partial write never becomes an artifact; an index
+document that cannot be parsed fails startup instead of silently discarding the
+artifacts it describes. The capture
+index is stored in the same document and follows the same rules; a capture whose
+artifacts expired stops resolving.
+
+**Context scope limits what survives:** artifacts and captures are keyed by the
+analysis context that produced them, and context handles are process-local
+(`internal/analysis`), so a restarted server reopens the bytes and the index but
+only serves them to handles that exist again. Listing a previous session's
+artifacts under a new context is not possible by design. Making the default
+context id stable, or persisting contexts next to the artifacts, is separate
+work.
+
 Retention today: `--artifact-ttl` / `EXODUS_MCP_ARTIFACT_TTL` expires artifacts
-on a startup sweep and a background sweep (`Store.ExpireOlderThan`). Two
-mechanisms named in earlier revisions are **not implemented**: explicit
-artifact deletion (no tool or HTTP method deletes an artifact) and cleanup at
-process exit (nothing runs on exit), so with unlimited retention the artifact
-directory grows until it is removed by hand.
+on a background sweep (`Store.ExpireOlderThan`, first tick after at most one
+minute). Two mechanisms named in earlier revisions are **not implemented**:
+explicit artifact deletion (no tool or HTTP method deletes an artifact) and
+cleanup at process exit (nothing runs on exit), so with unlimited retention the
+artifact directory grows until it is removed by hand.
+
+The store knows its retention from the last sweep (`SetRetention` is the
+explicit setter), so `artifact_get`, `artifact_list`, and `capture_get` report
+`expires_at` per artifact (`null` while retention is unlimited). A client can
+therefore see an expiry before a download fails. Because the retention is only
+learned when the sweeper first runs, `expires_at` is `null` for the first minute
+of a process that was started with a TTL and no persisted value.
 
 ## Artifact kinds
 
@@ -193,7 +246,8 @@ Every artifact produced from capture data carries `artifact-provenance/2`
 (`ProvenanceSchema` in `internal/artifact/artifact.go`) with
 `state: "complete"`. An artifact
 whose producer attached no metadata is reported as `provenance_unknown` by
-`artifact_describe` and by the descriptor (`provenance_state`), and no field is
+`artifact_get` (`include: ["provenance"]`), by its deprecated alias
+`artifact_describe`, and by the descriptor (`provenance_state`), and no field is
 invented. The envelope fields are:
 
 - `kind`, `state`, `artifact_schema`;
@@ -250,5 +304,8 @@ authentication is not implemented (only loopback binding plus `Origin`
 validation); the remaining items are covered by `internal/artifact/artifact_test.go`
 (roundtrip, context scoping, preview caps and modes, text sanitization, TTL
 expiry, HTTP full and range requests with `ETag`, startup sweep, and
-`provenance_unknown` versus stamped provenance) and by
+`provenance_unknown` versus stamped provenance, index listing and paging, capture
+index persistence across a store reopen) and by
 `internal/mcp/server_test.go` `TestRejectsForeignOrigin` for origin handling.
+Discovery and capture resolution are covered by
+`internal/mcp/tools_artifact_index_test.go`.

@@ -320,22 +320,30 @@ type frameCaptureArgs struct {
 // reaches model context; the response is a compact summary plus the artifact
 // descriptor.
 func frameCaptureValue(tc toolContext, context *analysis.Context, window *captureWindow) (map[string]any, *toolFailure) {
+	_, value, failure := captureFrameArtifact(tc, context, window, "")
+	return value, failure
+}
+
+// captureFrameArtifact stores the rendered frame and also returns the stored
+// artifact so a composite capture can index it as one of its components.
+// captureID, when set, links the frame artifact to the composite capture.
+func captureFrameArtifact(tc toolContext, context *analysis.Context, window *captureWindow, captureID string) (artifact.Artifact, map[string]any, *toolFailure) {
 	payload, failure := tc.server.executeCommand(tc.ctx, "frame_capture", nil)
 	if failure != nil {
-		return nil, failure
+		return artifact.Artifact{}, nil, failure
 	}
 
 	rawDataBase64, _ := payload["data"].(string)
 	rawRGB, err := base64.StdEncoding.DecodeString(rawDataBase64)
 	if err != nil {
-		return nil, &toolFailure{Code: "bridge_error", Message: "decode base64 frame payload: " + err.Error()}
+		return artifact.Artifact{}, nil, &toolFailure{Code: "bridge_error", Message: "decode base64 frame payload: " + err.Error()}
 	}
 	widthValue, _ := payload["width"].(float64)
 	heightValue, _ := payload["height"].(float64)
 	width := int(widthValue)
 	height := int(heightValue)
 	if width <= 0 || height <= 0 || len(rawRGB) != width*height*3 {
-		return nil, &toolFailure{
+		return artifact.Artifact{}, nil, &toolFailure{
 			Code:    "bridge_error",
 			Message: fmt.Sprintf("frame payload does not match declared dimensions (%dx%d, %d bytes).", width, height, len(rawRGB)),
 		}
@@ -343,11 +351,11 @@ func frameCaptureValue(tc toolContext, context *analysis.Context, window *captur
 
 	frame, err := rgb24ToNRGBA(rawRGB, width, height)
 	if err != nil {
-		return nil, &toolFailure{Code: "artifact_error", Message: err.Error()}
+		return artifact.Artifact{}, nil, &toolFailure{Code: "artifact_error", Message: err.Error()}
 	}
 	var pngBuffer bytes.Buffer
 	if err := png.Encode(&pngBuffer, frame); err != nil {
-		return nil, &toolFailure{Code: "artifact_error", Message: "encode PNG: " + err.Error()}
+		return artifact.Artifact{}, nil, &toolFailure{Code: "artifact_error", Message: "encode PNG: " + err.Error()}
 	}
 	frameToken, _ := payload["frame_token"].(float64)
 	provenance := vdpProvenance(tc, "frame-capture", "vdp-buffers", "VDP frame buffer")
@@ -356,6 +364,9 @@ func frameCaptureValue(tc toolContext, context *analysis.Context, window *captur
 		provenance.FrameToken = &token
 	}
 	provenance.ByteOrder = "not-applicable"
+	if captureID != "" {
+		provenance.CaptureID = captureID
+	}
 	// One consistency object for the frame artifact and the response. Inside a
 	// paused capture window the window owns it, so the artifact cannot claim a
 	// live sample while the response reports an atomic one.
@@ -369,10 +380,10 @@ func frameCaptureValue(tc toolContext, context *analysis.Context, window *captur
 	provenance.CaptureConsistency = consistencyObject
 	stored, err := tc.server.store.PutWithProvenance(context.ID, "frame-capture", "image/png", pngBuffer.Bytes(), provenance)
 	if err != nil {
-		return nil, &toolFailure{Code: "artifact_error", Message: err.Error()}
+		return artifact.Artifact{}, nil, &toolFailure{Code: "artifact_error", Message: err.Error()}
 	}
 	window.track(stored)
-	return map[string]any{
+	return stored, map[string]any{
 		"summary": map[string]any{
 			"kind":                      "frame-capture",
 			"width":                     width,
@@ -480,12 +491,15 @@ func vdpCaptureValue(tc toolContext, context *analysis.Context, includeFrame, in
 		"artifacts":           []map[string]any{},
 	}
 	var artifacts []map[string]any
+	var captureComponents []artifact.CaptureComponent
+	var captureFrameToken *uint64
 	// Helper to add artifact to manifest
 	addArtifact := func(kind string, stored artifact.Artifact) {
 		window.track(stored)
 		desc := artifactDescriptor(tc.server, stored, context.ID)
 		artifacts = append(artifacts, desc)
 		manifest["components"].(map[string]any)[kind] = desc
+		captureComponents = append(captureComponents, captureComponentFromProvenance(kind, stored))
 	}
 	// VDP status/registers
 	statusPayload, failure := tc.server.executeCommand(tc.ctx, "vdp_status", nil)
@@ -500,8 +514,14 @@ func vdpCaptureValue(tc toolContext, context *analysis.Context, includeFrame, in
 
 	// Frame buffer
 	if includeFrame {
-		frameResult, failure := frameCaptureValue(tc, context, window)
+		frameStored, frameResult, failure := captureFrameArtifact(tc, context, window, captureID)
 		if failure == nil {
+			captureComponents = append(captureComponents, captureComponentFromProvenance("frame", frameStored))
+			if summary, ok := frameResult["summary"].(map[string]any); ok {
+				if token, ok := summary["frame_token"].(uint64); ok && token != 0 {
+					captureFrameToken = &token
+				}
+			}
 			if art, ok := frameResult["artifact"].(map[string]any); ok {
 				artifacts = append(artifacts, art)
 				manifest["components"].(map[string]any)["frame"] = art
@@ -509,6 +529,7 @@ func vdpCaptureValue(tc toolContext, context *analysis.Context, includeFrame, in
 		}
 	} else {
 		manifest["components"].(map[string]any)["frame"] = map[string]any{"omitted": true, "reason": "include_frame=false"}
+		captureComponents = append(captureComponents, omittedCaptureComponent("frame", true, false, "include_frame=false"))
 	}
 
 	// CRAM
@@ -516,11 +537,14 @@ func vdpCaptureValue(tc toolContext, context *analysis.Context, includeFrame, in
 		cramRaw, _, failure := fetchVDPBytes(tc, "cram", 0, 128)
 		if failure == nil {
 			cramProvenance := vdpProvenanceWithCapture(tc, "vdp-cram", "mem-vdp-cram", "VDP CRAM", captureID, consistency)
+			cramLength := uint64(len(cramRaw))
+			cramProvenance.ByteLength = &cramLength
 			storedCRAM, _ := tc.server.store.PutWithProvenance(context.ID, "vdp-cram", "application/octet-stream", cramRaw, cramProvenance)
 			addArtifact("cram", storedCRAM)
 		}
 	} else {
 		manifest["components"].(map[string]any)["cram"] = map[string]any{"omitted": true}
+		captureComponents = append(captureComponents, omittedCaptureComponent("cram", true, false, "include_cram=false"))
 	}
 
 	// VSRAM
@@ -528,11 +552,14 @@ func vdpCaptureValue(tc toolContext, context *analysis.Context, includeFrame, in
 		vsramRaw, _, failure := fetchVDPBytes(tc, "vsram", 0, 80)
 		if failure == nil {
 			vsramProvenance := vdpProvenanceWithCapture(tc, "vdp-vsram", "mem-vdp-vsram", "VDP VSRAM", captureID, consistency)
+			vsramLength := uint64(len(vsramRaw))
+			vsramProvenance.ByteLength = &vsramLength
 			storedVSRAM, _ := tc.server.store.PutWithProvenance(context.ID, "vdp-vsram", "application/octet-stream", vsramRaw, vsramProvenance)
 			addArtifact("vsram", storedVSRAM)
 		}
 	} else {
 		manifest["components"].(map[string]any)["vsram"] = map[string]any{"omitted": true}
+		captureComponents = append(captureComponents, omittedCaptureComponent("vsram", true, false, "include_vsram=false"))
 	}
 
 	// VRAM range
@@ -542,22 +569,27 @@ func vdpCaptureValue(tc toolContext, context *analysis.Context, includeFrame, in
 			vramProvenance := vdpProvenanceWithCapture(tc, "vdp-vram", "mem-vdp-vram", "VDP VRAM", captureID, consistency)
 			vramProvenance.StartAddress = &vramAddr
 			vramProvenance.StartAddressHex = canonicalHex(vramAddr)
-			length := vramLen
+			vramProvenance.EffectiveAddress = &vramAddr
+			vramProvenance.EffectiveAddressHex = canonicalHex(vramAddr)
+			length := uint64(len(vramRaw))
 			vramProvenance.ByteLength = &length
 			storedVRAM, _ := tc.server.store.PutWithProvenance(context.ID, "vdp-vram", "application/octet-stream", vramRaw, vramProvenance)
 			addArtifact("vram", storedVRAM)
 		}
 	} else {
 		manifest["components"].(map[string]any)["vram"] = map[string]any{"omitted": true, "reason": "include_vram=false (expensive, capped at 131072)"}
+		captureComponents = append(captureComponents, omittedCaptureComponent("vram", true, false, "include_vram=false"))
 	}
 
 	// Sprite table
 	if includeSprite {
-		// Reuse existing sprite table logic but capture under same capture_id
-		// For now, just mark as included; the detailed sprite data is available via vdp_sprite_table
-		manifest["components"].(map[string]any)["sprite_table"] = map[string]any{"included": true, "note": "Use vdp_sprite_table for detailed decode; this capture shares capture_id for coherence"}
+		// The sprite table lives in VRAM: the stored VRAM component is what a
+		// later vdp_sprite_table reads, so this component records that the data
+		// is available there instead of claiming a separate read.
+		manifest["components"].(map[string]any)["sprite_table"] = map[string]any{"included": true, "source": "vram", "note": "The sprite table is part of the captured VRAM component; decode it with vdp_sprite_table using this capture id."}
 	} else {
 		manifest["components"].(map[string]any)["sprite_table"] = map[string]any{"omitted": true}
+		captureComponents = append(captureComponents, omittedCaptureComponent("sprite_table", true, false, "include_sprite_table=false"))
 	}
 
 	// Render manifest (simplified)
@@ -595,6 +627,22 @@ func vdpCaptureValue(tc toolContext, context *analysis.Context, includeFrame, in
 			return nil, &toolFailure{Code: "artifact_error", Message: err.Error()}
 		}
 		artifacts = append(artifacts, artifactDescriptor(tc.server, storedManifest, context.ID))
+		// The manifest and every component artifact now exist: index the capture
+		// so capture_get resolves it and the VDP readers can consume the stored
+		// components instead of reading the device again.
+		generation := tc.server.target.Generation()
+		if failure := registerCapture(tc.server.store, artifact.Capture{
+			CaptureID:        captureID,
+			ContextID:        context.ID,
+			ProducerTool:     "vdp_capture",
+			ManifestArtifact: storedManifest.ID,
+			Components:       captureComponents,
+			FrameToken:       captureFrameToken,
+			TargetGeneration: &generation,
+			CreatedAt:        capturedAt,
+		}); failure != nil {
+			return nil, failure
+		}
 		return map[string]any{
 			"summary": map[string]any{
 				"kind":                "vdp-capture",

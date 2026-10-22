@@ -71,6 +71,7 @@ func buildToolRegistry() []toolSpec {
 	specs = append(specs, resetToolSpecs()...)
 	specs = append(specs, runUntilToolSpecs()...)
 	specs = append(specs, systemSnapshotToolSpec())
+	specs = append(specs, captureGetToolSpecs()...)
 	specs = append(specs, audioToolSpecs()...)
 	specs = append(specs, traceSessionToolSpecs()...)
 	sort.Slice(specs, func(i, j int) bool { return specs[i].name < specs[j].name })
@@ -615,14 +616,17 @@ func resolveContext(server *Server, handle string) (*analysis.Context, *toolFail
 }
 
 func artifactDescriptor(server *Server, stored artifact.Artifact, contextID string) map[string]any {
+	// resource_uri was removed in roadmap issue #10: the server never served
+	// exodus://artifacts/<id> (there is no MCP resources endpoint), so
+	// advertising it promised a retrieval path that did not exist. The
+	// loopback URL is the only served path.
 	descriptor := map[string]any{
-		"id":           stored.ID,
-		"kind":         stored.Kind,
-		"mime_type":    stored.MimeType,
-		"size_bytes":   stored.SizeBytes,
-		"sha256":       stored.SHA256,
-		"url":          fmt.Sprintf("%s/artifacts/%s?context=%s", server.baseURL, stored.ID, contextID),
-		"resource_uri": "exodus://artifacts/" + stored.ID,
+		"id":         stored.ID,
+		"kind":       stored.Kind,
+		"mime_type":  stored.MimeType,
+		"size_bytes": stored.SizeBytes,
+		"sha256":     stored.SHA256,
+		"url":        fmt.Sprintf("%s/artifacts/%s?context=%s", server.baseURL, stored.ID, contextID),
 	}
 	if stored.Provenance != nil {
 		descriptor["provenance"] = provenanceEnvelopeView(*stored.Provenance)

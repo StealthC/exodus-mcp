@@ -40,9 +40,12 @@ claim to the exact test function or smoke-script check that proves it.
   byte order and raw-byte ordering, owning device, target generation, ROM
   SHA-256 and path, frame token, CPU run state, capture consistency, capture
   time, plus the standardized `capture_consistency` object and — for
-  composite captures — a stable `capture_id`). `artifact_describe` returns the
-  full typed envelope; artifacts whose producer attached no metadata are
-  reported honestly as `provenance_unknown` instead of inventing fields.
+  composite captures — a stable `capture_id`). `artifact_get` returns the full
+  typed envelope (`include: ["provenance"]`, the default), `artifact_list`
+  enumerates every artifact of a context with its `capture_id`, and
+  `capture_get` resolves a `capture_id` to its manifest and components;
+  artifacts whose producer attached no metadata are reported honestly as
+  `provenance_unknown` instead of inventing fields.
   Memory search and diff derive their address domain from the envelope, so a
   dump captured at `0xFF0000` is searched and diffed at `0xFF0000` without
   caller restatement.
@@ -260,11 +263,31 @@ claim to the exact test function or smoke-script check that proves it.
   `rom_load` with an audited invalidation batch. `memory_freeze` accepts the
   same mutually exclusive `data`/`data_hex` inputs as `memory_write` and
   echoes bounded hex.
-- `artifact_get`, `artifact_preview`, `artifact_describe`: metadata, direct
-  retrieval, bounded byte-oriented previews, and the full typed provenance
-  envelope (address domain, device, target generation, ROM identity, frame
-  token, run state, consistency, capture time — or the honest
-  `provenance_unknown` state) for every produced artifact.
+- `artifact_get` (merged successor of `artifact_get` + `artifact_describe`):
+  metadata, direct retrieval, `created_at`, `expires_at` (null when retention is
+  unlimited), the payload's own `schema_version`, the `capture_id` when the
+  artifact belongs to a capture, and the full typed provenance envelope (address
+  domain, device, target generation, ROM identity, frame token, run state,
+  consistency, capture time — or the honest `provenance_unknown` state).
+  `include` selects the `metadata` and `provenance` sections (both by default).
+  `artifact_describe` is a deprecated alias for one release: same payload plus a
+  `deprecated` note naming the replacement.
+- `artifact_list`: enumerates the artifacts of one context in creation order with
+  `kind` and `capture_id` filters and cursor paging (`total`, `returned`,
+  `has_more`, `next_cursor`), so a new session discovers what already exists
+  instead of copying ids out of earlier responses. Descriptors carry
+  `artifact_id`, kind, MIME type, size, SHA-256, `created_at`, `expires_at`,
+  `schema_version` when the payload declares one, `capture_id` when applicable,
+  and the download URL.
+- `capture_get`: resolves a `capture_id` from `memory_snapshot_capture`,
+  `system_snapshot_capture`, or `vdp_capture` to its producer, frame token,
+  target generation, manifest artifact (with its parsed document when bounded),
+  and one descriptor per component, including omitted/unavailable components and
+  their reasons. Unknown, expired, or foreign ids fail with `capture_not_found`.
+- The artifact and capture indexes are persisted in
+  `<artifact-dir>/artifact-index.json` and reloaded at startup, so a restarted
+  server reopens the artifacts and captures it wrote; because context handles are
+  process-local, they are only reachable through a handle that exists again.
 
 ## Audio observability (Phase 6, partial)
 
