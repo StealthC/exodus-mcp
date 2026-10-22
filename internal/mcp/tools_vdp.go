@@ -1297,7 +1297,7 @@ func vdpSpaceForKind(kind string) string {
 		return "mem-vdp-cram"
 	case "vdp-plane-a", "vdp-plane-b", "vdp-plane-window", "vdp-plane-json":
 		return "mem-vdp-vram"
-	case "vdp-tile-strip", "vdp-tile-json":
+	case "vdp-tile-strip", "vdp-tile-json", "vdp-tiles", "vdp-tiles-json":
 		return "mem-vdp-vram"
 	default:
 		return "vdp-buffers"
@@ -1311,7 +1311,7 @@ func vdpDeviceForKind(kind string) string {
 		return "VDP CRAM"
 	case "vdp-plane-a", "vdp-plane-b", "vdp-plane-window", "vdp-plane-json":
 		return "VDP VRAM"
-	case "vdp-tile-strip", "vdp-tile-json":
+	case "vdp-tile-strip", "vdp-tile-json", "vdp-tiles", "vdp-tiles-json":
 		return "VDP VRAM"
 	default:
 		return "VDP"
