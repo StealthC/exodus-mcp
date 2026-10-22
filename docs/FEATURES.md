@@ -144,8 +144,9 @@ is available; unavailable native features are documented explicitly (see
   bus_offset + space_relative_address` (RAM `mem-ram` → `0xFF0000`, Z80 RAM
   `mem-z80-ram` → `0xA00000`, ROM → `0x000000`; VDP buffers explain why they
   are not linearly mapped instead of guessing). Capabilities reflect actual
-  writability: VDP timed buffers and `mem-rom`/`mem-boot-rom` report read-only
-  and `memory_write` rejects them with `write_not_supported`. Out-of-range
+  writability and are authoritative: VDP timed buffers and
+  `mem-rom`/`mem-boot-rom` report read-only and `memory_write` enforces exactly
+  that, refusing them with `write_not_supported`. Out-of-range
   failures include the valid canonical hex range.
 - `memory_read`: bounded inline reads with explicit representation,
   effective-address echo, `system_paused_during_read`, the standardized
@@ -159,9 +160,15 @@ is available; unavailable native features are documented explicitly (see
   "paused"` makes the dump a temporally atomic snapshot.
 - `memory_write`: debugger-path writes to CPU bus spaces
   (`SetMemorySpaceByte`) and entry-based memory devices (read-modify-write
-  honoring byte order); timed-buffer spaces are refused with
-  `write_not_supported`, ROM writes are discarded by the bus like real
-  hardware, and every call is audited. Bytes arrive as exactly one of `data`
+  honoring byte order). The permissions `memory_spaces_list` reports are
+  enforced: timed-buffer VDP shells and `mem-rom`/`mem-boot-rom` are refused
+  with `write_not_supported` before any native write, so the loaded cartridge
+  image is never patched in place and the ROM identity keeps describing the
+  executing code. The refusal carries the space, its `permissions`, and a
+  stable `reason` (`timed_buffer_device`, `read_only_image`). Writes addressed
+  through a CPU bus space keep real hardware behavior, where the bus silently
+  discards writes to cartridge addresses. Every call, including a refusal, is
+  audited. Bytes arrive as exactly one of `data`
   (base64) or `data_hex` (hex bytes with optional spaces); the response echoes
   bounded uppercase hex of the exact bytes written, the effective address, and
   optional read-back verification (`verify_readback` reports whether the space

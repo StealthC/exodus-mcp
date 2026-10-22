@@ -159,22 +159,80 @@ func addressBusWidthMask(spaceID string) (int, uint64) {
 	}
 }
 
+// readOnlySpaceReasons classifies the spaces whose backing store the debugger
+// path must not modify, keyed by the catalog space id, with a stable refusal
+// reason. mem-rom and mem-boot-rom are the loaded cartridge image: patching it
+// in place would make the executing code disagree with the ROM identity
+// reported by rom_info, snapshots, and artifacts. Writes addressed through a
+// processor bus space (m68k-bus/z80-bus) keep real hardware behavior instead,
+// where the cartridge ignores them.
+//
+// This table is the single source of truth: memory_spaces_list derives the
+// reported permissions from it and memory_write enforces it, so a new
+// read-only space only needs one entry here to be enforced everywhere.
+var readOnlySpaceReasons = map[string]string{
+	"mem-rom":      "read_only_image",
+	"mem-boot-rom": "read_only_image",
+}
+
+// spaceWritePolicy is the resolved write decision for one space.
+type spaceWritePolicy struct {
+	Writable bool
+	Reason   string // stable refusal reason; empty when writable
+	Message  string // human-readable refusal detail; empty when writable
+}
+
+// spaceWritePolicyFor resolves the write decision for one space id. It depends
+// only on the id because the plugin reports every VDP memory shell as
+// "mem-vdp-*" and never emits a separate timed-buffer kind, so the id is the
+// one fact both the catalog view and the write path always share.
+func spaceWritePolicyFor(spaceID string) spaceWritePolicy {
+	if spaceID == "" {
+		return spaceWritePolicy{Writable: true}
+	}
+	if strings.HasPrefix(spaceID, "mem-vdp-") {
+		return spaceWritePolicy{
+			Reason:  "timed_buffer_device",
+			Message: "space " + spaceID + " is a timed-buffer device owned by its worker thread and cannot be written through the debugger path",
+		}
+	}
+	if reason, readOnly := readOnlySpaceReasons[spaceID]; readOnly {
+		return spaceWritePolicy{
+			Reason:  reason,
+			Message: "space " + spaceID + " is a read-only image space; the loaded cartridge image is not writable through the debugger path",
+		}
+	}
+	return spaceWritePolicy{Writable: true}
+}
+
+// spaceWriteRefusal renders the standard refusal for a write to a read-only
+// space. It echoes the same permission list memory_spaces_list reports so a
+// caller sees the catalog and the write path agree, plus the instruction that
+// bus-addressed writes keep hardware behavior.
+func spaceWriteRefusal(spaceID string, policy spaceWritePolicy) *toolFailure {
+	return &toolFailure{
+		Code:    "write_not_supported",
+		Message: policy.Message,
+		Data: map[string]any{
+			"space":       spaceID,
+			"permissions": spacePermissions(map[string]any{"id": spaceID}),
+			"reason":      policy.Reason,
+			"write_path":  "debugger",
+			"note":        "memory_spaces_list reports this space as read-only. Writes addressed through a processor bus space (for example m68k-bus) keep real hardware behavior, where the cartridge ignores them.",
+		},
+	}
+}
+
 // spacePermissions reports the readable and writable capabilities of a space
-// as understood by the server's memory_write path. Timed-buffer VDP spaces
-// and ROM are read-only; all other bus and memory spaces are read+write
-// through the debugger path (writes to ROM are discarded by the bus but the
-// debugger path exists, so ROM is reported read-only to reflect hardware).
+// exactly as memory_write enforces them: timed-buffer VDP shells and the
+// loaded cartridge image are read-only, every other bus and memory space is
+// read+write through the debugger path.
 func spacePermissions(space map[string]any) []string {
 	id, _ := space["id"].(string)
-	kind, _ := space["kind"].(string)
-	if kind == "timed-buffer" || strings.HasPrefix(id, "mem-vdp-") {
-		return []string{"read"}
+	if spaceWritePolicyFor(id).Writable {
+		return []string{"read", "write"}
 	}
-	switch id {
-	case "mem-rom", "mem-boot-rom":
-		return []string{"read"}
-	}
-	return []string{"read", "write"}
+	return []string{"read"}
 }
 
 // annotateSpaceRangeFailure enriches an out_of_range failure with the valid

@@ -611,7 +611,9 @@ func TestMemoryWriteReadbackMismatchNote(t *testing.T) {
 	}
 	server := newTestServer(t, client)
 	// Length 1 written, read-back returns 2 different bytes: mismatch + note.
-	result := structured(postToolCall(t, server, "memory_write", `{"space":"mem-rom","address":0,"data":"AA==","verify_readback":true}`))
+	// The mismatch is exercised on a writable space: writes addressed at a
+	// read-only space id (mem-rom) are refused before the bridge (issue #7).
+	result := structured(postToolCall(t, server, "memory_write", `{"space":"m68k-bus","address":0,"data":"AA==","verify_readback":true}`))
 	if result["code"] != nil {
 		t.Fatalf("write failed: %v", result)
 	}
