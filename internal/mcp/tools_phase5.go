@@ -2659,6 +2659,7 @@ func runCpuCoverageCapture(tc toolContext, args json.RawMessage) map[string]any 
 			"total_events":     entriesTotal,
 			"filtered_events":  len(filtered),
 			"unique_addresses": coverage.Distinct,
+			"decode_sweeps":    coverage.Truncation["decode_sweeps"],
 			"addresses":        coverage.Addresses,
 			"counts":           coverage.Counts,
 		},
@@ -2720,6 +2721,7 @@ func runCpuCoverageCapture(tc toolContext, args json.RawMessage) map[string]any 
 			"ranges_count":    len(coverage.Ranges),
 			"pages_total":     coverage.PagesTotal,
 			"pages_top":       coverage.PagesTop,
+			"decode_sweeps":   coverage.DecodeSweeps,
 			"truncated":       coverage.Truncation,
 			"sha256":          stored.SHA256,
 		},
@@ -2867,6 +2869,9 @@ type coverageResultV2 struct {
 	Blocks       []map[string]any
 	Edges        []map[string]any
 	Truncation   map[string]any
+	// DecodeSweeps is the number of native disassembly sweeps the block builder
+	// issued; it is reported so the batching is observable, not implicit.
+	DecodeSweeps int
 }
 
 func buildCoverageV2(tc toolContext, cpu string, ordered []uint64, uniqueForBlocks []uint64, regionStart, regionEnd uint64) coverageResultV2 {
@@ -2917,28 +2922,11 @@ func buildCoverageV2(tc toolContext, cpu string, ordered []uint64, uniqueForBloc
 		return edges[i]["to"].(uint64) < edges[j]["to"].(uint64)
 	})
 
-	// Instruction-aware blocks: need lengths
+	// Instruction-aware blocks: need lengths. One native sweep per contiguous
+	// run of executed addresses replaces one call per unique address, so a
+	// 500-address coverage report costs a handful of round trips instead of 500.
 	uniqueSorted := base.Addresses
-	// Fetch lengths for each unique address (cached)
-	lengths := map[uint64]int{}
-	for _, addr := range uniqueSorted {
-		info := fetchInstructionInfo(tc, cpu, addr)
-		if info != nil {
-			if l, ok := info["length"].(int); ok && l > 0 {
-				lengths[addr] = l
-			} else {
-				lengths[addr] = 2 // default for m68k
-				if cpu == "z80" {
-					lengths[addr] = 1
-				}
-			}
-		} else {
-			lengths[addr] = 2
-			if cpu == "z80" {
-				lengths[addr] = 1
-			}
-		}
-	}
+	lengths, decodeSweeps := fetchInstructionLengths(tc, cpu, uniqueSorted)
 	blocks := []map[string]any{}
 	if len(uniqueSorted) > 0 {
 		blockStart := uniqueSorted[0]
@@ -2989,6 +2977,7 @@ func buildCoverageV2(tc toolContext, cpu string, ordered []uint64, uniqueForBloc
 		"source_events":    len(ordered),
 		"decoded_events":   len(ordered), // we decoded all for lengths
 		"unique_addresses": len(uniqueSorted),
+		"decode_sweeps":    decodeSweeps,
 		"blocks":           len(blocks),
 		"edges":            len(edges),
 		"complete":         !base.AddressesTruncated,
@@ -3002,5 +2991,6 @@ func buildCoverageV2(tc toolContext, cpu string, ordered []uint64, uniqueForBloc
 		Blocks:         blocks,
 		Edges:          edges,
 		Truncation:     truncation,
+		DecodeSweeps:   decodeSweeps,
 	}
 }

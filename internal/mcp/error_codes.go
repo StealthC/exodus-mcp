@@ -160,6 +160,7 @@ var errorCodeRegistry = []errorCode{
 	{Code: "session_mismatch", Class: errorClassConflict, Origin: errorOriginServer, Description: "The trace session id does not match the retained session."},
 	{Code: "session_not_found", Class: errorClassNotFound, Origin: errorOriginServer, Description: "The trace session id does not resolve."},
 	{Code: "shutting_down", Class: errorClassBridge, Origin: errorOriginNative, Description: "The plugin is shutting down and refused the command."},
+	{Code: "soft_reset_partial", Class: errorClassTarget, Origin: errorOriginNative, Description: "The soft reset applied some reset lines but its proof failed; the mutation landed and the target generation advanced."},
 	{Code: "soft_reset_unavailable", Class: errorClassUnsupported, Origin: errorOriginNative, Description: "The plugin does not implement the soft-reset path."},
 	{Code: "state_api_unavailable", Class: errorClassUnsupported, Origin: errorOriginNative, Description: "The plugin cannot access the emulator's state API."},
 	{Code: "state_file_missing", Class: errorClassNotFound, Origin: errorOriginServer, Description: "The snapshot file recorded by a state entry is gone from disk."},

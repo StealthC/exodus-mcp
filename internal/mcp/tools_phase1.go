@@ -232,6 +232,8 @@ func performROMLoad(tc toolContext, path string, run bool, guard mutationGuard, 
 			// presenting a dead session as live.
 			server.retireTraceSession("the cartridge was reloaded, which stops native capture")
 			server.setROMPath(path)
+			// No command of this server describes the new machine's pads.
+			server.resetInputLedger()
 		},
 		resources: func() []string { return invalidated },
 	})

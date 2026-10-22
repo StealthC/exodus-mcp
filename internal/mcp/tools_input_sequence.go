@@ -196,6 +196,9 @@ func runInputSequence(tc toolContext, args json.RawMessage) map[string]any {
 	}
 
 	generationAfter := tc.server.target.Generation()
+	// The sequence releases every button before returning, so the ledger for
+	// this port is empty; the controller identity is kept from earlier echoes.
+	tc.server.inputs.set(player, nil, "", "input_sequence", generationAfter)
 	result := map[string]any{
 		"player":          player,
 		"steps":           len(steps),

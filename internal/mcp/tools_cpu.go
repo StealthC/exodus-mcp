@@ -40,11 +40,12 @@ func cpuToolSpecs() []toolSpec {
 		},
 		{
 			name:        "m68k_disassemble",
-			description: "Disassemble M68K instructions from a start address (default: current PC) via linear sweep. Not execution-verified; bytes are echoed for interpretation. Context symbols are resolved into per-line `symbol` and `targets` annotations.",
+			description: "Disassemble M68K instructions from a start address (default: current PC) via linear sweep. Not execution-verified; bytes are echoed for interpretation. Context symbols are resolved into per-line `symbol` and `targets` annotations. Pass `addresses` (up to 32) to disassemble several independent locations in one call: each becomes one native sweep of one instruction and a `batches` entry carrying its own lines, so a caller annotating a coverage report makes one MCP call instead of one per address.",
 			schema: objectSchema(map[string]any{
-				"address": addressProperty(),
-				"count":   integerProperty(fmt.Sprintf("Instruction count between 1 and %d (default %d).", maxDisassemblyCount, defaultDisassemblyCount), 1),
-				"context": contextProperty(),
+				"address":   addressProperty(),
+				"addresses": disassemblyAddressesProperty(),
+				"count":     integerProperty(fmt.Sprintf("Instruction count between 1 and %d (default %d).", maxDisassemblyCount, defaultDisassemblyCount), 1),
+				"context":   contextProperty(),
 			}, nil),
 			run: makeRunDisassembly("m68k"),
 		},
@@ -102,11 +103,12 @@ func cpuToolSpecs() []toolSpec {
 		},
 		{
 			name:        "z80_disassemble",
-			description: "Disassemble Z80 instructions from a start address (default: current PC) via linear sweep. Not execution-verified; bytes are echoed for interpretation. Context symbols are resolved into per-line `symbol` and `targets` annotations.",
+			description: "Disassemble Z80 instructions from a start address (default: current PC) via linear sweep. Not execution-verified; bytes are echoed for interpretation. Context symbols are resolved into per-line `symbol` and `targets` annotations. Pass `addresses` (up to 32) to disassemble several independent locations in one call: each becomes one native sweep of one instruction and a `batches` entry carrying its own lines, so a caller annotating a coverage report makes one MCP call instead of one per address.",
 			schema: objectSchema(map[string]any{
-				"address": addressProperty(),
-				"count":   integerProperty(fmt.Sprintf("Instruction count between 1 and %d (default %d).", maxDisassemblyCount, defaultDisassemblyCount), 1),
-				"context": contextProperty(),
+				"address":   addressProperty(),
+				"addresses": disassemblyAddressesProperty(),
+				"count":     integerProperty(fmt.Sprintf("Instruction count between 1 and %d (default %d).", maxDisassemblyCount, defaultDisassemblyCount), 1),
+				"context":   contextProperty(),
 			}, nil),
 			run: makeRunDisassembly("z80"),
 		},
@@ -157,9 +159,28 @@ func makeRunRegisters(cpu string) func(toolContext, json.RawMessage) map[string]
 
 type disassemblyArgs struct {
 	Address      any    `json:"address"`
+	Addresses    []any  `json:"addresses"`
 	AddressSpace string `json:"address_space"`
 	Count        uint64 `json:"count"`
 	Context      string `json:"context"`
+}
+
+// maxDisassemblyBatchAddresses bounds one disassemble call that names explicit
+// addresses: one native sweep per address is still generated, so the batch is
+// about client round trips and must stay bounded.
+const maxDisassemblyBatchAddresses = 32
+
+// disassemblyAddressesProperty publishes the batched form: independent
+// locations, each one instruction.
+func disassemblyAddressesProperty() map[string]any {
+	item := addressProperty()
+	return map[string]any{
+		"type":        "array",
+		"description": fmt.Sprintf("Independent addresses to disassemble one instruction at each, up to %d. Mutually exclusive with address and count. Each address becomes one batches entry with its own lines and symbol annotations.", maxDisassemblyBatchAddresses),
+		"items":       item,
+		"minItems":    1,
+		"maxItems":    maxDisassemblyBatchAddresses,
+	}
 }
 
 func makeRunDisassembly(cpu string) func(toolContext, json.RawMessage) map[string]any {
@@ -171,6 +192,12 @@ func makeRunDisassembly(cpu string) func(toolContext, json.RawMessage) map[strin
 		context, failure := resolveContext(tc.server, parsed.Context)
 		if failure != nil {
 			return failureResult(failure, tc.modern)
+		}
+		if len(parsed.Addresses) > 0 {
+			if parsed.Address != nil {
+				return failureResult(&toolFailure{Code: "invalid_params", Message: "pass either address or addresses, not both"}, tc.modern)
+			}
+			return runDisassemblyBatch(tc, context, cpu, parsed)
 		}
 		count := parsed.Count
 		if count == 0 {
@@ -201,6 +228,185 @@ func makeRunDisassembly(cpu string) func(toolContext, json.RawMessage) map[strin
 		}
 		return okResult(payload, tc.modern)
 	}
+}
+
+// runDisassemblyBatch disassembles one instruction at each requested address.
+// The native operation takes a start address and a count, so the batch is one
+// MCP call with one sweep per address; the alternative a client has today is a
+// tool call per address.
+func runDisassemblyBatch(tc toolContext, context *analysis.Context, cpu string, parsed *disassemblyArgs) map[string]any {
+	if len(parsed.Addresses) > maxDisassemblyBatchAddresses {
+		return failureResult(&toolFailure{
+			Code:    "invalid_params",
+			Message: fmt.Sprintf("addresses is capped at %d entries per call.", maxDisassemblyBatchAddresses),
+		}, tc.modern)
+	}
+	if parsed.Count != 0 {
+		return failureResult(&toolFailure{Code: "invalid_params", Message: "count is not accepted with addresses: each address disassembles exactly one instruction"}, tc.modern)
+	}
+	spaceID := disasmSpaceID(cpu)
+	batches := make([]map[string]any, 0, len(parsed.Addresses))
+	for index, raw := range parsed.Addresses {
+		address, failure := resolveAddress(raw, parsed.AddressSpace, spaceID)
+		if failure != nil {
+			failure.Data = map[string]any{"index": index, "field": fmt.Sprintf("addresses[%d]", index)}
+			return failureResult(failure, tc.modern)
+		}
+		payload, failure := tc.server.executeCommand(tc.ctx, "disasm", map[string]string{
+			"cpu":     cpu,
+			"address": strconv.FormatUint(address, 10),
+			"count":   "1",
+		})
+		if failure != nil {
+			failure.Data = map[string]any{"index": index, "field": fmt.Sprintf("addresses[%d]", index)}
+			return failureResult(failure, tc.modern)
+		}
+		annotated := false
+		if withSymbols, ok := annotateDisassemblySymbols(context, cpu, tc.server.currentROMSHA256(), payload); ok {
+			payload = withSymbols
+			annotated = true
+		} else {
+			normalizeDisassemblyPayload(payload, cpu)
+		}
+		entry := map[string]any{
+			"index":         index,
+			"address":       address,
+			"address_hex":   canonicalHex(address),
+			"address_space": spaceID,
+			"lines":         payload["lines"],
+		}
+		if annotated {
+			entry["symbols_annotated"] = payload["symbols_annotated"]
+			entry["annotation_method"] = payload["annotation_method"]
+		}
+		annotateAddressPair(entry, spaceID, address)
+		batches = append(batches, entry)
+	}
+	width := 24
+	if cpu == "z80" {
+		width = 16
+	}
+	return okResult(map[string]any{
+		"cpu":                cpu,
+		"cpu_name":           cpu,
+		"mode":               "address_list",
+		"batch_count":        len(batches),
+		"batches":            batches,
+		"address_space":      spaceID,
+		"address_width_bits": width,
+		"address_mask_hex":   canonicalHex(disasmSymbolMask(cpu)),
+		"byte_order":         map[string]string{"m68k": "big-endian", "z80": "little-endian"}[cpu],
+		"disassembly_method": "linear sweep from each address; not execution-verified",
+	}, tc.modern)
+}
+
+// fetchDisassemblyLines runs one native disasm sweep and returns its lines.
+func fetchDisassemblyLines(tc toolContext, cpu string, address, count uint64) []map[string]any {
+	payload, failure := tc.server.executeCommand(tc.ctx, "disasm", map[string]string{
+		"cpu":     cpu,
+		"address": strconv.FormatUint(address, 10),
+		"count":   strconv.FormatUint(count, 10),
+	})
+	if failure != nil {
+		return nil
+	}
+	rawLines, ok := payload["lines"].([]any)
+	if !ok {
+		return nil
+	}
+	lines := make([]map[string]any, 0, len(rawLines))
+	for _, entry := range rawLines {
+		if line, ok := entry.(map[string]any); ok {
+			lines = append(lines, line)
+		}
+	}
+	if len(lines) == 0 {
+		return nil
+	}
+	return lines
+}
+
+// instructionLength decodes the length of one disassembly line, falling back to
+// the byte string and then to the per-CPU minimum.
+func instructionLength(line map[string]any, cpu string) int {
+	if length, ok := numberAsUint64(line["length"]); ok && length > 0 {
+		return int(length)
+	}
+	if bytesHex, ok := line["bytes"].(string); ok {
+		if inferred := len(strings.Fields(bytesHex)); inferred > 0 {
+			return inferred
+		}
+	}
+	return minimumInstructionBytes(cpu)
+}
+
+// minimumInstructionBytes is the fallback length when the core cannot decode an
+// address: 2 bytes on the M68K (every opcode is at least one word) and 1 on the
+// Z80.
+func minimumInstructionBytes(cpu string) int {
+	if cpu == "z80" {
+		return 1
+	}
+	return 2
+}
+
+// fetchInstructionLengths resolves the instruction length at every requested
+// address with as few native sweeps as possible. The native disasm operation
+// takes a start address and a count, so a sorted address set is walked with one
+// sweep per contiguous run instead of one call per address: a sweep's lines are
+// consumed while they stay inside the run, and a sweep that steps past the next
+// wanted address starts a new run there. The returned count is the number of
+// native sweeps issued, reported in the coverage artifact so a reader can see
+// how the decode was batched.
+func fetchInstructionLengths(tc toolContext, cpu string, addresses []uint64) (map[uint64]int, int) {
+	lengths := make(map[uint64]int, len(addresses))
+	if len(addresses) == 0 {
+		return lengths, 0
+	}
+	sweeps := 0
+	position := 0
+	for position < len(addresses) {
+		remaining := len(addresses) - position
+		count := uint64(remaining)
+		if count > maxDisassemblyCount {
+			count = maxDisassemblyCount
+		}
+		lines := fetchDisassemblyLines(tc, cpu, addresses[position], count)
+		sweeps++
+		consumed := position
+		if lines == nil {
+			lengths[addresses[position]] = minimumInstructionBytes(cpu)
+			position++
+			continue
+		}
+		for _, line := range lines {
+			address, ok := numberAsUint64(line["address"])
+			if !ok {
+				break
+			}
+			if consumed >= len(addresses) {
+				break
+			}
+			if address < addresses[consumed] {
+				continue
+			}
+			if address > addresses[consumed] {
+				// The sweep jumped over the next wanted address (an invalid
+				// opcode or a run boundary); start a new sweep there.
+				break
+			}
+			lengths[address] = instructionLength(line, cpu)
+			consumed++
+		}
+		if consumed == position {
+			// The sweep did not cover the address it started at (a plugin that
+			// answers nothing useful); fall back and move on instead of looping.
+			lengths[addresses[position]] = minimumInstructionBytes(cpu)
+			consumed = position + 1
+		}
+		position = consumed
+	}
+	return lengths, sweeps
 }
 
 func normalizeDisassemblyPayload(payload map[string]any, cpu string) {
@@ -814,28 +1020,15 @@ func buildTraceJSONLEvents(tc toolContext, cpu, traceText string, rangeStart, ra
 }
 
 func fetchInstructionInfo(tc toolContext, cpu string, pc uint64) map[string]any {
-	payload, failure := tc.server.executeCommand(tc.ctx, "disasm", map[string]string{"cpu": cpu, "address": strconv.FormatUint(pc, 10), "count": "1"})
-	if failure != nil {
+	lines := fetchDisassemblyLines(tc, cpu, pc, 1)
+	if len(lines) == 0 {
 		return nil
 	}
-	lines, ok := payload["lines"].([]any)
-	if !ok || len(lines) == 0 {
-		return nil
-	}
-	line, ok := lines[0].(map[string]any)
-	if !ok {
-		return nil
-	}
+	line := lines[0]
 	bytesHex, _ := line["bytes"].(string)
-	lengthFloat, _ := line["length"].(float64)
-	length := int(lengthFloat)
-	if length == 0 {
-		// Fallback: try to infer from bytes length
-		length = len(bytesHex) / 2
-	}
 	return map[string]any{
 		"bytes_hex": bytesHex,
-		"length":    length,
+		"length":    instructionLength(line, cpu),
 	}
 }
 

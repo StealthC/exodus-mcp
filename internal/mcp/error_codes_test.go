@@ -39,18 +39,28 @@ func TestErrorCodeRegistryIsWellFormed(t *testing.T) {
 }
 
 var (
-	failureCodeLiteral   = regexp.MustCompile(`Code:\s*"([a-z_0-9]+)"`)
-	assignedCodeLiteral  = regexp.MustCompile(`\bcode\s*:?=\s*"([a-z_0-9]+)"`)
-	errorResultLiteral   = regexp.MustCompile(`errorResult\("([a-z_0-9]+)"`)
-	nativeCodeAssignment = regexp.MustCompile(`errorCode = "([a-z_0-9]+)"`)
+	failureCodeLiteral  = regexp.MustCompile(`Code:\s*"([a-z_0-9]+)"`)
+	assignedCodeLiteral = regexp.MustCompile(`\bcode\s*:?=\s*"([a-z_0-9]+)"`)
+	errorResultLiteral  = regexp.MustCompile(`errorResult\("([a-z_0-9]+)"`)
+	// A native assignment may be a ternary, so collect every literal on the
+	// right-hand side of the statement, not just a whole-statement literal.
+	nativeCodeAssignment = regexp.MustCompile(`errorCode\s*=\s*([^;]*);`)
 	// failParse and the fatal helper carry the protocol code as a positional
 	// argument rather than a labelled field.
 	experimentHelperCode = regexp.MustCompile(`(?:failParse|fatal)\(\s*[A-Za-z_.]+,\s*"([a-z_0-9]+)"`)
 )
 
+// codePattern is one way a code literal is written in the sources. When
+// expression is true the capture is a whole expression that may hold several
+// literals (the native plugin's ternary assignments).
+type codePattern struct {
+	re         *regexp.Regexp
+	expression bool
+}
+
 // collectCodeLiterals extracts every code literal from the files of one
 // directory, skipping test files and (optionally) one file by name.
-func collectCodeLiterals(t *testing.T, dir, skipFile string, patterns ...*regexp.Regexp) map[string]string {
+func collectCodeLiterals(t *testing.T, dir, skipFile string, patterns ...codePattern) map[string]string {
 	t.Helper()
 	entries, err := os.ReadDir(dir)
 	if err != nil {
@@ -70,12 +80,30 @@ func collectCodeLiterals(t *testing.T, dir, skipFile string, patterns ...*regexp
 			t.Fatalf("read %s: %v", name, err)
 		}
 		for _, pattern := range patterns {
-			for _, match := range pattern.FindAllStringSubmatch(string(data), -1) {
+			for _, match := range pattern.re.FindAllStringSubmatch(string(data), -1) {
+				if len(match) < 2 {
+					continue
+				}
+				if pattern.expression {
+					for _, literal := range codeLiteralsIn(match[1]) {
+						found[literal] = name
+					}
+					continue
+				}
 				found[match[1]] = name
 			}
 		}
 	}
 	return found
+}
+
+// codeLiteralsIn returns the snake-case literals of one captured expression.
+func codeLiteralsIn(expression string) []string {
+	literals := []string{}
+	for _, candidate := range regexp.MustCompile(`"([a-z_0-9]+)"`).FindAllStringSubmatch(expression, -1) {
+		literals = append(literals, candidate[1])
+	}
+	return literals
 }
 
 // TestEveryProducedCodeIsDeclared is the registry-driven gate: a literal code
@@ -86,11 +114,11 @@ func TestEveryProducedCodeIsDeclared(t *testing.T) {
 		label    string
 		dir      string
 		skip     string
-		patterns []*regexp.Regexp
+		patterns []codePattern
 	}{
-		{"server", ".", "error_codes.go", []*regexp.Regexp{failureCodeLiteral, assignedCodeLiteral, errorResultLiteral}},
-		{"plugin", "../../native-plugin", "", []*regexp.Regexp{nativeCodeAssignment}},
-		{"experiment", "../experiment", "", []*regexp.Regexp{failureCodeLiteral, assignedCodeLiteral, experimentHelperCode}},
+		{"server", ".", "error_codes.go", []codePattern{{failureCodeLiteral, false}, {assignedCodeLiteral, false}, {errorResultLiteral, false}}},
+		{"plugin", "../../native-plugin", "", []codePattern{{nativeCodeAssignment, true}}},
+		{"experiment", "../experiment", "", []codePattern{{failureCodeLiteral, false}, {assignedCodeLiteral, false}, {experimentHelperCode, false}}},
 	}
 	for _, source := range sources {
 		literals := collectCodeLiterals(t, source.dir, source.skip, source.patterns...)
@@ -118,11 +146,11 @@ func TestEveryDeclaredCodeIsProduced(t *testing.T) {
 	for _, source := range []struct {
 		dir      string
 		skip     string
-		patterns []*regexp.Regexp
+		patterns []codePattern
 	}{
-		{".", "error_codes.go", []*regexp.Regexp{failureCodeLiteral, assignedCodeLiteral, errorResultLiteral}},
-		{"../../native-plugin", "", []*regexp.Regexp{nativeCodeAssignment}},
-		{"../experiment", "", []*regexp.Regexp{failureCodeLiteral, assignedCodeLiteral, experimentHelperCode}},
+		{".", "error_codes.go", []codePattern{{failureCodeLiteral, false}, {assignedCodeLiteral, false}, {errorResultLiteral, false}}},
+		{"../../native-plugin", "", []codePattern{{nativeCodeAssignment, true}}},
+		{"../experiment", "", []codePattern{{failureCodeLiteral, false}, {assignedCodeLiteral, false}, {experimentHelperCode, false}}},
 	} {
 		for code := range collectCodeLiterals(t, source.dir, source.skip, source.patterns...) {
 			produced[code] = true

@@ -129,6 +129,11 @@ type Server struct {
 	// nil only before NewServer finishes construction.
 	freezes *freezeRegistry
 
+	// inputs records the button set this server last commanded per controller
+	// port. The plugin exposes no input read, so input_status reports this
+	// ledger explicitly instead of claiming an observation.
+	inputs *inputLedger
+
 	// runState attributes the emulator run state to MCP actions or external
 	// actors and records externally observed transitions in the audit stream.
 	runState *runStateTracker
@@ -167,6 +172,7 @@ func NewServer(version string, client bridge.Client, store *artifact.Store, cont
 		breakpoints: make(map[uint64]debugResourceMeta),
 		watchpoints: make(map[uint64]debugResourceMeta),
 		freezes:     newFreezeRegistry(),
+		inputs:      newInputLedger(),
 		runState:    &runStateTracker{},
 		romIdentity: newROMIdentityProvider(),
 		metrics:     newMetricsStore(),

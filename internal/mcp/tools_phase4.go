@@ -62,6 +62,14 @@ func phase4ToolSpecs() []toolSpec {
 			run: runInputSet,
 		},
 		{
+			name:        "input_status",
+			description: "Report the controller state this server last commanded per port: held buttons, controller instance, the tool that set it, when, and under which target generation. The pinned plugin exposes no operation that reads the pad (input_set only writes), so this is a command ledger, not an observation: verified_by_emulator is false and state_from is server_input_ledger. The pad type is the controller instance the native input_set echo reported (pad_type_source native_input_set_echo). An entry captured under another target generation (reset, ROM load, or a state restore performed elsewhere) is flagged stale, and the ledger is cleared outright on rom_load and target_reset. A port this server never commanded is absent. Optional player narrows the report to one port.",
+			schema: objectSchema(map[string]any{
+				"player": integerProperty("Only report this player port (1-4).", 1),
+			}, nil),
+			run: runInputStatus,
+		},
+		{
 			name:        "memory_write",
 			description: "Write bytes into a memory space through the emulator debugger path. Only CPU bus spaces and non-timed memory devices are writable; spaces memory_spaces_list reports without write permission (mem-rom, mem-boot-rom, and the timed-buffer VDP shells) are refused with write_not_supported before any native write, so a cartridge image is never patched in place. Writes addressed through a CPU bus space keep real hardware behavior, where the bus discards writes to cartridge addresses. Bytes arrive as exactly one of data (base64) or data_hex (hex bytes with optional spaces); the response echoes bounded uppercase hex of the exact bytes written, the effective address, the write result, and optional read-back verification. The call is recorded in the target audit stream. Accepts optional expected_target_generation and control_id.",
 			schema: objectSchema(map[string]any{
@@ -231,7 +239,41 @@ func runInputSet(tc toolContext, args json.RawMessage) map[string]any {
 	if failure != nil {
 		return failureResult(failure, tc.modern)
 	}
+	// The native echo names the controller instance and the applied buttons;
+	// the ledger keeps what is now held on that port.
+	controller, _ := payload["controller_instance"].(string)
+	tc.server.recordInputCommand("input_set", player, normalized, parsed.State, controller)
 	return okResult(stampGenerations(payload, before, after), tc.modern)
+}
+
+// runInputStatus reports the server's input command ledger. It performs no
+// native read: the pinned plugin has no such operation.
+func runInputStatus(tc toolContext, args json.RawMessage) map[string]any {
+	parsed, failure := decodeArgs[struct {
+		Player *uint64 `json:"player"`
+	}](args)
+	if failure != nil {
+		return failureResult(failure, tc.modern)
+	}
+	player := uint64(0)
+	if parsed.Player != nil {
+		if *parsed.Player < 1 || *parsed.Player > 4 {
+			return failureResult(&toolFailure{Code: "invalid_params", Message: "player must be between 1 and 4"}, tc.modern)
+		}
+		player = *parsed.Player
+	}
+	generation := tc.server.target.Generation()
+	ports := tc.server.inputs.view(player, generation)
+	result := map[string]any{
+		"ports":                 ports,
+		"port_count":            len(ports),
+		"native_read_supported": false,
+		"state_from":            "server_input_ledger",
+		"target_generation":     generation,
+		"note":                  "The plugin does not expose a controller read, so held buttons and pad type are what this server last commanded, not a hardware observation. A port that this server never commanded is absent; after rom_load or target_reset the ledger is empty.",
+		"capture_consistency":   tc.server.captureConsistencyView(buildCaptureConsistency(tc.server, map[string]any{}, false, true, nil, nil)),
+	}
+	return okResult(result, tc.modern)
 }
 
 // ----------------------------------------------------------------------------------------------------------------------

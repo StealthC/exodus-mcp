@@ -47,6 +47,7 @@ func runTargetReset(tc toolContext, args json.RawMessage) map[string]any {
 			payload["resources_invalidated"] = invalidated
 		}
 		recordStateFromPayload(tc.server, payload, false)
+		tc.server.resetInputLedger()
 		payload["reset_source"] = "hard"
 		payload["reset_note"] = "Hard reset reloaded the cartridge module and purged MCP-managed debug resources."
 		return okResult(stampGenerations(payload, before, after), tc.modern)
