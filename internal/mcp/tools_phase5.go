@@ -267,7 +267,6 @@ func resolveSearchSource(tc toolContext, contextID string, args memorySearchArgs
 		payload := map[string]any{
 			"effective_address":         float64(effective),
 			"byte_order":                byteOrder,
-			"consistency":               "live",
 			"system_paused_during_read": pausedDuringRead,
 		}
 		provenance := captureProvenance(tc.server, "memory-snapshot", space, startAddress, uint64(len(raw)), payload, time.Now().UTC(), "", nil)
@@ -721,7 +720,7 @@ func runMemorySearch(tc toolContext, args json.RawMessage) map[string]any {
 		"parsed_pattern":             map[string]any{"bytes_hex": patternHex, "mask_hex": maskHex, "alignment": parsed.Alignment},
 	}
 	if source.consistency != nil {
-		summary["capture_consistency"] = captureConsistencyToMap(source.consistency)
+		summary["capture_consistency"] = tc.server.captureConsistencyView(source.consistency)
 	}
 	if source.byteOrder != "" {
 		summary["byte_order"] = source.byteOrder
@@ -1338,7 +1337,6 @@ func runMemoryDiff(tc toolContext, args json.RawMessage) map[string]any {
 		payload := map[string]any{
 			"effective_address":         float64(effective),
 			"byte_order":                spaceOrder,
-			"consistency":               "live",
 			"system_paused_during_read": pausedDuringRead,
 		}
 		provenance := captureProvenance(tc.server, "memory-snapshot", space, freshStart, uint64(len(raw)), payload, time.Now().UTC(), "", nil)
@@ -1513,7 +1511,7 @@ func runMemoryDiff(tc toolContext, args json.RawMessage) map[string]any {
 		document["after_capture_id"] = afterProvenance.CaptureID
 	}
 	if afterProvenance != nil && afterProvenance.CaptureConsistency != nil {
-		document["capture_consistency"] = captureConsistencyToMap(afterProvenance.CaptureConsistency)
+		document["capture_consistency"] = tc.server.captureConsistencyView(afterProvenance.CaptureConsistency)
 	}
 	if parsed.Mode == "equal_to" {
 		document["value"] = *parsed.Value
@@ -1571,7 +1569,7 @@ func runMemoryDiff(tc toolContext, args json.RawMessage) map[string]any {
 		summary["after_capture_id"] = afterProvenance.CaptureID
 	}
 	if afterProvenance != nil && afterProvenance.CaptureConsistency != nil {
-		summary["capture_consistency"] = captureConsistencyToMap(afterProvenance.CaptureConsistency)
+		summary["capture_consistency"] = tc.server.captureConsistencyView(afterProvenance.CaptureConsistency)
 	}
 	if parsed.Mode == "equal_to" {
 		summary["value"] = *parsed.Value
@@ -2015,7 +2013,7 @@ func mdROMInfo(tc toolContext, contextID string, romSizeBytes uint64, paddedSize
 		},
 		"mapping":             mapping,
 		"artifact":            artifactDescriptor(tc.server, headerArtifact, contextID),
-		"capture_consistency": captureConsistencyToMap(consistencyObject),
+		"capture_consistency": tc.server.captureConsistencyView(consistencyObject),
 	}
 	if len(hardwareCode) > 0 {
 		result["header"].(map[string]any)["region"].(map[string]any)["hardware_code"] = hardwareCode
@@ -2111,8 +2109,12 @@ func runCpuTraceCaptureWatchpoint(tc toolContext, args json.RawMessage) map[stri
 	if value, ok := payload["stopped_on_watchpoint"].(bool); ok {
 		summary["stopped_on_watchpoint"] = value
 	}
+	// The native trace_capture stop reason is the plugin's own vocabulary
+	// ("watchpoint_hit", "stopped", ...), not the run_until_* stop_reason
+	// label, so it is namespaced instead of being the same field with a second
+	// meaning.
 	if value, ok := payload["stop_reason"].(string); ok {
-		summary["stop_reason"] = value
+		summary["native_stop_reason"] = value
 	}
 	if value, ok := payload["watchpoint_ids_hit"].([]any); ok {
 		summary["watchpoint_ids_hit"] = value

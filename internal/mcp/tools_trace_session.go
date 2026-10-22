@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/StealthC/exodus-mcp/internal/analysis"
+	"github.com/StealthC/exodus-mcp/internal/artifact"
 	"github.com/StealthC/exodus-mcp/internal/tracing"
 )
 
@@ -1636,13 +1637,12 @@ func traceSessionManifestPersist(tc toolContext, session *tracing.Session, nativ
 			break
 		}
 	}
-	consistency := "session-scoped: the CPU was never paused for the capture; the store is bounded and loss is reported"
 	view := map[string]any{
-		"schema":      tracing.ManifestSchema,
-		"rom_sha256":  romSHA,
-		"rom_bound":   romSHA != "",
-		"consistency": consistency,
-		"written":     false,
+		"schema":              tracing.ManifestSchema,
+		"rom_sha256":          romSHA,
+		"rom_bound":           romSHA != "",
+		"capture_consistency": tc.server.captureConsistencyView(traceSessionConsistency(tc, session, native)),
+		"written":             false,
 	}
 	path, err := manifest.Save(tc.server.TraceSessionsDir())
 	if err != nil {
@@ -1676,7 +1676,7 @@ func traceSessionSummary(tc toolContext, session *tracing.Session, native map[st
 		"totals":                     session.Totals(),
 		"parse":                      session.Stats(),
 		"loss":                       traceSessionLossView(session),
-		"capture_consistency":        traceSessionConsistency(tc, session, native),
+		"capture_consistency":        tc.server.captureConsistencyView(traceSessionConsistency(tc, session, native)),
 	}
 	if !session.StoppedAt.IsZero() {
 		summary["stopped_at"] = session.StoppedAt
@@ -1718,34 +1718,30 @@ func traceSessionSummary(tc toolContext, session *tracing.Session, native map[st
 // emulated timeline: a bounded window capture that never paused the CPU for
 // the capture itself, plus the observed run state and — when the caller asked
 // for the conservative start guard — the configuration pause it caused.
-func traceSessionConsistency(tc toolContext, session *tracing.Session, native map[string]any) map[string]any {
+func traceSessionConsistency(tc toolContext, session *tracing.Session, native map[string]any) *artifact.CaptureConsistency {
 	observed := initialRunStateLabel(tc.server)
-	view := map[string]any{
-		"state":                    "live_windowed",
-		"execution_paused_by_tool": false,
-		"execution_resumed_after":  false,
-		"initial_run_state":        observed,
-		"final_run_state":          observed,
-		"session_started_at":       session.StartedAt,
-		"note":                     "Execution events are the engine's own per-instruction trace lines written while the system ran; the capture never paused the CPU. Sampled mode leaves gaps between windows, and read/write counters are aggregate samples, so events from different windows must not be treated as one continuous instant.",
+	consistency := &artifact.CaptureConsistency{
+		State:                 consistencyLive,
+		ExecutionPausedByTool: false,
+		ExecutionResumedAfter: false,
+		InitialRunState:       observed,
+		FinalRunState:         observed,
+		Note:                  "Execution events are the engine's own per-instruction trace lines written while the system ran; the capture never paused the CPU. Sampled mode leaves gaps between windows, and read/write counters are aggregate samples, so events from different windows must not be treated as one continuous instant.",
 	}
 	if native != nil {
 		if setup, ok := native["setup_pause"].(map[string]any); ok {
 			guarded, _ := setup["guarded"].(bool)
 			wasRunning, _ := setup["system_was_running"].(bool)
 			if guarded && wasRunning {
-				view["execution_paused_by_tool"] = true
-				view["execution_resumed_after"] = true
-				view["initial_run_state"] = "running"
-				view["final_run_state"] = "running"
-				view["note"] = view["note"].(string) + " start_guard \"quiet\" paused the CPU once for the trace configuration calls and resumed it immediately; the capture windows themselves never pause execution."
+				consistency.ExecutionPausedByTool = true
+				consistency.ExecutionResumedAfter = true
+				consistency.InitialRunState = runStateRunning
+				consistency.FinalRunState = runStateRunning
+				consistency.Note += " start_guard \"quiet\" paused the CPU once for the trace configuration calls and resumed it immediately; the capture windows themselves never pause execution."
 			}
 		}
 	}
-	if !session.StoppedAt.IsZero() {
-		view["session_stopped_at"] = session.StoppedAt
-	}
-	return view
+	return consistency
 }
 
 // traceSessionLossView renders the explicit loss contract, including whether

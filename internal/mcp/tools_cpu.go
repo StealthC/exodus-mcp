@@ -150,7 +150,7 @@ func makeRunRegisters(cpu string) func(toolContext, json.RawMessage) map[string]
 		if failure != nil {
 			return failureResult(failure, tc.modern)
 		}
-		payload["capture_consistency"] = captureConsistencyToMap(buildCaptureConsistency(tc.server, payload, false, true, nil, nil))
+		payload["capture_consistency"] = tc.server.captureConsistencyView(buildCaptureConsistency(tc.server, payload, false, true, nil, nil))
 		return okResult(payload, tc.modern)
 	}
 }

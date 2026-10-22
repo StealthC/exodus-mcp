@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/StealthC/exodus-mcp/internal/analysis"
+	"github.com/StealthC/exodus-mcp/internal/artifact"
 )
 
 const (
@@ -622,10 +623,7 @@ func runStateLoad(tc toolContext, args json.RawMessage) map[string]any {
 		"final_run_state_verified": finalVerified,
 		"run_state_override":       runState,
 		"run_state_note":           "state_load preserves the machine's pre-load run state; saved_run_state is historical metadata and is never applied.",
-		"capture_consistency": map[string]any{
-			"state": consistencyStateRestored,
-			"note":  "The machine now describes the restored snapshot's instant, not a live capture; observations describe the restored state until the system runs again.",
-		},
+		"capture_consistency":      tc.server.captureConsistencyView(restoredConsistency(tc.server, finalRunState)),
 	}
 	if deprecation != nil {
 		result["deprecated_parameter_value"] = deprecation
@@ -636,18 +634,32 @@ func runStateLoad(tc toolContext, args json.RawMessage) map[string]any {
 	return okResult(stampGenerations(result, before, after), tc.modern)
 }
 
+// restoredConsistency is the one capture-consistency object of a state_load: the
+// machine now describes the restored snapshot's instant, not a live capture.
+// The observed final run state is used for both ends because the restore itself
+// is the last run-state fact the server proved.
+func restoredConsistency(server *Server, finalRunState string) *artifact.CaptureConsistency {
+	consistency := newCaptureConsistency(server, consistencyStateRestored,
+		"The machine now describes the restored snapshot's instant, not a live capture; observations describe the restored state until the system runs again.")
+	if state, ok := runStateVocab.coerce(finalRunState, runStateUnknown); !ok {
+		consistency.InitialRunState = state
+		consistency.FinalRunState = state
+	}
+	return consistency
+}
+
 // runStateLabelFromBool renders the plugin's system_running flag as the
 // standardized run-state label, or "unknown" when the payload does not carry
 // it.
 func runStateLabelFromBool(payload map[string]any) string {
 	running, ok := payload["system_running"].(bool)
 	if !ok {
-		return "unknown"
+		return runStateUnknown
 	}
 	if running {
-		return "running"
+		return runStateRunning
 	}
-	return "paused"
+	return runStatePaused
 }
 
 func runStateList(tc toolContext, args json.RawMessage) map[string]any {

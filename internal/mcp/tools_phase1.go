@@ -93,7 +93,7 @@ func phase1ToolSpecs() []toolSpec {
 		},
 		{
 			name:        "emulator_status",
-			description: "Report running state plus loaded modules and devices from the connected Exodus instance, with run-state observability: who paused or ran the system (pause_source: mcp, ui_or_external, breakpoint_or_watchpoint, or unknown) and when the run state last changed (last_run_state_change UTC). Externally observed transitions (UI pauses, other bridge clients, native stops) are recorded in the audit stream as run_state_change events and never advance target_generation: the generation advances only on successful MCP mutations.",
+			description: "Report running state plus loaded modules and devices from the connected Exodus instance, with run-state observability: `run_state` is the observed run state (running | paused | unknown), `pause_source` names who caused it (mcp | ui_or_external | breakpoint_or_watchpoint | unknown), `stop_source` answers why execution stopped in the same vocabulary as run_until_* (instrument | external | mcp | none | unknown), and `capture_consistency` is the standardized state-observing object every read tool reports. `last_run_state_change` is the UTC time of the last observed transition. Externally observed transitions (UI pauses, other bridge clients, native stops) are recorded in the audit stream as run_state_change events and never advance target_generation: the generation advances only on successful MCP mutations.",
 			schema:      objectSchema(map[string]any{}, nil),
 			run:         runEmulatorStatus,
 		},
@@ -332,11 +332,32 @@ func fetchEmulatorStatus(tc toolContext) (*emulatorStatusData, *toolFailure) {
 func runStateView(server *Server, status *emulatorStatusData) (string, string, time.Time, bool) {
 	source, note := server.runState.view(status.SystemRunning)
 	if !status.SystemRunning && status.StopReason != "" {
-		source = "breakpoint_or_watchpoint"
+		source = pauseSourceBreakpointOrWatchpoint
 		note = "The plugin reported a native stop reason: " + status.StopReason
 	}
 	lastChange, known := server.runState.lastKnownChange()
 	return source, note, lastChange, known
+}
+
+// stopSourceForRunState answers "why did execution stop" from one observed run
+// state, in the same vocabulary run_until_* and the structured debug events
+// publish. A running system has no stop; a paused one is attributed to the
+// managed instrument that proved the stop, to the MCP action that caused it, or
+// to an external actor.
+func stopSourceForRunState(pauseSource string, running bool) string {
+	if running {
+		return stopSourceNone
+	}
+	switch pauseSource {
+	case pauseSourceBreakpointOrWatchpoint:
+		return stopSourceInstrument
+	case pauseSourceMCP:
+		return stopSourceMCP
+	case pauseSourceUIOrExternal:
+		return stopSourceExternal
+	default:
+		return stopSourceUnknown
+	}
 }
 
 func runEmulatorStatus(tc toolContext, args json.RawMessage) map[string]any {
@@ -351,12 +372,14 @@ func runEmulatorStatus(tc toolContext, args json.RawMessage) map[string]any {
 	devices := status.Devices
 	pauseSource, pauseNote, lastChange, changeKnown := runStateView(tc.server, status)
 	result := map[string]any{
-		"system_running": status.SystemRunning,
-		"pause_source":   pauseSource,
-		"modules":        modules,
-		"devices":        devices,
-		"rom":            status.Rom,
-		"consistency":    "live",
+		"system_running":      status.SystemRunning,
+		"run_state":           runStateLabel(status.SystemRunning),
+		"pause_source":        pauseSource,
+		"stop_source":         stopSourceForRunState(pauseSource, status.SystemRunning),
+		"modules":             modules,
+		"devices":             devices,
+		"rom":                 status.Rom,
+		"capture_consistency": tc.server.captureConsistencyView(buildCaptureConsistency(tc.server, nil, false, false, nil, nil)),
 	}
 	if !changeKnown {
 		// The first observation anchors the timestamp; there is no verified
@@ -588,9 +611,8 @@ func readMemoryValue(tc toolContext, spaceID string, address uint64, length uint
 		"effective_address_hex":     canonicalHex(uint64(effective)),
 		"length":                    len(raw),
 		"byte_order":                byteOrder,
-		"consistency":               window.legacyConsistency(tc.server, payload),
 		"system_paused_during_read": pausedDuringRead,
-		"capture_consistency":       captureConsistencyToMap(window.consistencyFor(tc.server, payload)),
+		"capture_consistency":       tc.server.captureConsistencyViewWindow(window, window.consistencyFor(tc.server, payload)),
 		"representation":            representation,
 	}
 	echo.apply(value, spaceID, uint64(effective), uint64(len(raw)))
@@ -804,9 +826,8 @@ func memoryDumpValue(tc toolContext, context *analysis.Context, spaceID string, 
 		"effective_address_hex":     canonicalHex(uint64(effective)),
 		"byte_length":               len(raw),
 		"byte_order":                byteOrder,
-		"consistency":               window.legacyConsistency(tc.server, payload),
 		"system_paused_during_read": pausedDuringRead,
-		"capture_consistency":       captureConsistencyToMap(consistencyObject),
+		"capture_consistency":       tc.server.captureConsistencyViewWindow(window, consistencyObject),
 		"preview_hex":               artifact.HexDump(raw[:previewLength], int64(uint64(effective))),
 		"sha256":                    stored.SHA256,
 		"provenance_state":          stored.Provenance.State,
@@ -991,7 +1012,7 @@ func artifactDetailResult(tc toolContext, args json.RawMessage, deprecatedAlias 
 	}
 	if wantProvenance {
 		if stored.Provenance != nil {
-			result["provenance"] = provenanceEnvelopeView(*stored.Provenance)
+			result["provenance"] = tc.server.provenanceEnvelopeView(*stored.Provenance)
 			result["provenance_state"] = stored.Provenance.State
 			if stored.Provenance.CaptureID != "" {
 				result["capture_id"] = stored.Provenance.CaptureID

@@ -35,7 +35,7 @@ var mdSpaceDevice = map[string]string{
 
 // provenanceEnvelopeView renders the typed provenance envelope as a plain map
 // so structured responses and tests always see the same JSON shape.
-func provenanceEnvelopeView(provenance artifact.Provenance) map[string]any {
+func (server *Server) provenanceEnvelopeView(provenance artifact.Provenance) map[string]any {
 	encoded, err := json.Marshal(provenance)
 	if err != nil {
 		return map[string]any{"artifact_schema": artifact.ProvenanceSchema, "state": artifact.ProvenanceStateUnknown}
@@ -43,6 +43,13 @@ func provenanceEnvelopeView(provenance artifact.Provenance) map[string]any {
 	var view map[string]any
 	if err := json.Unmarshal(encoded, &view); err != nil {
 		return map[string]any{"artifact_schema": artifact.ProvenanceSchema, "state": artifact.ProvenanceStateUnknown}
+	}
+	// The stored envelope is marshalled from the frozen provenance struct, whose
+	// capture-consistency object omits unknown optional fields. Served views
+	// always carry the complete object shape, with the capture's own target
+	// generation, so no producer publishes a subset.
+	if _, present := view["capture_consistency"]; present {
+		view["capture_consistency"] = server.captureConsistencyViewFor(provenance.CaptureConsistency, provenance.TargetGeneration)
 	}
 	space, _ := view["address_space"].(string)
 	if start, ok := numberAsUint64(view["start_address"]); ok {
@@ -86,6 +93,10 @@ func genericProvenance(server *Server, kind string, capturedAt time.Time) *artif
 	if provenance.CaptureConsistency.Note == "" {
 		provenance.CaptureConsistency.Note = "Capture-time run state; the artifact may span an execution window (see the tool summary)."
 	}
+	// The envelope's flat consistency label is a deprecated, frozen-schema
+	// duplicate of capture_consistency.state; it is always derived from the
+	// object so the two cannot disagree.
+	provenance.Consistency = provenance.CaptureConsistency.State
 	return provenance
 }
 
@@ -137,15 +148,9 @@ func captureProvenance(server *Server, kind, spaceID string, requestedAddress ui
 	if pausedDuringRead {
 		// The handler had to stop a running system to sample; the capture is
 		// paused-atomically from a running state.
-		provenance.CPURunState = "running"
-	} else if running, known := server.runState.currentState(); known {
-		if running {
-			provenance.CPURunState = "running"
-		} else {
-			provenance.CPURunState = "paused"
-		}
+		provenance.CPURunState = runStateRunning
 	} else {
-		provenance.CPURunState = "unknown"
+		provenance.CPURunState = server.runStateString()
 	}
 	if consistency == nil {
 		consistency = buildCaptureConsistency(server, payload, false, true, nil, nil)
@@ -158,13 +163,12 @@ func captureProvenance(server *Server, kind, spaceID string, requestedAddress ui
 	return provenance
 }
 
-// runStateString renders the last observed run state as a provenance label.
+// runStateString renders the last observed run state as a run-state label
+// (running | paused | unknown); the vocabulary is declared once in
+// runStateVocab.
 func (server *Server) runStateString() string {
 	if running, known := server.runState.currentState(); known {
-		if running {
-			return "running"
-		}
-		return "paused"
+		return runStateLabel(running)
 	}
-	return "unknown"
+	return runStateUnknown
 }

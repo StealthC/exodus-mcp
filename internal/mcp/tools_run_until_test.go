@@ -823,9 +823,15 @@ func TestNonOneShotBreakpointAttributedButNotRemoved(t *testing.T) {
 	if len(entries) != 1 {
 		t.Fatalf("expected one run_state_change entry, got %d", len(entries))
 	}
-	attribution, _ := entries[0].Detail["attribution"].(string)
-	if !strings.Contains(attribution, "breakpoint_or_watchpoint") || !strings.Contains(attribution, "breakpoint 1") {
-		t.Fatalf("attribution = %q, want breakpoint_or_watchpoint naming resource 1", attribution)
+	// The audit stream uses the same pause_source vocabulary as every other
+	// surface; the prose that names the instrument is the note beside it.
+	pauseSource, _ := entries[0].Detail["pause_source"].(string)
+	if pauseSource != pauseSourceBreakpointOrWatchpoint {
+		t.Fatalf("pause_source = %q, want %q", pauseSource, pauseSourceBreakpointOrWatchpoint)
+	}
+	pauseSourceNote, _ := entries[0].Detail["pause_source_note"].(string)
+	if !strings.Contains(pauseSourceNote, "breakpoint 1") {
+		t.Fatalf("pause_source_note = %q, want the instrument named", pauseSourceNote)
 	}
 
 	// #14: a steady (non-one-shot) breakpoint stop is recorded exactly like a

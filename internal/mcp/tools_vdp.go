@@ -198,11 +198,10 @@ func vdpMemoryReadValue(tc toolContext, target string, address uint64, length ui
 		"buffer_size":               uint64(bufferSize),
 		"entry_size":                uint64(entrySize),
 		"byte_order":                byteOrder,
-		"consistency":               window.legacyConsistency(tc.server, payload),
 		"representation":            representation,
 		"representation_note":       representationNote(representation),
 		"system_paused_during_read": pausedDuringRead,
-		"capture_consistency":       captureConsistencyToMap(window.consistencyFor(tc.server, payload)),
+		"capture_consistency":       tc.server.captureConsistencyViewWindow(window, window.consistencyFor(tc.server, payload)),
 	}
 	annotateAddressPair(value, addressSpace, address)
 	switch representation {
@@ -370,10 +369,7 @@ func captureFrameArtifact(tc toolContext, context *analysis.Context, window *cap
 	// One consistency object for the frame artifact and the response. Inside a
 	// paused capture window the window owns it, so the artifact cannot claim a
 	// live sample while the response reports an atomic one.
-	consistencyObject := &artifact.CaptureConsistency{
-		State: consistencyLive,
-		Note:  "The frame buffer is sampled as one rendered frame under the VDP's own lock; the frame token identifies it. The handler never pauses the system.",
-	}
+	consistencyObject := newCaptureConsistency(tc.server, consistencyLive, "The frame buffer is sampled as one rendered frame under the VDP's own lock; the frame token identifies it. The handler never pauses the system.")
 	if window != nil && window.Consistency != nil {
 		consistencyObject = window.Consistency
 	}
@@ -390,10 +386,9 @@ func captureFrameArtifact(tc toolContext, context *analysis.Context, window *cap
 			"height":                    height,
 			"source_format":             "rgb24",
 			"byte_order":                "not-applicable",
-			"consistency":               consistencyObject.State,
 			"frame_token":               token,
 			"system_paused_during_read": false,
-			"capture_consistency":       captureConsistencyToMap(consistencyObject),
+			"capture_consistency":       tc.server.captureConsistencyViewWindow(window, consistencyObject),
 			"png_size_bytes":            pngBuffer.Len(),
 			"sha256":                    stored.SHA256,
 		},
@@ -486,7 +481,7 @@ func vdpCaptureValue(tc toolContext, context *analysis.Context, includeFrame, in
 		"kind":                "vdp-capture",
 		"capture_id":          captureID,
 		"captured_at":         capturedAt,
-		"capture_consistency": captureConsistencyToMap(consistency),
+		"capture_consistency": tc.server.captureConsistencyView(consistency),
 		"components":          map[string]any{},
 		"artifacts":           []map[string]any{},
 	}
@@ -625,7 +620,7 @@ func vdpCaptureValue(tc toolContext, context *analysis.Context, includeFrame, in
 	// window as it ended, not as it stood while the components were read.
 	// Publication therefore happens after the guard closed the window.
 	window.publish = func() (map[string]any, *toolFailure) {
-		view := captureConsistencyToMap(consistency)
+		view := tc.server.captureConsistencyViewWindow(window, consistency)
 		manifest["artifacts"] = artifacts
 		manifest["artifact_count"] = len(artifacts)
 		manifest["capture_consistency"] = view
@@ -840,9 +835,8 @@ func runVDPSpriteTable(tc toolContext, args json.RawMessage) map[string]any {
 		"sprite_table_base":         base,
 		"sprite_table_base_hex":     canonicalHex(base),
 		"byte_order":                "big-endian",
-		"consistency":               consistency.State,
 		"system_paused_during_read": pausedDuringRead,
-		"capture_consistency":       captureConsistencyToMap(consistency),
+		"capture_consistency":       tc.server.captureConsistencyView(consistency),
 		"entries":                   window,
 		"returned_entries":          len(window),
 		"table_entries_valid":       len(all),
@@ -1009,9 +1003,8 @@ func runVDPPaletteExport(tc toolContext, args json.RawMessage) map[string]any {
 			"backdrop_color":            decoded[0]["color_hex"],
 			"color_format":              "9-bit RGB expanded to 8-bit",
 			"byte_order":                "big-endian",
-			"consistency":               "live",
 			"capture_id":                captureID,
-			"capture_consistency":       captureConsistencyToMap(consistency),
+			"capture_consistency":       tc.server.captureConsistencyView(consistency),
 			"system_paused_during_read": pausedDuringRead,
 			"png_size_bytes":            pngBuffer.Len(),
 			"png_sha256":                pngStored.SHA256,
@@ -1280,13 +1273,15 @@ func vdpProvenanceWithCapture(tc toolContext, kind, spaceID, device string, capt
 	provenance.EffectiveAddressHex = canonicalHex(0)
 	provenance.SpaceKind = "timed-buffer"
 	provenance.ByteOrder = "device-specific"
-	provenance.Consistency = "live"
 	if captureID != "" {
 		provenance.CaptureID = captureID
 	}
 	if consistency != nil {
 		provenance.CaptureConsistency = consistency
 	}
+	// The deprecated flat label is derived from the object, never hardcoded:
+	// a VDP export read inside a paused window must not claim to be live.
+	provenance.Consistency = provenance.CaptureConsistency.State
 	return provenance
 }
 
@@ -1489,9 +1484,8 @@ func runVDPTileExport(tc toolContext, args json.RawMessage) map[string]any {
 		"nonzero_pixels_per_tile":   nonzeroPerTile,
 		"coherent_snapshot":         coherent,
 		"system_paused_during_read": !coherent,
-		"consistency":               consistency.State,
 		"capture_id":                captureID,
-		"capture_consistency":       captureConsistencyToMap(consistency),
+		"capture_consistency":       tc.server.captureConsistencyView(consistency),
 		"byte_order":                "big-endian",
 		"layout_note":               "Each tile is 8x8 4bpp: four bytes per row, two pixels per byte, high nibble left. Pixel 0 is transparent unless transparent_zero is false. system_paused_during_read is true when any chunked read had to pause a running system; coherent_snapshot is true only when every chunk found it already paused. Both artifacts share one capture_id; when the composition is composite_non_atomic the VRAM and CRAM pieces may come from different frames and must not be combined into a coherent instant.",
 		"png_size_bytes":            pngBuffer.Len(),
@@ -1707,9 +1701,8 @@ func runVDPPlaneExport(tc toolContext, args json.RawMessage) map[string]any {
 		"interlace_active":          interlaceActive,
 		"coherent_snapshot":         coherent,
 		"system_paused_during_read": !coherent,
-		"consistency":               consistency.State,
 		"capture_id":                captureID,
-		"capture_consistency":       captureConsistencyToMap(consistency),
+		"capture_consistency":       tc.server.captureConsistencyView(consistency),
 		"byte_order":                "big-endian",
 		"notes":                     notes,
 	}
@@ -1777,14 +1770,10 @@ func runVDPPixelInfo(tc toolContext, args json.RawMessage) map[string]any {
 	}
 	payload["address_space"] = "315-5313 completed image buffer"
 	payload["coordinate_space"] = "completed frame buffer coordinates, including border and blanking regions"
-	payload["consistency"] = "live"
 	// Pixel attribution reads the completed render buffer under the VDP's own
 	// lock; the handler never pauses the system for it.
 	payload["system_paused_during_read"] = false
-	payload["capture_consistency"] = map[string]any{
-		"state": consistencyLive,
-		"note":  "The completed render buffer is read under the VDP's own lock; the read never pauses the system and the buffer may advance between reads.",
-	}
+	payload["capture_consistency"] = tc.server.captureConsistencyView(newCaptureConsistency(tc.server, consistencyLive, "The completed render buffer is read under the VDP's own lock; the read never pauses the system and the buffer may advance between reads."))
 	captureReuseOf("", nil).annotate(tc, payload, "")
 	return okResult(payload, tc.modern)
 }
