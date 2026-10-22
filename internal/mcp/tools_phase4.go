@@ -61,7 +61,7 @@ func phase4ToolSpecs() []toolSpec {
 		},
 		{
 			name:        "memory_write",
-			description: "Write bytes into a memory space through the emulator debugger path. Only CPU bus spaces and non-timed memory devices are writable; ROM writes are discarded by the bus like real hardware. Bytes arrive as exactly one of data (base64) or data_hex (hex bytes with optional spaces); the response echoes bounded uppercase hex of the exact bytes written, the effective address, the write result, and optional read-back verification. The call is recorded in the target audit stream. Accepts optional expected_target_generation and control_id.",
+			description: "Write bytes into a memory space through the emulator debugger path. Only CPU bus spaces and non-timed memory devices are writable; spaces memory_spaces_list reports without write permission (mem-rom, mem-boot-rom, and the timed-buffer VDP shells) are refused with write_not_supported before any native write, so a cartridge image is never patched in place. Writes addressed through a CPU bus space keep real hardware behavior, where the bus discards writes to cartridge addresses. Bytes arrive as exactly one of data (base64) or data_hex (hex bytes with optional spaces); the response echoes bounded uppercase hex of the exact bytes written, the effective address, the write result, and optional read-back verification. The call is recorded in the target audit stream. Accepts optional expected_target_generation and control_id.",
 			schema: objectSchema(map[string]any{
 				"context":                    contextProperty(),
 				"space":                      stringProperty("Space id from memory_spaces_list, such as m68k-bus."),
@@ -296,6 +296,12 @@ func runMemoryWrite(tc toolContext, args json.RawMessage) map[string]any {
 	if len(bytes) < 1 || len(bytes) > maxMemoryWriteBytes {
 		return failureResult(&toolFailure{Code: "invalid_params", Message: fmt.Sprintf("data must hold between 1 and %d bytes", maxMemoryWriteBytes)}, tc.modern)
 	}
+	// The reported permissions are authoritative: a space memory_spaces_list
+	// reports as read-only is refused before any native write, so the loaded
+	// cartridge image can never be patched behind the caller's back. The
+	// check runs inside the scheduler after the guard preconditions, so a
+	// generation conflict or a foreign control lock still reports first.
+	policy := spaceWritePolicyFor(parsed.Space)
 	payload, before, after, failure := tc.server.executeMutation(tc.ctx, mutationCall{
 		tool:      "memory_write",
 		operation: "mem_write",
@@ -313,6 +319,12 @@ func runMemoryWrite(tc toolContext, args json.RawMessage) map[string]any {
 			"length":  len(bytes),
 			"sha256":  sha256Hex(bytes),
 			"input":   "data_hex",
+		},
+		prepare: func() *toolFailure {
+			if policy.Writable {
+				return nil
+			}
+			return spaceWriteRefusal(parsed.Space, policy)
 		},
 	})
 	if failure != nil {
