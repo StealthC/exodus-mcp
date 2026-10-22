@@ -65,6 +65,26 @@ var toolAliasRecords = []toolAliasRecord{
 		Mapping:     "mega_drive_memory_map returns the legacy {regions, note, live_spaces} object; memory_map.reference carries the same fields.",
 	},
 	{
+		Alias:       "m68k_step",
+		Replacement: "cpu_step",
+		Mapping:     "m68k_step returns the legacy synchronous M68K single-step payload; cpu_step{cpu:\"m68k\", mode:\"instruction\"} runs the same native action and adds mode (and cpu, which the native echo already carries).",
+	},
+	{
+		Alias:       "z80_step",
+		Replacement: "cpu_step",
+		Mapping:     "z80_step returns the legacy synchronous Z80 single-step payload; cpu_step{cpu:\"z80\", mode:\"instruction\"} runs the same native action and adds mode.",
+	},
+	{
+		Alias:       "cpu_step_over",
+		Replacement: "cpu_step",
+		Mapping:     "cpu_step_over returns the legacy step_over payload; cpu_step{cpu:..., mode:\"over\"} runs the same native action and adds mode (plus step_completion only when timeout_ms is supplied).",
+	},
+	{
+		Alias:       "cpu_step_out",
+		Replacement: "cpu_step",
+		Mapping:     "cpu_step_out returns the legacy step_out payload; cpu_step{cpu:..., mode:\"out\"} runs the same native action and adds mode (plus step_completion only when timeout_ms is supplied).",
+	},
+	{
 		Alias:       "m68k_disassemble",
 		Replacement: "disassemble",
 		Mapping:     "m68k_disassemble returns the legacy M68K sweep payload; disassemble{cpu:\"m68k\", ...} accepts the same address/addresses/count/context arguments and returns the same payload.",

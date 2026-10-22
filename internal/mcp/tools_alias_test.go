@@ -141,7 +141,7 @@ func TestConsolidatedCatalogHasNoDuplicateConcept(t *testing.T) {
 
 // consolidatedCanonicalTools is the merged catalog. Each consolidation group
 // appends its canonical concept here.
-var consolidatedCanonicalTools = []string{"target_status", "memory_map", "memory_read", "disassemble"}
+var consolidatedCanonicalTools = []string{"target_status", "memory_map", "memory_read", "disassemble", "cpu_step"}
 
 // payloadView strips the fields the dispatcher injects into every response and
 // the alias' own deprecation marker, so two payloads can be compared field by
@@ -519,6 +519,97 @@ func TestDisassembleRequiresAKnownProcessor(t *testing.T) {
 	result = postToolCall(t, newTestServer(t, client), "disassemble", `{}`)
 	if structured(result)["code"] != "invalid_params" {
 		t.Fatalf("code = %v, want invalid_params for a missing cpu", structured(result))
+	}
+}
+
+// ----------------------------------------------------------------------------------------------------------------------
+// cpu_step alias parity (group 5)
+// ----------------------------------------------------------------------------------------------------------------------
+
+// stepClient answers the native cpu_control step actions and the run-state
+// observation the optional completion wait polls.
+func stepClient(runningPolls int) *fakeBridgeClient {
+	client := &fakeBridgeClient{status: newFakeStatus()}
+	statusPolls := 0
+	client.executeFunc = func(_ context.Context, method string, params map[string]string) (json.RawMessage, error) {
+		switch method {
+		case "cpu_control":
+			action := params["action"]
+			cpu := params["cpu"]
+			state := "false"
+			if action == "run" {
+				state = "true"
+			}
+			return json.RawMessage(fmt.Sprintf(`{"action":%q,"cpu":%q,"processor_pc":4660,"system_running":%s}`, action, cpu, state)), nil
+		case "emulator_status":
+			statusPolls++
+			return json.RawMessage(fmt.Sprintf(`{"system_running":%t,"modules":[],"devices":[]}`, statusPolls <= runningPolls)), nil
+		default:
+			return json.RawMessage(`{}`), nil
+		}
+	}
+	return client
+}
+
+// TestCPUStepAbsorbsTheStepTools proves each legacy stepping tool is cpu_step
+// with the processor and the mode as arguments.
+func TestCPUStepAbsorbsTheStepTools(t *testing.T) {
+	for _, tc := range []struct {
+		canonicalArgs string
+		alias         string
+		aliasArgs     string
+		mode          string
+	}{
+		{`{"cpu":"m68k"}`, "m68k_step", `{}`, cpuStepModeInstruction},
+		{`{"cpu":"z80"}`, "z80_step", `{}`, cpuStepModeInstruction},
+		{`{"cpu":"m68k","mode":"over"}`, "cpu_step_over", `{"cpu":"m68k"}`, cpuStepModeOver},
+		{`{"cpu":"z80","mode":"out"}`, "cpu_step_out", `{"cpu":"z80"}`, cpuStepModeOut},
+	} {
+		client := stepClient(0)
+		canonical := canonicalPayload(t, client, "cpu_step", tc.canonicalArgs)
+		legacy := canonicalPayload(t, client, tc.alias, tc.aliasArgs)
+		if canonical["mode"] != tc.mode {
+			t.Fatalf("%s: cpu_step.mode = %v, want %s", tc.alias, canonical["mode"], tc.mode)
+		}
+		delete(canonical, "mode")
+		delete(canonical, "step_completion")
+		if !jsonEqual(t, canonical, legacy) {
+			t.Fatalf("%s parity failed:\ncanonical = %v\nlegacy     = %v", tc.alias, canonical, legacy)
+		}
+	}
+}
+
+// TestCPUStepWaitsForCompletionWhenAsked covers the only new behavior of the
+// merged tool: an optional bounded wait for the pause that over/out produce.
+func TestCPUStepWaitsForCompletionWhenAsked(t *testing.T) {
+	client := stepClient(1)
+	result := structured(postToolCall(t, newTestServer(t, client), "cpu_step", `{"cpu":"m68k","mode":"over","timeout_ms":2000}`))
+	completion, ok := result["step_completion"].(map[string]any)
+	if !ok {
+		t.Fatalf("step_completion missing: %v", result)
+	}
+	if completion["completed"] != true {
+		t.Fatalf("step did not complete: %v", completion)
+	}
+	if completion["system_running"] != false {
+		t.Fatalf("system_running = %v", completion["system_running"])
+	}
+
+	// The same call without timeout_ms returns immediately, like the legacy
+	// alias, and never polls the run state.
+	client = stepClient(1)
+	result = structured(postToolCall(t, newTestServer(t, client), "cpu_step", `{"cpu":"m68k","mode":"over"}`))
+	if _, present := result["step_completion"]; present {
+		t.Fatalf("step_completion must not appear without timeout_ms: %v", result)
+	}
+}
+
+// TestCPUStepRejectsAMeaninglessTimeout keeps timeout_ms honest: an instruction
+// step cannot outlive the call.
+func TestCPUStepRejectsAMeaninglessTimeout(t *testing.T) {
+	result := postToolCall(t, newTestServer(t, stepClient(0)), "cpu_step", `{"cpu":"m68k","timeout_ms":10}`)
+	if structured(result)["code"] != "invalid_params" {
+		t.Fatalf("code = %v, want invalid_params", structured(result))
 	}
 }
 
