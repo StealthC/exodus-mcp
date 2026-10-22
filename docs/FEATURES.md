@@ -121,7 +121,9 @@ claim to the exact test function or smoke-script check that proves it.
   `system_snapshot_capture` provides the cross-domain atomic form: memory
   ranges, CPU registers, VDP status/buffers, and an optional frame share one
   pause window and one `capture_id` in a `system-snapshot/1` manifest, and
-  omitted or unavailable components are explicit. `memory_read`,
+  omitted or unavailable components are explicit. Each memory component is
+  indexed under its range label (`memory:<name>`) while its provenance carries
+  the range's real space id, device, space-relative start, and bus start. `memory_read`,
   `memory_dump`, `m68k_read_memory`, `z80_read_memory`, `vdp_memory_read`,
   `vdp_memory_export`, `frame_capture`, and `vdp_capture` accept an optional
   `capture_mode: "paused"` guard that makes a single sample temporally atomic
@@ -237,7 +239,16 @@ claim to the exact test function or smoke-script check that proves it.
   (`TestSystemSnapshotCaptureRestoresWithExpectedGeneration`,
   `TestSystemSnapshotCapturePausedTargetStaysPaused`); **unvalidated** for
   component selection beyond a memory range (register, VDP buffer, and frame
-  components have no behavioral test).
+  components have no behavioral test). Every memory component records the real
+  address domain of its range — the published `space` of the range or the
+  top-level `space`, never the range label — plus the owning device, the
+  space-relative start, and the bus start, through the same
+  `artifact-provenance/2` builder `memory_snapshot_capture` uses, so both
+  producers describe the same range identically
+  (`TestSystemSnapshotMemoryProvenanceMatchesMemorySnapshot`). The published
+  schema and the strict decoder are held to one property list by
+  `TestPublishedSchemaMatchesArgumentStructs`; `address_space` is the optional
+  domain of `vram_address`, and it never replaces a range's `space`.
 - `memory_snapshot_capture`: bounded paused composite capture — one or more
   named ranges of one address space are read inside a single pause window
   (the system is paused exactly once when running and restored afterwards;
@@ -1025,7 +1036,9 @@ behavior is unverified as of this revision:
 - `system_snapshot_capture` component selection beyond a memory range: the
   register, VDP buffer, and frame components have no behavioral test (the
   pause window, restore verification, and manifest provenance are proven by
-  `internal/mcp/tools_guard_window_test.go`).
+  `internal/mcp/tools_guard_window_test.go`; the memory-range provenance,
+  capture index, and schema/decoder agreement are proven by
+  `internal/mcp/tools_system_snapshot_test.go`).
 - Trace session `mode: "continuous"` and `stop_after_vdp_frames`: both tests
   and the live check use the default `sampled` window mode.
 - `cpu_coverage_capture` `blocks`/`edges`: the tests assert entry, distinct and

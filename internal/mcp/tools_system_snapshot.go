@@ -15,7 +15,12 @@ import (
 const systemSnapshotSchema = "system-snapshot/1"
 
 type systemSnapshotArgs struct {
-	Space                    string             `json:"space"`
+	Space string `json:"space"`
+	// AddressSpace is the published optional domain of the supplied address
+	// (injected by objectSchema because the tool has vram_address). The decoder
+	// must accept it: rejecting a property the schema advertises made the field
+	// unusable for every client that followed the published contract.
+	AddressSpace             string             `json:"address_space"`
 	MemoryRanges             []captureRangeArgs `json:"memory_ranges"`
 	IncludeM68K              *bool              `json:"include_m68k_registers"`
 	IncludeZ80               *bool              `json:"include_z80_registers"`
@@ -34,7 +39,7 @@ type systemSnapshotArgs struct {
 
 func systemSnapshotToolSpec() toolSpec {
 	boolProp := func(text string) map[string]any { return booleanProperty(text) }
-	return toolSpec{name: "system_snapshot_capture", description: "Capture a temporally atomic, artifact-first snapshot of memory, CPU registers, VDP state, and the rendered frame. The server pauses once when needed, performs all selected reads in that window, and restores the prior run state. The versioned system-snapshot/1 manifest links every component with one capture_id and records consistency, generation, ROM identity, byte order, address domains, and omitted/unavailable components. This tool has no live mode.", schema: objectSchema(map[string]any{
+	return toolSpec{name: "system_snapshot_capture", description: "Capture a temporally atomic, artifact-first snapshot of memory, CPU registers, VDP state, and the rendered frame. The server pauses once when needed, performs all selected reads in that window, and restores the prior run state. The versioned system-snapshot/1 manifest links every component with one capture_id and records consistency, generation, ROM identity, byte order, address domains, and omitted/unavailable components. This tool has no live mode. Each memory range declares its own space or falls back to the top-level space; address_space is the optional domain of vram_address only, and every memory component records the real space id, device, and space-relative plus bus start address in its provenance.", schema: objectSchema(map[string]any{
 		"space":                  stringProperty("Default memory space id for ranges that omit space."),
 		"memory_ranges":          map[string]any{"type": "array", "description": fmt.Sprintf("Named memory ranges (1-%d; total capped at %d bytes).", captureMaxRanges, dumpCapBytes), "items": map[string]any{"type": "object", "additionalProperties": false, "properties": map[string]any{"name": stringProperty("Range name."), "address": addressProperty(), "address_space": stringProperty("Address domain; omitted means space."), "length": integerProperty("Range length.", 1), "space": stringProperty("Memory space id; defaults to the address domain.")}, "required": []string{"name", "address", "length"}}, "minItems": 1, "maxItems": captureMaxRanges},
 		"include_m68k_registers": boolProp("Include M68K registers (default true)."), "include_z80_registers": boolProp("Include Z80 registers (default true)."), "include_vdp_status": boolProp("Include VDP status (default true)."), "include_frame": boolProp("Include rendered PNG frame (default true)."), "include_cram": boolProp("Include CRAM bytes (default true)."), "include_vsram": boolProp("Include VSRAM bytes (default true)."), "include_vram": boolProp("Include VRAM range (default false)."), "vram_address": addressProperty(), "vram_length": integerProperty("VRAM length, capped at 131072 bytes.", 1), "include_sprite_table": boolProp("Include sprite-table data when available (default true)."),
@@ -63,7 +68,9 @@ func runSystemSnapshot(tc toolContext, args json.RawMessage) map[string]any {
 			return failureResult(f, tc.modern)
 		}
 	}
-	// A named range carries its own space; require it explicitly so domains cannot be guessed.
+	// A named range carries its own space; default only from the explicit
+	// top-level space. Promoting address_space into space silently ignored the
+	// caller's address domain and skipped translation.
 	ranges := make([]captureRange, 0, len(p.MemoryRanges))
 	seen := map[string]bool{}
 	var total uint64
@@ -71,20 +78,18 @@ func runSystemSnapshot(tc toolContext, args json.RawMessage) map[string]any {
 		return failureResult(&toolFailure{Code: "invalid_params", Message: "memory_ranges must hold between 1 and 16 entries"}, tc.modern)
 	}
 	for i, r := range p.MemoryRanges {
-		if r.Space == "" {
-			r.Space = r.AddressSpace
+		space := r.Space
+		if space == "" {
+			space = p.Space
 		}
-		if r.Space == "" {
-			r.Space = p.Space
-		}
-		if r.Space == "" {
+		if space == "" {
 			return failureResult(&toolFailure{Code: "invalid_params", Message: fmt.Sprintf("memory_ranges[%d].space is required", i)}, tc.modern)
 		}
 		if seen[r.Name] {
 			return failureResult(&toolFailure{Code: "invalid_params", Message: "memory range names must be unique"}, tc.modern)
 		}
 		seen[r.Name] = true
-		addr, f := resolveAddress(r.Address, r.AddressSpace, r.Space)
+		addr, f := resolveAddress(r.Address, r.AddressSpace, space)
 		if f != nil {
 			return failureResult(f, tc.modern)
 		}
@@ -92,7 +97,7 @@ func runSystemSnapshot(tc toolContext, args json.RawMessage) map[string]any {
 			return failureResult(&toolFailure{Code: "invalid_params", Message: "memory_ranges exceed the per-range or total byte cap"}, tc.modern)
 		}
 		total += r.Length
-		ranges = append(ranges, captureRange{Name: r.Name, Space: r.Space, Address: addr, Length: r.Length})
+		ranges = append(ranges, captureRange{Name: r.Name, Space: space, Address: addr, Length: r.Length})
 	}
 	vramLen := p.VRAMLength
 	if vramLen == 0 {
@@ -103,7 +108,7 @@ func runSystemSnapshot(tc toolContext, args json.RawMessage) map[string]any {
 	}
 	vramAddr := uint64(0)
 	if p.VRAMAddress != nil {
-		vramAddr, failure = resolveAddress(p.VRAMAddress, "mem-vdp-vram", "mem-vdp-vram")
+		vramAddr, failure = resolveAddress(p.VRAMAddress, p.AddressSpace, "mem-vdp-vram")
 		if failure != nil {
 			return failureResult(failure, tc.modern)
 		}
@@ -236,7 +241,10 @@ func runSystemSnapshot(tc toolContext, args json.RawMessage) map[string]any {
 		if e != nil {
 			return fail(&toolFailure{Code: "bridge_error", Message: e.Error()})
 		}
-		if f = addRaw("memory:"+r.Name, "system-memory", r.Name, r.Address, raw, payload); f != nil {
+		// The range name is a label, never an address domain: provenance carries
+		// the real space id, its device, and both the space-relative and bus form
+		// of the start address through the shared memory-range envelope builder.
+		if f = addRaw("memory:"+r.Name, "system-memory", r.Space, r.Address, raw, payload); f != nil {
 			return fail(f)
 		}
 	}
