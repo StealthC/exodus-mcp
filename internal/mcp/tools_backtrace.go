@@ -4,11 +4,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
-	"sort"
 	"strings"
-
-	"github.com/StealthC/exodus-mcp/internal/analysis"
-	"github.com/StealthC/exodus-mcp/internal/symbols"
 )
 
 // m68k_backtrace (roadmap P7): walk the M68K stack through A7 (the active
@@ -36,6 +32,18 @@ const (
 // disasmSymbolMask("m68k") and addressBusWidthMask.
 const m68kBusMask = 0x00FFFFFF
 
+// z80 backtrace limits. The Z80 bus is 16 bits, so the scan window and the
+// number of probed slots are smaller than the M68K ones while the shape stays
+// identical.
+const (
+	z80BusMask         = 0x0000FFFF
+	z80ScanWindow      = 0x1000
+	z80ScanSlots       = 128
+	z80RAMWindowEnd    = 0x2000 // Z80 work RAM: where a sound driver's code lives
+	z80ScanSlotBytes   = 2
+	z80SymbolMaxOffset = 0x0800
+)
+
 func backtraceToolSpecs() []toolSpec {
 	return []toolSpec{
 		{
@@ -47,6 +55,16 @@ func backtraceToolSpecs() []toolSpec {
 				"context":     contextProperty(),
 			}, nil),
 			run: runBacktrace,
+		},
+		{
+			name:        "z80_backtrace",
+			description: "Walk the Z80 stack from SP, resolving candidate return addresses against symbols_set symbols through the z80-bus coordinate model. Frame 0 is the live PC; every other frame is a 2-byte stack slot read little-endian whose value is nonzero and, when it falls inside Z80 work RAM (0x0000-0x1FFF, where a sound driver's code lives), marked medium confidence; other candidates are low. The Z80 has no documented frame-pointer convention, so only the stack scan runs; nothing is claimed to be an execution-verified call site. Reads are live (the plugin pauses per read when the system runs) and the result carries the standardized capture_consistency object.",
+			schema: objectSchema(map[string]any{
+				"max_frames":  integerProperty(fmt.Sprintf("Maximum frames (default %d, cap %d).", defaultBacktraceFrames, maxBacktraceFrames), 1),
+				"include_raw": booleanProperty("Include the raw 2-byte stack slot (stack address and word value) per frame (default false)."),
+				"context":     contextProperty(),
+			}, nil),
+			run: runZ80Backtrace,
 		},
 	}
 }
@@ -93,34 +111,10 @@ func registerValue(registers map[string]any, names ...string) (uint64, bool) {
 	return 0, false
 }
 
-// backtraceSymbolIndex resolves addresses against the context symbols that
-// belong to the M68K bus, through the 24-bit bus mask (mirroring the
-// disassembly annotation rules).
-type backtraceSymbolIndex struct {
-	byAddress map[uint64]string
-	sorted    []symbols.Symbol
-}
-
-func buildBacktraceSymbolIndex(context *analysis.Context, romSHA256 string) *backtraceSymbolIndex {
-	index := &backtraceSymbolIndex{byAddress: map[uint64]string{}}
-	for _, symbol := range context.Symbols.ListForROM("", romSHA256) {
-		if symbol.SpaceID != "" && symbol.SpaceID != disasmSpaceID("m68k") {
-			continue
-		}
-		masked := symbol.Address & m68kBusMask
-		if _, exists := index.byAddress[masked]; !exists {
-			index.byAddress[masked] = symbol.Name
-		}
-		index.sorted = append(index.sorted, symbols.Symbol{Name: symbol.Name, Address: masked})
-	}
-	sort.Slice(index.sorted, func(i, j int) bool { return index.sorted[i].Address < index.sorted[j].Address })
-	return index
-}
-
 // resolve returns the symbol at the exact masked address (offset 0), or the
 // nearest symbol at or below the address when the distance is bounded.
-func (index *backtraceSymbolIndex) resolve(address uint64) (string, uint64) {
-	masked := address & m68kBusMask
+func (index *symbolBusIndex) resolve(address uint64) (string, uint64) {
+	masked := address & index.mask
 	if name, ok := index.byAddress[masked]; ok {
 		return name, 0
 	}
@@ -167,7 +161,7 @@ func backtraceConfidence(candidate uint64) string {
 
 // backtraceFrame builds one result frame entry with symbol resolution and the
 // optional raw stack slot view.
-func backtraceFrame(address, stackAddress uint64, raw []byte, method, confidence, note string, includeRaw bool, index *backtraceSymbolIndex) map[string]any {
+func backtraceFrame(address, stackAddress uint64, raw []byte, method, confidence, note string, includeRaw bool, index *symbolBusIndex) map[string]any {
 	masked := address & m68kBusMask
 	frame := map[string]any{
 		"address":        masked,
@@ -239,7 +233,7 @@ func runBacktrace(tc toolContext, args json.RawMessage) map[string]any {
 	usp, _ := registerValue(registers, "usp")
 	ssp, _ := registerValue(registers, "ssp")
 
-	symbolsIndex := buildBacktraceSymbolIndex(context, tc.server.currentROMSHA256())
+	symbolsIndex := newSymbolBusIndex(context.Symbols, tc.server.currentROMSHA256(), disasmSpaceID("m68k"))
 
 	// readWord reads one big-endian 32-bit slot through the M68K bus and
 	// reports whether the plugin had to pause a running system for the read.
@@ -383,13 +377,234 @@ func runBacktrace(tc toolContext, args json.RawMessage) map[string]any {
 		"truncated":           truncated,
 		"frames":              frames,
 		"registers":           registerSummary,
-		"capture_consistency": captureConsistencyToMap(buildCaptureConsistency(tc.server, map[string]any{}, true, allReadsPaused, nil, nil)),
+		"capture_consistency": tc.server.captureConsistencyView(buildCaptureConsistency(tc.server, map[string]any{}, true, allReadsPaused, nil, nil)),
 	}
 	if scanNote != "" {
 		result["scan_note"] = scanNote
 	}
 	if fpWalkNote != "" {
 		result["frame_pointer_note"] = fpWalkNote
+	}
+	return okResult(result, tc.modern)
+}
+
+// ----------------------------------------------------------------------------------------------------------------------
+// z80_backtrace
+// ----------------------------------------------------------------------------------------------------------------------
+
+// z80BacktraceFrame builds one Z80 frame with symbol resolution through the
+// z80-bus coordinate model and the optional raw slot view. Values are decoded
+// little-endian, the declared Z80 byte order, and the raw bytes stay in address
+// order.
+func z80BacktraceFrame(address, stackAddress uint64, raw []byte, method, confidence, note string, includeRaw bool, index *symbolBusIndex) map[string]any {
+	masked := address & z80BusMask
+	frame := map[string]any{
+		"address":        masked,
+		"address_hex":    canonicalHex(masked),
+		"address_space":  disasmSpaceID("z80"),
+		"method":         method,
+		"confidence":     confidence,
+		"heuristic_note": note,
+	}
+	annotateAddressPair(frame, disasmSpaceID("z80"), masked)
+	if name, offset := index.resolveZ80(masked); name != "" {
+		frame["symbol"] = name
+		frame["offset"] = offset
+	}
+	if includeRaw && raw != nil {
+		rawView := map[string]any{
+			"stack_address":     stackAddress & z80BusMask,
+			"stack_address_hex": canonicalHex(stackAddress & z80BusMask),
+			"bytes_hex":         strings.ToUpper(hex.EncodeToString(raw)),
+			"word":              address,
+			"word_hex":          canonicalHex(address),
+			"byte_order":        "little-endian",
+		}
+		annotateAddressPair(rawView, disasmSpaceID("z80"), stackAddress&z80BusMask)
+		frame["raw"] = rawView
+	}
+	return frame
+}
+
+// resolveZ80 resolves a symbol at or below one Z80 bus address within the
+// documented offset window.
+func (index *symbolBusIndex) resolveZ80(address uint64) (string, uint64) {
+	masked := address & z80BusMask
+	if name, ok := index.byAddress[masked]; ok {
+		return name, 0
+	}
+	lo, hi := 0, len(index.sorted)
+	for lo < hi {
+		mid := (lo + hi) / 2
+		if index.sorted[mid].Address <= masked {
+			lo = mid + 1
+		} else {
+			hi = mid
+		}
+	}
+	if lo == 0 {
+		return "", 0
+	}
+	best := index.sorted[lo-1]
+	offset := masked - best.Address
+	if offset > z80SymbolMaxOffset {
+		return "", 0
+	}
+	return best.Name, offset
+}
+
+func runZ80Backtrace(tc toolContext, args json.RawMessage) map[string]any {
+	parsed, failure := decodeArgs[backtraceArgs](args)
+	if failure != nil {
+		return failureResult(failure, tc.modern)
+	}
+	context, failure := resolveContext(tc.server, parsed.Context)
+	if failure != nil {
+		return failureResult(failure, tc.modern)
+	}
+	maxFrames := parsed.MaxFrames
+	if maxFrames == 0 {
+		maxFrames = defaultBacktraceFrames
+	}
+	if maxFrames > maxBacktraceFrames {
+		return failureResult(&toolFailure{
+			Code:    "invalid_params",
+			Message: fmt.Sprintf("max_frames is capped at %d.", maxBacktraceFrames),
+		}, tc.modern)
+	}
+	budget := int(maxFrames)
+
+	payload, failure := tc.server.executeCommand(tc.ctx, "regs_get", map[string]string{"cpu": "z80"})
+	if failure != nil {
+		return failureResult(failure, tc.modern)
+	}
+	registers, ok := payload["registers"].(map[string]any)
+	if !ok {
+		registers = payload
+	}
+	sp, ok := registerValue(registers, "sp")
+	if !ok {
+		return failureResult(&toolFailure{
+			Code:    "bridge_error",
+			Message: "the z80 register payload provides no usable stack pointer (sp)",
+		}, tc.modern)
+	}
+	pc, _ := registerValue(registers, "pc")
+	ix, _ := registerValue(registers, "ix")
+	iy, _ := registerValue(registers, "iy")
+	af, _ := registerValue(registers, "af")
+	stackPointer := sp & z80BusMask
+	if stackPointer == 0 {
+		return failureResult(&toolFailure{
+			Code:    "invalid_params",
+			Message: "The Z80 stack pointer is zero; there is no stack to walk.",
+		}, tc.modern)
+	}
+
+	symbolsIndex := newSymbolBusIndex(context.Symbols, tc.server.currentROMSHA256(), disasmSpaceID("z80"))
+
+	// readSlot reads one 2-byte little-endian slot and reports whether the
+	// plugin had to pause a running system for it.
+	allReadsPaused := true
+	readSlot := func(address uint64) ([]byte, uint64, *toolFailure) {
+		raw, _, _, pausedDuringRead, failure := readBridgeBytes(tc, disasmSpaceID("z80"), address, z80ScanSlotBytes)
+		if failure != nil {
+			return nil, 0, failure
+		}
+		if pausedDuringRead {
+			allReadsPaused = false
+		}
+		value := uint64(raw[0]) | uint64(raw[1])<<8
+		return raw, value, nil
+	}
+
+	scanNote := ""
+	scanFrames := []map[string]any{}
+	scanStart := stackPointer
+	scanEnd := scanStart + z80ScanWindow
+	if scanEnd > z80BusMask {
+		scanEnd = z80BusMask
+	}
+	attempts := 0
+	for address := scanStart; len(scanFrames) < budget && attempts < z80ScanSlots && address+1 < scanEnd; address += z80ScanSlotBytes {
+		attempts++
+		raw, candidate, failure := readSlot(address)
+		if failure != nil {
+			scanNote = "stack scan stopped: " + failure.Code
+			break
+		}
+		if candidate == 0 {
+			continue
+		}
+		// A Z80 return address has no alignment rule; the documented filter is
+		// "nonzero, and inside Z80 work RAM when it can be trusted". Values
+		// outside that window are kept but labelled low confidence instead of
+		// being discarded, so RAM-resident or banked code is still visible.
+		confidence := "low"
+		if candidate < z80RAMWindowEnd {
+			confidence = "medium"
+		}
+		scanFrames = append(scanFrames, z80BacktraceFrame(candidate, address, raw, "stack_scan", confidence,
+			"2-byte stack slot decoded little-endian; the Z80 has no frame-pointer convention, so this is a plausible return address, not an execution-verified call site.", parsed.IncludeRaw, symbolsIndex))
+	}
+
+	frames := []map[string]any{}
+	seen := map[uint64]bool{}
+	frames = append(frames, z80BacktraceFrame(pc, 0, nil, "register_pc", "high",
+		"Current Z80 program counter from regs_get; not a stack guess.", false, symbolsIndex))
+	seen[pc&z80BusMask] = true
+	for _, frame := range scanFrames {
+		address, _ := frame["address"].(uint64)
+		if seen[address] {
+			continue
+		}
+		seen[address] = true
+		frames = append(frames, frame)
+	}
+	truncated := false
+	if len(frames) > budget {
+		frames = frames[:budget]
+		truncated = true
+	}
+	if len(frames) >= budget && !truncated {
+		truncated = true
+	}
+	for index, frame := range frames {
+		frame["index"] = index
+	}
+
+	registerSummary := map[string]any{"sp": sp, "pc": pc, "af": af}
+	if ix != 0 {
+		registerSummary["ix"] = ix
+	}
+	if iy != 0 {
+		registerSummary["iy"] = iy
+	}
+	for key, value := range registerSummary {
+		if numeric, ok := value.(uint64); ok {
+			registerSummary[key+"_hex"] = canonicalHex(numeric & z80BusMask)
+		}
+	}
+
+	result := map[string]any{
+		"cpu":                 "z80",
+		"heuristic":           true,
+		"note":                "Heuristic, not execution-verified; the stack may contain data, not return addresses. Frame 0 is the live PC; every other frame is a nonzero 2-byte stack slot decoded little-endian.",
+		"methodology":         "Frame 0 reads the live PC from regs_get. A linear scan walks 2-byte slots upward from SP, accepting nonzero values decoded little-endian; candidates inside Z80 work RAM (0x0000-0x1FFF) are marked medium confidence and everything else low. The Z80 has no documented frame-pointer linkage, so no chain walk is performed and IX/IY are reported as registers only. Symbol annotation uses the z80-bus coordinate model with the 16-bit bus mask.",
+		"frame_count":         len(frames),
+		"truncated":           truncated,
+		"frames":              frames,
+		"registers":           registerSummary,
+		"address_width_bits":  16,
+		"address_mask_hex":    canonicalHex(z80BusMask),
+		"byte_order":          "little-endian",
+		"capture_consistency": tc.server.captureConsistencyView(buildCaptureConsistency(tc.server, map[string]any{}, true, allReadsPaused, nil, nil)),
+	}
+	if scanNote != "" {
+		result["scan_note"] = scanNote
+	}
+	if stackPointer >= z80ScanWindow && scanStart+z80ScanWindow > z80BusMask {
+		result["scan_wrapped"] = true
 	}
 	return okResult(result, tc.modern)
 }

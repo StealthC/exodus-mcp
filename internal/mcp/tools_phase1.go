@@ -3,7 +3,10 @@ package mcp
 import (
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -16,21 +19,43 @@ func phase1ToolSpecs() []toolSpec {
 	return []toolSpec{
 		{
 			name:        "artifact_get",
-			description: "Return metadata plus the direct loopback download URL for one artifact. Raw bytes are never placed in this response.",
+			description: "Return one artifact's metadata, provenance envelope, and direct loopback download URL (raw bytes are never placed in this response): artifact id, kind, MIME type, size, SHA-256, created_at, expires_at (null when retention is unlimited), the payload's own schema_version when it declares one, and the capture_id when the artifact belongs to a capture. include selects the metadata and provenance sections (both by default).",
 			schema: objectSchema(map[string]any{
-				"artifact_id": stringProperty("Opaque artifact id returned by a producing tool."),
-				"context":     contextProperty(),
+				"artifact_id": stringProperty("Opaque artifact id returned by a producing tool or artifact_list."),
+				"include": map[string]any{
+					"type":        "array",
+					"description": "Sections to return; omitted means both. \"metadata\" adds the metadata block, \"provenance\" adds the typed provenance envelope.",
+					"items":       map[string]any{"type": "string", "enum": []string{"metadata", "provenance"}},
+				},
+				"context": contextProperty(),
 			}, []string{"artifact_id"}),
 			run: runArtifactGet,
 		},
 		{
 			name:        "artifact_describe",
-			description: "Return the full typed provenance envelope of one artifact: address domain (space, requested and effective addresses in decimal and canonical hex, byte length, byte order, raw-byte ordering), owning device, target generation, ROM identity, frame token, CPU run state, capture consistency, and capture time. Artifacts whose producer attached no capture metadata are reported honestly with the provenance_unknown state instead of invented fields.",
+			description: "DEPRECATED: use artifact_get with include [\"metadata\",\"provenance\"], which returns the same payload. Returns the full typed provenance envelope of one artifact: address domain (space, requested and effective addresses in decimal and canonical hex, byte length, byte order, raw-byte ordering), owning device, target generation, ROM identity, frame token, CPU run state, capture consistency, and capture time. Artifacts whose producer attached no capture metadata are reported honestly with the provenance_unknown state instead of invented fields. include selects the metadata and provenance sections exactly like artifact_get.",
 			schema: objectSchema(map[string]any{
-				"artifact_id": stringProperty("Opaque artifact id returned by a producing tool."),
-				"context":     contextProperty(),
+				"artifact_id": stringProperty("Opaque artifact id returned by a producing tool or artifact_list."),
+				"include": map[string]any{
+					"type":        "array",
+					"description": "Sections to return; omitted means both. \"metadata\" adds the metadata block, \"provenance\" adds the typed provenance envelope.",
+					"items":       map[string]any{"type": "string", "enum": []string{"metadata", "provenance"}},
+				},
+				"context": contextProperty(),
 			}, []string{"artifact_id"}),
 			run: runArtifactDescribe,
+		},
+		{
+			name:        "artifact_list",
+			description: "Enumerate the artifacts one analysis context holds, newest discovery for a new session or a lost response. Each descriptor carries artifact_id, kind, mime_type, size_bytes, sha256, created_at, expires_at (null when retention is unlimited), schema_version when the payload declares one, capture_id when the artifact belongs to a capture, and the direct download URL. Filters by kind and capture_id; pages by cursor/limit (default 50, cap 200) and reports total, returned, has_more, and next_cursor (null on the last page).",
+			schema: objectSchema(map[string]any{
+				"kind":       stringProperty("Exact artifact kind to list, for example \"memory-dump\" or \"vdp-capture-manifest\"."),
+				"capture_id": stringProperty("Only artifacts carrying this capture id, including a capture's manifest and its components."),
+				"cursor":     stringProperty("next_cursor from a previous artifact_list call; omitted starts at the first page."),
+				"limit":      integerProperty(fmt.Sprintf("Page size between 1 and %d (default %d).", artifact.MaxListLimit, artifact.DefaultListLimit), 1),
+				"context":    contextProperty(),
+			}, nil),
+			run: runArtifactList,
 		},
 		{
 			name:        "artifact_preview",
@@ -39,7 +64,7 @@ func phase1ToolSpecs() []toolSpec {
 				"artifact_id": stringProperty("Opaque artifact id."),
 				"offset":      integerProperty("Byte offset to start the preview at.", 0),
 				"length":      integerProperty(fmt.Sprintf("Maximum preview bytes (default %d, cap %d).", defaultPreviewLen, maxPreviewLen), 0),
-				"mode":        enumProperty("Preview rendering.", []string{"hex", "text", "base64"}),
+				"mode":        artifactPreviewModeVocab.property("Preview rendering (default hex)."),
 				"context":     contextProperty(),
 			}, []string{"artifact_id"}),
 			run: runArtifactPreview,
@@ -69,8 +94,16 @@ func phase1ToolSpecs() []toolSpec {
 			run:         runContextList,
 		},
 		{
+			name:        "context_prune",
+			description: "Reclaim one closed analysis context and its data from disk. Contexts and their annotations now survive a restart, so a finished workspace needs an explicit way out: context_prune removes the context from the persisted workspace, deletes its annotation document, its artifacts and capture index entries (bytes included), and its saved state snapshot files, and reports how much was removed. It refuses the implicit default context and any context that is still open; close it first with context_close. Symbols are in-memory only and end with the context. The global audit stream is not context-scoped and is never pruned.",
+			schema: objectSchema(map[string]any{
+				"context_id": stringProperty("Handle of a closed, non-default analysis context from context_create."),
+			}, []string{"context_id"}),
+			run: runContextPrune,
+		},
+		{
 			name:        "emulator_status",
-			description: "Report running state plus loaded modules and devices from the connected Exodus instance, with run-state observability: who paused or ran the system (pause_source: mcp, ui_or_external, breakpoint_or_watchpoint, or unknown) and when the run state last changed (last_run_state_change UTC). Externally observed transitions (UI pauses, other bridge clients, native stops) are recorded in the audit stream as run_state_change events and never advance target_generation: the generation advances only on successful MCP mutations.",
+			description: "Report running state plus loaded modules and devices from the connected Exodus instance, with run-state observability: `run_state` is the observed run state (running | paused | unknown), `pause_source` names who caused it (mcp | ui_or_external | breakpoint_or_watchpoint | unknown), `stop_source` answers why execution stopped in the same vocabulary as run_until_* (instrument | external | mcp | none | unknown), and `capture_consistency` is the standardized state-observing object every read tool reports. `last_run_state_change` is the UTC time of the last observed transition. Externally observed transitions (UI pauses, other bridge clients, native stops) are recorded in the audit stream as run_state_change events and never advance target_generation: the generation advances only on successful MCP mutations.",
 			schema:      objectSchema(map[string]any{}, nil),
 			run:         runEmulatorStatus,
 		},
@@ -93,7 +126,7 @@ func phase1ToolSpecs() []toolSpec {
 				"space":          stringProperty("Address space id from memory_spaces_list."),
 				"address":        addressProperty(),
 				"length":         integerProperty(fmt.Sprintf("Byte length between 1 and %d.", inlineReadCapBytes), 1),
-				"representation": enumProperty("Inline rendering.", []string{"raw_base64", "hexdump", "array_u8"}),
+				"representation": memoryRepresentationVocab.property("Inline rendering."),
 				"decode":         decodeSchemaProperty(),
 				"capture_mode":   captureModeProperty(),
 				"context":        contextProperty(),
@@ -119,7 +152,7 @@ func phase1ToolSpecs() []toolSpec {
 		},
 		{
 			name:        "target_info",
-			description: "Report emulator identity, loaded modules, device summary, and the platform baseline. ROM header parsing arrives in a later phase.",
+			description: "Report emulator identity (plugin version and lifecycle), loaded modules, device summary, the platform baseline, and a light cartridge summary read from the 256-byte header at 0x100 (identified flag, system type, title, serial, region, or an explicit reason when no cartridge is identified). The full parsed header, checksum validation, and memory mapping are available through rom_info.",
 			schema:      objectSchema(map[string]any{}, nil),
 			run:         runTargetInfo,
 		},
@@ -199,6 +232,8 @@ func performROMLoad(tc toolContext, path string, run bool, guard mutationGuard, 
 			// presenting a dead session as live.
 			server.retireTraceSession("the cartridge was reloaded, which stops native capture")
 			server.setROMPath(path)
+			// No command of this server describes the new machine's pads.
+			server.resetInputLedger()
 		},
 		resources: func() []string { return invalidated },
 	})
@@ -211,7 +246,10 @@ func performROMLoad(tc toolContext, path string, run bool, guard mutationGuard, 
 // ----------------------------------------------------------------------------------------------------------------------
 // Status and identity
 // ----------------------------------------------------------------------------------------------------------------------
-func runBridgeStatus(tc toolContext, _ json.RawMessage) map[string]any {
+func runBridgeStatus(tc toolContext, args json.RawMessage) map[string]any {
+	if _, failure := decodeArgs[noArgs](args); failure != nil {
+		return failureResult(failure, tc.modern)
+	}
 	status, err := tc.server.statusFor(tc.ctx)
 	if err == nil {
 		operations := status.SupportedOperations
@@ -306,14 +344,38 @@ func fetchEmulatorStatus(tc toolContext) (*emulatorStatusData, *toolFailure) {
 func runStateView(server *Server, status *emulatorStatusData) (string, string, time.Time, bool) {
 	source, note := server.runState.view(status.SystemRunning)
 	if !status.SystemRunning && status.StopReason != "" {
-		source = "breakpoint_or_watchpoint"
+		source = pauseSourceBreakpointOrWatchpoint
 		note = "The plugin reported a native stop reason: " + status.StopReason
 	}
 	lastChange, known := server.runState.lastKnownChange()
 	return source, note, lastChange, known
 }
 
-func runEmulatorStatus(tc toolContext, _ json.RawMessage) map[string]any {
+// stopSourceForRunState answers "why did execution stop" from one observed run
+// state, in the same vocabulary run_until_* and the structured debug events
+// publish. A running system has no stop; a paused one is attributed to the
+// managed instrument that proved the stop, to the MCP action that caused it, or
+// to an external actor.
+func stopSourceForRunState(pauseSource string, running bool) string {
+	if running {
+		return stopSourceNone
+	}
+	switch pauseSource {
+	case pauseSourceBreakpointOrWatchpoint:
+		return stopSourceInstrument
+	case pauseSourceMCP:
+		return stopSourceMCP
+	case pauseSourceUIOrExternal:
+		return stopSourceExternal
+	default:
+		return stopSourceUnknown
+	}
+}
+
+func runEmulatorStatus(tc toolContext, args json.RawMessage) map[string]any {
+	if _, failure := decodeArgs[noArgs](args); failure != nil {
+		return failureResult(failure, tc.modern)
+	}
 	status, failure := fetchEmulatorStatus(tc)
 	if failure != nil {
 		return failureResult(failure, tc.modern)
@@ -322,12 +384,14 @@ func runEmulatorStatus(tc toolContext, _ json.RawMessage) map[string]any {
 	devices := status.Devices
 	pauseSource, pauseNote, lastChange, changeKnown := runStateView(tc.server, status)
 	result := map[string]any{
-		"system_running": status.SystemRunning,
-		"pause_source":   pauseSource,
-		"modules":        modules,
-		"devices":        devices,
-		"rom":            status.Rom,
-		"consistency":    "live",
+		"system_running":      status.SystemRunning,
+		"run_state":           runStateLabel(status.SystemRunning),
+		"pause_source":        pauseSource,
+		"stop_source":         stopSourceForRunState(pauseSource, status.SystemRunning),
+		"modules":             modules,
+		"devices":             devices,
+		"rom":                 status.Rom,
+		"capture_consistency": tc.server.captureConsistencyView(buildCaptureConsistency(tc.server, nil, false, false, nil, nil)),
 	}
 	if !changeKnown {
 		// The first observation anchors the timestamp; there is no verified
@@ -345,7 +409,10 @@ func runEmulatorStatus(tc toolContext, _ json.RawMessage) map[string]any {
 	return okResult(result, tc.modern)
 }
 
-func runTargetInfo(tc toolContext, _ json.RawMessage) map[string]any {
+func runTargetInfo(tc toolContext, args json.RawMessage) map[string]any {
+	if _, failure := decodeArgs[noArgs](args); failure != nil {
+		return failureResult(failure, tc.modern)
+	}
 	statusPayload, failure := tc.server.executeCommand(tc.ctx, "status", nil)
 	if failure != nil {
 		return failureResult(failure, tc.modern)
@@ -423,7 +490,10 @@ func targetInfoROM(tc toolContext) map[string]any {
 // ----------------------------------------------------------------------------------------------------------------------
 // Memory
 // ----------------------------------------------------------------------------------------------------------------------
-func runMemorySpacesList(tc toolContext, _ json.RawMessage) map[string]any {
+func runMemorySpacesList(tc toolContext, args json.RawMessage) map[string]any {
+	if _, failure := decodeArgs[noArgs](args); failure != nil {
+		return failureResult(failure, tc.modern)
+	}
 	payload, failure := tc.server.executeCommand(tc.ctx, "mem_spaces", nil)
 	if failure != nil {
 		return failureResult(failure, tc.modern)
@@ -452,6 +522,20 @@ type decodeRequest struct {
 	ByteOrder string `json:"byte_order"`
 }
 
+// cpuMemoryReadArgs is the argument set of the bus-pinned readers
+// (m68k_read_memory, z80_read_memory). The address space is the tool's own, so
+// a supplied `space` is rejected by the strict decoder instead of being
+// decoded and ignored.
+type cpuMemoryReadArgs struct {
+	Address        any            `json:"address"`
+	AddressSpace   string         `json:"address_space"`
+	Length         uint64         `json:"length"`
+	Representation string         `json:"representation"`
+	Decode         *decodeRequest `json:"decode"`
+	CaptureMode    string         `json:"capture_mode"`
+	Context        string         `json:"context"`
+}
+
 type memoryReadArgs struct {
 	Space          string         `json:"space"`
 	Address        any            `json:"address"`
@@ -463,10 +547,44 @@ type memoryReadArgs struct {
 	Context        string         `json:"context"`
 }
 
+// readRequestEcho carries the caller's requested coordinates so a read that
+// translated the address into another domain, or that returned fewer bytes than
+// requested, can state both the request and the effective values.
+type readRequestEcho struct {
+	Address      uint64
+	AddressSpace string
+	Length       uint64
+	HasAddress   bool
+	HasLength    bool
+}
+
+// apply writes the request echo onto one read or dump summary. The effective
+// values already on the summary (effective_address, effective_length) stay the
+// authoritative ones; the requested_* fields are what the caller sent.
+func (echo readRequestEcho) apply(summary map[string]any, targetSpace string, effectiveAddress, effectiveLength uint64) {
+	if echo.HasAddress {
+		summary["requested_address"] = echo.Address
+		summary["requested_address_hex"] = canonicalHex(echo.Address)
+		if echo.AddressSpace != "" {
+			summary["requested_address_space"] = echo.AddressSpace
+			summary["address_translated"] = echo.AddressSpace != targetSpace
+		}
+	}
+	if echo.HasLength {
+		summary["requested_length"] = echo.Length
+	}
+	summary["effective_address"] = effectiveAddress
+	summary["effective_address_hex"] = canonicalHex(effectiveAddress)
+	summary["effective_length"] = effectiveLength
+	if echo.HasLength {
+		summary["length_clamped"] = effectiveLength != echo.Length
+	}
+}
+
 // readMemoryValue executes mem_read and renders the bounded inline
 // representation, returning the value map and any failure. The standardized
 // capture_consistency object is attached from the bridge payload.
-func readMemoryValue(tc toolContext, spaceID string, address uint64, length uint64, representation string, decode *decodeRequest) (map[string]any, *toolFailure) {
+func readMemoryValue(tc toolContext, spaceID string, address uint64, length uint64, representation string, decode *decodeRequest, window *captureWindow, echo readRequestEcho) (map[string]any, *toolFailure) {
 	if length < 1 || length > inlineReadCapBytes {
 		return nil, &toolFailure{
 			Code:    "length_exceeds_inline_cap",
@@ -474,10 +592,8 @@ func readMemoryValue(tc toolContext, spaceID string, address uint64, length uint
 			Data:    map[string]any{"inline_cap_bytes": inlineReadCapBytes},
 		}
 	}
-	switch representation {
-	case "", "raw_base64", "hexdump", "array_u8":
-	default:
-		return nil, &toolFailure{Code: "invalid_params", Message: "representation must be raw_base64, hexdump, or array_u8"}
+	if failure := memoryRepresentationVocab.validate(representation); failure != nil {
+		return nil, failure
 	}
 	params := map[string]string{
 		"space":   spaceID,
@@ -507,11 +623,11 @@ func readMemoryValue(tc toolContext, spaceID string, address uint64, length uint
 		"effective_address_hex":     canonicalHex(uint64(effective)),
 		"length":                    len(raw),
 		"byte_order":                byteOrder,
-		"consistency":               payload["consistency"],
 		"system_paused_during_read": pausedDuringRead,
-		"capture_consistency":       captureConsistencyToMap(buildCaptureConsistency(tc.server, payload, false, true, nil, nil)),
+		"capture_consistency":       tc.server.captureConsistencyViewWindow(window, window.consistencyFor(tc.server, payload)),
 		"representation":            representation,
 	}
+	echo.apply(value, spaceID, uint64(effective), uint64(len(raw)))
 	annotateAddressPair(value, spaceID, address)
 	if width, mask := addressBusWidthMask(spaceID); width != 0 {
 		value["address_width_bits"] = width
@@ -541,10 +657,17 @@ func readMemoryValue(tc toolContext, spaceID string, address uint64, length uint
 	return value, nil
 }
 
-// readMemory renders one inline read, honoring the optional capture guard.
+// readMemory renders one inline read, honoring the optional capture guard. The
+// request echo is omitted: callers that need it use readMemoryWithEcho.
 func readMemory(tc toolContext, spaceID string, address uint64, length uint64, representation string, decode *decodeRequest, guard captureGuard) map[string]any {
-	return withCaptureGuard(tc, guard, func() (map[string]any, *toolFailure) {
-		return readMemoryValue(tc, spaceID, address, length, representation, decode)
+	return readMemoryWithEcho(tc, spaceID, address, length, representation, decode, guard, readRequestEcho{})
+}
+
+// readMemoryWithEcho renders one inline read together with the echo of the
+// caller's request.
+func readMemoryWithEcho(tc toolContext, spaceID string, address uint64, length uint64, representation string, decode *decodeRequest, guard captureGuard, echo readRequestEcho) map[string]any {
+	return withCaptureGuard(tc, guard, func(window *captureWindow) (map[string]any, *toolFailure) {
+		return readMemoryValue(tc, spaceID, address, length, representation, decode, window, echo)
 	})
 }
 
@@ -564,7 +687,11 @@ func runMemoryRead(tc toolContext, args json.RawMessage) map[string]any {
 	if failure != nil {
 		return failureResult(failure, tc.modern)
 	}
-	return readMemory(tc, parsed.Space, address, parsed.Length, parsed.Representation, parsed.Decode, guard)
+	echo := readRequestEcho{HasAddress: true, HasLength: parsed.Length != 0, Length: parsed.Length, AddressSpace: addressSpaceFromArgs(args)}
+	if requested, failure := parseAddress(parsed.Address); failure == nil {
+		echo.Address = requested
+	}
+	return readMemoryWithEcho(tc, parsed.Space, address, parsed.Length, parsed.Representation, parsed.Decode, guard, echo)
 }
 
 func decodeValues(raw []byte, spaceOrder string, decode *decodeRequest) (map[string]any, *toolFailure) {
@@ -661,7 +788,7 @@ type memoryDumpArgs struct {
 // provenance, and renders the bounded summary. The standardized
 // capture_consistency object is derived from the read payload; the optional
 // capture guard overrides it at the result level.
-func memoryDumpValue(tc toolContext, context *analysis.Context, spaceID string, address uint64, length uint64) (map[string]any, *toolFailure) {
+func memoryDumpValue(tc toolContext, context *analysis.Context, spaceID string, address uint64, length uint64, window *captureWindow, echo readRequestEcho) (map[string]any, *toolFailure) {
 	if length < 1 || length > dumpCapBytes {
 		return nil, &toolFailure{
 			Code:    "length_out_of_range",
@@ -683,18 +810,23 @@ func memoryDumpValue(tc toolContext, context *analysis.Context, spaceID string, 
 	if err != nil {
 		return nil, &toolFailure{Code: "bridge_error", Message: "decode base64 memory payload: " + err.Error()}
 	}
-	provenance := captureProvenance(tc.server, "memory-dump", spaceID, address, uint64(len(raw)), payload, time.Now().UTC(), "", nil)
+	// One consistency object for this dump: the guard's window object when the
+	// caller asked for a paused capture, otherwise the object derived from the
+	// read payload. The response and the artifact provenance both use it, so
+	// they can never describe different windows.
+	consistencyObject := window.consistencyFor(tc.server, payload)
+	provenance := captureProvenance(tc.server, "memory-dump", spaceID, address, uint64(len(raw)), payload, time.Now().UTC(), "", consistencyObject)
 	stored, err := tc.server.store.PutWithProvenance(context.ID, "memory-dump", "application/octet-stream", raw, provenance)
 	if err != nil {
 		return nil, &toolFailure{Code: "artifact_error", Message: err.Error()}
 	}
+	window.track(stored)
 
 	previewLength := int64(96)
 	if int64(len(raw)) < previewLength {
 		previewLength = int64(len(raw))
 	}
 	byteOrder, _ := payload["byte_order"].(string)
-	consistency, _ := payload["consistency"].(string)
 	effective, _ := payload["effective_address"].(float64)
 	pausedDuringRead, _ := payload["system_paused_during_read"].(bool)
 	summary := map[string]any{
@@ -706,13 +838,13 @@ func memoryDumpValue(tc toolContext, context *analysis.Context, spaceID string, 
 		"effective_address_hex":     canonicalHex(uint64(effective)),
 		"byte_length":               len(raw),
 		"byte_order":                byteOrder,
-		"consistency":               consistency,
 		"system_paused_during_read": pausedDuringRead,
-		"capture_consistency":       captureConsistencyToMap(buildCaptureConsistency(tc.server, payload, false, true, nil, nil)),
+		"capture_consistency":       tc.server.captureConsistencyViewWindow(window, consistencyObject),
 		"preview_hex":               artifact.HexDump(raw[:previewLength], int64(uint64(effective))),
 		"sha256":                    stored.SHA256,
 		"provenance_state":          stored.Provenance.State,
 	}
+	echo.apply(summary, spaceID, uint64(effective), uint64(len(raw)))
 	annotateAddressPair(summary, spaceID, address)
 	if width, mask := addressBusWidthMask(spaceID); width != 0 {
 		summary["address_width_bits"] = width
@@ -741,59 +873,127 @@ func runMemoryDump(tc toolContext, args json.RawMessage) map[string]any {
 	if failure = guard.resolve(); failure != nil {
 		return failureResult(failure, tc.modern)
 	}
-	return withCaptureGuard(tc, guard, func() (map[string]any, *toolFailure) {
-		return memoryDumpValue(tc, context, parsed.Space, address, parsed.Length)
+	echo := readRequestEcho{HasAddress: true, HasLength: parsed.Length != 0, Length: parsed.Length, AddressSpace: addressSpaceFromArgs(args)}
+	if requested, failure := parseAddress(parsed.Address); failure == nil {
+		echo.Address = requested
+	}
+	return withCaptureGuard(tc, guard, func(window *captureWindow) (map[string]any, *toolFailure) {
+		return memoryDumpValue(tc, context, parsed.Space, address, parsed.Length, window, echo)
 	})
 }
 
 // ----------------------------------------------------------------------------------------------------------------------
 // Artifacts
 // ----------------------------------------------------------------------------------------------------------------------
+
+// artifactDetailIncludeMetadata and artifactDetailIncludeProvenance are the
+// include tokens artifact_get accepts; both are on by default so a bare call
+// returns the merged artifact_describe payload.
+const (
+	artifactDetailIncludeMetadata   = "metadata"
+	artifactDetailIncludeProvenance = "provenance"
+)
+
 type artifactRefArgs struct {
-	ArtifactID string `json:"artifact_id"`
-	Context    string `json:"context"`
+	ArtifactID string   `json:"artifact_id"`
+	Context    string   `json:"context"`
+	Include    []string `json:"include"`
 }
 
+// artifactIncludeSelection resolves the include argument into two switches.
+// An empty list means both sections; an unknown token is rejected instead of
+// silently ignored.
+func artifactIncludeSelection(include []string) (metadata bool, provenance bool, failure *toolFailure) {
+	if len(include) == 0 {
+		return true, true, nil
+	}
+	for _, token := range include {
+		switch token {
+		case artifactDetailIncludeMetadata:
+			metadata = true
+		case artifactDetailIncludeProvenance:
+			provenance = true
+		default:
+			return false, false, &toolFailure{
+				Code:    "invalid_params",
+				Message: "include accepts \"metadata\" and \"provenance\"; omit it to receive both",
+				Data:    map[string]any{"value": token, "allowed": []string{artifactDetailIncludeMetadata, artifactDetailIncludeProvenance}},
+			}
+		}
+	}
+	return metadata, provenance, nil
+}
+
+// artifactSummaryView renders one artifact as a discovery descriptor: the facts a
+// client needs to decide whether to fetch it, including its retention. Listing
+// and capture resolution share it so one artifact always describes itself the
+// same way.
+func artifactSummaryView(server *Server, stored artifact.Artifact, contextID string) map[string]any {
+	view := map[string]any{
+		"artifact_id":      stored.ID,
+		"kind":             stored.Kind,
+		"mime_type":        stored.MimeType,
+		"size_bytes":       stored.SizeBytes,
+		"sha256":           stored.SHA256,
+		"created_at":       stored.CreatedAt,
+		"expires_at":       nil,
+		"url":              fmt.Sprintf("%s/artifacts/%s?context=%s", server.baseURL, stored.ID, contextID),
+		"provenance_state": artifact.ProvenanceStateUnknown,
+	}
+	if expiry := server.store.ExpiresAt(stored.CreatedAt); expiry != nil {
+		view["expires_at"] = *expiry
+	}
+	if stored.SchemaVersion != "" {
+		view["schema_version"] = stored.SchemaVersion
+	}
+	if stored.Provenance != nil {
+		view["provenance_state"] = stored.Provenance.State
+		if stored.Provenance.CaptureID != "" {
+			view["capture_id"] = stored.Provenance.CaptureID
+		}
+	}
+	return view
+}
+
+// artifactMetadataView is the artifactSummaryView metadata block of artifact_get:
+// the same facts, plus the owning context.
+func artifactMetadataView(server *Server, stored artifact.Artifact, contextID string) map[string]any {
+	view := artifactSummaryView(server, stored, contextID)
+	view["context_id"] = stored.ContextID
+	return view
+}
+
+// artifactRetrievalView is the stable download hint returned with artifact_get.
+func artifactRetrievalView() map[string]string {
+	return map[string]string{
+		"hint":  "Fetch the URL directly with curl or a script; HTTP byte ranges are supported. Use artifact_preview for a bounded in-context view.",
+		"range": "Range: bytes=<start>-<end>",
+	}
+}
+
+// runArtifactGet returns one artifact's metadata, provenance envelope, and direct
+// download URL. Raw bytes are never placed in this response.
 func runArtifactGet(tc toolContext, args json.RawMessage) map[string]any {
-	parsed, failure := decodeArgs[artifactRefArgs](args)
-	if failure != nil {
-		return failureResult(failure, tc.modern)
-	}
-	context, failure := resolveContext(tc.server, parsed.Context)
-	if failure != nil {
-		return failureResult(failure, tc.modern)
-	}
-	stored, err := tc.server.store.Metadata(parsed.ArtifactID, context.ID)
-	if err != nil {
-		return failureResult(&toolFailure{Code: "unknown_artifact", Message: err.Error()}, tc.modern)
-	}
-	return okResult(map[string]any{
-		"artifact": artifactDescriptor(tc.server, stored, context.ID),
-		"retrieval": map[string]string{
-			"hint":  "Fetch the URL directly with curl or a script; HTTP byte ranges are supported. Use artifact_preview for a bounded in-context view.",
-			"range": "Range: bytes=<start>-<end>",
-		},
-	}, tc.modern)
+	return artifactDetailResult(tc, args, false)
 }
 
-type artifactPreviewArgs struct {
-	ArtifactID string `json:"artifact_id"`
-	Offset     uint64 `json:"offset"`
-	Length     uint64 `json:"length"`
-	Mode       string `json:"mode"`
-	Context    string `json:"context"`
-}
-
-// runArtifactDescribe returns the full typed provenance envelope of one
-// artifact: the versioned envelope when the producer attached one, or the
-// honest provenance_unknown state for legacy artifacts. It never downloads
-// or previews bytes; artifact_preview stays the bounded byte-oriented view.
 func runArtifactDescribe(tc toolContext, args json.RawMessage) map[string]any {
+	return artifactDetailResult(tc, args, true)
+}
+
+// artifactDetailResult implements artifact_get and its deprecated alias. Both
+// return one payload so a caller can switch tools without re-reading fields;
+// the alias adds a deprecation note.
+func artifactDetailResult(tc toolContext, args json.RawMessage, deprecatedAlias bool) map[string]any {
 	parsed, failure := decodeArgs[artifactRefArgs](args)
 	if failure != nil {
 		return failureResult(failure, tc.modern)
 	}
 	context, failure := resolveContext(tc.server, parsed.Context)
+	if failure != nil {
+		return failureResult(failure, tc.modern)
+	}
+	wantMetadata, wantProvenance, failure := artifactIncludeSelection(parsed.Include)
 	if failure != nil {
 		return failureResult(failure, tc.modern)
 	}
@@ -802,21 +1002,127 @@ func runArtifactDescribe(tc toolContext, args json.RawMessage) map[string]any {
 		return failureResult(&toolFailure{Code: "unknown_artifact", Message: err.Error()}, tc.modern)
 	}
 	result := map[string]any{
-		"artifact_id": stored.ID,
-		"kind":        stored.Kind,
-		"created_at":  stored.CreatedAt,
-		"sha256":      stored.SHA256,
-		"retrieval": map[string]string{
-			"hint":  "Fetch the URL directly with curl or a script; HTTP byte ranges are supported. Use artifact_preview for a bounded in-context view.",
-			"range": "Range: bytes=<start>-<end>",
-		},
+		"artifact_id":      stored.ID,
+		"kind":             stored.Kind,
+		"mime_type":        stored.MimeType,
+		"size_bytes":       stored.SizeBytes,
+		"sha256":           stored.SHA256,
+		"created_at":       stored.CreatedAt,
+		"expires_at":       nil,
+		"provenance_state": artifact.ProvenanceStateUnknown,
+		"artifact":         artifactDescriptor(tc.server, stored, context.ID),
+		"retrieval":        artifactRetrievalView(),
 	}
-	if stored.Provenance != nil {
-		result["provenance"] = provenanceEnvelopeView(*stored.Provenance)
-	} else {
-		result["provenance"] = provenanceUnknownView()
+	if expiry := tc.server.store.ExpiresAt(stored.CreatedAt); expiry != nil {
+		result["expires_at"] = *expiry
+	}
+	if stored.SchemaVersion != "" {
+		result["schema_version"] = stored.SchemaVersion
+	}
+	if wantMetadata {
+		result["metadata"] = artifactMetadataView(tc.server, stored, context.ID)
+	}
+	if wantProvenance {
+		if stored.Provenance != nil {
+			result["provenance"] = tc.server.provenanceEnvelopeView(*stored.Provenance)
+			result["provenance_state"] = stored.Provenance.State
+			if stored.Provenance.CaptureID != "" {
+				result["capture_id"] = stored.Provenance.CaptureID
+			}
+		} else {
+			result["provenance"] = provenanceUnknownView()
+		}
+	}
+	if deprecatedAlias {
+		result["deprecated"] = map[string]any{
+			"code":             "artifact_describe_deprecated",
+			"replacement_tool": "artifact_get",
+			"replacement_args": map[string]any{"include": []string{artifactDetailIncludeMetadata, artifactDetailIncludeProvenance}},
+			"message":          "artifact_describe is a deprecated alias of artifact_get{include:[\"metadata\",\"provenance\"]} and returns the same payload. It stays available for one release and is removed afterwards.",
+		}
 	}
 	return okResult(result, tc.modern)
+}
+
+// ----------------------------------------------------------------------------------------------------------------------
+// Artifact listing (roadmap issue #10)
+// ----------------------------------------------------------------------------------------------------------------------
+type artifactListArgs struct {
+	Kind      string `json:"kind"`
+	CaptureID string `json:"capture_id"`
+	Cursor    string `json:"cursor"`
+	Limit     uint64 `json:"limit"`
+	Context   string `json:"context"`
+}
+
+// runArtifactList enumerates the artifacts of one analysis context so a new
+// session can discover what already exists instead of copying ids out of earlier
+// responses. Retention is part of every descriptor, so an expiry is visible
+// before a download fails.
+func runArtifactList(tc toolContext, args json.RawMessage) map[string]any {
+	parsed, failure := decodeArgs[artifactListArgs](args)
+	if failure != nil {
+		return failureResult(failure, tc.modern)
+	}
+	context, failure := resolveContext(tc.server, parsed.Context)
+	if failure != nil {
+		return failureResult(failure, tc.modern)
+	}
+	if parsed.CaptureID != "" && !artifact.ValidCaptureID(parsed.CaptureID) {
+		return failureResult(&toolFailure{Code: "invalid_params", Message: "capture_id must be a capture id issued by a capture tool (cap_...)"}, tc.modern)
+	}
+	limit := int(parsed.Limit)
+	if limit <= 0 {
+		limit = artifact.DefaultListLimit
+	}
+	if limit > artifact.MaxListLimit {
+		limit = artifact.MaxListLimit
+	}
+	page, err := tc.server.store.List(artifact.ListQuery{
+		ContextID: context.ID,
+		Kind:      parsed.Kind,
+		CaptureID: parsed.CaptureID,
+		Cursor:    parsed.Cursor,
+		Limit:     limit,
+	})
+	if err != nil {
+		code := "artifact_error"
+		if errors.Is(err, artifact.ErrInvalidCursor) {
+			code = "invalid_params"
+		}
+		return failureResult(&toolFailure{Code: code, Message: err.Error()}, tc.modern)
+	}
+	views := make([]map[string]any, 0, len(page.Artifacts))
+	for _, stored := range page.Artifacts {
+		views = append(views, artifactSummaryView(tc.server, stored, context.ID))
+	}
+	result := map[string]any{
+		"artifacts":   views,
+		"returned":    len(views),
+		"total":       page.Total,
+		"has_more":    page.HasMore,
+		"next_cursor": nil,
+		"context_id":  context.ID,
+		"limit":       limit,
+	}
+	if page.NextCursor != "" {
+		result["next_cursor"] = page.NextCursor
+	}
+	if parsed.Kind != "" {
+		result["kind"] = parsed.Kind
+	}
+	if parsed.CaptureID != "" {
+		result["capture_id"] = parsed.CaptureID
+	}
+	return okResult(result, tc.modern)
+}
+
+type artifactPreviewArgs struct {
+	ArtifactID string `json:"artifact_id"`
+	Offset     uint64 `json:"offset"`
+	Length     uint64 `json:"length"`
+	Mode       string `json:"mode"`
+	Context    string `json:"context"`
 }
 
 func runArtifactPreview(tc toolContext, args json.RawMessage) map[string]any {
@@ -828,9 +1134,9 @@ func runArtifactPreview(tc toolContext, args json.RawMessage) map[string]any {
 	if failure != nil {
 		return failureResult(failure, tc.modern)
 	}
-	mode := parsed.Mode
-	if mode == "" {
-		mode = "hex"
+	mode, failure := artifactPreviewModeVocab.resolve(parsed.Mode, "hex")
+	if failure != nil {
+		return failureResult(failure, tc.modern)
 	}
 	length := parsed.Length
 	if length == 0 {
@@ -863,12 +1169,19 @@ func runContextCreate(tc toolContext, args json.RawMessage) map[string]any {
 	}
 	context, err := tc.server.contexts.Create(parsed.Name)
 	if err != nil {
-		return failureResult(&toolFailure{Code: "invalid_params", Message: err.Error()}, tc.modern)
+		code := "invalid_params"
+		if errors.Is(err, analysis.ErrContextStore) {
+			code = "workspace_store_error"
+		}
+		return failureResult(&toolFailure{Code: code, Message: err.Error()}, tc.modern)
 	}
 	return okResult(map[string]any{"context": contextView(context)}, tc.modern)
 }
 
-func runContextList(tc toolContext, _ json.RawMessage) map[string]any {
+func runContextList(tc toolContext, args json.RawMessage) map[string]any {
+	if _, failure := decodeArgs[noArgs](args); failure != nil {
+		return failureResult(failure, tc.modern)
+	}
 	contexts := tc.server.contexts.List()
 	views := make([]map[string]any, 0, len(contexts))
 	defaultID := ""
@@ -906,6 +1219,79 @@ func runContextClose(tc toolContext, args json.RawMessage) map[string]any {
 	view := contextView(context)
 	view["closed"] = true
 	return okResult(map[string]any{"context": view}, tc.modern)
+}
+
+type contextPruneArgs struct {
+	ContextID string `json:"context_id"`
+}
+
+func runContextPrune(tc toolContext, args json.RawMessage) map[string]any {
+	parsed, failure := decodeArgs[contextPruneArgs](args)
+	if failure != nil {
+		return failureResult(failure, tc.modern)
+	}
+	if tc.server.contexts.Dir() == "" {
+		return failureResult(&toolFailure{
+			Code:    "unsupported_operation",
+			Message: "this server runs an in-memory analysis workspace, so there is nothing persisted to prune for a context",
+		}, tc.modern)
+	}
+	context, err := tc.server.contexts.Prune(parsed.ContextID)
+	if err != nil {
+		code := "unknown_context"
+		switch {
+		case strings.Contains(err.Error(), "cannot be pruned"):
+			code = "cannot_prune_default"
+		case strings.Contains(err.Error(), "still open"):
+			code = "context_still_open"
+		}
+		return failureResult(&toolFailure{Code: code, Message: err.Error()}, tc.modern)
+	}
+	artifactsRemoved, capturesRemoved, artifactErr := tc.server.store.DeleteContext(context.ID)
+	stateFilesRemoved := removeStateDirectory(tc.server, context.ID)
+	detail := map[string]any{
+		"context_id":          context.ID,
+		"name":                context.Name,
+		"annotations_removed": len(context.Annotations.Export(context.ID)),
+		"artifacts_removed":   artifactsRemoved,
+		"captures_removed":    capturesRemoved,
+		"state_files_removed": stateFilesRemoved,
+		"symbols_note":        "Symbols are in-memory only; they never survived a restart and are gone with the context.",
+		"audit_note":          "The global target audit stream is not context-scoped and is never pruned.",
+	}
+	if artifactErr != nil {
+		detail["artifact_cleanup_error"] = artifactErr.Error()
+	}
+	tc.server.recordAudit(analysis.AuditEntry{
+		Tool:        "context_prune",
+		ContextID:   context.ID,
+		Outcome:     analysis.OutcomeOK,
+		Detail:      detail,
+		ResourceIDs: []string{context.ID},
+	})
+	return okResult(detail, tc.modern)
+}
+
+// removeStateDirectory deletes the saved snapshot files one context owns and
+// reports how many files were removed. A missing directory is not an error: the
+// context may never have saved a snapshot.
+func removeStateDirectory(server *Server, contextID string) int {
+	directory := filepath.Join(server.StatesDir(), contextID)
+	entries, err := os.ReadDir(directory)
+	if err != nil {
+		return 0
+	}
+	removed := 0
+	for _, entry := range entries {
+		if entry.IsDir() {
+			continue
+		}
+		if err := os.Remove(filepath.Join(directory, entry.Name())); err == nil {
+			removed++
+		}
+	}
+	_ = os.Remove(directory)
+	return removed
 }
 
 func contextView(context *analysis.Context) map[string]any {

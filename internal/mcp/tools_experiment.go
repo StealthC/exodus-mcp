@@ -237,13 +237,12 @@ func experimentFailure(err error) *toolFailure {
 // full artifact.Artifact record.
 func experimentArtifactView(ref experiment.ArtifactRef, server *Server, contextID string) map[string]any {
 	descriptor := map[string]any{
-		"id":           ref.ID,
-		"kind":         ref.Kind,
-		"mime_type":    ref.MimeType,
-		"size_bytes":   ref.SizeBytes,
-		"sha256":       ref.SHA256,
-		"url":          fmt.Sprintf("%s/artifacts/%s?context=%s", server.baseURL, ref.ID, contextID),
-		"resource_uri": "exodus://artifacts/" + ref.ID,
+		"id":         ref.ID,
+		"kind":       ref.Kind,
+		"mime_type":  ref.MimeType,
+		"size_bytes": ref.SizeBytes,
+		"sha256":     ref.SHA256,
+		"url":        fmt.Sprintf("%s/artifacts/%s?context=%s", server.baseURL, ref.ID, contextID),
 	}
 	// Script artifacts have no capture provenance; report honestly.
 	descriptor["provenance"] = provenanceUnknownView()
@@ -276,11 +275,13 @@ func (executor *experimentExecutor) Call(ctx context.Context, tool string, argum
 	if arguments == nil {
 		arguments = map[string]any{}
 	}
-	arguments["context"] = executor.contextID
-	arguments["control_id"] = executor.controlID
+	scopeExperimentArguments(spec, arguments, executor.contextID, executor.controlID)
 	raw, err := json.Marshal(arguments)
 	if err != nil {
 		return nil, &experiment.ToolError{Code: "tool_args_invalid", Message: "encode tool arguments: " + err.Error()}
+	}
+	if failure := validateToolArguments(spec, raw); failure != nil {
+		return nil, &experiment.ToolError{Code: failure.Code, Message: failure.Message}
 	}
 	result := injectTargetGeneration(executor.server, injectResultType(spec.run(toolContext{server: executor.server, ctx: ctx, modern: true}, raw), tool))
 	if failed, _ := result["isError"].(bool); failed {

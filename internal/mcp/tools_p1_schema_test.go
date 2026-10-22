@@ -138,10 +138,19 @@ func TestStrictDecodingRejectsTypoWithPath(t *testing.T) {
 			t.Fatalf("valid address form %s rejected: %v", args, structured(result))
 		}
 	}
-	// Globally allowed fields must not be rejected.
+	// Mediation fields are declared per tool: memory_read consumes a context
+	// but not a control id or a generation precondition, so those are rejected
+	// instead of silently ignored (roadmap issue #9).
 	result := postToolCall(t, server, "memory_read", `{"space":"m68k-ram","address":0,"length":4,"control_id":"abc","expected_target_generation":1}`)
-	if result["isError"] == true {
-		t.Fatalf("globally allowed control_id must not be rejected: %v", structured(result))
+	if result["isError"] != true {
+		t.Fatalf("memory_read must reject the guard fields it does not consume: %v", structured(result))
+	}
+	rejected := structured(result)
+	if rejected["code"] != "unsupported_parameter" || rejected["field"] != "control_id" {
+		t.Fatalf("memory_read must report unsupported_parameter for control_id, got %v", rejected)
+	}
+	if accepted, ok := rejected["accepted_fields"].([]any); !ok || len(accepted) == 0 {
+		t.Fatalf("memory_read rejection must list the accepted fields, got %v", rejected)
 	}
 }
 
@@ -207,7 +216,7 @@ func TestCanonicalAddressAndArtifactShapes(t *testing.T) {
 		t.Fatalf("memory_dump summary canonical wrong: %v", summary)
 	}
 	artifactDesc := dumpSc["artifact"].(map[string]any)
-	for _, key := range []string{"id", "kind", "mime_type", "size_bytes", "sha256", "url", "resource_uri", "provenance", "provenance_state"} {
+	for _, key := range []string{"id", "kind", "mime_type", "size_bytes", "sha256", "url", "provenance", "provenance_state"} {
 		if _, ok := artifactDesc[key]; !ok {
 			t.Fatalf("artifact descriptor missing %s: %v", key, artifactDesc)
 		}
@@ -233,7 +242,7 @@ func TestCanonicalAddressAndArtifactShapes(t *testing.T) {
 	}
 	for _, a := range artifacts {
 		desc := a.(map[string]any)
-		for _, key := range []string{"id", "mime_type", "size_bytes", "sha256", "url", "resource_uri", "provenance"} {
+		for _, key := range []string{"id", "mime_type", "size_bytes", "sha256", "url", "provenance"} {
 			if _, ok := desc[key]; !ok {
 				t.Fatalf("tile artifact missing %s: %v", key, desc)
 			}

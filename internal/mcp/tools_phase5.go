@@ -65,27 +65,28 @@ func phase5ToolSpecs() []toolSpec {
 		},
 		{
 			name:        "memory_search",
-			description: "Search a consistent snapshot for a raw byte pattern, with optional wildcard/mask. Without snapshot_id the tool dumps the range into a snapshot artifact first (never a live racy scan); with snapshot_id it searches that artifact without any new read and derives the address space, start address, byte length, and byte order from the snapshot's capture provenance. Pattern is hex bytes with optional spaces; use \"??\" or \"?\" for a single wildcard byte (any value), e.g. \"4A ?? 42\" matches 4A xx 42. Wildcard mask is explicitly documented; exact-byte mode (no wildcards) is unchanged. Optional alignment restricts matches to addresses aligned to that power-of-two. Snapshots without capture metadata (legacy) are reported as provenance_unknown. Returns bounded inline matches plus a full-results artifact that serializes the parsed pattern and mask for reproducibility.",
+			description: "Search a consistent snapshot for a raw byte pattern, with optional wildcard/mask. Without snapshot_id the tool dumps the range into a snapshot artifact first (never a live racy scan); with snapshot_id it searches that artifact without any new read and derives the address space, start address, byte length, and byte order from the snapshot's capture provenance. A requested start_address/length may NARROW the captured range (a subset is a smaller question about the same bytes) and the response echoes the requested range next to the searched_range it actually scanned; a window that leaves the captured range is provenance_conflict. Pattern is hex bytes with optional spaces; use \"??\" or \"?\" for a single wildcard byte (any value), e.g. \"4A ?? 42\" matches 4A xx 42. Wildcard mask is explicitly documented; exact-byte mode (no wildcards) is unchanged. Optional alignment restricts matches to addresses aligned to that power-of-two. Snapshots without capture metadata (legacy) are reported as provenance_unknown. Returns bounded inline matches plus a full-results artifact that serializes the parsed pattern and mask for reproducibility. Matches page by cursor (default page is the first max_matches matches); the cursor carries the snapshot, the searched window, the pattern with its wildcard mask, and the resume offset, so later pages never re-read the target or resend a snapshot. " + cursorSteppingNote + " " + pagingNote,
 			schema: objectSchema(map[string]any{
 				"space":         stringProperty("Address space id from memory_spaces_list; required without snapshot_id or when the snapshot lacks provenance. With a proven snapshot it must match the snapshot's captured space."),
-				"pattern":       stringProperty("Byte pattern as hex with optional spaces and ??/? wildcards, e.g. \"4A 42 41\" or \"4A ?? 42\" (wildcard byte)."),
+				"pattern":       stringProperty("Byte pattern as hex with optional spaces and ??/? wildcards, e.g. \"4A 42 41\" or \"4A ?? 42\" (wildcard byte). Required unless cursor is given; with a cursor it must match the cursor's pattern."),
 				"start_address": addressProperty(),
-				"length":        integerProperty(fmt.Sprintf("Bytes to scan (default %d when no snapshot is given; must equal the snapshot size with snapshot_id).", dumpCapBytes), 1),
-				"max_matches":   integerProperty(fmt.Sprintf("Maximum inline matches (default %d, cap %d).", defaultSearchMaxMatches, maxSearchMaxMatches), 1),
+				"length":        integerProperty(fmt.Sprintf("Bytes to scan (default %d when no snapshot is given; with a proven snapshot it may narrow the captured range and must stay inside it).", dumpCapBytes), 1),
+				"max_matches":   integerProperty(fmt.Sprintf("Maximum inline matches per page (default %d, cap %d).", defaultSearchMaxMatches, maxSearchMaxMatches), 1),
 				"snapshot_id":   stringProperty("Optional id of a memory-dump or memory-snapshot artifact to search instead of reading again."),
 				"alignment":     integerProperty("Optional alignment: matches only at addresses where (address - start_address) % alignment == 0 (must be power of two, e.g. 2 for word-aligned).", 1),
+				"cursor":        stringProperty("next_cursor from a previous memory_search call. The cursor carries the snapshot, the searched window, the pattern, and the alignment, so a later page needs only the cursor; any argument supplied alongside it must match the cursor. Omit to start at the first page."),
 				"context":       contextProperty(),
-			}, []string{"pattern"}),
+			}, nil),
 			run: runMemorySearch,
 		},
 		{
 			name:        "memory_diff",
-			description: "Compare two consistent memory snapshots cell-by-cell and report cells matching a comparison mode. Without snapshot_after_id the region is read fresh into a snapshot first (never a live racy scan). The before snapshot's capture provenance supplies the address space, range, and default byte order; comparing snapshots with incompatible provenance (different space, range, or ROM identity) fails with incompatible_provenance by default — pass allow_incompatible_provenance to force it, and the response warns with both source manifests instead of fabricating a common address origin. Snapshots without capture metadata (legacy) are reported provenance_unknown. Modes: changed, unchanged, increased, decreased, changed_by (signed delta), equal_to (after value), in_range (after value bounds). Width byte/word/long with explicit byte order (default big-endian) and aligned scanning by default. Returns bounded inline matches plus a full-results artifact.",
+			description: "Compare two consistent memory snapshots cell-by-cell and report cells matching a comparison mode. Without snapshot_after_id the region is read fresh into a snapshot first (never a live racy scan). The before snapshot's capture provenance supplies the address space, range, and default byte order; comparing snapshots with incompatible provenance (different space, range, or ROM identity) fails with incompatible_provenance by default — pass allow_incompatible_provenance to force it, and the response warns with both source manifests instead of fabricating a common address origin. Snapshots without capture metadata (legacy) are reported provenance_unknown. Modes: changed, unchanged, increased, decreased, changed_by (signed delta), equal_to (after value), in_range (after value bounds). Width byte/word/long with explicit byte order (default big-endian) and aligned scanning by default. Returns bounded inline matches plus a full-results artifact. The response echoes the requested comparison next to the compared_range it actually scanned. Matches page by cursor: the cursor names both snapshot artifacts (so a later page compares the same bytes instead of reading the target again), the mode, width, byte order, comparison values, and the resume offset. " + cursorSteppingNote + " " + pagingNote,
 			schema: objectSchema(map[string]any{
-				"snapshot_before_id":            stringProperty("id of a memory-dump or memory-snapshot artifact representing the earlier state."),
+				"snapshot_before_id":            stringProperty("id of a memory-dump or memory-snapshot artifact representing the earlier state. Required unless cursor is given."),
 				"snapshot_after_id":             stringProperty("optional id of a memory-dump or memory-snapshot artifact representing the later state; when omitted, the before range is read fresh into a snapshot before comparing."),
 				"space":                         stringProperty("Address space id from memory_spaces_list; required when snapshot_after_id is omitted and the before snapshot lacks provenance. With a proven before snapshot it must match the captured space."),
-				"mode":                          enumProperty("Comparison mode.", []string{"changed", "unchanged", "increased", "decreased", "changed_by", "equal_to", "in_range"}),
+				"mode":                          enumProperty("Comparison mode. Required unless cursor is given.", []string{"changed", "unchanged", "increased", "decreased", "changed_by", "equal_to", "in_range"}),
 				"width":                         enumProperty("Cell width. Default byte; word/long cells honor byte_order.", []string{"byte", "word", "long"}),
 				"byte_order":                    enumProperty("Byte order for word/long cells. Defaults to the before snapshot's captured byte order when it has provenance; otherwise big-endian (M68K domain); use little-endian for Z80 RAM cells.", []string{"big-endian", "little-endian"}),
 				"value":                         integerProperty("Value for equal_to (unsigned, must fit the width) or the signed delta for changed_by.", 0),
@@ -95,8 +96,9 @@ func phase5ToolSpecs() []toolSpec {
 				"max_matches":                   integerProperty(fmt.Sprintf("Maximum inline matches (default %d, cap %d).", defaultSearchMaxMatches, maxSearchMaxMatches), 1),
 				"allow_misaligned":              booleanProperty("Scan every cell offset instead of aligning to the cell width in the address domain."),
 				"allow_incompatible_provenance": booleanProperty("Compare snapshots whose capture provenance differs (space, range, or ROM identity) and report a prominent warning instead of failing with incompatible_provenance. Never fabricates a common address origin."),
+				"cursor":                        stringProperty("next_cursor from a previous memory_diff call. The cursor carries both snapshots, the mode, width, byte order, comparison values, and the alignment policy, so a later page needs only the cursor; any argument supplied alongside it must match the cursor. Omit to start at the first page."),
 				"context":                       contextProperty(),
-			}, []string{"snapshot_before_id", "mode"}),
+			}, nil),
 			run: runMemoryDiff,
 		},
 		{
@@ -216,6 +218,7 @@ type memorySearchArgs struct {
 	MaxMatches   uint64 `json:"max_matches"`
 	SnapshotID   string `json:"snapshot_id"`
 	Alignment    uint64 `json:"alignment"`
+	Cursor       string `json:"cursor"`
 	Context      string `json:"context"`
 }
 
@@ -264,7 +267,6 @@ func resolveSearchSource(tc toolContext, contextID string, args memorySearchArgs
 		payload := map[string]any{
 			"effective_address":         float64(effective),
 			"byte_order":                byteOrder,
-			"consistency":               "live",
 			"system_paused_during_read": pausedDuringRead,
 		}
 		provenance := captureProvenance(tc.server, "memory-snapshot", space, startAddress, uint64(len(raw)), payload, time.Now().UTC(), "", nil)
@@ -276,6 +278,8 @@ func resolveSearchSource(tc toolContext, contextID string, args memorySearchArgs
 		source.descriptor = artifactDescriptor(tc.server, stored, contextID)
 		source.provenance = provenance
 		source.startAddress = uint64(effective)
+		source.capturedStart = uint64(effective)
+		source.capturedLength = len(raw)
 		source.byteOrder = byteOrder
 		source.pausedDuringRead = pausedDuringRead
 		source.consistency = buildCaptureConsistency(tc.server, payload, false, true, nil, nil)
@@ -310,16 +314,37 @@ func resolveSearchSource(tc toolContext, contextID string, args memorySearchArgs
 		if args.Space != "" && args.Space != provenance.AddressSpace {
 			return source, provenanceConflict("space", provenance.AddressSpace, args.Space)
 		}
-		if args.StartAddress != nil && startAddress != derivedStart {
-			return source, provenanceConflict("start_address", derivedStart, startAddress)
-		}
-		if args.Length != 0 && args.Length != derivedLength {
-			return source, provenanceConflict("length", derivedLength, args.Length)
+		if derivedLength == 0 {
+			derivedLength = uint64(len(raw))
 		}
 		if args.Length == 0 && derivedLength == 0 {
 			return source, &toolFailure{Code: "invalid_params", Message: "the snapshot's captured byte length is unknown; pass length explicitly"}
 		}
-		source.startAddress = derivedStart
+		// Narrowing: the requested window must stay inside the captured range.
+		// The snapshot is the provenance source, so a subset is a smaller
+		// question about the same bytes; a window that leaves the capture is a
+		// contradiction and stays provenance_conflict.
+		captureEnd := derivedStart + uint64(len(raw))
+		searchStart := derivedStart
+		searchEnd := captureEnd
+		if args.StartAddress != nil {
+			if startAddress < derivedStart || startAddress >= captureEnd {
+				return source, provenanceRangeConflict("start_address", captureRangeView(derivedStart, uint64(len(raw))), canonicalHex(startAddress))
+			}
+			searchStart = startAddress
+		}
+		if args.Length != 0 {
+			if args.Length > captureEnd-searchStart {
+				return source, provenanceRangeConflict("length", captureRangeView(derivedStart, uint64(len(raw))), fmt.Sprintf("%d bytes from %s", args.Length, canonicalHex(searchStart)))
+			}
+			searchEnd = searchStart + args.Length
+		}
+		source.startAddress = searchStart
+		source.capturedStart = derivedStart
+		source.capturedLength = len(raw)
+		source.searchedOffset = int(searchStart - derivedStart)
+		source.bytes = raw[source.searchedOffset : source.searchedOffset+int(searchEnd-searchStart)]
+		source.narrowed = searchStart != derivedStart || searchEnd != captureEnd
 		source.byteOrder = provenance.ByteOrder
 		source.provenance = provenance
 		source.consistency = provenance.CaptureConsistency
@@ -339,17 +364,48 @@ func resolveSearchSource(tc toolContext, contextID string, args memorySearchArgs
 		}
 	}
 	source.startAddress = startAddress
+	source.capturedStart = startAddress
+	source.capturedLength = len(raw)
 	source.readOrigin = "snapshot artifact reused; the artifact has no capture provenance (provenance_unknown), so matches are anchored to the caller-provided start address " + canonicalHex(startAddress)
 	source.provenanceNote = "provenance_unknown"
 	return source, nil
 }
 
+// captureRangeView renders the captured range a narrowing request was compared
+// against, so the rejection states which bytes are available.
+func captureRangeView(start, length uint64) string {
+	if length == 0 {
+		return canonicalHex(start)
+	}
+	return fmt.Sprintf("%s..%s (%d bytes)", canonicalHex(start), canonicalHex(start+length-1), length)
+}
+
+// provenanceRangeConflict rejects a request that leaves the captured range.
+// The snapshot stays the provenance source; only a subset narrows it.
+func provenanceRangeConflict(parameter, captured, provided string) *toolFailure {
+	return &toolFailure{
+		Code:    "provenance_conflict",
+		Message: fmt.Sprintf("%s leaves the snapshot's captured range: provenance says %s, call says %s. A subset of the captured range narrows the search; anything outside it contradicts the snapshot.", parameter, captured, provided),
+		Data: map[string]any{
+			"parameter":        parameter,
+			"provenance_value": captured,
+			"provided_value":   provided,
+		},
+	}
+}
+
 // searchSource is the resolved byte range and its provenance for one search.
+// bytes is the searched slice while capturedStart/capturedLength describe the
+// whole snapshot, so a narrowed search never rewrites the captured range.
 type searchSource struct {
 	bytes            []byte
 	descriptor       map[string]any
 	provenance       *artifact.Provenance
 	startAddress     uint64
+	capturedStart    uint64
+	capturedLength   int
+	searchedOffset   int
+	narrowed         bool
 	byteOrder        string
 	pausedDuringRead bool
 	readOrigin       string
@@ -360,11 +416,14 @@ type searchSource struct {
 // sourceRange renders the captured address range of the searched snapshot.
 func (source *searchSource) sourceRange() map[string]any {
 	rangeInfo := map[string]any{
-		"start_address":     source.startAddress,
-		"start_address_hex": canonicalHex(source.startAddress),
-		"byte_length":       len(source.bytes),
-		"end_address":       source.startAddress + uint64(len(source.bytes)) - 1,
-		"end_address_hex":   canonicalHex(source.startAddress + uint64(len(source.bytes)) - 1),
+		"start_address":     source.capturedStart,
+		"start_address_hex": canonicalHex(source.capturedStart),
+		"byte_length":       source.capturedLength,
+	}
+	if source.capturedLength > 0 {
+		end := source.capturedStart + uint64(source.capturedLength) - 1
+		rangeInfo["end_address"] = end
+		rangeInfo["end_address_hex"] = canonicalHex(end)
 	}
 	if source.provenance != nil {
 		if source.provenance.EffectiveAddress != nil {
@@ -378,6 +437,186 @@ func (source *searchSource) sourceRange() map[string]any {
 	return rangeInfo
 }
 
+// searchedRange renders the range this call actually scanned plus its offset
+// inside the snapshot, so a narrowed search is visible without re-deriving it.
+func (source *searchSource) searchedRange() map[string]any {
+	length := uint64(len(source.bytes))
+	rangeInfo := map[string]any{
+		"start_address":          source.startAddress,
+		"start_address_hex":      canonicalHex(source.startAddress),
+		"byte_length":            length,
+		"offset_within_snapshot": uint64(source.searchedOffset),
+		"narrowed":               source.narrowed,
+	}
+	if length > 0 {
+		end := source.startAddress + length - 1
+		rangeInfo["end_address"] = end
+		rangeInfo["end_address_hex"] = canonicalHex(end)
+	}
+	return rangeInfo
+}
+
+// searchCursor is the paging state of one memory_search enumeration. It names
+// the snapshot, the searched window inside it, the query, and the byte offset
+// to resume at, so later pages reuse the same immutable snapshot instead of
+// re-reading the target or re-sending the request. The offset is a position in
+// the searched bytes, not an index into a response array, and the snapshot
+// artifact never changes, so pages cannot shift, repeat, or skip.
+type searchCursor struct {
+	SnapshotID string
+	SpaceID    string
+	Offset     uint64 // byte offset of the searched window inside the snapshot
+	Start      uint64 // first address of the searched window
+	Length     uint64 // searched byte length
+	PatternHex string
+	MaskHex    string
+	Alignment  uint64
+	After      uint64 // byte offset inside the searched window to resume at
+}
+
+func (cursor searchCursor) encode() string {
+	return encodeCursor(searchCursorPrefix,
+		cursor.SnapshotID, cursor.SpaceID,
+		strconv.FormatUint(cursor.Offset, 10),
+		strconv.FormatUint(cursor.Start, 10),
+		strconv.FormatUint(cursor.Length, 10),
+		cursor.PatternHex,
+		cursor.MaskHex,
+		strconv.FormatUint(cursor.Alignment, 10),
+		strconv.FormatUint(cursor.After, 10),
+	)
+}
+
+func parseSearchCursor(raw string) (searchCursor, *toolFailure) {
+	parts, failure := decodeCursor(raw, searchCursorPrefix, 9)
+	if failure != nil {
+		return searchCursor{}, failure
+	}
+	numbers := make([]uint64, 5)
+	for index, position := range []int{2, 3, 4, 7, 8} {
+		value, err := strconv.ParseUint(parts[position], 10, 64)
+		if err != nil {
+			return searchCursor{}, invalidCursorFailure(fmt.Sprintf("%q is not a cursor this server issued", raw))
+		}
+		numbers[index] = value
+	}
+	if parts[0] == "" || numbers[2] == 0 {
+		return searchCursor{}, invalidCursorFailure(fmt.Sprintf("%q is not a cursor this server issued", raw))
+	}
+	if parts[5] == "" || len(parts[5]) != len(parts[6]) {
+		return searchCursor{}, invalidCursorFailure(fmt.Sprintf("%q is not a cursor this server issued", raw))
+	}
+	cursor := searchCursor{
+		SnapshotID: parts[0],
+		SpaceID:    parts[1],
+		Offset:     numbers[0],
+		Start:      numbers[1],
+		Length:     numbers[2],
+		PatternHex: parts[5],
+		MaskHex:    parts[6],
+		Alignment:  numbers[3],
+		After:      numbers[4],
+	}
+	if cursor.Alignment != 0 && cursor.Alignment&(cursor.Alignment-1) != 0 {
+		return searchCursor{}, invalidCursorFailure(fmt.Sprintf("%q is not a cursor this server issued", raw))
+	}
+	if _, err := hex.DecodeString(cursor.PatternHex); err != nil {
+		return searchCursor{}, invalidCursorFailure(fmt.Sprintf("%q is not a cursor this server issued", raw))
+	}
+	if _, err := hex.DecodeString(cursor.MaskHex); err != nil {
+		return searchCursor{}, invalidCursorFailure(fmt.Sprintf("%q is not a cursor this server issued", raw))
+	}
+	return cursor, nil
+}
+
+// reconcileSearchCursorQuery applies the query a cursor carries when the caller
+// omitted it, and rejects an argument that contradicts it. The decoded cursor is
+// the request, so a cursor-only call is valid and a conflicting argument is an
+// error naming the field.
+func reconcileSearchCursorQuery(parsed *memorySearchArgs, cursor searchCursor) (patternHex, maskHex string, failure *toolFailure) {
+	patternHex, maskHex = cursor.PatternHex, cursor.MaskHex
+	if parsed.Pattern != "" {
+		pattern, mask, parseFailure := parseHexPatternWithMask(parsed.Pattern)
+		if parseFailure != nil {
+			return "", "", parseFailure
+		}
+		providedPattern := strings.ToUpper(hex.EncodeToString(pattern))
+		providedMask := strings.ToUpper(hex.EncodeToString(mask))
+		if providedPattern != cursor.PatternHex || providedMask != cursor.MaskHex {
+			return "", "", cursorConflictFailure("pattern",
+				fmt.Sprintf("%s with mask %s", cursor.PatternHex, cursor.MaskHex),
+				fmt.Sprintf("%s with mask %s", providedPattern, providedMask))
+		}
+	}
+	if parsed.Alignment != 0 && parsed.Alignment != cursor.Alignment {
+		return "", "", cursorConflictFailure("alignment", cursor.Alignment, parsed.Alignment)
+	}
+	if parsed.SnapshotID != "" && parsed.SnapshotID != cursor.SnapshotID {
+		return "", "", cursorConflictFailure("snapshot_id", cursor.SnapshotID, parsed.SnapshotID)
+	}
+	if parsed.Space != "" && parsed.Space != cursor.SpaceID {
+		return "", "", cursorConflictFailure("space", cursor.SpaceID, parsed.Space)
+	}
+	if parsed.StartAddress != nil {
+		return "", "", cursorConflictFailure("start_address", canonicalHex(cursor.Start), fmt.Sprint(parsed.StartAddress))
+	}
+	if parsed.Length != 0 && parsed.Length != cursor.Length {
+		return "", "", cursorConflictFailure("length", cursor.Length, parsed.Length)
+	}
+	return patternHex, maskHex, nil
+}
+
+// resolveSearchCursor loads the snapshot a cursor names and slices the window it
+// recorded, so a later page reuses exactly the bytes the first page searched.
+func resolveSearchCursor(tc toolContext, contextID string, cursor searchCursor) (searchSource, *toolFailure) {
+	source := searchSource{}
+	raw, meta, failure := loadSearchSnapshot(tc, contextID, cursor.SnapshotID)
+	if failure != nil {
+		return source, failure
+	}
+	if cursor.Offset+cursor.Length > uint64(len(raw)) {
+		return source, invalidCursorFailure(fmt.Sprintf("snapshot %q now holds %d bytes, so the cursor's window is gone", cursor.SnapshotID, len(raw)))
+	}
+	source.bytes = raw[cursor.Offset : cursor.Offset+cursor.Length]
+	source.descriptor = artifactDescriptor(tc.server, meta, contextID)
+	source.startAddress = cursor.Start
+	source.capturedStart = cursor.Start - cursor.Offset
+	source.capturedLength = len(raw)
+	source.searchedOffset = int(cursor.Offset)
+	source.narrowed = cursor.Offset != 0 || cursor.Length != uint64(len(raw))
+	source.pausedDuringRead = false
+	source.readOrigin = "snapshot artifact reused through a paging cursor; no new read was performed, so system_paused_during_read is false"
+	source.provenance = meta.Provenance
+	if meta.Provenance != nil && meta.Provenance.Known() {
+		source.byteOrder = meta.Provenance.ByteOrder
+		source.consistency = meta.Provenance.CaptureConsistency
+		source.provenanceNote = "complete"
+	} else {
+		source.provenanceNote = "provenance_unknown"
+	}
+	return source, nil
+}
+
+// loadSearchSnapshot reads one snapshot artifact and its metadata. A wrong
+// artifact kind is rejected before its bytes are used as a search domain.
+func loadSearchSnapshot(tc toolContext, contextID, id string) ([]byte, artifact.Artifact, *toolFailure) {
+	meta, err := tc.server.store.Metadata(id, contextID)
+	if err != nil {
+		return nil, artifact.Artifact{}, &toolFailure{Code: "unknown_artifact", Message: err.Error()}
+	}
+	if meta.Kind != "memory-dump" && meta.Kind != "memory-snapshot" {
+		return nil, artifact.Artifact{}, &toolFailure{
+			Code:    "invalid_params",
+			Message: "snapshot_id must reference a memory-dump or memory-snapshot artifact; got kind " + meta.Kind,
+		}
+	}
+	raw, _, err := tc.server.store.Bytes(id, contextID)
+	if err != nil {
+		return nil, artifact.Artifact{}, &toolFailure{Code: "artifact_error", Message: err.Error()}
+	}
+	return raw, meta, nil
+}
+
 func runMemorySearch(tc toolContext, args json.RawMessage) map[string]any {
 	parsed, failure := decodeArgs[memorySearchArgs](args)
 	if failure != nil {
@@ -387,12 +626,39 @@ func runMemorySearch(tc toolContext, args json.RawMessage) map[string]any {
 	if failure != nil {
 		return failureResult(failure, tc.modern)
 	}
-	pattern, mask, failure := parseHexPatternWithMask(parsed.Pattern)
-	if failure != nil {
-		return failureResult(failure, tc.modern)
+	// The cursor is decoded before any required-argument check: the token IS the
+	// request, so a page 2 call needs nothing else, and a missing pattern is only
+	// an error when there is no cursor to supply it.
+	cursor := searchCursor{}
+	cursorPage := parsed.Cursor != ""
+	if cursorPage {
+		cursor, failure = parseSearchCursor(parsed.Cursor)
+		if failure != nil {
+			return failureResult(failure, tc.modern)
+		}
 	}
-	if parsed.Alignment != 0 && (parsed.Alignment&(parsed.Alignment-1) != 0) {
-		return failureResult(&toolFailure{Code: "invalid_params", Message: "alignment must be a power of two"}, tc.modern)
+	var pattern, mask []byte
+	if cursorPage {
+		patternHex, maskHex, conflict := reconcileSearchCursorQuery(parsed, cursor)
+		if conflict != nil {
+			return failureResult(conflict, tc.modern)
+		}
+		pattern, _ = hex.DecodeString(patternHex)
+		mask, _ = hex.DecodeString(maskHex)
+	} else {
+		pattern, mask, failure = parseHexPatternWithMask(parsed.Pattern)
+		if failure != nil {
+			return failureResult(failure, tc.modern)
+		}
+		if parsed.Alignment != 0 && (parsed.Alignment&(parsed.Alignment-1) != 0) {
+			return failureResult(&toolFailure{Code: "invalid_params", Message: "alignment must be a power of two"}, tc.modern)
+		}
+	}
+	alignment := parsed.Alignment
+	if cursorPage {
+		// The alignment is part of the query: paging with a different one would
+		// select a different set of matches.
+		alignment = cursor.Alignment
 	}
 
 	maxMatches := parsed.MaxMatches
@@ -407,14 +673,21 @@ func runMemorySearch(tc toolContext, args json.RawMessage) map[string]any {
 	}
 
 	startAddress := uint64(0)
-	if parsed.StartAddress != nil {
+	if parsed.StartAddress != nil && !cursorPage {
 		startAddress, failure = resolveAddress(parsed.StartAddress, addressSpaceFromArgs(args), parsed.Space)
 		if failure != nil {
 			return failureResult(failure, tc.modern)
 		}
 	}
 
-	source, failure := resolveSearchSource(tc, context.ID, *parsed, startAddress, pattern)
+	var source searchSource
+	if cursorPage {
+		// A cursor fixes the snapshot, window, and query, so the page reuses
+		// exactly the bytes the first page searched.
+		source, failure = resolveSearchCursor(tc, context.ID, cursor)
+	} else {
+		source, failure = resolveSearchSource(tc, context.ID, *parsed, startAddress, pattern)
+	}
 	if failure != nil {
 		return failureResult(failure, tc.modern)
 	}
@@ -423,7 +696,36 @@ func runMemorySearch(tc toolContext, args json.RawMessage) map[string]any {
 	if source.provenance != nil && source.provenance.AddressSpace != "" {
 		spaceID = source.provenance.AddressSpace
 	}
-	matches, total, inlineTruncated, artifactTruncated := findPatternMatches(source.bytes, pattern, mask, source.startAddress, maxMatches, parsed.Alignment)
+	if parsed.Cursor != "" && spaceID == "" {
+		spaceID = cursor.SpaceID
+	}
+	matches, total, remaining, artifactTruncated := findPatternMatches(source.bytes, pattern, mask, source.startAddress, maxMatches, alignment, cursor.After)
+	inlineTruncated := uint64(len(matches.Inline)) < total
+	nextCursor := ""
+	if remaining > uint64(len(matches.Inline)) && len(matches.Inline) > 0 {
+		snapshotID, _ := source.descriptor["id"].(string)
+		nextCursor = searchCursor{
+			SnapshotID: snapshotID,
+			SpaceID:    spaceID,
+			Offset:     uint64(source.searchedOffset),
+			Start:      source.startAddress,
+			Length:     uint64(len(source.bytes)),
+			PatternHex: strings.ToUpper(hex.EncodeToString(pattern)),
+			MaskHex:    strings.ToUpper(hex.EncodeToString(mask)),
+			Alignment:  alignment,
+			After:      matches.LastOffset + 1,
+		}.encode()
+	}
+	remainingAfterPage := int(remaining) - len(matches.Inline)
+	if remainingAfterPage < 0 {
+		remainingAfterPage = 0
+	}
+	paging := pagingPage{
+		Returned:   len(matches.Inline),
+		Total:      int(total),
+		Remaining:  remainingAfterPage,
+		NextCursor: nextCursor,
+	}
 
 	patternHex := strings.ToUpper(hex.EncodeToString(pattern))
 	maskHex := strings.ToUpper(hex.EncodeToString(mask))
@@ -433,10 +735,11 @@ func runMemorySearch(tc toolContext, args json.RawMessage) map[string]any {
 		"pattern_hex":          patternHex,
 		"pattern_mask_hex":     maskHex,
 		"pattern_length_bytes": len(pattern),
-		"alignment":            parsed.Alignment,
+		"alignment":            alignment,
 		"interpretation":       "matches are byte addresses in the address space; the pattern is raw bytes in address order with mask 00=wildcard and no endian interpretation is applied",
 		"source_snapshot":      source.descriptor,
 		"source_range":         source.sourceRange(),
+		"searched_range":       source.searchedRange(),
 		"range": map[string]any{
 			"start_address": source.startAddress,
 			"byte_length":   len(source.bytes),
@@ -444,13 +747,9 @@ func runMemorySearch(tc toolContext, args json.RawMessage) map[string]any {
 		"matches_total":  total,
 		"truncated":      artifactTruncated,
 		"addresses":      matches.Addresses,
-		"parsed_pattern": map[string]any{"bytes_hex": patternHex, "mask_hex": maskHex, "alignment": parsed.Alignment},
+		"parsed_pattern": map[string]any{"bytes_hex": patternHex, "mask_hex": maskHex, "alignment": alignment},
 	}
-	resultsBytes, err := json.Marshal(results)
-	if err != nil {
-		return failureResult(&toolFailure{Code: "artifact_error", Message: err.Error()}, tc.modern)
-	}
-	storedResults, err := tc.server.store.PutWithProvenance(context.ID, "memory-search-results", "application/json", resultsBytes, genericProvenance(tc.server, "memory-search-results", time.Now().UTC()))
+	storedResults, err := putJSONArtifact(tc.server, context.ID, "memory-search-results", results, genericProvenance(tc.server, "memory-search-results", time.Now().UTC()))
 	if err != nil {
 		return failureResult(&toolFailure{Code: "artifact_error", Message: err.Error()}, tc.modern)
 	}
@@ -461,7 +760,7 @@ func runMemorySearch(tc toolContext, args json.RawMessage) map[string]any {
 		"pattern_hex":                patternHex,
 		"pattern_mask_hex":           maskHex,
 		"pattern_length_bytes":       len(pattern),
-		"alignment":                  parsed.Alignment,
+		"alignment":                  alignment,
 		"interpretation":             "matches are byte addresses; raw pattern bytes preserve address order with mask 00=wildcard and are never decoded",
 		"searched_start_address":     source.startAddress,
 		"searched_start_address_hex": canonicalHex(source.startAddress),
@@ -473,10 +772,10 @@ func runMemorySearch(tc toolContext, args json.RawMessage) map[string]any {
 		"snapshot_read_note":         source.readOrigin,
 		"snapshot":                   source.descriptor,
 		"source_range":               source.sourceRange(),
-		"parsed_pattern":             map[string]any{"bytes_hex": patternHex, "mask_hex": maskHex, "alignment": parsed.Alignment},
+		"parsed_pattern":             map[string]any{"bytes_hex": patternHex, "mask_hex": maskHex, "alignment": alignment},
 	}
 	if source.consistency != nil {
-		summary["capture_consistency"] = captureConsistencyToMap(source.consistency)
+		summary["capture_consistency"] = tc.server.captureConsistencyView(source.consistency)
 	}
 	if source.byteOrder != "" {
 		summary["byte_order"] = source.byteOrder
@@ -484,29 +783,72 @@ func runMemorySearch(tc toolContext, args json.RawMessage) map[string]any {
 	if source.provenanceNote == "provenance_unknown" {
 		summary["provenance_warning"] = "The searched snapshot has no capture provenance (provenance_unknown, legacy artifact); its address origin cannot be verified and matches are anchored to the caller-provided start address."
 	}
+	// Request echo: the caller sees the range it asked for next to the range
+	// that was actually scanned, so a narrowed search is never guessed at.
+	requestedStart := any(nil)
+	requestedLength := parsed.Length
+	requestedSnapshotID := parsed.SnapshotID
+	if parsed.Cursor != "" {
+		requestedStart = source.startAddress
+		requestedLength = uint64(len(source.bytes))
+		requestedSnapshotID = cursor.SnapshotID
+	} else if parsed.StartAddress != nil {
+		requestedStart = startAddress
+	}
+	summary["requested_range"] = map[string]any{
+		"start_address": requestedStart,
+		"byte_length":   requestedLength,
+		"snapshot_id":   requestedSnapshotID,
+		"address_space": strings.TrimSpace(parsed.Space),
+	}
+	summary["searched_range"] = source.searchedRange()
+	summary["paging"] = pagingView(paging)
 	result := map[string]any{
 		"summary":  summary,
 		"matches":  matches.Inline,
 		"artifact": artifactDescriptor(tc.server, storedResults, context.ID),
 	}
+	paging.apply(result)
 	annotateAddressMap(result, spaceID)
 	return okResult(result, tc.modern)
+}
+
+// pagingView renders the envelope as a nested block for tools that group their
+// pagination facts (memory_search/memory_diff keep the flat envelope too).
+func pagingView(page pagingPage) map[string]any {
+	view := map[string]any{
+		"returned":    page.Returned,
+		"total":       page.Total,
+		"truncated":   page.hasMore(),
+		"has_more":    page.hasMore(),
+		"next_cursor": nil,
+	}
+	if page.hasMore() {
+		view["next_cursor"] = page.NextCursor
+	}
+	return view
 }
 
 type searchMatches struct {
 	Inline    []map[string]any
 	Addresses []uint64
+	// LastOffset is the byte offset of the last inline match, so the next
+	// cursor resumes right after it.
+	LastOffset uint64
 }
 
 // findPatternMatches scans data for pattern and reports the first up to
-// inlineLimit matches inline plus up to maxSearchArtifactMatches addresses for
-// the full-results artifact. Adresses are anchored at startAddress.
-// It supports wildcard masks (mask 0x00 = any) and optional alignment (0 = no alignment).
-func findPatternMatches(data, pattern, mask []byte, startAddress uint64, inlineLimit uint64, alignment uint64) (searchMatches, uint64, bool, bool) {
+// inlineLimit matches at or after afterOffset inline, how many matches exist in
+// total, how many exist at or after afterOffset, and up to
+// maxSearchArtifactMatches addresses for the full-results artifact. Addresses
+// are anchored at startAddress. It supports wildcard masks (mask 0x00 = any) and
+// optional alignment (0 = no alignment).
+func findPatternMatches(data, pattern, mask []byte, startAddress uint64, inlineLimit uint64, alignment uint64, afterOffset uint64) (searchMatches, uint64, uint64, bool) {
 	result := searchMatches{Inline: []map[string]any{}, Addresses: []uint64{}}
 	var total uint64
+	var remaining uint64
 	if len(pattern) == 0 {
-		return result, 0, false, false
+		return result, 0, 0, false
 	}
 	for index := 0; index+len(pattern) <= len(data); index++ {
 		if alignment != 0 && (uint64(index)%alignment != 0) {
@@ -530,17 +872,21 @@ func findPatternMatches(data, pattern, mask []byte, startAddress uint64, inlineL
 		if uint64(len(result.Addresses)) < maxSearchArtifactMatches {
 			result.Addresses = append(result.Addresses, address)
 		}
+		if uint64(index) < afterOffset {
+			continue
+		}
+		remaining++
 		if uint64(len(result.Inline)) < inlineLimit {
 			result.Inline = append(result.Inline, map[string]any{
 				"address":     address,
 				"address_hex": canonicalHex(address),
 				"offset":      uint64(index),
 			})
+			result.LastOffset = uint64(index)
 		}
 	}
-	inlineTruncated := uint64(len(result.Inline)) < total
 	artifactTruncated := uint64(len(result.Addresses)) < total
-	return result, total, inlineTruncated, artifactTruncated
+	return result, total, remaining, artifactTruncated
 }
 
 func parseHexPattern(raw string) ([]byte, *toolFailure) {
@@ -620,6 +966,7 @@ type memoryDiffArgs struct {
 	MaxMatches                  uint64  `json:"max_matches"`
 	AllowMisaligned             bool    `json:"allow_misaligned"`
 	AllowIncompatibleProvenance bool    `json:"allow_incompatible_provenance"`
+	Cursor                      string  `json:"cursor"`
 	Context                     string  `json:"context"`
 }
 
@@ -642,9 +989,145 @@ func maxCellValue(width int) uint64 {
 	}
 }
 
-// loadDiffSnapshot resolves one memory snapshot artifact and returns its raw
-// bytes, its descriptor, its provenance (nil for legacy artifacts), and the
-// space used for a fresh read when needed.
+// memoryDiffCursor is the paging state of one memory_diff enumeration. It
+// names both snapshot artifacts (so later pages compare exactly the same bytes
+// instead of reading the target again), the comparison shape, and the byte
+// offset to resume at. The offset is a position in the compared bytes, never an
+// index into the response, and both snapshots are immutable artifacts, so pages
+// cannot shift, repeat, or skip.
+type memoryDiffCursor struct {
+	BeforeID  string
+	AfterID   string
+	Mode      string
+	Width     string
+	ByteOrder string
+	Value     string
+	MinValue  string
+	MaxValue  string
+	Alignment string
+	After     uint64
+}
+
+func (cursor memoryDiffCursor) encode() string {
+	return encodeCursor(diffCursorPrefix,
+		cursor.BeforeID, cursor.AfterID, cursor.Mode, cursor.Width, cursor.ByteOrder,
+		cursor.Value, cursor.MinValue, cursor.MaxValue, cursor.Alignment,
+		strconv.FormatUint(cursor.After, 10),
+	)
+}
+
+func parseDiffCursor(raw string) (memoryDiffCursor, *toolFailure) {
+	parts, failure := decodeCursor(raw, diffCursorPrefix, 10)
+	if failure != nil {
+		return memoryDiffCursor{}, failure
+	}
+	after, err := strconv.ParseUint(parts[9], 10, 64)
+	if err != nil || parts[0] == "" || parts[1] == "" {
+		return memoryDiffCursor{}, invalidCursorFailure(fmt.Sprintf("%q is not a cursor this server issued", raw))
+	}
+	cursor := memoryDiffCursor{
+		BeforeID:  parts[0],
+		AfterID:   parts[1],
+		Mode:      parts[2],
+		Width:     parts[3],
+		ByteOrder: parts[4],
+		Value:     parts[5],
+		MinValue:  parts[6],
+		MaxValue:  parts[7],
+		Alignment: parts[8],
+		After:     after,
+	}
+	// The cursor is the request, so its own vocabulary must hold: a token this
+	// server issued can only carry a documented comparison shape.
+	switch cursor.Mode {
+	case "changed", "unchanged", "increased", "decreased", "changed_by", "equal_to", "in_range":
+	default:
+		return memoryDiffCursor{}, invalidCursorFailure(fmt.Sprintf("%q carries no usable comparison mode", raw))
+	}
+	if _, supported := diffWidths[cursor.Width]; !supported {
+		return memoryDiffCursor{}, invalidCursorFailure(fmt.Sprintf("%q carries no usable cell width", raw))
+	}
+	if cursor.ByteOrder != "big-endian" && cursor.ByteOrder != "little-endian" {
+		return memoryDiffCursor{}, invalidCursorFailure(fmt.Sprintf("%q carries no usable byte order", raw))
+	}
+	if cursor.Alignment != "aligned-to-width" && cursor.Alignment != "misaligned-scan" {
+		return memoryDiffCursor{}, invalidCursorFailure(fmt.Sprintf("%q carries no usable alignment policy", raw))
+	}
+	return cursor, nil
+}
+
+// resumeMemoryDiff rewrites the request into the comparison the cursor names,
+// so a later page cannot silently compare different bytes or a different mode.
+// A cursor-only call is valid: every argument the comparison needs travels in
+// the token. Arguments supplied next to it must match, and a differing one is
+// rejected naming the field.
+func resumeMemoryDiff(parsed *memoryDiffArgs, cursor memoryDiffCursor) *toolFailure {
+	if parsed.SnapshotBeforeID != "" && parsed.SnapshotBeforeID != cursor.BeforeID {
+		return cursorConflictFailure("snapshot_before_id", cursor.BeforeID, parsed.SnapshotBeforeID)
+	}
+	if parsed.SnapshotAfterID != "" && parsed.SnapshotAfterID != cursor.AfterID {
+		return cursorConflictFailure("snapshot_after_id", cursor.AfterID, parsed.SnapshotAfterID)
+	}
+	if parsed.Mode != "" && parsed.Mode != cursor.Mode {
+		return cursorConflictFailure("mode", cursor.Mode, parsed.Mode)
+	}
+	if parsed.Width != "" && parsed.Width != cursor.Width {
+		return cursorConflictFailure("width", cursor.Width, parsed.Width)
+	}
+	if parsed.ByteOrder != "" && parsed.ByteOrder != cursor.ByteOrder {
+		return cursorConflictFailure("byte_order", cursor.ByteOrder, parsed.ByteOrder)
+	}
+	if parsed.AllowMisaligned != (cursor.Alignment == "misaligned-scan") && parsed.AllowMisaligned {
+		return cursorConflictFailure("allow_misaligned", cursor.Alignment == "misaligned-scan", parsed.AllowMisaligned)
+	}
+	if cursor.Value != "" {
+		value, err := strconv.ParseInt(cursor.Value, 10, 64)
+		if err != nil {
+			return invalidCursorFailure(fmt.Sprintf("%q holds an unreadable comparison value", cursor.Value))
+		}
+		if parsed.Value != nil && *parsed.Value != value {
+			return cursorConflictFailure("value", value, *parsed.Value)
+		}
+		parsed.Value = &value
+	} else if parsed.Value != nil {
+		return cursorConflictFailure("value", nil, *parsed.Value)
+	}
+	if cursor.MinValue != "" {
+		minValue, err := strconv.ParseUint(cursor.MinValue, 10, 64)
+		if err != nil {
+			return invalidCursorFailure(fmt.Sprintf("%q holds an unreadable min_value", cursor.MinValue))
+		}
+		if parsed.MinValue != nil && *parsed.MinValue != minValue {
+			return cursorConflictFailure("min_value", minValue, *parsed.MinValue)
+		}
+		parsed.MinValue = &minValue
+	} else if parsed.MinValue != nil {
+		return cursorConflictFailure("min_value", nil, *parsed.MinValue)
+	}
+	if cursor.MaxValue != "" {
+		maxValue, err := strconv.ParseUint(cursor.MaxValue, 10, 64)
+		if err != nil {
+			return invalidCursorFailure(fmt.Sprintf("%q holds an unreadable max_value", cursor.MaxValue))
+		}
+		if parsed.MaxValue != nil && *parsed.MaxValue != maxValue {
+			return cursorConflictFailure("max_value", maxValue, *parsed.MaxValue)
+		}
+		parsed.MaxValue = &maxValue
+	} else if parsed.MaxValue != nil {
+		return cursorConflictFailure("max_value", nil, *parsed.MaxValue)
+	}
+	parsed.SnapshotBeforeID = cursor.BeforeID
+	parsed.SnapshotAfterID = cursor.AfterID
+	parsed.Mode = cursor.Mode
+	parsed.Width = cursor.Width
+	parsed.ByteOrder = cursor.ByteOrder
+	// The compared range and alignment come from the cursor: they were proven
+	// on the first page, and re-asserting them would only add conflict surface.
+	parsed.StartAddress = nil
+	parsed.AllowMisaligned = cursor.Alignment == "misaligned-scan"
+	return nil
+}
+
 func loadDiffSnapshot(tc toolContext, contextID, id string) ([]byte, map[string]any, *artifact.Provenance, *toolFailure) {
 	meta, err := tc.server.store.Metadata(id, contextID)
 	if err != nil {
@@ -760,6 +1243,24 @@ func runMemoryDiff(tc toolContext, args json.RawMessage) map[string]any {
 	parsed, failure := decodeArgs[memoryDiffArgs](args)
 	if failure != nil {
 		return failureResult(failure, tc.modern)
+	}
+	// A cursor names the whole comparison (both snapshots and the cell
+	// semantics) plus the offset to resume at, so later pages compare exactly
+	// the bytes the first page compared and never re-read the target.
+	pagingCursor := memoryDiffCursor{}
+	afterOffset := uint64(0)
+	// Echo the address the caller asked for before a cursor rewrites the
+	// request into the comparison it pages.
+	requestedStartEcho := parsed.StartAddress
+	if parsed.Cursor != "" {
+		pagingCursor, failure = parseDiffCursor(parsed.Cursor)
+		if failure != nil {
+			return failureResult(failure, tc.modern)
+		}
+		if failure = resumeMemoryDiff(parsed, pagingCursor); failure != nil {
+			return failureResult(failure, tc.modern)
+		}
+		afterOffset = pagingCursor.After
 	}
 	if parsed.SnapshotBeforeID == "" {
 		return errorResult("invalid_params", "snapshot_before_id is required", tc.modern)
@@ -917,7 +1418,6 @@ func runMemoryDiff(tc toolContext, args json.RawMessage) map[string]any {
 		payload := map[string]any{
 			"effective_address":         float64(effective),
 			"byte_order":                spaceOrder,
-			"consistency":               "live",
 			"system_paused_during_read": pausedDuringRead,
 		}
 		provenance := captureProvenance(tc.server, "memory-snapshot", space, freshStart, uint64(len(raw)), payload, time.Now().UTC(), "", nil)
@@ -949,6 +1449,8 @@ func runMemoryDiff(tc toolContext, args json.RawMessage) map[string]any {
 	matches := []map[string]any{}
 	records := []map[string]any{}
 	var total uint64
+	var remaining uint64
+	var lastOffset uint64
 	littleEndian := byteOrder == "little-endian"
 	// Aligned scans advance one cell per step; a misaligned scan advances one
 	// byte so every byte offset is visited as a cell.
@@ -991,6 +1493,12 @@ func runMemoryDiff(tc toolContext, args json.RawMessage) map[string]any {
 				"delta":   delta,
 			})
 		}
+		// The page starts at the cursor offset; the full-results artifact above
+		// always carries the whole comparison so a page never loses rows.
+		if offset < afterOffset {
+			continue
+		}
+		remaining++
 		if uint64(len(matches)) < maxMatches {
 			matches = append(matches, map[string]any{
 				"address":     address,
@@ -1000,6 +1508,7 @@ func runMemoryDiff(tc toolContext, args json.RawMessage) map[string]any {
 				"after":       afterValue,
 				"delta":       delta,
 			})
+			lastOffset = offset
 		}
 	}
 
@@ -1015,8 +1524,33 @@ func runMemoryDiff(tc toolContext, args json.RawMessage) map[string]any {
 		}
 		trailingBytes = uint64(len(beforeBytes)) - firstCell - cellsScanned*uint64(width)
 	}
-	inlineTruncated := uint64(len(matches)) < total
+	inlineTruncated := uint64(len(matches)) < remaining
 	artifactTruncated := uint64(len(records)) < total
+	remainingAfterPage := int(remaining) - len(matches)
+	if remainingAfterPage < 0 {
+		remainingAfterPage = 0
+	}
+	nextCursor := ""
+	if remainingAfterPage > 0 {
+		nextCursor = memoryDiffCursor{
+			BeforeID:  descriptorID(beforeSnapshot),
+			AfterID:   descriptorID(afterSnapshot),
+			Mode:      parsed.Mode,
+			Width:     widthName,
+			ByteOrder: byteOrder,
+			Value:     optionalIntString(parsed.Value),
+			MinValue:  optionalUintString(parsed.MinValue),
+			MaxValue:  optionalUintString(parsed.MaxValue),
+			Alignment: alignment,
+			After:     lastOffset + 1,
+		}.encode()
+	}
+	paging := pagingPage{
+		Returned:   len(matches),
+		Total:      int(total),
+		Remaining:  remainingAfterPage,
+		NextCursor: nextCursor,
+	}
 
 	rangeInfo := map[string]any{
 		"start_address":          startAddress,
@@ -1058,7 +1592,7 @@ func runMemoryDiff(tc toolContext, args json.RawMessage) map[string]any {
 		document["after_capture_id"] = afterProvenance.CaptureID
 	}
 	if afterProvenance != nil && afterProvenance.CaptureConsistency != nil {
-		document["capture_consistency"] = captureConsistencyToMap(afterProvenance.CaptureConsistency)
+		document["capture_consistency"] = tc.server.captureConsistencyView(afterProvenance.CaptureConsistency)
 	}
 	if parsed.Mode == "equal_to" {
 		document["value"] = *parsed.Value
@@ -1070,11 +1604,7 @@ func runMemoryDiff(tc toolContext, args json.RawMessage) map[string]any {
 		document["min_value"] = *parsed.MinValue
 		document["max_value"] = *parsed.MaxValue
 	}
-	documentBytes, err := json.Marshal(document)
-	if err != nil {
-		return failureResult(&toolFailure{Code: "artifact_error", Message: err.Error()}, tc.modern)
-	}
-	storedResults, err := tc.server.store.PutWithProvenance(context.ID, "memory-diff-results", "application/json", documentBytes, genericProvenance(tc.server, "memory-diff-results", time.Now().UTC()))
+	storedResults, err := putJSONArtifact(tc.server, context.ID, "memory-diff-results", document, genericProvenance(tc.server, "memory-diff-results", time.Now().UTC()))
 	if err != nil {
 		return failureResult(&toolFailure{Code: "artifact_error", Message: err.Error()}, tc.modern)
 	}
@@ -1095,6 +1625,16 @@ func runMemoryDiff(tc toolContext, args json.RawMessage) map[string]any {
 		"inline_matches_shown": len(matches),
 		"matches_truncated":    inlineTruncated,
 		"sha256":               storedResults.SHA256,
+		"paging":               pagingView(paging),
+		"requested_comparison": map[string]any{
+			"mode":             parsed.Mode,
+			"width":            parsed.Width,
+			"byte_order":       parsed.ByteOrder,
+			"start_address":    requestedStartEcho,
+			"snapshot_ids":     map[string]any{"before": descriptorID(beforeSnapshot), "after": descriptorID(afterSnapshot)},
+			"fresh_after_read": freshAfterRead,
+		},
+		"compared_range": rangeInfo,
 	}
 	if warning != "" {
 		summary["provenance_warning"] = warning
@@ -1106,7 +1646,7 @@ func runMemoryDiff(tc toolContext, args json.RawMessage) map[string]any {
 		summary["after_capture_id"] = afterProvenance.CaptureID
 	}
 	if afterProvenance != nil && afterProvenance.CaptureConsistency != nil {
-		summary["capture_consistency"] = captureConsistencyToMap(afterProvenance.CaptureConsistency)
+		summary["capture_consistency"] = tc.server.captureConsistencyView(afterProvenance.CaptureConsistency)
 	}
 	if parsed.Mode == "equal_to" {
 		summary["value"] = *parsed.Value
@@ -1123,12 +1663,36 @@ func runMemoryDiff(tc toolContext, args json.RawMessage) map[string]any {
 		"matches":  matches,
 		"artifact": artifactDescriptor(tc.server, storedResults, context.ID),
 	}
+	paging.apply(result)
 	space := parsed.Space
 	if beforeProvenance != nil && beforeProvenance.AddressSpace != "" {
 		space = beforeProvenance.AddressSpace
 	}
 	annotateAddressMap(result, space)
 	return okResult(result, tc.modern)
+}
+
+// descriptorID returns the artifact id of one snapshot descriptor, which is
+// what a paging cursor records so a later page compares the same bytes.
+func descriptorID(descriptor map[string]any) string {
+	id, _ := descriptor["id"].(string)
+	return id
+}
+
+// optionalIntString renders an optional signed comparison value for a cursor.
+func optionalIntString(value *int64) string {
+	if value == nil {
+		return ""
+	}
+	return strconv.FormatInt(*value, 10)
+}
+
+// optionalUintString renders an optional unsigned comparison bound for a cursor.
+func optionalUintString(value *uint64) string {
+	if value == nil {
+		return ""
+	}
+	return strconv.FormatUint(*value, 10)
 }
 
 // decodeCell reads one cell of the given width from data at offset using the
@@ -1345,7 +1909,7 @@ var mdBusMap = []map[string]any{
 // paddedSizeBytes is the padded mapping size for the rom_identity view;
 // contextID scopes the header artifact.
 func mdROMInfo(tc toolContext, contextID string, romSizeBytes uint64, paddedSizeBytes uint64) (map[string]any, *toolFailure) {
-	header, byteOrder, effective, _, failure := readBridgeBytes(tc, "m68k-bus", 0x100, 0x100)
+	header, byteOrder, effective, headerPaused, failure := readBridgeBytes(tc, "m68k-bus", 0x100, 0x100)
 	if failure != nil {
 		return nil, failure
 	}
@@ -1425,6 +1989,10 @@ func mdROMInfo(tc toolContext, contextID string, romSizeBytes uint64, paddedSize
 
 	generation := tc.server.target.Generation()
 	romFacts := tc.server.romIdentity.romFileFacts(tc.server.currentROMPath())
+	// One capture-consistency object for the header artifact and the response;
+	// the legacy consistency label is derived from it, so the durable artifact
+	// can never claim "live" while the object reports a paused system.
+	consistencyObject := buildCaptureConsistency(tc.server, map[string]any{"system_paused_during_read": headerPaused}, false, true, nil, nil)
 	headerProvenance := &artifact.Provenance{
 		State:               artifact.ProvenanceStateComplete,
 		Kind:                "rom-header",
@@ -1441,9 +2009,9 @@ func mdROMInfo(tc toolContext, contextID string, romSizeBytes uint64, paddedSize
 		TargetGeneration:    &generation,
 		ROMSHA256:           romFacts.SHA256,
 		ROMPath:             tc.server.currentROMPath(),
-		Consistency:         "live",
+		Consistency:         consistencyObject.State,
 		CapturedAt:          time.Now().UTC(),
-		CaptureConsistency:  buildCaptureConsistency(tc.server, map[string]any{}, false, true, nil, nil),
+		CaptureConsistency:  consistencyObject,
 	}
 	headerArtifact, err := tc.server.store.PutWithProvenance(contextID, "rom-header", "application/octet-stream", header, headerProvenance)
 	if err != nil {
@@ -1467,12 +2035,27 @@ func mdROMInfo(tc toolContext, contextID string, romSizeBytes uint64, paddedSize
 	checksumView := map[string]any{
 		"stored":         parsed.Checksum,
 		"computed":       computed,
-		"matches":        parsed.Checksum == computed,
 		"complete":       checksumComplete,
 		"bytes_covered":  checksumRange["byte_length"],
 		"expected_range": expectedRange,
 		"cap_reason":     capReason,
 		"range":          checksumRange,
+	}
+	if checksumComplete {
+		// Only a comparison that covered the whole declared body may state a
+		// verdict; matches, verified, and verdict travel together.
+		checksumView["matches"] = parsed.Checksum == computed
+		checksumView["verified"] = true
+		checksumView["verdict"] = "mismatch"
+		if parsed.Checksum == computed {
+			checksumView["verdict"] = "match"
+		}
+	} else {
+		// An incomplete comparison has no verdict: emitting matches here would
+		// let a consumer read "checksum ok" from a prefix.
+		checksumView["verified"] = false
+		checksumView["verdict"] = "unverified"
+		checksumView["unverified_reason"] = capReason
 	}
 	if checksumNote != "" {
 		checksumView["note"] = checksumNote
@@ -1505,8 +2088,9 @@ func mdROMInfo(tc toolContext, contextID string, romSizeBytes uint64, paddedSize
 				"countries": countries,
 			},
 		},
-		"mapping":  mapping,
-		"artifact": artifactDescriptor(tc.server, headerArtifact, contextID),
+		"mapping":             mapping,
+		"artifact":            artifactDescriptor(tc.server, headerArtifact, contextID),
+		"capture_consistency": tc.server.captureConsistencyView(consistencyObject),
 	}
 	if len(hardwareCode) > 0 {
 		result["header"].(map[string]any)["region"].(map[string]any)["hardware_code"] = hardwareCode
@@ -1602,8 +2186,12 @@ func runCpuTraceCaptureWatchpoint(tc toolContext, args json.RawMessage) map[stri
 	if value, ok := payload["stopped_on_watchpoint"].(bool); ok {
 		summary["stopped_on_watchpoint"] = value
 	}
+	// The native trace_capture stop reason is the plugin's own vocabulary
+	// ("watchpoint_hit", "stopped", ...), not the run_until_* stop_reason
+	// label, so it is namespaced instead of being the same field with a second
+	// meaning.
 	if value, ok := payload["stop_reason"].(string); ok {
-		summary["stop_reason"] = value
+		summary["native_stop_reason"] = value
 	}
 	if value, ok := payload["watchpoint_ids_hit"].([]any); ok {
 		summary["watchpoint_ids_hit"] = value
@@ -1902,7 +2490,7 @@ func debugEventDescriptor(server *Server, event debugEvent, contextID, captureID
 	eventData["note"] = "Access width/value fields are not exposed by the native API and are marked unknown."
 	// Store as artifact
 	// Use a temporary context for storage; the event's context is used for provenance but storage is per requesting context
-	stored, _ := server.store.PutWithProvenance(contextID, "debug-event", "application/json", mustMarshal(eventData), provenance)
+	stored, _ := putJSONArtifact(server, contextID, "debug-event", eventData, provenance)
 	return artifactDescriptor(server, stored, contextID)
 }
 
@@ -2053,12 +2641,11 @@ func runCpuCoverageCapture(tc toolContext, args json.RawMessage) map[string]any 
 	coverage := buildCoverageV2(tc, parsed.CPU, filtered, addressesForBlocks, regionStart, regionEnd)
 	// Build versioned document
 	coverageDocument := map[string]any{
-		"schema_version": "cpu-coverage/2",
-		"kind":           "cpu-coverage",
-		"cpu":            parsed.CPU,
-		"address_space":  coverage.AddressSpace,
-		"byte_order":     coverage.ByteOrder,
-		"region":         map[string]any{"start_address": regionStart, "start_address_hex": canonicalHex(regionStart), "end_address": regionEnd, "end_address_hex": canonicalHex(regionEnd)},
+		"kind":          "cpu-coverage",
+		"cpu":           parsed.CPU,
+		"address_space": coverage.AddressSpace,
+		"byte_order":    coverage.ByteOrder,
+		"region":        map[string]any{"start_address": regionStart, "start_address_hex": canonicalHex(regionStart), "end_address": regionEnd, "end_address_hex": canonicalHex(regionEnd)},
 		"capture": map[string]any{
 			"duration_ms":     duration,
 			"max_entries":     maxEntries,
@@ -2072,6 +2659,7 @@ func runCpuCoverageCapture(tc toolContext, args json.RawMessage) map[string]any 
 			"total_events":     entriesTotal,
 			"filtered_events":  len(filtered),
 			"unique_addresses": coverage.Distinct,
+			"decode_sweeps":    coverage.Truncation["decode_sweeps"],
 			"addresses":        coverage.Addresses,
 			"counts":           coverage.Counts,
 		},
@@ -2105,10 +2693,6 @@ func runCpuCoverageCapture(tc toolContext, args json.RawMessage) map[string]any 
 		coverageDocument["addresses"] = coverage.Addresses[:maxCoverageAddresses]
 	}
 	annotateAddressMap(coverageDocument, coverage.AddressSpace)
-	documentBytes, err := json.Marshal(coverageDocument)
-	if err != nil {
-		return failureResult(&toolFailure{Code: "artifact_error", Message: err.Error()}, tc.modern)
-	}
 	provenance := coverageProvenance(tc, parsed.CPU, regionStart, regionEnd)
 	// Record filters in provenance
 	if !includeROM || !includeRAM || !retainRepeated {
@@ -2117,7 +2701,7 @@ func runCpuCoverageCapture(tc toolContext, args json.RawMessage) map[string]any 
 			Note:  fmt.Sprintf("Filters: include_rom=%v include_ram=%v retain_repeated=%v", includeROM, includeRAM, retainRepeated),
 		}
 	}
-	stored, err := tc.server.store.PutWithProvenance(context.ID, "cpu-coverage", "application/json", documentBytes, provenance)
+	stored, err := putJSONArtifact(tc.server, context.ID, "cpu-coverage", coverageDocument, provenance)
 	if err != nil {
 		return failureResult(&toolFailure{Code: "artifact_error", Message: err.Error()}, tc.modern)
 	}
@@ -2137,6 +2721,7 @@ func runCpuCoverageCapture(tc toolContext, args json.RawMessage) map[string]any 
 			"ranges_count":    len(coverage.Ranges),
 			"pages_total":     coverage.PagesTotal,
 			"pages_top":       coverage.PagesTop,
+			"decode_sweeps":   coverage.DecodeSweeps,
 			"truncated":       coverage.Truncation,
 			"sha256":          stored.SHA256,
 		},
@@ -2284,6 +2869,9 @@ type coverageResultV2 struct {
 	Blocks       []map[string]any
 	Edges        []map[string]any
 	Truncation   map[string]any
+	// DecodeSweeps is the number of native disassembly sweeps the block builder
+	// issued; it is reported so the batching is observable, not implicit.
+	DecodeSweeps int
 }
 
 func buildCoverageV2(tc toolContext, cpu string, ordered []uint64, uniqueForBlocks []uint64, regionStart, regionEnd uint64) coverageResultV2 {
@@ -2334,28 +2922,11 @@ func buildCoverageV2(tc toolContext, cpu string, ordered []uint64, uniqueForBloc
 		return edges[i]["to"].(uint64) < edges[j]["to"].(uint64)
 	})
 
-	// Instruction-aware blocks: need lengths
+	// Instruction-aware blocks: need lengths. One native sweep per contiguous
+	// run of executed addresses replaces one call per unique address, so a
+	// 500-address coverage report costs a handful of round trips instead of 500.
 	uniqueSorted := base.Addresses
-	// Fetch lengths for each unique address (cached)
-	lengths := map[uint64]int{}
-	for _, addr := range uniqueSorted {
-		info := fetchInstructionInfo(tc, cpu, addr)
-		if info != nil {
-			if l, ok := info["length"].(int); ok && l > 0 {
-				lengths[addr] = l
-			} else {
-				lengths[addr] = 2 // default for m68k
-				if cpu == "z80" {
-					lengths[addr] = 1
-				}
-			}
-		} else {
-			lengths[addr] = 2
-			if cpu == "z80" {
-				lengths[addr] = 1
-			}
-		}
-	}
+	lengths, decodeSweeps := fetchInstructionLengths(tc, cpu, uniqueSorted)
 	blocks := []map[string]any{}
 	if len(uniqueSorted) > 0 {
 		blockStart := uniqueSorted[0]
@@ -2406,6 +2977,7 @@ func buildCoverageV2(tc toolContext, cpu string, ordered []uint64, uniqueForBloc
 		"source_events":    len(ordered),
 		"decoded_events":   len(ordered), // we decoded all for lengths
 		"unique_addresses": len(uniqueSorted),
+		"decode_sweeps":    decodeSweeps,
 		"blocks":           len(blocks),
 		"edges":            len(edges),
 		"complete":         !base.AddressesTruncated,
@@ -2419,5 +2991,6 @@ func buildCoverageV2(tc toolContext, cpu string, ordered []uint64, uniqueForBloc
 		Blocks:         blocks,
 		Edges:          edges,
 		Truncation:     truncation,
+		DecodeSweeps:   decodeSweeps,
 	}
 }

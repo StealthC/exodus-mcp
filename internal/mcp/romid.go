@@ -227,6 +227,35 @@ func computeFileChecksum(file *os.File, start, end uint64) (uint16, error) {
 	return sum, nil
 }
 
+// checksumStatusView renders one Sega checksum comparison. The verdict
+// (matches) is emitted only when the comparison covered the whole declared
+// body: a partial read has no verdict to report, so a consumer can never read
+// "checksum ok" from a truncated comparison.
+func checksumStatusView(status *romChecksumStatus) map[string]any {
+	view := map[string]any{
+		"stored":               status.Stored,
+		"computed":             status.Computed,
+		"complete":             status.Complete,
+		"bytes_covered":        status.BytesCovered,
+		"expected_end_address": status.ExpectedEnd,
+		"expected_byte_length": status.ExpectedLength,
+		"cap_reason":           status.CapReason,
+	}
+	if status.Complete {
+		view["matches"] = status.Matches
+		view["verified"] = true
+		view["verdict"] = "mismatch"
+		if status.Matches {
+			view["verdict"] = "match"
+		}
+	} else {
+		view["verified"] = false
+		view["verdict"] = "unverified"
+		view["unverified_reason"] = status.CapReason
+	}
+	return view
+}
+
 // romIdentityView stamps the target generation onto the file facts and renders
 // the shared rom_identity object attached to rom_info, target_info, and
 // artifact provenance.
@@ -250,7 +279,7 @@ func (server *Server) romIdentityView(paddedSizeBytes uint64) map[string]any {
 		view["serial"] = facts.Serial
 	}
 	if facts.Checksum != nil {
-		view["checksum"] = facts.Checksum
+		view["checksum"] = checksumStatusView(facts.Checksum)
 	}
 	if facts.FileUnreadable {
 		view["note"] = "The ROM file is not readable from the server host; file-derived identity (SHA-256, header, checksum) is unavailable. Header and checksum facts that need the bus remain available through rom_info."

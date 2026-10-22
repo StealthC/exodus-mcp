@@ -102,6 +102,11 @@ func runVDPMemoryExport(tc toolContext, args json.RawMessage) map[string]any {
 	if failure != nil {
 		return failureResult(failure, tc.modern)
 	}
+	// Echo the caller's address expression before any domain translation.
+	requestedAddress := any(nil)
+	if parsedValue, failure := parseAddress(parsed.Address); failure == nil {
+		requestedAddress = parsedValue
+	}
 	length := parsed.Length
 	if length == 0 {
 		length = capBytes - address
@@ -123,7 +128,7 @@ func runVDPMemoryExport(tc toolContext, args json.RawMessage) map[string]any {
 	if failure = guard.resolve(); failure != nil {
 		return failureResult(failure, tc.modern)
 	}
-	export := func() (map[string]any, *toolFailure) {
+	export := func(window *captureWindow) (map[string]any, *toolFailure) {
 		payload, failure := tc.server.executeCommand(tc.ctx, "vdp_mem_read", map[string]string{
 			"target":  parsed.Target,
 			"address": fmt.Sprintf("%d", address),
@@ -139,6 +144,12 @@ func runVDPMemoryExport(tc toolContext, args json.RawMessage) map[string]any {
 		}
 		byteOrder, _ := payload["byte_order"].(string)
 		pausedDuringRead, _ := payload["system_paused_during_read"].(bool)
+		effective, hasEffective := payload["effective_address"].(float64)
+		if !hasEffective {
+			// The VDP read path reports no separate effective address: the
+			// buffer address is the effective one.
+			effective = float64(address)
+		}
 		capturedAt := time.Now().UTC()
 
 		provenance := genericProvenance(tc.server, vdpExportKind, capturedAt)
@@ -153,13 +164,19 @@ func runVDPMemoryExport(tc toolContext, args json.RawMessage) map[string]any {
 		provenance.ByteLength = &byteLength
 		provenance.SpaceKind = "timed-buffer"
 		provenance.ByteOrder = byteOrder
-		provenance.Consistency = "live"
-		provenance.CaptureConsistency = buildCaptureConsistency(tc.server, payload, false, true, nil, nil)
+		// One consistency object for the artifact and the response; inside a
+		// paused capture window the window owns it and completes it after the
+		// restore, so the stored provenance can never disagree with the
+		// response.
+		consistencyObject := window.consistencyFor(tc.server, payload)
+		provenance.Consistency = consistencyObject.State
+		provenance.CaptureConsistency = consistencyObject
 
 		stored, err := tc.server.store.PutWithProvenance(context.ID, vdpExportKind, vdpExportMimeType, raw, provenance)
 		if err != nil {
 			return nil, &toolFailure{Code: "artifact_error", Message: err.Error()}
 		}
+		window.track(stored)
 		result := map[string]any{
 			"target":                    parsed.Target,
 			"address_space":             vdpExportSpaceForTarget(parsed.Target),
@@ -169,9 +186,16 @@ func runVDPMemoryExport(tc toolContext, args json.RawMessage) map[string]any {
 			"byte_order":                byteOrder,
 			"raw_byte_ordering":         "address-order",
 			"system_paused_during_read": pausedDuringRead,
-			"capture_consistency":       captureConsistencyToMap(provenance.CaptureConsistency),
+			"capture_consistency":       tc.server.captureConsistencyViewWindow(window, consistencyObject),
 			"artifact":                  artifactDescriptor(tc.server, stored, context.ID),
 			"sha256":                    stored.SHA256,
+			// Request echo: the address and defaulted length the caller asked
+			// for next to the buffer address and byte count actually exported.
+			"requested_address":     requestedAddress,
+			"requested_length":      parsed.Length,
+			"effective_address":     uint64(effective),
+			"effective_address_hex": canonicalHex(uint64(effective)),
+			"effective_length":      len(raw),
 		}
 		annotateAddressPair(result, vdpExportSpaceForTarget(parsed.Target), address)
 		return result, nil

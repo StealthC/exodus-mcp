@@ -6,12 +6,14 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"math"
 	"os"
 	"path/filepath"
 	"strconv"
 	"time"
 
 	"github.com/StealthC/exodus-mcp/internal/analysis"
+	"github.com/StealthC/exodus-mcp/internal/artifact"
 	"github.com/StealthC/exodus-mcp/internal/tracing"
 )
 
@@ -68,7 +70,7 @@ func traceSessionToolSpecs() []toolSpec {
 	return []toolSpec{
 		{
 			name:        "trace_session_start",
-			description: "Start a persistent, non-pausing trace session. It remains active until trace_session_stop, processor removal, or an explicitly configured stop_after_vdp_frames threshold; there is no wall-clock expiry, so time spent paused does not consume the frame threshold. The threshold counts completed rendered VDP frames, not instruction executions, and requires a VDP. The monitor may observe the threshold several frames late; vdp_frames_elapsed reports the actual count. Reaching the threshold stops capture, not emulation. The native plugin captures execution trace lines in sampled windows (default) or continuously, and can also record each read/write access. Set access_capture to \"ranges\" to record individual accesses overlapping the configured watches, or \"all\" to record every access; the default \"off\" keeps only aggregate watch counters. Per-access records include monotonic sequence, cycle, PC, direction, width, transferred value, and (by default for ranges) a same-instant register snapshot. Access ranges are filtered natively; execution-trace address filters are post-capture. Storage remains bounded by segment/event/byte caps with explicit loss reporting. Starting a new session retires the previous one. Accepts optional expected_target_generation and control_id.",
+			description: "Start a persistent, non-pausing trace session. It remains active until trace_session_stop, processor removal, or an explicitly configured stop_after_vdp_frames threshold; there is no wall-clock expiry, so time spent paused does not consume the frame threshold. The threshold counts completed rendered VDP frames, not instruction executions, and requires a VDP. The monitor may observe the threshold several frames late; vdp_frames_elapsed reports the actual count. Reaching the threshold stops capture, not emulation. The native plugin captures execution trace lines in sampled windows (default) or continuously, and can also record each read/write access. Set access_capture to \"ranges\" to record individual accesses overlapping the configured watches, or \"all\" to record every access; the default \"off\" keeps only aggregate watch counters. Per-access records include monotonic sequence, cycle, PC, direction, width, transferred value, and (by default for ranges) a same-instant register snapshot. Access ranges are filtered natively; execution-trace address filters are post-capture. Storage remains bounded by segment/event/byte caps with explicit loss reporting; the response's loss object states the completeness contract without overpromising at start: loss.complete is true only for a session that has ended (loss.final) in continuous mode with zero loss, so a just-started session reports loss.complete false with the reason session_running, loss.estimated_eviction_risk when the estimated trace write rate exhausts a finite retention cap before the session ends (loss.estimated_eviction carries the horizons, the assumed frame rate, and the rule), and, for sampled mode, loss.capture_is_sampled plus loss.capture (window_ms, interval_ms, duty_cycle). Starting a new session retires the previous one. Accepts optional expected_target_generation and control_id.",
 			schema: objectSchema(map[string]any{
 				"cpu":                   enumProperty("Processor to trace.", []string{"m68k", "z80"}),
 				"mode":                  enumProperty("sampled (default) captures window_ms of every interval_ms and leaves the engine untouched in between; continuous keeps the trace writer enabled and rotates only by segment_ms.", []string{"sampled", "continuous"}),
@@ -108,10 +110,10 @@ func traceSessionToolSpecs() []toolSpec {
 		},
 		{
 			name:        "trace_session_status",
-			description: "Report the live trace session and, by default, drain every sealed native segment into the server-side event store first. The response carries the session configuration, native capture counters, per-segment table, watched read/write counter deltas, the bounded store's totals, and a machine-readable loss object (dropped events, malformed/truncated trace lines, evicted undrained segments). Native elapsed_ms is wall-clock telemetry only; sessions have no wall-clock auto-expiry. stop_after_vdp_frames/vdp_frames_elapsed count completed VDP rendered frames, independently of instruction-event counts, and do not advance while paused. Never mutates the target and never pauses the system.",
+			description: "Report the live trace session and, by default, drain every sealed native segment into the server-side event store first. Draining only reads sealed segments and never ends capture: a continuous session keeps tracing across the segment boundary because the plugin re-arms its trace gate after every seal/rotate. The response carries the session configuration, native capture counters, per-segment table, watched read/write counter deltas, the bounded store's totals, and a machine-readable loss object (dropped events, malformed/truncated trace lines, evicted undrained segments). loss.complete is true only when the session has ended (loss.final) and the capture covered the requested window with no gaps: while the session runs it is always false with the reason session_running, and loss.estimated_eviction_risk states whether the estimated write rate will exhaust a finite retention cap before the session ends (loss.estimated_eviction carries the horizons and the rule). A sampled session is never complete, and loss.capture_is_sampled plus loss.capture (mode, window_ms, interval_ms, duty_cycle, untraced_ms_per_interval) and loss.incomplete_reasons state what was actually captured and why it is or is not complete. Native elapsed_ms is wall-clock telemetry only; sessions have no wall-clock auto-expiry. stop_after_vdp_frames/vdp_frames_elapsed count completed VDP rendered frames, independently of instruction-event counts, and do not advance while paused. Never mutates the target and never pauses the system.",
 			schema: objectSchema(map[string]any{
 				"session_id":           stringProperty("Optional session id; when present it must match the live session."),
-				"collect":              booleanProperty("Drain sealed native segments before reporting (default true)."),
+				"collect":              booleanProperty("Drain sealed native segments before reporting (default true). Draining never disarms capture: a continuous session keeps tracing across the sealed segment boundary."),
 				"max_collect_bytes":    integerProperty(fmt.Sprintf("Per-call drain budget in bytes (default %d, cap %d).", traceSessionDefaultCollectBudget, traceSessionMaxCollectBudget), 1),
 				"request_watch_report": booleanProperty("Request the watchpoint counter report and fold its deltas into the store (default true)."),
 				"context":              contextProperty(),
@@ -120,7 +122,7 @@ func traceSessionToolSpecs() []toolSpec {
 		},
 		{
 			name:        "trace_session_events",
-			description: "Query accumulated trace-session data: bounded execution events and histogram, aggregate watch-counter samples, and—when access_capture was set to \"ranges\" or \"all\"—individual read/write access events with PC, cycle, width, value, and optional registers. Filters and optional JSONL export operate on retained events; access ranges are filtered natively, while execution-address filters are post-capture. Drains native segments first unless collect=false. Never pauses the system.",
+			description: "Query accumulated trace-session data: bounded execution events and histogram, aggregate watch-counter samples, and—when access_capture was set to \"ranges\" or \"all\"—individual read/write access events with PC, cycle, width, value, and optional registers. Filters and optional JSONL export operate on retained events; access ranges are filtered natively, while execution-address filters are post-capture. Drains native segments first unless collect=false; the drain never ends a continuous session. Events page in capture order by cursor: the first page starts at the oldest retained event and each next_cursor resumes strictly after the last returned event's store sequence, so pages advance to exhaustion instead of repeating the oldest window. The cursor also carries the event filter, so a later page returns the same filtered events. " + cursorSteppingNote + " " + pagingNote + " loss.complete means the capture covered the requested window with no gaps, which is only decidable once the session has ended (loss.final): a running session reports loss.complete false with the reason session_running, a sampled session reports loss.complete false with capture_is_sampled and its capture duty cycle, and loss.estimated_eviction_risk states whether a finite retention cap will run out first. drained.complete is only about this call's drain cursor, not capture coverage. Never pauses the system.",
 			schema: objectSchema(map[string]any{
 				"kind":                   enumProperty("Event kind to select.", []string{"execute", "read", "write", "any"}),
 				"address_range_start":    addressProperty(),
@@ -142,9 +144,10 @@ func traceSessionToolSpecs() []toolSpec {
 				"limit":                  integerProperty(fmt.Sprintf("Inline event sample size (default %d, cap %d).", traceSessionInlineEvents, traceSessionMaxInlineEvents), 1),
 				"include_address_counts": booleanProperty("Include the per-address execution histogram (default true)."),
 				"address_limit":          integerProperty(fmt.Sprintf("Inline histogram entries (default %d, cap %d).", traceSessionInlineAddresses, traceSessionMaxInlineAddresses), 1),
-				"export":                 booleanProperty("Store every retained matching event as a versioned JSONL artifact (default false)."),
-				"collect":                booleanProperty("Drain sealed native segments before querying (default true)."),
+				"export":                 booleanProperty("Store every retained matching event as a versioned JSONL artifact (default false). The artifact descriptor reports truncated_by_store (with truncation_reasons) when events were evicted from the bounded store or a sealed segment was evicted before it was drained, so an export is never mistaken for the whole capture."),
+				"collect":                booleanProperty("Drain sealed native segments before querying (default true). Draining never disarms capture: a continuous session keeps tracing across the sealed segment boundary."),
 				"max_collect_bytes":      integerProperty(fmt.Sprintf("Per-call drain budget in bytes (default %d, cap %d).", traceSessionDefaultCollectBudget, traceSessionMaxCollectBudget), 1),
+				"cursor":                 stringProperty("next_cursor from a previous trace_session_events call. The cursor carries the session, the event filter, and the position, so a later page needs only the cursor; any filter supplied alongside it must match the cursor. Omit to start at the oldest retained event. Pages advance, so repeated calls never return the same page."),
 				"context":                contextProperty(),
 			}, nil),
 			run: runTraceSessionEvents,
@@ -238,6 +241,7 @@ type traceSessionEventsArgs struct {
 	Export               bool   `json:"export"`
 	Collect              *bool  `json:"collect"`
 	MaxCollectBytes      uint64 `json:"max_collect_bytes"`
+	Cursor               string `json:"cursor"`
 	Context              string `json:"context"`
 }
 
@@ -562,12 +566,60 @@ func runTraceSessionEvents(tc toolContext, args json.RawMessage) map[string]any 
 	if limit > traceSessionMaxInlineEvents {
 		limit = traceSessionMaxInlineEvents
 	}
+	// A cursor resumes strictly after one store sequence and carries the filter
+	// that produced the page. The store sequence is this server's monotonic event
+	// number, so a drain between pages inserts new events after the cursor
+	// instead of shifting the page boundary the way a row offset in a bounded
+	// ring would.
+	afterSequence := uint64(0)
+	// The query identity starts as the caller's filter, so the first page issues a
+	// cursor that reproduces exactly this result set.
+	cursorQuery := newTraceEventsCursorQuery(filter)
+	cursorPage := parsed.Cursor != ""
+	if cursorPage {
+		cursorSession, cursorSequence, query, cursorFailure := parseTraceEventsCursor(parsed.Cursor)
+		if cursorFailure != nil {
+			return failureResult(cursorFailure, tc.modern)
+		}
+		if cursorSession != session.ID {
+			return failureResult(invalidCursorFailure(fmt.Sprintf("this cursor pages session %q, not %q", cursorSession, session.ID)), tc.modern)
+		}
+		afterSequence = cursorSequence
+		cursorQuery = query
+		// The cursor is the request: the filter it carries applies unless the
+		// caller re-sent a filter, in which case it must match.
+		if traceSessionFilterArgsSupplied(*parsed) {
+			if conflict := reconcileTraceEventsCursorFilter(filter, cursorQuery); conflict != nil {
+				return failureResult(conflict, tc.modern)
+			}
+		}
+		filter = cursorQuery.filter()
+	}
 	sampleFilter := filter
 	sampleFilter.Limit = limit
-	sample := session.Select(sampleFilter)
+	if afterSequence != 0 {
+		sampleFilter.HasAfterSequence = true
+		sampleFilter.AfterSequence = afterSequence
+	}
+	page := session.SelectPage(sampleFilter)
+	sample := page.Events
 	inline := make([]map[string]any, 0, len(sample))
 	for _, event := range sample {
 		inline = append(inline, traceEventView(event))
+	}
+	nextCursor := ""
+	if page.Remaining > len(inline) && len(sample) > 0 {
+		next, nextFailure := encodeTraceEventsCursor(session.ID, sample[len(sample)-1].StoreSequence, cursorQuery.filter())
+		if nextFailure != nil {
+			return failureResult(nextFailure, tc.modern)
+		}
+		nextCursor = next
+	}
+	paging := pagingPage{
+		Returned:   len(inline),
+		Total:      page.Total,
+		Remaining:  page.Remaining - len(inline),
+		NextCursor: nextCursor,
 	}
 	resolveSymbols := true
 	if parsed.ResolveSymbols != nil {
@@ -586,6 +638,29 @@ func runTraceSessionEvents(tc toolContext, args json.RawMessage) map[string]any 
 		"symbols":     symbolView,
 		"recovery":    traceSessionManifestPersist(tc, session, status),
 		"limitations": traceSessionLimitations(),
+		"paging": map[string]any{
+			"returned":                 paging.Returned,
+			"total":                    paging.Total,
+			"truncated":                paging.hasMore(),
+			"has_more":                 paging.hasMore(),
+			"next_cursor":              nil,
+			"order":                    "store_sequence_asc",
+			"oldest_retained_sequence": page.OldestSequence,
+			"newest_retained_sequence": page.NewestSequence,
+			"cursor":                   nil,
+		},
+	}
+	if paging.hasMore() {
+		result["paging"].(map[string]any)["next_cursor"] = paging.NextCursor
+	}
+	if parsed.Cursor != "" {
+		result["paging"].(map[string]any)["cursor"] = parsed.Cursor
+		// A cursor whose events were evicted from the bounded store resumes at
+		// the oldest retained event; say how many rows that skipped instead of
+		// presenting a silent hole.
+		if page.OldestSequence > afterSequence+1 {
+			result["paging"].(map[string]any)["skipped_evicted"] = page.OldestSequence - afterSequence - 1
+		}
 	}
 	includeCounts := true
 	if parsed.IncludeAddressCounts != nil {
@@ -625,7 +700,172 @@ func runTraceSessionEvents(tc toolContext, args json.RawMessage) map[string]any 
 		}
 		result["artifact"] = artifactDesc
 	}
+	paging.apply(result)
 	return okResult(result, tc.modern)
+}
+
+// traceEventsCursorQuery is the filter identity of one trace_session_events
+// enumeration. A cursor reproduces it, so a later page returns the same filtered
+// events instead of the unfiltered stream.
+type traceEventsCursorQuery struct {
+	Kind           string `json:"kind"`
+	HasRange       bool   `json:"has_range"`
+	Start          uint64 `json:"start"`
+	End            uint64 `json:"end"`
+	HasCycle       bool   `json:"has_cycle"`
+	CycleMin       uint64 `json:"cycle_min"`
+	CycleMax       uint64 `json:"cycle_max"`
+	Direction      string `json:"direction,omitempty"`
+	HasValueEquals bool   `json:"has_value_equals"`
+	ValueEquals    uint64 `json:"value_equals"`
+	HasValueRange  bool   `json:"has_value_range"`
+	ValueMin       uint64 `json:"value_min"`
+	ValueMax       uint64 `json:"value_max"`
+	HasPrevious    bool   `json:"has_previous"`
+	PreviousEquals uint64 `json:"previous_equals"`
+	HasPC          bool   `json:"has_pc"`
+	PCStart        uint64 `json:"pc_start"`
+	PCEnd          uint64 `json:"pc_end"`
+	HasSequence    bool   `json:"has_sequence"`
+	SequenceMin    uint64 `json:"sequence_min"`
+	SequenceMax    uint64 `json:"sequence_max"`
+}
+
+// newTraceEventsCursorQuery renders the paging-relevant part of one event filter.
+func newTraceEventsCursorQuery(filter tracing.Filter) traceEventsCursorQuery {
+	return traceEventsCursorQuery{
+		Kind:           filter.Kind,
+		HasRange:       filter.HasRange,
+		Start:          filter.Start,
+		End:            filter.End,
+		HasCycle:       filter.HasCycle,
+		CycleMin:       filter.CycleMin,
+		CycleMax:       filter.CycleMax,
+		Direction:      filter.Direction,
+		HasValueEquals: filter.HasValueEquals,
+		ValueEquals:    filter.ValueEquals,
+		HasValueRange:  filter.HasValueRange,
+		ValueMin:       filter.ValueMin,
+		ValueMax:       filter.ValueMax,
+		HasPrevious:    filter.HasPrevious,
+		PreviousEquals: filter.PreviousEquals,
+		HasPC:          filter.HasPC,
+		PCStart:        filter.PCStart,
+		PCEnd:          filter.PCEnd,
+		HasSequence:    filter.HasSequence,
+		SequenceMin:    filter.SequenceMin,
+		SequenceMax:    filter.SequenceMax,
+	}
+}
+
+// filter rebuilds the event filter this cursor pages.
+func (query traceEventsCursorQuery) filter() tracing.Filter {
+	return tracing.Filter{
+		Kind:           query.Kind,
+		HasRange:       query.HasRange,
+		Start:          query.Start,
+		End:            query.End,
+		HasCycle:       query.HasCycle,
+		CycleMin:       query.CycleMin,
+		CycleMax:       query.CycleMax,
+		Direction:      query.Direction,
+		HasValueEquals: query.HasValueEquals,
+		ValueEquals:    query.ValueEquals,
+		HasValueRange:  query.HasValueRange,
+		ValueMin:       query.ValueMin,
+		ValueMax:       query.ValueMax,
+		HasPrevious:    query.HasPrevious,
+		PreviousEquals: query.PreviousEquals,
+		HasPC:          query.HasPC,
+		PCStart:        query.PCStart,
+		PCEnd:          query.PCEnd,
+		HasSequence:    query.HasSequence,
+		SequenceMin:    query.SequenceMin,
+		SequenceMax:    query.SequenceMax,
+	}
+}
+
+// encodeTraceEventsCursor renders the (session, store sequence, filter) token of
+// one trace_session_events page.
+func encodeTraceEventsCursor(sessionID string, storeSequence uint64, filter tracing.Filter) (string, *toolFailure) {
+	encodedQuery, failure := encodeCursorQuery(newTraceEventsCursorQuery(filter))
+	if failure != nil {
+		return "", failure
+	}
+	return encodeCursor(traceEventsCursorPrefix, sessionID, strconv.FormatUint(storeSequence, 10), encodedQuery), nil
+}
+
+// parseTraceEventsCursor decodes the (session id, store sequence, filter) cursor
+// of one trace_session_events enumeration.
+func parseTraceEventsCursor(raw string) (string, uint64, traceEventsCursorQuery, *toolFailure) {
+	parts, failure := decodeCursor(raw, traceEventsCursorPrefix, 3)
+	if failure != nil {
+		return "", 0, traceEventsCursorQuery{}, failure
+	}
+	sequence, err := strconv.ParseUint(parts[1], 10, 64)
+	if err != nil || parts[0] == "" {
+		return "", 0, traceEventsCursorQuery{}, invalidCursorFailure(fmt.Sprintf("%q is not a cursor this server issued", raw))
+	}
+	query := traceEventsCursorQuery{}
+	if failure := decodeCursorQuery(parts[2], &query, raw); failure != nil {
+		return "", 0, traceEventsCursorQuery{}, failure
+	}
+	if query.Kind == "" {
+		return "", 0, traceEventsCursorQuery{}, invalidCursorFailure(fmt.Sprintf("%q is not a cursor this server issued", raw))
+	}
+	return parts[0], sequence, query, nil
+}
+
+// traceSessionFilterArgsSupplied reports whether the caller supplied any event
+// filter, which decides between "use the cursor's filter" and "the caller's
+// filter must match the cursor".
+func traceSessionFilterArgsSupplied(parsed traceSessionEventsArgs) bool {
+	return parsed.Kind != "" ||
+		parsed.AddressRangeStart != nil || parsed.AddressRangeEnd != nil ||
+		parsed.CycleMin != 0 || parsed.CycleMax != 0 ||
+		parsed.Direction != "" ||
+		parsed.ValueEquals != nil || parsed.ValueMin != nil || parsed.ValueMax != nil ||
+		parsed.PreviousEquals != nil ||
+		parsed.PCStart != nil || parsed.PCEnd != nil ||
+		parsed.SequenceMin != 0 || parsed.SequenceMax != 0 ||
+		parsed.AddressSpace != ""
+}
+
+// reconcileTraceEventsCursorFilter rejects a caller filter that contradicts the
+// filter a cursor pages, naming the field that differs.
+func reconcileTraceEventsCursorFilter(provided tracing.Filter, cursor traceEventsCursorQuery) *toolFailure {
+	expected := cursor.filter()
+	switch {
+	case provided.Kind != expected.Kind:
+		return cursorConflictFailure("kind", expected.Kind, provided.Kind)
+	case provided.Direction != expected.Direction:
+		return cursorConflictFailure("direction", expected.Direction, provided.Direction)
+	case provided.HasRange != expected.HasRange || (expected.HasRange && (provided.Start != expected.Start || provided.End != expected.End)):
+		return cursorConflictFailure("address_range_start/address_range_end",
+			fmt.Sprintf("%s..%s", canonicalHex(expected.Start), canonicalHex(expected.End)),
+			fmt.Sprintf("%s..%s", canonicalHex(provided.Start), canonicalHex(provided.End)))
+	case provided.HasCycle != expected.HasCycle || (expected.HasCycle && (provided.CycleMin != expected.CycleMin || provided.CycleMax != expected.CycleMax)):
+		return cursorConflictFailure("cycle_min/cycle_max",
+			fmt.Sprintf("%d..%d", expected.CycleMin, expected.CycleMax),
+			fmt.Sprintf("%d..%d", provided.CycleMin, provided.CycleMax))
+	case provided.HasSequence != expected.HasSequence || (expected.HasSequence && (provided.SequenceMin != expected.SequenceMin || provided.SequenceMax != expected.SequenceMax)):
+		return cursorConflictFailure("sequence_min/sequence_max",
+			fmt.Sprintf("%d..%d", expected.SequenceMin, expected.SequenceMax),
+			fmt.Sprintf("%d..%d", provided.SequenceMin, provided.SequenceMax))
+	case provided.HasPC != expected.HasPC || (expected.HasPC && (provided.PCStart != expected.PCStart || provided.PCEnd != expected.PCEnd)):
+		return cursorConflictFailure("pc_start/pc_end",
+			fmt.Sprintf("%s..%s", canonicalHex(expected.PCStart), canonicalHex(expected.PCEnd)),
+			fmt.Sprintf("%s..%s", canonicalHex(provided.PCStart), canonicalHex(provided.PCEnd)))
+	case provided.HasValueEquals != expected.HasValueEquals || (expected.HasValueEquals && provided.ValueEquals != expected.ValueEquals):
+		return cursorConflictFailure("value_equals", expected.ValueEquals, provided.ValueEquals)
+	case provided.HasValueRange != expected.HasValueRange || (expected.HasValueRange && (provided.ValueMin != expected.ValueMin || provided.ValueMax != expected.ValueMax)):
+		return cursorConflictFailure("value_min/value_max",
+			fmt.Sprintf("%d..%d", expected.ValueMin, expected.ValueMax),
+			fmt.Sprintf("%d..%d", provided.ValueMin, provided.ValueMax))
+	case provided.HasPrevious != expected.HasPrevious || (expected.HasPrevious && provided.PreviousEquals != expected.PreviousEquals):
+		return cursorConflictFailure("previous_equals", expected.PreviousEquals, provided.PreviousEquals)
+	}
+	return nil
 }
 
 func runTraceSessionStop(tc toolContext, args json.RawMessage) map[string]any {
@@ -770,17 +1010,18 @@ func traceSessionNativeStatus(tc toolContext) (map[string]any, *toolFailure) {
 // within one per-call byte budget.
 func collectTraceSession(tc toolContext, session *tracing.Session, budget uint64, collect bool, stream string) (map[string]any, *toolFailure) {
 	summary := map[string]any{
-		"requested":    collect,
-		"stream":       streamOrDefault(stream),
-		"bytes_read":   uint64(0),
-		"bytes_parsed": uint64(0),
-		"segments":     uint64(0),
-		"events":       uint64(0),
-		"malformed":    uint64(0),
-		"truncated":    uint64(0),
-		"budget_bytes": budget,
-		"complete":     !collect,
-		"calls":        0,
+		"requested":           collect,
+		"stream":              streamOrDefault(stream),
+		"bytes_read":          uint64(0),
+		"bytes_parsed":        uint64(0),
+		"segments":            uint64(0),
+		"events":              uint64(0),
+		"malformed":           uint64(0),
+		"truncated":           uint64(0),
+		"budget_bytes":        budget,
+		"complete":            !collect,
+		"complete_definition": "drained.complete reports only that this call's drain cursor consumed every sealed segment; it says nothing about capture coverage, which is loss.complete.",
+		"calls":               0,
 	}
 	if !collect {
 		summary["note"] = "collect=false: sealed native segments were left on disk for a later drain."
@@ -923,14 +1164,15 @@ func accessCaptureActive(session *tracing.Session) bool {
 // line-delimited but their record contracts, carries, and counters differ.
 func collectTraceSessionAccess(tc toolContext, session *tracing.Session, budget uint64) (map[string]any, *toolFailure) {
 	summary := map[string]any{
-		"stream":       "access",
-		"bytes_read":   uint64(0),
-		"bytes_parsed": uint64(0),
-		"events":       uint64(0),
-		"malformed":    uint64(0),
-		"budget_bytes": budget,
-		"complete":     false,
-		"calls":        0,
+		"stream":              "access",
+		"bytes_read":          uint64(0),
+		"bytes_parsed":        uint64(0),
+		"events":              uint64(0),
+		"malformed":           uint64(0),
+		"budget_bytes":        budget,
+		"complete":            false,
+		"complete_definition": "drained.access.complete reports only that this call's drain cursor consumed every sealed access segment; it says nothing about capture coverage.",
+		"calls":               0,
 	}
 	var readBytes, parsedBytes, events, malformed uint64
 	calls := 0
@@ -1293,7 +1535,22 @@ func exportTraceSessionEvents(tc toolContext, context *analysis.Context, session
 	descriptor := artifactDescriptor(tc.server, stored, context.ID)
 	descriptor["events"] = len(events)
 	descriptor["session_id"] = session.ID
-	descriptor["truncated_by_store"] = session.LossView().DroppedEvents > 0
+	// Truncation accounting: the export can only contain events the bounded
+	// store still retains, so an evicted or never-drained segment is as much a
+	// truncation as an inline cap. Reasons are listed so a consumer can tell
+	// why the artifact is not the whole capture.
+	loss := session.LossView()
+	reasons := []string{}
+	if loss.DroppedEvents > 0 {
+		reasons = append(reasons, fmt.Sprintf("%d event(s) were evicted from the bounded event store", loss.DroppedEvents))
+	}
+	if loss.EvictedUnreadSegments > 0 {
+		reasons = append(reasons, fmt.Sprintf("%d sealed segment(s) were evicted before this server drained them", loss.EvictedUnreadSegments))
+	}
+	descriptor["truncated_by_store"] = len(reasons) > 0
+	if len(reasons) > 0 {
+		descriptor["truncation_reasons"] = reasons
+	}
 	return descriptor, nil
 }
 
@@ -1479,7 +1736,7 @@ func traceSessionVolume(session *tracing.Session) map[string]any {
 	if config.Mode == "sampled" && config.IntervalMs > 0 {
 		duty = float64(config.WindowMs) / float64(config.IntervalMs)
 	}
-	traceBytesPerSecond := 13.0 * 1024 * 1024 * duty
+	traceBytesPerSecond := traceSessionTraceBytesPerSecond(config)
 	limits := map[string]any{
 		"stop_after_vdp_frames": config.StopAfterVdpFrames,
 		"max_total_bytes":       config.MaxTotalBytes,
@@ -1499,7 +1756,7 @@ func traceSessionVolume(session *tracing.Session) map[string]any {
 			"untraced_time_in_sampled": config.Mode == "sampled",
 			"basis":                    "Trace session lifetime is unbounded unless stop_after_vdp_frames is set; disk and event retention caps bound storage and evict oldest data. The throughput estimate is provided, but a total-byte estimate is not meaningful without a lifetime limit.",
 		},
-		"note": "Retention caps evict the oldest sealed segments and the bounded store evicts the oldest events; every eviction is counted in loss, so a cap is never silent. Serialize large results into artifacts instead of inline responses.",
+		"note": "Retention caps evict the oldest sealed segments and the bounded store evicts the oldest events; every eviction is counted in loss, so a cap is never silent. Serialize large results into artifacts instead of inline responses. Whether this estimated write rate exhausts a finite cap before the session ends is stated in loss.estimated_eviction_risk.",
 	}
 	if config.AccessCapture == "" || config.AccessCapture == "off" {
 		view["access_estimate"] = map[string]any{
@@ -1516,6 +1773,18 @@ func traceSessionVolume(session *tracing.Session) map[string]any {
 		}
 	}
 	return view
+}
+
+// traceSessionTraceBytesPerSecond is the one write-rate estimate shared by the
+// volume report and the retention-risk projection: the engine writes roughly
+// 1.3 MB per 100 ms of traced time (~13 MiB/s) in continuous mode, scaled by the
+// fraction of wall-clock time sampled mode actually traces.
+func traceSessionTraceBytesPerSecond(config tracing.Config) float64 {
+	duty := 1.0
+	if config.Mode == "sampled" && config.IntervalMs > 0 {
+		duty = float64(config.WindowMs) / float64(config.IntervalMs)
+	}
+	return 13.0 * 1024 * 1024 * duty
 }
 
 // traceSessionManifestPersist writes the durable manifest for a live session so
@@ -1535,13 +1804,12 @@ func traceSessionManifestPersist(tc toolContext, session *tracing.Session, nativ
 			break
 		}
 	}
-	consistency := "session-scoped: the CPU was never paused for the capture; the store is bounded and loss is reported"
 	view := map[string]any{
-		"schema":      tracing.ManifestSchema,
-		"rom_sha256":  romSHA,
-		"rom_bound":   romSHA != "",
-		"consistency": consistency,
-		"written":     false,
+		"schema":              tracing.ManifestSchema,
+		"rom_sha256":          romSHA,
+		"rom_bound":           romSHA != "",
+		"capture_consistency": tc.server.captureConsistencyView(traceSessionConsistency(tc, session, native)),
+		"written":             false,
 	}
 	path, err := manifest.Save(tc.server.TraceSessionsDir())
 	if err != nil {
@@ -1575,7 +1843,7 @@ func traceSessionSummary(tc toolContext, session *tracing.Session, native map[st
 		"totals":                     session.Totals(),
 		"parse":                      session.Stats(),
 		"loss":                       traceSessionLossView(session),
-		"capture_consistency":        traceSessionConsistency(tc, session, native),
+		"capture_consistency":        tc.server.captureConsistencyView(traceSessionConsistency(tc, session, native)),
 	}
 	if !session.StoppedAt.IsZero() {
 		summary["stopped_at"] = session.StoppedAt
@@ -1617,53 +1885,110 @@ func traceSessionSummary(tc toolContext, session *tracing.Session, native map[st
 // emulated timeline: a bounded window capture that never paused the CPU for
 // the capture itself, plus the observed run state and — when the caller asked
 // for the conservative start guard — the configuration pause it caused.
-func traceSessionConsistency(tc toolContext, session *tracing.Session, native map[string]any) map[string]any {
+func traceSessionConsistency(tc toolContext, session *tracing.Session, native map[string]any) *artifact.CaptureConsistency {
 	observed := initialRunStateLabel(tc.server)
-	view := map[string]any{
-		"state":                    "live_windowed",
-		"execution_paused_by_tool": false,
-		"execution_resumed_after":  false,
-		"initial_run_state":        observed,
-		"final_run_state":          observed,
-		"session_started_at":       session.StartedAt,
-		"note":                     "Execution events are the engine's own per-instruction trace lines written while the system ran; the capture never paused the CPU. Sampled mode leaves gaps between windows, and read/write counters are aggregate samples, so events from different windows must not be treated as one continuous instant.",
+	consistency := &artifact.CaptureConsistency{
+		State:                 consistencyLive,
+		ExecutionPausedByTool: false,
+		ExecutionResumedAfter: false,
+		InitialRunState:       observed,
+		FinalRunState:         observed,
+		Note:                  "Execution events are the engine's own per-instruction trace lines written while the system ran; the capture never paused the CPU. Sampled mode leaves gaps between windows, and read/write counters are aggregate samples, so events from different windows must not be treated as one continuous instant.",
 	}
 	if native != nil {
 		if setup, ok := native["setup_pause"].(map[string]any); ok {
 			guarded, _ := setup["guarded"].(bool)
 			wasRunning, _ := setup["system_was_running"].(bool)
 			if guarded && wasRunning {
-				view["execution_paused_by_tool"] = true
-				view["execution_resumed_after"] = true
-				view["initial_run_state"] = "running"
-				view["final_run_state"] = "running"
-				view["note"] = view["note"].(string) + " start_guard \"quiet\" paused the CPU once for the trace configuration calls and resumed it immediately; the capture windows themselves never pause execution."
+				consistency.ExecutionPausedByTool = true
+				consistency.ExecutionResumedAfter = true
+				consistency.InitialRunState = runStateRunning
+				consistency.FinalRunState = runStateRunning
+				consistency.Note += " start_guard \"quiet\" paused the CPU once for the trace configuration calls and resumed it immediately; the capture windows themselves never pause execution."
 			}
 		}
 	}
-	if !session.StoppedAt.IsZero() {
-		view["session_stopped_at"] = session.StoppedAt
-	}
-	return view
+	return consistency
 }
 
 // traceSessionLossView renders the explicit loss contract, including whether
 // the retained data is complete.
+//
+// `complete` has exactly one meaning here: the capture covered the requested
+// window with no gaps and the session has ended. Two independent reasons keep
+// it false while a session runs:
+//
+//   - A running session has not finished its loss accounting: retention can
+//     still evict and dropped counters can still move, so a start or status
+//     response cannot promise a completeness verdict the remaining lifetime may
+//     contradict. Such a session reports the `session_running` reason and
+//     `final: false`.
+//   - A sampled session leaves the processor untraced between its capture
+//     windows by construction, so it can never be complete; its coverage is
+//     stated in `capture` and `capture_is_sampled` so a consumer can decide
+//     what to do with a sample instead of mistaking it for a record.
+//
+// A continuous session that has ended with every loss counter at zero is the
+// only combination that reports `complete: true` with `final: true`.
 func traceSessionLossView(session *tracing.Session) map[string]any {
 	if session == nil {
-		return map[string]any{"complete": true, "note": "no session"}
+		return map[string]any{
+			"complete":                false,
+			"final":                   true,
+			"capture_is_sampled":      false,
+			"incomplete_reasons":      []string{"no_session"},
+			"estimated_eviction_risk": false,
+			"note":                    "no session exists, so there is no capture to describe and no completeness to claim.",
+		}
 	}
 	loss := session.LossView()
-	complete := loss.DroppedEvents == 0 &&
-		loss.MalformedLines == 0 &&
-		loss.TruncatedLines == 0 &&
-		loss.EvictedUnreadSegments == 0 &&
-		loss.DroppedAddressCounts == 0 &&
-		loss.AccessMalformedLines == 0 &&
-		loss.EvictedUnreadAccessSegments == 0 &&
-		loss.AccessSequenceGaps == 0
+	capture := traceSessionCaptureFacts(session)
+	sampled, _ := capture["sampled"].(bool)
+	final := session.Stopped
+	reasons := make([]string, 0, 6)
+	if !final {
+		// The session's own end is the primary reason: no verdict about a
+		// capture is final before the capture stops.
+		reasons = append(reasons, "session_running")
+	}
+	if sampled {
+		reasons = append(reasons, "sampled_mode")
+	}
+	if loss.DroppedEvents != 0 {
+		reasons = append(reasons, "dropped_events")
+	}
+	if loss.MalformedLines != 0 {
+		reasons = append(reasons, "malformed_lines")
+	}
+	if loss.TruncatedLines != 0 {
+		reasons = append(reasons, "truncated_lines")
+	}
+	if loss.EvictedUnreadSegments != 0 {
+		reasons = append(reasons, "evicted_unread_segments")
+	}
+	if loss.DroppedAddressCounts != 0 {
+		reasons = append(reasons, "dropped_address_counts")
+	}
+	if loss.AccessMalformedLines != 0 {
+		reasons = append(reasons, "access_malformed_lines")
+	}
+	if loss.EvictedUnreadAccessSegments != 0 {
+		reasons = append(reasons, "evicted_unread_access_segments")
+	}
+	if loss.AccessSequenceGaps != 0 {
+		reasons = append(reasons, "access_sequence_gaps")
+	}
+	complete := final && len(reasons) == 0
+	risk, riskBasis := traceSessionEvictionEstimate(session, final)
 	view := map[string]any{
 		"complete":                       complete,
+		"final":                          final,
+		"complete_definition":            "complete is true only when the session has ended (final is true) and the capture covered the requested window with no gaps: continuous mode, every loss counter zero, and therefore no incomplete_reasons. A running session always reports complete false with the reason session_running, because retention and loss accounting are not final yet. Sampled mode leaves the processor untraced between windows, so a sampled session is never complete and reports its coverage in capture.",
+		"incomplete_reasons":             reasons,
+		"capture":                        capture,
+		"capture_is_sampled":             sampled,
+		"estimated_eviction_risk":        risk,
+		"estimated_eviction":             riskBasis,
 		"dropped_events":                 loss.DroppedEvents,
 		"dropped_address_counts":         loss.DroppedAddressCounts,
 		"dropped_watch_samples":          loss.DroppedWatchSamples,
@@ -1680,12 +2005,157 @@ func traceSessionLossView(session *tracing.Session) map[string]any {
 		"access_sequence_gaps":           loss.AccessSequenceGaps,
 		"access_sequence_gap_samples":    loss.AccessSequenceGapSamples,
 		"notes":                          loss.Notes,
-		"sampled_mode_gaps":              session.Config.Mode == "sampled",
+		"sampled_mode_gaps":              sampled,
 	}
 	if !complete {
-		view["note"] = "The session lost data in at least one dimension; do not present the retained events as a complete record of execution."
+		switch {
+		case !final && len(reasons) == 1:
+			view["note"] = "The session is still running, so completeness is not final: retention can still evict and every loss counter can still move. Query again after trace_session_stop for a final verdict, and read estimated_eviction_risk for whether the estimated write rate exhausts a finite retention cap before the session ends."
+		case !final:
+			view["note"] = "The session is still running (session_running) and has already reported gaps or loss; see incomplete_reasons. Neither the sample nor the loss total is final until the session stops."
+		case sampled && len(reasons) == 1:
+			view["note"] = "Sampled mode leaves the processor untraced between capture windows, so the retained events are a sample of execution, not a complete record; capture.duty_cycle states the fraction of the session that was traced."
+		case sampled:
+			view["note"] = "The session is sampled and lost data in at least one further dimension; the retained events are neither a sample of known coverage nor a complete record. See incomplete_reasons."
+		default:
+			view["note"] = "The session ended with loss in at least one dimension; do not present the retained events as a complete record of execution. See incomplete_reasons."
+		}
 	}
 	return view
+}
+
+// traceSessionBaselineFrameRateHz projects a stop_after_vdp_frames budget onto
+// wall-clock seconds. The plugin reports frames elapsed, never a frame rate, so
+// the projection states the Mega Drive NTSC baseline it assumes instead of
+// implying a measurement.
+const traceSessionBaselineFrameRateHz = 60.0
+
+// traceSessionEvictionEstimate projects whether the configured retention caps
+// will be exhausted before the session ends, and states the numbers behind the
+// verdict.
+//
+// The rule: retention is finite when max_total_bytes or max_segments can evict
+// (the defaults always can). The write rate is the same 13 MiB per traced
+// second used by traceSessionVolume, scaled by the sampled duty cycle; the byte
+// cap's horizon is max_total_bytes/rate and the segment cap's horizon is
+// max_segments * segment_ms. The session window is bounded only by
+// stop_after_vdp_frames, projected at the baseline frame rate. Risk is true when
+// a finite retention horizon is reached inside the session window; with no
+// frame limit the window is unbounded, so any finite cap is eventually reached
+// and the risk is reported as true rather than as unknown.
+//
+// A session that has already ended reports false: its outcome is stated by the
+// loss counters, not by a projection.
+func traceSessionEvictionEstimate(session *tracing.Session, final bool) (bool, map[string]any) {
+	config := session.Config
+	rate := traceSessionTraceBytesPerSecond(config)
+	retentionBounded := false
+	byteCapSeconds := 0.0
+	if rate > 0 && config.MaxTotalBytes > 0 {
+		byteCapSeconds = float64(config.MaxTotalBytes) / rate
+		retentionBounded = true
+	}
+	segmentCapSeconds := 0.0
+	if config.MaxSegments > 0 && config.SegmentMs > 0 {
+		segmentCapSeconds = float64(config.MaxSegments) * float64(config.SegmentMs) / 1000.0
+		retentionBounded = true
+	}
+	retentionSeconds := 0.0
+	switch {
+	case byteCapSeconds > 0 && segmentCapSeconds > 0:
+		retentionSeconds = math.Min(byteCapSeconds, segmentCapSeconds)
+	case byteCapSeconds > 0:
+		retentionSeconds = byteCapSeconds
+	default:
+		retentionSeconds = segmentCapSeconds
+	}
+
+	windowBounded := config.StopAfterVdpFrames > 0
+	windowSeconds := 0.0
+	if windowBounded {
+		windowSeconds = float64(config.StopAfterVdpFrames) / traceSessionBaselineFrameRateHz
+	}
+
+	appliesTo := "running_session"
+	verdict := "no_write_rate"
+	risk := false
+	switch {
+	case final:
+		appliesTo = "ended_session"
+		verdict = "session_ended"
+	case !retentionBounded || rate <= 0:
+		verdict = "no_write_rate"
+	case !windowBounded:
+		risk = true
+		verdict = "retention_exhausted_within_unbounded_session"
+	case retentionSeconds < windowSeconds:
+		risk = true
+		verdict = "retention_exhausted_before_session_window_end"
+	default:
+		verdict = "retention_survives_session_window"
+	}
+
+	basis := map[string]any{
+		"applies_to":             appliesTo,
+		"retention_bounded":      retentionBounded,
+		"trace_bytes_per_second": uint64(rate),
+		"byte_cap_seconds":       traceSessionSeconds(byteCapSeconds),
+		"segment_cap_seconds":    traceSessionSeconds(segmentCapSeconds),
+		"retention_cap_seconds":  traceSessionSeconds(retentionSeconds),
+		"session_window_bounded": windowBounded,
+		"session_window_seconds": traceSessionSeconds(windowSeconds),
+		"verdict":                verdict,
+		"rule":                   "estimated_eviction_risk is true when retention is finite and the estimated trace write rate (13 MiB per traced second, scaled by the sampled duty cycle) exhausts max_total_bytes or max_segments * segment_ms before the session window ends. The window is the stop_after_vdp_frames budget projected at 60 fps; a session with no frame limit has an unbounded window, so any finite cap is eventually reached. The numbers are estimates, not measurements, and an ended session reports false because its loss counters state what actually happened.",
+	}
+	if windowBounded {
+		basis["assumed_frame_rate_hz"] = traceSessionBaselineFrameRateHz
+	}
+	return risk, basis
+}
+
+// traceSessionSeconds rounds a projection to milliseconds of a second so the
+// rendered estimate stays readable; 0 means "unbounded" together with the
+// companion boolean flag, never a zero-length horizon.
+func traceSessionSeconds(value float64) float64 {
+	return math.Round(value*1000) / 1000
+}
+
+// traceSessionCaptureFacts renders what slice of the emulated timeline the
+// session actually traced, independently of how much was lost. An unknown mode
+// is treated as sampled: claiming continuous coverage is the unsafe direction.
+func traceSessionCaptureFacts(session *tracing.Session) map[string]any {
+	mode := session.Config.Mode
+	if mode != "continuous" {
+		mode = "sampled"
+	}
+	sampled := mode == "sampled"
+	windowMs := session.Config.WindowMs
+	intervalMs := session.Config.IntervalMs
+	dutyCycle := 1.0
+	untracedMs := uint64(0)
+	if sampled {
+		switch {
+		case intervalMs == 0 || windowMs == 0:
+			// A session without a usable window/interval pair cannot claim any
+			// traced fraction.
+			dutyCycle = 0
+			untracedMs = intervalMs
+		case windowMs >= intervalMs:
+			dutyCycle = 1
+		default:
+			dutyCycle = float64(windowMs) / float64(intervalMs)
+			untracedMs = intervalMs - windowMs
+		}
+	}
+	return map[string]any{
+		"mode":                     mode,
+		"sampled":                  sampled,
+		"window_ms":                windowMs,
+		"interval_ms":              intervalMs,
+		"duty_cycle":               dutyCycle,
+		"untraced_ms_per_interval": untracedMs,
+		"note":                     "duty_cycle is the fraction of wall-clock time the processor write was traced (1 in continuous mode); untraced_ms_per_interval is how long each sampled interval runs untraced. Both describe the capture mode, not the data that survived retention.",
+	}
 }
 
 // traceSessionLimitations states the honest capability boundary of the
@@ -1705,12 +2175,13 @@ func traceSessionLimitations() map[string]any {
 // traceEventView renders one event for an inline response sample.
 func traceEventView(event tracing.Event) map[string]any {
 	view := map[string]any{
-		"kind":          event.Kind,
-		"address":       event.Address,
-		"address_hex":   event.AddressHex,
-		"address_space": event.AddressSpace,
-		"cycle":         event.Cycle,
-		"segment_index": event.SegmentIndex,
+		"kind":           event.Kind,
+		"address":        event.Address,
+		"address_hex":    event.AddressHex,
+		"address_space":  event.AddressSpace,
+		"cycle":          event.Cycle,
+		"segment_index":  event.SegmentIndex,
+		"store_sequence": event.StoreSequence,
 	}
 	if event.EmulatedNanoseconds != 0 {
 		view["emulated_nanoseconds"] = event.EmulatedNanoseconds

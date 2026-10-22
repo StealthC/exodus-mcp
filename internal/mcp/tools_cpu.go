@@ -24,7 +24,7 @@ func cpuToolSpecs() []toolSpec {
 			name:        "cpu_trace_capture",
 			description: "Capture a bounded M68K or Z80 execution trace into a text artifact plus a versioned JSONL artifact with one event per executed instruction (PC numeric/hex, address_space, opcode bytes, length, mnemonic/operands, cycle, target_generation, capture_id, frame_token where available, and typed control-flow where available). The capture stops the system, routes the processor trace log through a temporary on-disk file, and restores the prior run state. The system runs during the window, so the capture mutates the target and advances the target generation. Optional filters (address_range_start/end, include_rom/include_ram, retain_repeated) are applied to the JSONL view and recorded in provenance. Accepts optional expected_target_generation and control_id.",
 			schema: objectSchema(map[string]any{
-				"cpu":                        enumProperty("Processor to trace.", []string{"m68k", "z80"}),
+				"cpu":                        cpuVocab.property("Processor to trace."),
 				"max_entries":                integerProperty(fmt.Sprintf("Maximum entries (default %d, cap %d).", defaultTraceEntries, maxTraceEntries), 1),
 				"timeout_ms":                 integerProperty("Capture window in milliseconds (default 5000, cap 30000).", 100),
 				"address_range_start":        addressProperty(),
@@ -40,11 +40,12 @@ func cpuToolSpecs() []toolSpec {
 		},
 		{
 			name:        "m68k_disassemble",
-			description: "Disassemble M68K instructions from a start address (default: current PC) via linear sweep. Not execution-verified; bytes are echoed for interpretation. Context symbols are resolved into per-line `symbol` and `targets` annotations.",
+			description: "Disassemble M68K instructions from a start address (default: current PC) via linear sweep. Not execution-verified; bytes are echoed for interpretation. Context symbols are resolved into per-line `symbol` and `targets` annotations. Pass `addresses` (up to 32) to disassemble several independent locations in one call: each becomes one native sweep of one instruction and a `batches` entry carrying its own lines, so a caller annotating a coverage report makes one MCP call instead of one per address.",
 			schema: objectSchema(map[string]any{
-				"address": addressProperty(),
-				"count":   integerProperty(fmt.Sprintf("Instruction count between 1 and %d (default %d).", maxDisassemblyCount, defaultDisassemblyCount), 1),
-				"context": contextProperty(),
+				"address":   addressProperty(),
+				"addresses": disassemblyAddressesProperty(),
+				"count":     integerProperty(fmt.Sprintf("Instruction count between 1 and %d (default %d).", maxDisassemblyCount, defaultDisassemblyCount), 1),
+				"context":   contextProperty(),
 			}, nil),
 			run: makeRunDisassembly("m68k"),
 		},
@@ -79,7 +80,7 @@ func cpuToolSpecs() []toolSpec {
 		},
 		{
 			name:        "symbols_set",
-			description: "Upsert named addresses in an analysis context. Symbols are server-side labels only; emulator state is untouched.",
+			description: "Upsert named addresses in an analysis context. Symbols are server-side labels only; emulator state is untouched. Every symbol is stored with two coordinates: the space the caller supplied (space_id plus the address in that space) and the processor-bus coordinate resolved from it (bus_space_id plus bus address), which is what disassembly and backtrace annotation compare against. The response echoes the stored symbols with both coordinates.",
 			schema: objectSchema(map[string]any{
 				"symbols": map[string]any{
 					"type":        "array",
@@ -89,8 +90,8 @@ func cpuToolSpecs() []toolSpec {
 						"additionalProperties": false,
 						"properties": map[string]any{
 							"name":          stringProperty("Symbol label."),
-							"space_id":      stringProperty("Address space id from memory_spaces_list."),
-							"address_space": stringProperty("Optional domain of this symbol address; omitted means space_id."),
+							"space_id":      stringProperty("Address space id from memory_spaces_list (for example mem-ram, mem-rom, m68k-bus, z80-bus). Validated against the documented CPU-bus mapping; an id without one fails with invalid_params because the symbol could never annotate disassembly. Omit both space_id and address_space for an untyped symbol that applies to the raw address on every processor bus."),
+							"address_space": stringProperty("Optional domain of this symbol address; omitted means space_id. Supplying it without space_id makes that space the symbol's own space."),
 							"address":       addressProperty(),
 						},
 						"required": []string{"name", "address"},
@@ -102,11 +103,12 @@ func cpuToolSpecs() []toolSpec {
 		},
 		{
 			name:        "z80_disassemble",
-			description: "Disassemble Z80 instructions from a start address (default: current PC) via linear sweep. Not execution-verified; bytes are echoed for interpretation. Context symbols are resolved into per-line `symbol` and `targets` annotations.",
+			description: "Disassemble Z80 instructions from a start address (default: current PC) via linear sweep. Not execution-verified; bytes are echoed for interpretation. Context symbols are resolved into per-line `symbol` and `targets` annotations. Pass `addresses` (up to 32) to disassemble several independent locations in one call: each becomes one native sweep of one instruction and a `batches` entry carrying its own lines, so a caller annotating a coverage report makes one MCP call instead of one per address.",
 			schema: objectSchema(map[string]any{
-				"address": addressProperty(),
-				"count":   integerProperty(fmt.Sprintf("Instruction count between 1 and %d (default %d).", maxDisassemblyCount, defaultDisassemblyCount), 1),
-				"context": contextProperty(),
+				"address":   addressProperty(),
+				"addresses": disassemblyAddressesProperty(),
+				"count":     integerProperty(fmt.Sprintf("Instruction count between 1 and %d (default %d).", maxDisassemblyCount, defaultDisassemblyCount), 1),
+				"context":   contextProperty(),
 			}, nil),
 			run: makeRunDisassembly("z80"),
 		},
@@ -129,7 +131,7 @@ func cpuReadMemorySchema() map[string]any {
 	return objectSchema(map[string]any{
 		"address":        addressProperty(),
 		"length":         integerProperty(fmt.Sprintf("Byte length between 1 and %d.", inlineReadCapBytes), 1),
-		"representation": enumProperty("Inline rendering.", []string{"raw_base64", "hexdump", "array_u8"}),
+		"representation": memoryRepresentationVocab.property("Inline rendering."),
 		"decode":         decodeSchemaProperty(),
 		"capture_mode":   captureModeProperty(),
 		"context":        contextProperty(),
@@ -140,21 +142,45 @@ func cpuReadMemorySchema() map[string]any {
 // Registers and disassembly
 // ----------------------------------------------------------------------------------------------------------------------
 func makeRunRegisters(cpu string) func(toolContext, json.RawMessage) map[string]any {
-	return func(tc toolContext, _ json.RawMessage) map[string]any {
+	return func(tc toolContext, args json.RawMessage) map[string]any {
+		// The schema publishes no arguments, so the decoder rejects every
+		// field instead of letting a caller pass a guard the handler ignores.
+		if _, failure := decodeArgs[noArgs](args); failure != nil {
+			return failureResult(failure, tc.modern)
+		}
 		payload, failure := tc.server.executeCommand(tc.ctx, "regs_get", map[string]string{"cpu": cpu})
 		if failure != nil {
 			return failureResult(failure, tc.modern)
 		}
-		payload["capture_consistency"] = captureConsistencyToMap(buildCaptureConsistency(tc.server, payload, false, true, nil, nil))
+		payload["capture_consistency"] = tc.server.captureConsistencyView(buildCaptureConsistency(tc.server, payload, false, true, nil, nil))
 		return okResult(payload, tc.modern)
 	}
 }
 
 type disassemblyArgs struct {
 	Address      any    `json:"address"`
+	Addresses    []any  `json:"addresses"`
 	AddressSpace string `json:"address_space"`
 	Count        uint64 `json:"count"`
 	Context      string `json:"context"`
+}
+
+// maxDisassemblyBatchAddresses bounds one disassemble call that names explicit
+// addresses: one native sweep per address is still generated, so the batch is
+// about client round trips and must stay bounded.
+const maxDisassemblyBatchAddresses = 32
+
+// disassemblyAddressesProperty publishes the batched form: independent
+// locations, each one instruction.
+func disassemblyAddressesProperty() map[string]any {
+	item := addressProperty()
+	return map[string]any{
+		"type":        "array",
+		"description": fmt.Sprintf("Independent addresses to disassemble one instruction at each, up to %d. Mutually exclusive with address and count. Each address becomes one batches entry with its own lines and symbol annotations.", maxDisassemblyBatchAddresses),
+		"items":       item,
+		"minItems":    1,
+		"maxItems":    maxDisassemblyBatchAddresses,
+	}
 }
 
 func makeRunDisassembly(cpu string) func(toolContext, json.RawMessage) map[string]any {
@@ -166,6 +192,12 @@ func makeRunDisassembly(cpu string) func(toolContext, json.RawMessage) map[strin
 		context, failure := resolveContext(tc.server, parsed.Context)
 		if failure != nil {
 			return failureResult(failure, tc.modern)
+		}
+		if len(parsed.Addresses) > 0 {
+			if parsed.Address != nil {
+				return failureResult(&toolFailure{Code: "invalid_params", Message: "pass either address or addresses, not both"}, tc.modern)
+			}
+			return runDisassemblyBatch(tc, context, cpu, parsed)
 		}
 		count := parsed.Count
 		if count == 0 {
@@ -196,6 +228,185 @@ func makeRunDisassembly(cpu string) func(toolContext, json.RawMessage) map[strin
 		}
 		return okResult(payload, tc.modern)
 	}
+}
+
+// runDisassemblyBatch disassembles one instruction at each requested address.
+// The native operation takes a start address and a count, so the batch is one
+// MCP call with one sweep per address; the alternative a client has today is a
+// tool call per address.
+func runDisassemblyBatch(tc toolContext, context *analysis.Context, cpu string, parsed *disassemblyArgs) map[string]any {
+	if len(parsed.Addresses) > maxDisassemblyBatchAddresses {
+		return failureResult(&toolFailure{
+			Code:    "invalid_params",
+			Message: fmt.Sprintf("addresses is capped at %d entries per call.", maxDisassemblyBatchAddresses),
+		}, tc.modern)
+	}
+	if parsed.Count != 0 {
+		return failureResult(&toolFailure{Code: "invalid_params", Message: "count is not accepted with addresses: each address disassembles exactly one instruction"}, tc.modern)
+	}
+	spaceID := disasmSpaceID(cpu)
+	batches := make([]map[string]any, 0, len(parsed.Addresses))
+	for index, raw := range parsed.Addresses {
+		address, failure := resolveAddress(raw, parsed.AddressSpace, spaceID)
+		if failure != nil {
+			failure.Data = map[string]any{"index": index, "field": fmt.Sprintf("addresses[%d]", index)}
+			return failureResult(failure, tc.modern)
+		}
+		payload, failure := tc.server.executeCommand(tc.ctx, "disasm", map[string]string{
+			"cpu":     cpu,
+			"address": strconv.FormatUint(address, 10),
+			"count":   "1",
+		})
+		if failure != nil {
+			failure.Data = map[string]any{"index": index, "field": fmt.Sprintf("addresses[%d]", index)}
+			return failureResult(failure, tc.modern)
+		}
+		annotated := false
+		if withSymbols, ok := annotateDisassemblySymbols(context, cpu, tc.server.currentROMSHA256(), payload); ok {
+			payload = withSymbols
+			annotated = true
+		} else {
+			normalizeDisassemblyPayload(payload, cpu)
+		}
+		entry := map[string]any{
+			"index":         index,
+			"address":       address,
+			"address_hex":   canonicalHex(address),
+			"address_space": spaceID,
+			"lines":         payload["lines"],
+		}
+		if annotated {
+			entry["symbols_annotated"] = payload["symbols_annotated"]
+			entry["annotation_method"] = payload["annotation_method"]
+		}
+		annotateAddressPair(entry, spaceID, address)
+		batches = append(batches, entry)
+	}
+	width := 24
+	if cpu == "z80" {
+		width = 16
+	}
+	return okResult(map[string]any{
+		"cpu":                cpu,
+		"cpu_name":           cpu,
+		"mode":               "address_list",
+		"batch_count":        len(batches),
+		"batches":            batches,
+		"address_space":      spaceID,
+		"address_width_bits": width,
+		"address_mask_hex":   canonicalHex(disasmSymbolMask(cpu)),
+		"byte_order":         map[string]string{"m68k": "big-endian", "z80": "little-endian"}[cpu],
+		"disassembly_method": "linear sweep from each address; not execution-verified",
+	}, tc.modern)
+}
+
+// fetchDisassemblyLines runs one native disasm sweep and returns its lines.
+func fetchDisassemblyLines(tc toolContext, cpu string, address, count uint64) []map[string]any {
+	payload, failure := tc.server.executeCommand(tc.ctx, "disasm", map[string]string{
+		"cpu":     cpu,
+		"address": strconv.FormatUint(address, 10),
+		"count":   strconv.FormatUint(count, 10),
+	})
+	if failure != nil {
+		return nil
+	}
+	rawLines, ok := payload["lines"].([]any)
+	if !ok {
+		return nil
+	}
+	lines := make([]map[string]any, 0, len(rawLines))
+	for _, entry := range rawLines {
+		if line, ok := entry.(map[string]any); ok {
+			lines = append(lines, line)
+		}
+	}
+	if len(lines) == 0 {
+		return nil
+	}
+	return lines
+}
+
+// instructionLength decodes the length of one disassembly line, falling back to
+// the byte string and then to the per-CPU minimum.
+func instructionLength(line map[string]any, cpu string) int {
+	if length, ok := numberAsUint64(line["length"]); ok && length > 0 {
+		return int(length)
+	}
+	if bytesHex, ok := line["bytes"].(string); ok {
+		if inferred := len(strings.Fields(bytesHex)); inferred > 0 {
+			return inferred
+		}
+	}
+	return minimumInstructionBytes(cpu)
+}
+
+// minimumInstructionBytes is the fallback length when the core cannot decode an
+// address: 2 bytes on the M68K (every opcode is at least one word) and 1 on the
+// Z80.
+func minimumInstructionBytes(cpu string) int {
+	if cpu == "z80" {
+		return 1
+	}
+	return 2
+}
+
+// fetchInstructionLengths resolves the instruction length at every requested
+// address with as few native sweeps as possible. The native disasm operation
+// takes a start address and a count, so a sorted address set is walked with one
+// sweep per contiguous run instead of one call per address: a sweep's lines are
+// consumed while they stay inside the run, and a sweep that steps past the next
+// wanted address starts a new run there. The returned count is the number of
+// native sweeps issued, reported in the coverage artifact so a reader can see
+// how the decode was batched.
+func fetchInstructionLengths(tc toolContext, cpu string, addresses []uint64) (map[uint64]int, int) {
+	lengths := make(map[uint64]int, len(addresses))
+	if len(addresses) == 0 {
+		return lengths, 0
+	}
+	sweeps := 0
+	position := 0
+	for position < len(addresses) {
+		remaining := len(addresses) - position
+		count := uint64(remaining)
+		if count > maxDisassemblyCount {
+			count = maxDisassemblyCount
+		}
+		lines := fetchDisassemblyLines(tc, cpu, addresses[position], count)
+		sweeps++
+		consumed := position
+		if lines == nil {
+			lengths[addresses[position]] = minimumInstructionBytes(cpu)
+			position++
+			continue
+		}
+		for _, line := range lines {
+			address, ok := numberAsUint64(line["address"])
+			if !ok {
+				break
+			}
+			if consumed >= len(addresses) {
+				break
+			}
+			if address < addresses[consumed] {
+				continue
+			}
+			if address > addresses[consumed] {
+				// The sweep jumped over the next wanted address (an invalid
+				// opcode or a run boundary); start a new sweep there.
+				break
+			}
+			lengths[address] = instructionLength(line, cpu)
+			consumed++
+		}
+		if consumed == position {
+			// The sweep did not cover the address it started at (a plugin that
+			// answers nothing useful); fall back and move on instead of looping.
+			lengths[addresses[position]] = minimumInstructionBytes(cpu)
+			consumed = position + 1
+		}
+		position = consumed
+	}
+	return lengths, sweeps
 }
 
 func normalizeDisassemblyPayload(payload map[string]any, cpu string) {
@@ -356,17 +567,10 @@ func annotateDisassemblySymbols(context *analysis.Context, cpu, romSHA256 string
 	}
 	mask := disasmSymbolMask(cpu)
 	spaceID := disasmSpaceID(cpu)
-	byAddress := make(map[uint64]string)
-	for _, symbol := range context.Symbols.ListForROM("", romSHA256) {
-		if symbol.SpaceID != "" && symbol.SpaceID != spaceID {
-			continue
-		}
-		address := symbol.Address & mask
-		if _, exists := byAddress[address]; !exists {
-			byAddress[address] = symbol.Name
-		}
-	}
-	if len(byAddress) == 0 {
+	// Symbols are indexed by their processor-bus coordinate, so a symbol stored
+	// space-relative (mem-ram 0x1000) annotates the instruction at 0xFF1000.
+	symbolIndex := newSymbolBusIndex(context.Symbols, romSHA256, spaceID)
+	if symbolIndex.empty() {
 		return payload, false
 	}
 
@@ -386,14 +590,14 @@ func annotateDisassemblySymbols(context *analysis.Context, cpu, romSHA256 string
 		if line.Comment != "" {
 			entry["comment"] = line.Comment
 		}
-		if name, exists := byAddress[line.Address&mask]; exists {
+		if name, exists := symbolIndex.lookup(line.Address & mask); exists {
 			entry["symbol"] = name
 			applied = true
 		}
 		var targets []symbolTarget
 		for _, literal := range operandHexLiterals(line.Operands) {
 			masked := literal & mask
-			if name, exists := byAddress[masked]; exists {
+			if name, exists := symbolIndex.lookup(masked); exists {
 				targets = append(targets, symbolTarget{Name: name, Address: masked, AddressHex: canonicalHex(masked)})
 			}
 		}
@@ -428,7 +632,7 @@ func annotateDisassemblySymbols(context *analysis.Context, cpu, romSHA256 string
 // ----------------------------------------------------------------------------------------------------------------------
 func makeRunCpuMemoryRead(spaceID string) func(toolContext, json.RawMessage) map[string]any {
 	return func(tc toolContext, args json.RawMessage) map[string]any {
-		parsed, failure := decodeArgs[memoryReadArgs](args)
+		parsed, failure := decodeArgs[cpuMemoryReadArgs](args)
 		if failure != nil {
 			return failureResult(failure, tc.modern)
 		}
@@ -467,6 +671,9 @@ type traceCaptureArgs struct {
 func runCpuTraceCapture(tc toolContext, args json.RawMessage) map[string]any {
 	parsed, failure := decodeArgs[traceCaptureArgs](args)
 	if failure != nil {
+		return failureResult(failure, tc.modern)
+	}
+	if failure := cpuVocab.validate(parsed.CPU); failure != nil {
 		return failureResult(failure, tc.modern)
 	}
 	context, failure := resolveContext(tc.server, parsed.Context)
@@ -813,28 +1020,15 @@ func buildTraceJSONLEvents(tc toolContext, cpu, traceText string, rangeStart, ra
 }
 
 func fetchInstructionInfo(tc toolContext, cpu string, pc uint64) map[string]any {
-	payload, failure := tc.server.executeCommand(tc.ctx, "disasm", map[string]string{"cpu": cpu, "address": strconv.FormatUint(pc, 10), "count": "1"})
-	if failure != nil {
+	lines := fetchDisassemblyLines(tc, cpu, pc, 1)
+	if len(lines) == 0 {
 		return nil
 	}
-	lines, ok := payload["lines"].([]any)
-	if !ok || len(lines) == 0 {
-		return nil
-	}
-	line, ok := lines[0].(map[string]any)
-	if !ok {
-		return nil
-	}
+	line := lines[0]
 	bytesHex, _ := line["bytes"].(string)
-	lengthFloat, _ := line["length"].(float64)
-	length := int(lengthFloat)
-	if length == 0 {
-		// Fallback: try to infer from bytes length
-		length = len(bytesHex) / 2
-	}
 	return map[string]any{
 		"bytes_hex": bytesHex,
-		"length":    length,
+		"length":    instructionLength(line, cpu),
 	}
 }
 
@@ -879,34 +1073,11 @@ func runSymbolsSet(tc toolContext, args json.RawMessage) map[string]any {
 	}
 	prepared := make([]storedSymbolInput, 0, len(parsed.Symbols))
 	for index, symbol := range parsed.Symbols {
-		spaceID := symbol.SpaceID
-		inputSpace := symbol.AddressSpace
-		if spaceID == "" {
-			// Untyped symbols historically annotate both CPU buses. Preserve
-			// that behavior; only translate when the caller supplied a domain.
-			var address uint64
-			if inputSpace == "" {
-				address, failure = parseAddress(symbol.Address)
-			} else {
-				address, failure = resolveAddress(symbol.Address, inputSpace, inputSpace)
-			}
-			if failure != nil {
-				return failureResult(&toolFailure{Code: "invalid_params", Message: fmt.Sprintf("symbols[%d].address: %s", index, failure.Message)}, tc.modern)
-			}
-			prepared = append(prepared, storedSymbolInput{Name: symbol.Name, SpaceID: spaceID, Address: address})
-			continue
-		}
-		if inputSpace == "" {
-			inputSpace = spaceID
-		}
-		address, failure := resolveAddress(symbol.Address, inputSpace, spaceID)
+		entry, failure := prepareSymbolInput(tc, index, symbol)
 		if failure != nil {
-			return failureResult(&toolFailure{
-				Code:    "invalid_params",
-				Message: fmt.Sprintf("symbols[%d].address: %s", index, failure.Message),
-			}, tc.modern)
+			return failureResult(failure, tc.modern)
 		}
-		prepared = append(prepared, storedSymbolInput{Name: symbol.Name, SpaceID: spaceID, Address: address})
+		prepared = append(prepared, entry)
 	}
 	romSHA256 := tc.server.currentROMSHA256()
 	bound := toStoreSymbols(prepared, romSHA256)
@@ -915,9 +1086,11 @@ func runSymbolsSet(tc toolContext, args json.RawMessage) map[string]any {
 		return failureResult(&toolFailure{Code: "invalid_params", Message: err.Error()}, tc.modern)
 	}
 	result := map[string]any{
-		"upserted":   written,
-		"rom_sha256": romSHA256,
-		"rom_bound":  romSHA256 != "",
+		"upserted":        written,
+		"symbols":         symbolsView(bound),
+		"rom_sha256":      romSHA256,
+		"rom_bound":       romSHA256 != "",
+		"coordinate_note": "Each symbol reports the space the caller supplied (space_id/address) and the processor-bus coordinate annotation uses (bus_space_id/bus_address).",
 	}
 	if romSHA256 == "" {
 		result["note"] = "No readable cartridge was loaded, so these symbols are unbound and apply to any target; reload the ROM and set them again to bind them to a specific cartridge hash."
@@ -927,10 +1100,100 @@ func runSymbolsSet(tc toolContext, args json.RawMessage) map[string]any {
 	return okResult(result, tc.modern)
 }
 
+// prepareSymbolInput resolves one caller-supplied symbol into the two
+// coordinates the store keeps: the space the caller named and the processor bus
+// that space maps to. A symbol without any space stays untyped and keeps its
+// historical meaning (raw address, every processor bus). A space id the server
+// cannot map to a CPU bus is rejected here instead of being stored inert.
+func prepareSymbolInput(tc toolContext, index int, symbol symbolInput) (storedSymbolInput, *toolFailure) {
+	spaceID := strings.TrimSpace(symbol.SpaceID)
+	inputSpace := strings.TrimSpace(symbol.AddressSpace)
+	declaredSpaceField := "space_id"
+	if spaceID == "" {
+		declaredSpaceField = "address_space"
+	}
+	if spaceID == "" && inputSpace == "" {
+		address, failure := parseAddress(symbol.Address)
+		if failure != nil {
+			return storedSymbolInput{}, symbolFieldFailure(index, "address", failure.Message)
+		}
+		return storedSymbolInput{Name: symbol.Name, Address: address}, nil
+	}
+	if spaceID == "" {
+		// address_space alone names the space the address lives in.
+		spaceID = inputSpace
+	}
+	busSpaceID, mapped := symbolBusSpaceFor(spaceID)
+	if !mapped {
+		return storedSymbolInput{}, symbolFieldFailure(index, declaredSpaceField, symbolSpaceRejection(tc, spaceID))
+	}
+	if inputSpace == "" {
+		inputSpace = spaceID
+	}
+	// Translate the caller's address into the named space, then into that
+	// space's processor bus. Passing the space as both input and target (the
+	// previous behavior) returned the raw value and left bus symbols inert.
+	spaceAddress, failure := resolveAddress(symbol.Address, inputSpace, spaceID)
+	if failure != nil {
+		return storedSymbolInput{}, symbolFieldFailure(index, "address", failure.Message)
+	}
+	busAddress, failure := resolveAddress(symbol.Address, inputSpace, busSpaceID)
+	if failure != nil {
+		return storedSymbolInput{}, symbolFieldFailure(index, "address_space", failure.Message)
+	}
+	return storedSymbolInput{
+		Name:       symbol.Name,
+		SpaceID:    spaceID,
+		Address:    spaceAddress,
+		BusSpaceID: busSpaceID,
+		BusAddress: busAddress,
+	}, nil
+}
+
+func symbolFieldFailure(index int, field, message string) *toolFailure {
+	return &toolFailure{Code: "invalid_params", Message: fmt.Sprintf("symbols[%d].%s: %s", index, field, message)}
+}
+
+// symbolSpaceRejection explains why a space id cannot carry a symbol. A space
+// the server knows but cannot map is reported with its documented reason; an
+// unknown id is checked against the live catalog so a typo and a genuinely new
+// device space produce different messages.
+func symbolSpaceRejection(tc toolContext, spaceID string) string {
+	if note := symbolSpaceNote(spaceID); note != "" {
+		return fmt.Sprintf("space %q has no CPU-bus coordinate: %s", spaceID, note)
+	}
+	if spaceListedLive(tc, spaceID) {
+		return fmt.Sprintf("space %q exists but has no documented CPU-bus mapping, so a symbol there would never annotate disassembly", spaceID)
+	}
+	return fmt.Sprintf("unknown address space %q; use a space id from memory_spaces_list that has a documented CPU-bus mapping (for example mem-ram, mem-rom, m68k-bus, z80-bus)", spaceID)
+}
+
+// spaceListedLive reports whether the live space catalog contains the id. It is
+// used only to phrase a rejection, so an unavailable bridge is not an error.
+func spaceListedLive(tc toolContext, spaceID string) bool {
+	payload, failure := tc.server.executeCommand(tc.ctx, "mem_spaces", nil)
+	if failure != nil {
+		return false
+	}
+	spaces, ok := payload["spaces"].([]any)
+	if !ok {
+		return false
+	}
+	for _, entry := range spaces {
+		space, ok := entry.(map[string]any)
+		if ok && spaceIDFromEntry(space) == spaceID {
+			return true
+		}
+	}
+	return false
+}
+
 type storedSymbolInput struct {
-	Name    string
-	SpaceID string
-	Address uint64
+	Name       string
+	SpaceID    string
+	Address    uint64
+	BusSpaceID string
+	BusAddress uint64
 }
 
 // toStoreSymbols converts parsed input to stored symbols, stamping each with the
@@ -938,7 +1201,14 @@ type storedSymbolInput struct {
 func toStoreSymbols(inputs []storedSymbolInput, romSHA256 string) []symbols.Symbol {
 	prepared := make([]symbols.Symbol, 0, len(inputs))
 	for _, input := range inputs {
-		prepared = append(prepared, symbols.Symbol{Name: input.Name, SpaceID: input.SpaceID, Address: input.Address, ROMSHA256: romSHA256})
+		prepared = append(prepared, symbols.Symbol{
+			Name:       input.Name,
+			SpaceID:    input.SpaceID,
+			Address:    input.Address,
+			BusSpaceID: input.BusSpaceID,
+			BusAddress: input.BusAddress,
+			ROMSHA256:  romSHA256,
+		})
 	}
 	return prepared
 }
@@ -958,20 +1228,9 @@ func runSymbolsList(tc toolContext, args json.RawMessage) map[string]any {
 	stored := context.Symbols.List(parsed.Filter)
 	views := make([]map[string]any, 0, len(stored))
 	for _, symbol := range stored {
-		view := map[string]any{
-			"name":          symbol.Name,
-			"space_id":      symbol.SpaceID,
-			"address":       symbol.Address,
-			"address_hex":   canonicalHex(symbol.Address),
-			"address_space": symbol.SpaceID,
-			"rom_sha256":    symbol.ROMSHA256,
-			"rom_bound":     symbol.ROMSHA256 != "",
-		}
-		annotateAddressPair(view, symbol.SpaceID, symbol.Address)
-		if width, mask := addressBusWidthMask(symbol.SpaceID); width != 0 {
-			view["address_width_bits"] = width
-			view["address_mask_hex"] = canonicalHex(mask)
-		}
+		view := symbolView(symbol)
+		view["rom_sha256"] = symbol.ROMSHA256
+		view["rom_bound"] = symbol.ROMSHA256 != ""
 		views = append(views, view)
 	}
 	return okResult(map[string]any{
@@ -979,6 +1238,7 @@ func runSymbolsList(tc toolContext, args json.RawMessage) map[string]any {
 		"count":             len(views),
 		"rom_sha256":        tc.server.currentROMSHA256(),
 		"rom_bound_symbols": context.Symbols.CountBound(),
+		"coordinate_note":   "Symbols report the space the caller supplied (space_id/address) and the processor-bus coordinate annotation uses (bus_space_id/bus_address).",
 	}, tc.modern)
 }
 

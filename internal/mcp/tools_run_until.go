@@ -36,7 +36,7 @@ func runUntilToolSpecs() []toolSpec {
 	return []toolSpec{
 		{
 			name:        "run_until_breakpoint",
-			description: "Set a one-shot execution breakpoint, run the system until it fires, and pause with the stop evidence: the stop reason, triggering PC, hit count, and registers. The instrument is removed automatically (and audited), so no armed instrumentation is left behind; the call ends paused at the stop. A foreign pause preempts the call with the instrument removed, and a timeout removes it too. Optional `condition`, `break_on_counter`, and `break_counter` match cpu_breakpoint_set; `timeout_ms` bounds the window (default 30000, cap 120000). Runs under exclusive control for the whole window (caller control_id reused, otherwise an internal lock is acquired and released). Accepts optional expected_target_generation and control_id.",
+			description: "Set a one-shot execution breakpoint, run the system until it fires, and pause with the stop evidence: the stop reason, triggering PC, hit count, and registers. Stop provenance is split: `stop_source` says why execution stopped (`instrument` when this call's breakpoint fired, `external` for a foreign pause, `mcp` for an MCP pause, `none` when the window ended without a stop), while `triggering_pc_source` says where the PC came from (`register_read`; the PC is null when no read proved it) and never carries the stop reason (`pc_source` is a deprecated alias with the same value). `debug_event_id` names the structured debug event recorded for the stop (`debug_event_ids` lists every event when the stop produced more than one), so the response joins directly to cpu_debug_events_list. The instrument is removed automatically (and audited), so no armed instrumentation is left behind; the call ends paused at the stop. A foreign pause preempts the call with the instrument removed, and a timeout removes it too. Optional `condition`, `break_on_counter`, and `break_counter` match cpu_breakpoint_set; `timeout_ms` bounds the window (default 30000, cap 120000). Runs under exclusive control for the whole window (caller control_id reused, otherwise an internal lock is acquired and released). Accepts optional expected_target_generation and control_id.",
 			schema: objectSchema(map[string]any{
 				"cpu":                        enumProperty("Processor to break.", []string{"m68k", "z80"}),
 				"address":                    addressProperty(),
@@ -53,7 +53,7 @@ func runUntilToolSpecs() []toolSpec {
 		},
 		{
 			name:        "run_until_watchpoint",
-			description: "Set a one-shot read and/or write watchpoint, run the system until it fires, and pause with the stop evidence: the stop reason, triggering PC, watched address, access direction, hit count, and registers. The instrument is removed automatically (and audited), so no armed instrumentation is left behind; the call ends paused at the stop. A foreign pause preempts the call with the instrument removed, and a timeout removes it too. `access` matches cpu_watchpoint_set (default any); `timeout_ms` bounds the window (default 30000, cap 120000). Runs under exclusive control for the whole window (caller control_id reused, otherwise an internal lock is acquired and released). Accepts optional expected_target_generation and control_id.",
+			description: "Set a one-shot read and/or write watchpoint, run the system until it fires, and pause with the stop evidence: the stop reason, triggering PC, watched address, access direction, hit count, and registers. Stop provenance is split: `stop_source` says why execution stopped (`instrument` when this call's watchpoint fired, `external` for a foreign pause, `mcp` for an MCP pause, `none` when the window ended without a stop), while `triggering_pc_source` says where the PC came from (`register_read`; the PC is null when no read proved it) and never carries the stop reason (`pc_source` is a deprecated alias with the same value). `debug_event_id` names the structured debug event recorded for the stop (`debug_event_ids` lists every event when the stop produced more than one), so the response joins directly to cpu_debug_events_list. The watched range matches access start addresses exactly like cpu_watchpoint_set. The instrument is removed automatically (and audited), so no armed instrumentation is left behind; the call ends paused at the stop. A foreign pause preempts the call with the instrument removed, and a timeout removes it too. `access` matches cpu_watchpoint_set (default any); `timeout_ms` bounds the window (default 30000, cap 120000). Runs under exclusive control for the whole window (caller control_id reused, otherwise an internal lock is acquired and released). Accepts optional expected_target_generation and control_id.",
 			schema: objectSchema(map[string]any{
 				"cpu":                        enumProperty("Processor to watch.", []string{"m68k", "z80"}),
 				"address":                    addressProperty(),
@@ -257,6 +257,9 @@ type runUntilPlan struct {
 	guard            mutationGuard
 	setDetail        map[string]any
 	generationBefore uint64
+	// eventCursor is the highest debug-event id when the window opened; the
+	// stop's events are the ones recorded after it.
+	eventCursor uint64
 }
 
 // runUntil is the shared run-until choreography: arm a one-shot instrument,
@@ -298,6 +301,9 @@ func runUntil(tc toolContext, ac *analysis.Context, plan runUntilPlan) map[strin
 	}
 	windowGuard := mutationGuard{ControlID: controlID}
 	plan.generationBefore = server.target.Generation()
+	// Events recorded after this boundary belong to this window; the tool
+	// reports their ids so a caller can join the response to the event rows.
+	plan.eventCursor = server.lastDebugEventID()
 
 	// 1. Arm the instrument with one-shot semantics.
 	setPayload, _, _, failure := server.executeMutation(tc.ctx, mutationCall{
@@ -316,6 +322,9 @@ func runUntil(tc toolContext, ac *analysis.Context, plan runUntilPlan) map[strin
 		return failureResult(&toolFailure{Code: "bridge_error", Message: "instrument set succeeded without a resource id"}, tc.modern)
 	}
 	id := uint64(idValue)
+	// The window owns the removal: the paused-state sweep must only attribute
+	// the stop and record the event while this call is still running, so the
+	// tool can remove the instrument itself and report the verified outcome.
 	server.trackDebugResource(plan.kind, id, debugResourceMeta{
 		ContextID:        ac.ID,
 		ControlID:        controlID,
@@ -323,14 +332,15 @@ func runUntil(tc toolContext, ac *analysis.Context, plan runUntilPlan) map[strin
 		CreatedAt:        time.Now().UTC(),
 		ROMPath:          server.currentROMPath(),
 		OneShot:          true,
+		DeferRemoval:     true,
 		BreakCounter:     plan.breakCounter,
 	})
 
 	// removeInstrument cleans the armed instrument through the audited
-	// mutation path; used on every non-success exit. When the caller's request
-	// context is already cancelled (run_until_cancelled), the cleanup runs on
-	// a short detached window so the residue is still removed.
-	removeInstrument := func() *toolFailure {
+	// mutation path and reports what the native side proved. When the caller's
+	// request context is already cancelled (run_until_cancelled), the cleanup
+	// runs on a short detached window so the residue is still removed.
+	removeInstrument := func() instrumentRemoval {
 		removeCtx, cancel := tc.ctx, func() {}
 		if err := tc.ctx.Err(); err != nil {
 			removeCtx, cancel = context.WithTimeout(context.Background(), 10*time.Second)
@@ -348,7 +358,21 @@ func runUntil(tc toolContext, ac *analysis.Context, plan runUntilPlan) map[strin
 			commit:    func() { server.forgetDebugResource(plan.kind, id) },
 			resources: func() []string { return []string{strconv.FormatUint(id, 10)} },
 		})
-		return failure
+		removal := instrumentRemoval{Result: instrumentRemovalFailed, Failure: failure}
+		switch {
+		case failure == nil:
+			removal.Removed, removal.Result = true, instrumentRemovalRemoved
+		case failure.Code == plan.kind+"_not_found":
+			// The native side no longer owns the resource (for example a ROM
+			// reload purged managed instruments), so nothing is armed.
+			removal.Removed, removal.Result = true, instrumentRemovalAlreadyAbsent
+			server.forgetDebugResource(plan.kind, id)
+		default:
+			// Keep the sweep as a retry path instead of leaving the instrument
+			// armed with no owner.
+			server.setDebugResourceDeferRemoval(plan.kind, id, false)
+		}
+		return removal
 	}
 
 	// 2. Run the system toward the instrument.
@@ -361,10 +385,11 @@ func runUntil(tc toolContext, ac *analysis.Context, plan runUntilPlan) map[strin
 		detail:    mergeDetail(plan.setDetail, map[string]any{"step": "run"}),
 	})
 	if failure != nil {
-		if removeFailure := removeInstrument(); removeFailure != nil {
+		removal := removeInstrument()
+		if !removal.Removed {
 			return failureResult(&toolFailure{
 				Code:    failure.Code,
-				Message: failure.Message + "; additionally, removing the instrument also failed (" + removeFailure.Message + ")",
+				Message: failure.Message + "; additionally, removing the instrument also failed (" + removal.Failure.Message + "), so it is still armed",
 			}, tc.modern)
 		}
 		return failureResult(failure, tc.modern)
@@ -378,15 +403,17 @@ func runUntil(tc toolContext, ac *analysis.Context, plan runUntilPlan) map[strin
 	polls := 0
 	for {
 		if err := tc.ctx.Err(); err != nil {
-			_ = removeInstrument()
+			removal := removeInstrument()
+			data := map[string]any{
+				"stop_source": stopSourceNone,
+				"elapsed_ms":  time.Since(started).Milliseconds(),
+				"poll_count":  polls,
+			}
+			applyInstrumentRemoval(data, removal)
 			return failureResult(&toolFailure{
 				Code:    "run_until_cancelled",
-				Message: "the run_until call was cancelled before the instrument fired; the instrument was removed",
-				Data: map[string]any{
-					"instrument_removed": true,
-					"elapsed_ms":         time.Since(started).Milliseconds(),
-					"poll_count":         polls,
-				},
+				Message: "the run_until call was cancelled before the instrument fired; " + removalSentence(removal),
+				Data:    data,
 			}, tc.modern)
 		}
 		// Force a fresh emulator_status probe: the 5 s status cache would
@@ -395,18 +422,28 @@ func runUntil(tc toolContext, ac *analysis.Context, plan runUntilPlan) map[strin
 		status, failure := fetchEmulatorStatus(tc)
 		polls++
 		if failure != nil {
-			_ = removeInstrument()
+			removal := removeInstrument()
+			data := map[string]any{"stop_source": stopSourceUnknown}
+			applyInstrumentRemoval(data, removal)
+			if failure.Data == nil {
+				failure.Data = map[string]any{}
+			}
+			for key, value := range data {
+				failure.Data[key] = value
+			}
 			return failureResult(failure, tc.modern)
 		}
 		if !status.SystemRunning {
 			stop := server.runState.lastBreakpointStop()
 			if stop != nil && stop.Kind == plan.kind && stop.ResourceID == id {
-				return runUntilSuccess(tc, plan, id, stop, polls, started)
+				removal := removeInstrument()
+				return runUntilSuccess(tc, plan, status, id, stop, removal, polls, started)
 			}
 			// A foreign pause preempted the run: leave no residue behind.
 			pauseSource, pauseNote, _, _ := runStateView(server, status)
+			removal := removeInstrument()
 			data := map[string]any{
-				"instrument_removed":    true,
+				"stop_source":           stopSourceForPause(pauseSource, stop),
 				"observed_pause_source": pauseSource,
 				"poll_count":            polls,
 				"elapsed_ms":            time.Since(started).Milliseconds(),
@@ -419,32 +456,26 @@ func runUntil(tc toolContext, ac *analysis.Context, plan runUntilPlan) map[strin
 			if pauseNote != "" {
 				data["observed_pause_note"] = pauseNote
 			}
-			removeFailure := removeInstrument()
-			if removeFailure != nil {
-				data["instrument_removed"] = false
-				data["instrument_removal_failure"] = removeFailure.Message
-			}
+			applyInstrumentRemoval(data, removal)
 			return failureResult(&toolFailure{
 				Code:    "run_until_preempted",
-				Message: "the system paused before the requested instrument fired; the instrument was removed",
+				Message: "the system paused before the requested instrument fired; " + removalSentence(removal),
 				Data:    data,
 			}, tc.modern)
 		}
 		if time.Now().After(deadline) {
+			removal := removeInstrument()
 			data := map[string]any{
-				"instrument_removed":  true,
+				"stop_source":         stopSourceNone,
 				"last_system_running": status.SystemRunning,
 				"poll_count":          polls,
 				"elapsed_ms":          time.Since(started).Milliseconds(),
 				"retry_hint":          "Raise timeout_ms, or verify the instrument's address/condition actually executes.",
 			}
-			if removeFailure := removeInstrument(); removeFailure != nil {
-				data["instrument_removed"] = false
-				data["instrument_removal_failure"] = removeFailure.Message
-			}
+			applyInstrumentRemoval(data, removal)
 			return failureResult(&toolFailure{
 				Code:    "run_until_timeout",
-				Message: fmt.Sprintf("the instrument did not fire within %d ms; the instrument was removed", plan.timeout.Milliseconds()),
+				Message: fmt.Sprintf("the instrument did not fire within %d ms; %s", plan.timeout.Milliseconds(), removalSentence(removal)),
 				Data:    data,
 			}, tc.modern)
 		}
@@ -452,45 +483,234 @@ func runUntil(tc toolContext, ac *analysis.Context, plan runUntilPlan) map[strin
 	}
 }
 
-// runUntilSuccess renders the stop evidence after the instrument proved fired.
-func runUntilSuccess(tc toolContext, plan runUntilPlan, id uint64, stop *stopAttributionInfo, polls int, started time.Time) map[string]any {
+// run_until stop_reason labels: which instrument ended the window. This is not
+// stop_source (why execution stopped) and not triggering_pc_source (where the
+// PC came from).
+const (
+	stopReasonBreakpointHit = "breakpoint_hit"
+	stopReasonWatchpointHit = "watchpoint_hit"
+)
+
+// stopReasonForKind renders the stop_reason of one run_until window from its
+// instrument kind, in the declared vocabulary.
+func stopReasonForKind(kind string) string {
+	switch kind {
+	case "breakpoint":
+		return stopReasonBreakpointHit
+	case "watchpoint":
+		return stopReasonWatchpointHit
+	default:
+		return consistencyUnknown
+	}
+}
+
+// instrumentRemoval is the verified outcome of one native removal call.
+// Removed is true only when the native side proved no instrument is armed:
+// either it deleted the resource (removed) or it no longer owned it
+// (already_absent).
+type instrumentRemoval struct {
+	Removed bool
+	Result  string // removed | already_absent | failed
+	Failure *toolFailure
+}
+
+const (
+	instrumentRemovalRemoved       = "removed"
+	instrumentRemovalAlreadyAbsent = "already_absent"
+	instrumentRemovalFailed        = "failed"
+)
+
+// applyInstrumentRemoval stamps the verified removal outcome into a response.
+// A failure is always named, so a caller never infers cleanup from a field
+// that was merely optimistically set.
+func applyInstrumentRemoval(data map[string]any, removal instrumentRemoval) {
+	data["instrument_removed"] = removal.Removed
+	data["instrument_removal"] = removal.Result
+	if removal.Failure != nil {
+		data["instrument_removal_detail"] = removal.Failure.Message
+	}
+	if !removal.Removed && removal.Failure != nil {
+		data["instrument_removal_failure"] = removal.Failure.Message
+	}
+}
+
+// removalSentence renders the cleanup outcome for a failure message.
+func removalSentence(removal instrumentRemoval) string {
+	if removal.Removed {
+		if removal.Result == instrumentRemovalAlreadyAbsent {
+			return "the instrument was already absent (nothing is armed)"
+		}
+		return "the instrument was removed"
+	}
+	message := "the instrument could NOT be removed and is still armed"
+	if removal.Failure != nil {
+		message += " (" + removal.Failure.Message + ")"
+	}
+	return message + "; the paused-state sweep will retry"
+}
+
+// stopSourceForPause classifies why the system is paused: a managed
+// instrument fired, an MCP run-state action explains it, or an external actor
+// paused the machine. It answers "why did execution stop" only; where the PC
+// came from is reported separately as triggering_pc_source.
+func stopSourceForPause(pauseSource string, stop *stopAttributionInfo) string {
+	switch {
+	case pauseSource == stopSourceMCP:
+		return stopSourceMCP
+	case stop != nil:
+		return stopSourceInstrument
+	default:
+		return stopSourceExternal
+	}
+}
+
+// runUntilSuccess renders the stop evidence after the instrument proved fired
+// and its removal was attempted.
+func runUntilSuccess(tc toolContext, plan runUntilPlan, status *emulatorStatusData, id uint64, stop *stopAttributionInfo, removal instrumentRemoval, polls int, started time.Time) map[string]any {
 	server := tc.server
 	elapsed := time.Since(started).Milliseconds()
-	pc := fetchCPUCurrentPC(tc, plan.cpu)
+	pauseSource, pauseNote, _, _ := runStateView(server, status)
+	// The stop's events are the ones this window recorded; the newest one is
+	// the stop that ended it.
+	windowEvents := server.debugEventsForResourceSince(plan.kind, id, plan.eventCursor)
+	var event *debugEvent
+	if len(windowEvents) > 0 {
+		last := windowEvents[len(windowEvents)-1]
+		event = &last
+	} else if fallback := server.debugEventForResource(plan.kind, id); fallback != nil {
+		event = fallback
+		windowEvents = []debugEvent{*fallback}
+	}
+	stopSource := stopSourceForPause(pauseSource, stop)
+	registers := fetchCPURegisters(tc, plan.cpu)
+	pc, pcSource := stopTriggeringPC(event, registers)
 	result := map[string]any{
-		"stop_reason":        plan.kind + "_hit",
-		"resource_kind":      plan.kind,
-		"resource_id":        id,
-		"hit_count":          stop.HitCount,
-		"triggering_pc":      pc,
-		"triggering_pc_hex":  canonicalHex(pc),
-		"address_space":      plan.cpu + "-bus",
-		"pause_source":       "breakpoint_or_watchpoint",
-		"system_running":     false,
-		"instrument_removed": true,
-		"poll_count":         polls,
-		"elapsed_ms":         elapsed,
-		"note":               "The system is paused at the instrument's stop; call cpu_run to resume.",
+		"stop_reason":   stopReasonForKind(plan.kind),
+		"stop_source":   stopSource,
+		"resource_kind": plan.kind,
+		"resource_id":   id,
+		"hit_count":     stop.HitCount,
+		"one_shot":      true,
+		// triggering_pc_source answers "where did the PC come from" on every
+		// surface; pc_source is its deprecated alias and carries the same
+		// value.
+		"triggering_pc_source": pcSource,
+		"pc_source":            pcSource,
+		"address_space":        plan.cpu + "-bus",
+		"pause_source":         pauseSource,
+		"pause_source_note":    pauseNote,
+		"system_running":       false,
+		"poll_count":           polls,
+		"elapsed_ms":           elapsed,
+		"note":                 "The system is paused at the instrument's stop; call cpu_run to resume.",
 	}
-	annotateAddressRangePair(result, "triggering_pc", plan.cpu+"-bus", pc)
-	if payload, failure := server.executeCommand(tc.ctx, "regs_get", map[string]string{"cpu": plan.cpu}); failure == nil {
-		if registers, ok := payload["registers"].(map[string]any); ok {
-			result["registers"] = registers
-		} else {
-			result["registers"] = payload
+	if pcSource == pcSourceUnknown {
+		// 0x000000 is a plausible vector address; an unreadable PC is reported
+		// as null with its source instead of a fabricated zero.
+		result["triggering_pc"] = nil
+		result["triggering_pc_hex"] = nil
+		result["triggering_pc_note"] = "The triggering PC could not be proven for this stop; the value is null, not zero."
+	} else {
+		result["triggering_pc"] = pc
+		result["triggering_pc_hex"] = canonicalHex(pc)
+		annotateAddressRangePair(result, "triggering_pc", plan.cpu+"-bus", pc)
+	}
+	applyInstrumentRemoval(result, removal)
+	if registers != nil {
+		result["registers"] = registers
+	}
+	if len(windowEvents) > 0 {
+		ids := make([]uint64, 0, len(windowEvents))
+		for _, recorded := range windowEvents {
+			ids = append(ids, recorded.ID)
 		}
+		// debug_event_id is the join key back to cpu_debug_events_list; the
+		// array carries every event the stop produced.
+		result["debug_event_id"] = ids[len(ids)-1]
+		if len(ids) > 1 {
+			result["debug_event_ids"] = ids
+		}
+		// event_id predates the debug_event_id name and keeps its value.
+		result["event_id"] = ids[len(ids)-1]
 	}
-	if event := server.debugEventForResource(plan.kind, id); event != nil {
-		result["event_id"] = event.ID
+	if event != nil {
+		result["configured_access"] = event.AccessDirection
+		// access_direction is the historical name of configured_access and keeps
+		// its old value for compatibility.
+		result["access_direction"] = event.AccessDirection
+		result["observed_direction"] = event.ObservedDirection
 		if plan.kind == "watchpoint" {
 			result["watched_address"] = event.WatchedAddress
 			result["watched_address_hex"] = canonicalHex(event.WatchedAddress)
-			result["access_direction"] = event.AccessDirection
 			result["requested_length"] = event.RequestedLength
+			result["range_semantics"] = watchpointRangeSemantics(event.RequestedLength)
 			annotateAddressRangePair(result, "watched", event.AddressSpace, event.WatchedAddress)
 		}
 	}
-	return okResult(stampGenerations(result, plan.generationBefore, server.target.Generation()), tc.modern)
+	stamped := stampGenerations(result, plan.generationBefore, server.target.Generation())
+	if !removal.Removed {
+		evidence := make(map[string]any, len(stamped)+1)
+		for key, value := range stamped {
+			evidence[key] = value
+		}
+		return failureResult(&toolFailure{
+			Code:    "run_until_cleanup_failed",
+			Message: "the instrument fired and the stop evidence is complete, but removing the armed instrument failed; it is still armed and the paused-state sweep will retry",
+			Data:    evidence,
+		}, tc.modern)
+	}
+	return okResult(stamped, tc.modern)
+}
+
+// fetchCPURegisters reads every register of one processor, or nil when the
+// read failed. The payload itself is returned when the plugin answers without
+// a nested registers object.
+func fetchCPURegisters(tc toolContext, cpu string) map[string]any {
+	payload, failure := tc.server.executeCommand(tc.ctx, "regs_get", map[string]string{"cpu": cpu})
+	if failure != nil {
+		return nil
+	}
+	if registers, ok := payload["registers"].(map[string]any); ok {
+		return registers
+	}
+	return payload
+}
+
+// registerPC extracts the program counter from a register view.
+func registerPC(registers map[string]any) (uint64, bool) {
+	if registers == nil {
+		return 0, false
+	}
+	for _, key := range []string{"pc", "PC"} {
+		if value, ok := numberAsUint64(registers[key]); ok {
+			return value, true
+		}
+	}
+	return 0, false
+}
+
+// fetchCPUCurrentPCSourced reads a program counter and reports whether the
+// read proved a value; a failed read is unknown, never zero.
+func fetchCPUCurrentPCSourced(tc toolContext, cpu string) (uint64, string) {
+	if value, ok := registerPC(fetchCPURegisters(tc, cpu)); ok {
+		return value, pcSourceRegisterRead
+	}
+	return 0, pcSourceUnknown
+}
+
+// stopTriggeringPC returns the PC proven for one managed stop and where that
+// value came from. The value the stop event recorded while the CPU was paused
+// at the instrument wins (the PC cannot have moved since) and is still a
+// register read; otherwise the registers read in the tool path are used. The
+// second return value is the PC source, never the stop reason.
+func stopTriggeringPC(event *debugEvent, registers map[string]any) (uint64, string) {
+	if event != nil && event.TriggeringPCSource == pcSourceRegisterRead {
+		return event.TriggeringPC, pcSourceRegisterRead
+	}
+	if value, ok := registerPC(registers); ok {
+		return value, pcSourceRegisterRead
+	}
+	return 0, pcSourceUnknown
 }
 
 // ----------------------------------------------------------------------------------------------------------------------
@@ -508,16 +728,17 @@ func instrumentFiredProof(hitCount, breakCounter uint64) bool {
 	return hitCount >= 1 && hitCount%breakCounter == 0
 }
 
-// sweepDebugInstruments is the server-side one-shot housekeeping pass. It
-// runs whenever the emulator is observed paused (from fetchEmulatorStatus)
-// and:
+// sweepDebugInstruments is the server-side housekeeping pass. It runs
+// whenever the emulator is observed paused (from fetchEmulatorStatus) and:
 //   - drops provenance for managed instruments the plugin no longer lists
 //     (a ROM reload purges them natively);
 //   - attributes every managed instrument whose hit counter proves a break
 //     fired to the run-state tracker, so emulator_status reports
 //     pause_source breakpoint_or_watchpoint;
+//   - records one structured debug event for every proven stop, one-shot or
+//     steady, so a plain cpu_run hit is queryable exactly like a one-shot hit;
 //   - removes fired one-shot instruments through the audited mutation path
-//     and records a structured debug event per removal.
+//     (unless a run_until window owns that removal).
 //
 // The pass is best-effort and never fails the caller; a failed removal is
 // audited by the mutation path and retried on the next sweep.
@@ -576,12 +797,22 @@ func (server *Server) sweepDebugKind(tc toolContext, kind, listOp, listKey, idKe
 		if !instrumentFiredProof(hitCount, breakCounter) {
 			continue
 		}
-		// Attribution for any proven stop; removal only for one-shot.
+		// Every proven managed stop is attributed and recorded, one-shot or
+		// not, so a plain breakpoint/watchpoint hit is as queryable as a
+		// one-shot stop; folding keeps a repeated paused observation from
+		// creating duplicates.
 		server.runState.setBreakpointStop(kind, id, hitCount)
+		eventID := server.pushSweepDebugEvent(tc, kind, id, entry, meta, server.target.Generation())
 		if !meta.OneShot {
 			continue
 		}
-		_, _, after, failure := server.executeMutation(tc.ctx, mutationCall{
+		if meta.DeferRemoval {
+			// A run_until window owns this removal: it removes the instrument
+			// synchronously and reports the verified outcome. The tool clears
+			// the flag when its own removal fails, so the sweep retries.
+			continue
+		}
+		_, _, _, failure := server.executeMutation(tc.ctx, mutationCall{
 			tool:      "one_shot_sweep",
 			operation: kind + "_remove",
 			params:    map[string]string{idKey: strconv.FormatUint(id, 10)},
@@ -601,7 +832,6 @@ func (server *Server) sweepDebugKind(tc toolContext, kind, listOp, listKey, idKe
 			// The failure is already audited; the next sweep retries.
 			continue
 		}
-		eventID := server.pushSweepDebugEvent(tc, kind, id, entry, meta, after)
 		removals = append(removals, map[string]any{
 			"resource_kind": kind,
 			"resource_id":   id,
@@ -638,25 +868,30 @@ func hitCountFromEntry(entry map[string]any) uint64 {
 	return 0
 }
 
-// pushSweepDebugEvent records the structured stop evidence for a one-shot
-// instrument the sweep removed.
+// pushSweepDebugEvent records the structured stop evidence for a managed
+// instrument the paused-state sweep proved fired, one-shot or not.
 func (server *Server) pushSweepDebugEvent(tc toolContext, kind string, id uint64, entry map[string]any, meta debugResourceMeta, generation uint64) uint64 {
 	cpu, _ := entry["cpu"].(string)
 	if cpu == "" {
 		return 0
 	}
+	pc, pcSource := fetchCPUCurrentPCSourced(tc, cpu)
 	event := debugEvent{
-		ResourceKind:     kind,
-		ResourceID:       id,
-		ContextID:        meta.ContextID,
-		CPU:              cpu,
-		TriggeringPC:     fetchCPUCurrentPC(tc, cpu),
-		AddressSpace:     cpu + "-bus",
-		AccessDirection:  "execute",
-		RequestedLength:  1,
-		HitCount:         hitCountFromEntry(entry),
-		TargetGeneration: generation,
-		FrameToken:       currentFrameToken(tc),
+		ResourceKind:       kind,
+		ResourceID:         id,
+		ContextID:          meta.ContextID,
+		CPU:                cpu,
+		TriggeringPC:       pc,
+		TriggeringPCSource: pcSource,
+		AddressSpace:       cpu + "-bus",
+		AccessDirection:    "execute",
+		RequestedLength:    1,
+		HitCount:           hitCountFromEntry(entry),
+		TargetGeneration:   generation,
+		FrameToken:         currentFrameToken(tc),
+		// The sweep only runs on a paused observation, so the state is known
+		// here even though the tracker's own observation lands after it.
+		RunState: "paused",
 	}
 	if address, ok := entry["address"].(float64); ok {
 		event.WatchedAddress = uint64(address)
@@ -665,8 +900,14 @@ func (server *Server) pushSweepDebugEvent(tc toolContext, kind string, id uint64
 		if length, ok := entry["length"].(float64); ok {
 			event.RequestedLength = uint64(length)
 		}
+		// The configured access is what the watchpoint was set with; the
+		// observed direction is derived in pushDebugEvent and stays unknown
+		// for an "any" watchpoint because the core reports no transfer
+		// direction.
 		if access, ok := entry["access"].(string); ok {
 			event.AccessDirection = access
+		} else {
+			event.AccessDirection = "any"
 		}
 	}
 	return server.pushDebugEvent(event)
@@ -685,4 +926,28 @@ func (server *Server) debugEventForResource(kind string, id uint64) *debugEvent 
 		}
 	}
 	return nil
+}
+
+// lastDebugEventID returns the highest event id handed out so far, or 0. A
+// caller that looks at the events recorded after this boundary observes only
+// the stops produced by its own window.
+func (server *Server) lastDebugEventID() uint64 {
+	server.debugEventsMu.Lock()
+	defer server.debugEventsMu.Unlock()
+	return server.nextEventID
+}
+
+// debugEventsForResourceSince returns the retained events of one managed
+// resource recorded after a boundary id, oldest first. It is the join between a
+// run_until_* window and the events its stop produced.
+func (server *Server) debugEventsForResourceSince(kind string, id, since uint64) []debugEvent {
+	server.debugEventsMu.Lock()
+	defer server.debugEventsMu.Unlock()
+	var out []debugEvent
+	for _, event := range server.debugEvents {
+		if event.ID > since && event.ResourceKind == kind && event.ResourceID == id {
+			out = append(out, event)
+		}
+	}
+	return out
 }

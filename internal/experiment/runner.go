@@ -125,6 +125,11 @@ func NewRunner(config Config, store *artifact.Store) (*Runner, error) {
 	return &Runner{config: config, store: store}, nil
 }
 
+// ManifestSchema is the versioned schema of the experiment-manifest artifact.
+// Consumers compare it for equality; a future revision is a separate version,
+// never a silent shape change.
+const ManifestSchema = "experiment-manifest/1"
+
 // ScriptsDir reports the configured scripts root.
 func (runner *Runner) ScriptsDir() string { return runner.config.ScriptsDir }
 
@@ -486,13 +491,12 @@ func (runner *Runner) runPython(ctx context.Context, request RunRequest, result 
 				ref := runner.refOf(stored)
 				result.Artifacts = append(result.Artifacts, ref)
 				reply := map[string]any{
-					"id":           ref.ID,
-					"kind":         ref.Kind,
-					"mime_type":    ref.MimeType,
-					"size_bytes":   ref.SizeBytes,
-					"sha256":       ref.SHA256,
-					"url":          runner.artifactURL(request.ContextID, ref.ID),
-					"resource_uri": "exodus://artifacts/" + ref.ID,
+					"id":         ref.ID,
+					"kind":       ref.Kind,
+					"mime_type":  ref.MimeType,
+					"size_bytes": ref.SizeBytes,
+					"sha256":     ref.SHA256,
+					"url":        runner.artifactURL(request.ContextID, ref.ID),
 				}
 				if err := writeMessage(resultMessage{Type: messageResult, ID: published.ID, OK: true, Value: reply}); err != nil {
 					exitWhileReplying(result, waitCh, stdout)
@@ -689,6 +693,7 @@ type manifestScript struct {
 }
 
 type manifest struct {
+	SchemaVersion  string         `json:"schema_version"`
 	ExperimentID   string         `json:"experiment_id"`
 	Script         manifestScript `json:"script"`
 	ContextID      string         `json:"context_id"`
@@ -707,6 +712,7 @@ type manifest struct {
 
 func (runner *Runner) manifestJSON(result *Result) manifest {
 	return manifest{
+		SchemaVersion:  ManifestSchema,
 		ExperimentID:   result.ExperimentID,
 		Script:         manifestScript{Name: result.ScriptName, Kind: result.ScriptKind, SHA256: result.ScriptSHA256},
 		ContextID:      result.ContextID,

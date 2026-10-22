@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strconv"
 	"strings"
 	"time"
 
@@ -80,7 +81,7 @@ func annotationToolSpecs() []toolSpec {
 		},
 		{
 			name:        "annotation_list",
-			description: "List the analyst annotations of a context, newest first, with bounded pagination. Every annotation is flagged stale (with stale_reason) when its creation-time ROM SHA-256 or target generation no longer matches the loaded target; stale annotations are preserved for historical analysis and by default excluded but counted in stale_excluded so nothing is dropped silently. include_stale keeps them in the results flagged; stale_only lists only stale ones. Filter by substring query (case-insensitive over title, text, tags), tags, category, kind, and address space.",
+			description: "List the analyst annotations of a context, newest first (created_at descending, then id), with bounded pagination. Every annotation is flagged stale (with stale_reason) when its creation-time ROM SHA-256 or target generation no longer matches the loaded target; stale annotations are preserved for historical analysis and by default excluded but counted in stale_excluded so nothing is dropped silently. include_stale keeps them in the results flagged; stale_only lists only stale ones. Filter by substring query (case-insensitive over title, text, tags), tags, category, kind, and address space. Pages by cursor (keyset anchor on the immutable created_at+id pair, so a concurrent create, edit, or delete never repeats or skips an annotation) or by offset. The cursor carries the filters, so a later page selects the same result set. " + cursorSteppingNote + " " + pagingNote,
 			schema: objectSchema(map[string]any{
 				"filter":        stringProperty("Case-insensitive substring matched against title, text, and tags."),
 				"tags":          stringArrayProperty("Only annotations carrying every listed tag."),
@@ -89,8 +90,9 @@ func annotationToolSpecs() []toolSpec {
 				"address_space": stringProperty("Only annotations in this address space."),
 				"stale_only":    booleanProperty("Only annotations whose ROM identity or target generation no longer matches the loaded target."),
 				"include_stale": booleanProperty("Keep stale annotations in the results, flagged (default false: they are excluded but counted in stale_excluded)."),
-				"offset":        integerProperty("Skip this many matching annotations (default 0).", 0),
+				"offset":        integerProperty("Skip this many matching annotations (default 0). Mutually exclusive with cursor.", 0),
 				"limit":         integerProperty(fmt.Sprintf("Maximum annotations returned (default %d, cap %d).", analysis.DefaultAnnotationLimit, analysis.MaxAnnotationLimit), 0),
+				"cursor":        stringProperty("next_cursor from a previous annotation_list call. The cursor carries the filters and the position, so a later page needs only the cursor; any filter supplied alongside it must match the cursor. Omit to start at the first page; mutually exclusive with offset."),
 				"context":       contextProperty(),
 			}, nil),
 			run: runAnnotationList,
@@ -314,6 +316,8 @@ func annotationStoreFailure(err error) *toolFailure {
 		return &toolFailure{Code: "unknown_annotation", Message: err.Error()}
 	case errors.Is(err, analysis.ErrAnnotationLimit):
 		return &toolFailure{Code: "annotation_limit_exceeded", Message: fmt.Sprintf("at most %d annotations per context", analysis.MaxAnnotationsPerContext)}
+	case errors.Is(err, analysis.ErrAnnotationStore):
+		return &toolFailure{Code: "annotation_store_error", Message: err.Error()}
 	default:
 		return &toolFailure{Code: "invalid_params", Message: err.Error()}
 	}
@@ -575,11 +579,110 @@ type annotationListArgs struct {
 	Category     string   `json:"category"`
 	Kind         string   `json:"kind"`
 	AddressSpace string   `json:"address_space"`
-	StaleOnly    bool     `json:"stale_only"`
-	IncludeStale bool     `json:"include_stale"`
+	StaleOnly    *bool    `json:"stale_only"`
+	IncludeStale *bool    `json:"include_stale"`
 	Offset       *uint64  `json:"offset"`
 	Limit        *uint64  `json:"limit"`
+	Cursor       string   `json:"cursor"`
 	Context      string   `json:"context"`
+}
+
+// annotationCursorQuery is the filter identity of one annotation_list
+// enumeration. A cursor reproduces it, so a later page selects the same result
+// set instead of the unfiltered listing.
+type annotationCursorQuery struct {
+	Filter       string   `json:"filter,omitempty"`
+	Tags         []string `json:"tags,omitempty"`
+	Category     string   `json:"category,omitempty"`
+	Kind         string   `json:"kind,omitempty"`
+	AddressSpace string   `json:"address_space,omitempty"`
+	StaleOnly    bool     `json:"stale_only,omitempty"`
+	IncludeStale bool     `json:"include_stale,omitempty"`
+}
+
+// annotationCursor is the keyset anchor of one annotation_list enumeration plus
+// the query that produced it: the (created_at, id) of the last annotation of the
+// previous page, and the filters. All of it travels in the token, so page 2 can
+// be requested with the cursor alone and both fields are immutable, so
+// concurrent creates, edits, and deletes cannot shift the boundary the way an
+// offset does.
+type annotationCursor struct {
+	CreatedAt time.Time
+	ID        string
+	Query     annotationCursorQuery
+}
+
+func (cursor annotationCursor) encode() (string, *toolFailure) {
+	query, failure := encodeCursorQuery(cursor.Query)
+	if failure != nil {
+		return "", failure
+	}
+	return encodeCursor(annotationCursorPrefix,
+		strconv.FormatInt(cursor.CreatedAt.UnixNano(), 10), cursor.ID, query), nil
+}
+
+func parseAnnotationCursor(raw string) (annotationCursor, *toolFailure) {
+	parts, failure := decodeCursor(raw, annotationCursorPrefix, 3)
+	if failure != nil {
+		return annotationCursor{}, failure
+	}
+	nanos, err := strconv.ParseInt(parts[0], 10, 64)
+	if err != nil || parts[1] == "" {
+		return annotationCursor{}, invalidCursorFailure(fmt.Sprintf("%q is not a cursor this server issued", raw))
+	}
+	cursor := annotationCursor{CreatedAt: time.Unix(0, nanos).UTC(), ID: parts[1]}
+	if failure := decodeCursorQuery(parts[2], &cursor.Query, raw); failure != nil {
+		return annotationCursor{}, failure
+	}
+	return cursor, nil
+}
+
+// reconcileAnnotationCursorQuery applies the filter a cursor carries when the
+// caller omitted it, and rejects an argument that contradicts it. The cursor is
+// the request, so a cursor-only call is the normal way to page.
+func reconcileAnnotationCursorQuery(parsed annotationListArgs, cursor annotationCursor) (annotationCursorQuery, *toolFailure) {
+	query := cursor.Query
+	if provided := strings.TrimSpace(parsed.Filter); provided != "" && provided != query.Filter {
+		return query, cursorConflictFailure("filter", query.Filter, provided)
+	}
+	if len(parsed.Tags) > 0 && !sameTagSet(parsed.Tags, query.Tags) {
+		return query, cursorConflictFailure("tags", query.Tags, parsed.Tags)
+	}
+	if provided := strings.TrimSpace(parsed.Category); provided != "" && provided != query.Category {
+		return query, cursorConflictFailure("category", query.Category, provided)
+	}
+	if provided := strings.TrimSpace(parsed.Kind); provided != "" && provided != query.Kind {
+		return query, cursorConflictFailure("kind", query.Kind, provided)
+	}
+	if provided := strings.TrimSpace(parsed.AddressSpace); provided != "" && provided != query.AddressSpace {
+		return query, cursorConflictFailure("address_space", query.AddressSpace, provided)
+	}
+	if parsed.StaleOnly != nil && *parsed.StaleOnly != query.StaleOnly {
+		return query, cursorConflictFailure("stale_only", query.StaleOnly, *parsed.StaleOnly)
+	}
+	if parsed.IncludeStale != nil && *parsed.IncludeStale != query.IncludeStale {
+		return query, cursorConflictFailure("include_stale", query.IncludeStale, *parsed.IncludeStale)
+	}
+	return query, nil
+}
+
+// sameTagSet reports whether two tag lists select the same annotations; order
+// and duplicates do not change the filter.
+func sameTagSet(left, right []string) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	seen := make(map[string]int, len(left))
+	for _, tag := range left {
+		seen[tag]++
+	}
+	for _, tag := range right {
+		seen[tag]--
+		if seen[tag] < 0 {
+			return false
+		}
+	}
+	return true
 }
 
 func runAnnotationList(tc toolContext, args json.RawMessage) map[string]any {
@@ -591,17 +694,50 @@ func runAnnotationList(tc toolContext, args json.RawMessage) map[string]any {
 	if failure != nil {
 		return failureResult(failure, tc.modern)
 	}
-	filter := analysis.AnnotationFilter{
+	// The cursor is decoded before the filter is resolved: the token carries the
+	// filter, so a page 2 call needs no filter arguments of its own.
+	query := annotationCursorQuery{
+		Filter:       parsed.Filter,
 		Tags:         parsed.Tags,
 		Category:     strings.TrimSpace(parsed.Category),
 		Kind:         strings.TrimSpace(parsed.Kind),
-		Query:        parsed.Filter,
 		AddressSpace: strings.TrimSpace(parsed.AddressSpace),
-		IncludeStale: parsed.IncludeStale,
-		StaleOnly:    parsed.StaleOnly,
+	}
+	if parsed.StaleOnly != nil {
+		query.StaleOnly = *parsed.StaleOnly
+	}
+	if parsed.IncludeStale != nil {
+		query.IncludeStale = *parsed.IncludeStale
+	}
+	cursor := annotationCursor{}
+	cursorPage := parsed.Cursor != ""
+	if cursorPage {
+		cursor, failure = parseAnnotationCursor(parsed.Cursor)
+		if failure != nil {
+			return failureResult(failure, tc.modern)
+		}
+		query, failure = reconcileAnnotationCursorQuery(*parsed, cursor)
+		if failure != nil {
+			return failureResult(failure, tc.modern)
+		}
+	}
+	filter := analysis.AnnotationFilter{
+		Tags:         query.Tags,
+		Category:     query.Category,
+		Kind:         query.Kind,
+		Query:        query.Filter,
+		AddressSpace: query.AddressSpace,
+		IncludeStale: query.IncludeStale,
+		StaleOnly:    query.StaleOnly,
 		Limit:        analysis.DefaultAnnotationLimit,
 	}
-	if parsed.Offset != nil {
+	if cursorPage {
+		if parsed.Offset != nil {
+			return failureResult(invalidCursorFailure("pass either cursor or offset, not both: the cursor already names the position in the listing"), tc.modern)
+		}
+		filter.AfterCreatedAt = cursor.CreatedAt
+		filter.AfterID = cursor.ID
+	} else if parsed.Offset != nil {
 		filter.Offset = int(*parsed.Offset)
 	}
 	if parsed.Limit != nil {
@@ -615,7 +751,25 @@ func runAnnotationList(tc toolContext, args json.RawMessage) map[string]any {
 	for _, ann := range result.Annotations {
 		views = append(views, annotationView(tc.server, ann))
 	}
-	return okResult(map[string]any{
+	paging := pagingPage{
+		Returned: len(views),
+		Total:    result.Total,
+		// Truncated is exactly "more matching annotations follow this page".
+		Remaining: boolToRemaining(result.Truncated),
+	}
+	if result.Truncated && len(result.Annotations) > 0 {
+		last := result.Annotations[len(result.Annotations)-1]
+		next, nextFailure := annotationCursor{CreatedAt: last.CreatedAt, ID: last.ID, Query: query}.encode()
+		if nextFailure != nil {
+			return failureResult(nextFailure, tc.modern)
+		}
+		paging.NextCursor = next
+	}
+	nextOffset := any(nil)
+	if paging.hasMore() && !cursorPage {
+		nextOffset = filter.Offset + len(views)
+	}
+	response := map[string]any{
 		"annotations":    views,
 		"count":          len(views),
 		"total":          result.Total,
@@ -624,9 +778,25 @@ func runAnnotationList(tc toolContext, args json.RawMessage) map[string]any {
 		"pagination": map[string]any{
 			"offset":      filter.Offset,
 			"limit":       filter.Limit,
-			"next_offset": filter.Offset + len(views),
+			"next_offset": nextOffset,
+			"order":       "created_at_desc",
+			"cursor":      nil,
 		},
-	}, tc.modern)
+	}
+	if cursorPage {
+		response["pagination"].(map[string]any)["cursor"] = parsed.Cursor
+	}
+	paging.apply(response)
+	return okResult(response, tc.modern)
+}
+
+// boolToRemaining converts a "more rows follow" fact into the paging
+// envelope's remaining count.
+func boolToRemaining(more bool) int {
+	if more {
+		return 1
+	}
+	return 0
 }
 
 // ----------------------------------------------------------------------------------------------------------------------

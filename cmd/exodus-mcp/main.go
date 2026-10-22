@@ -107,7 +107,13 @@ func main() {
 	}
 
 	client := bridge.NewNamedPipeClient(*pipeName, *pipeCapability)
-	mcpServer := mcp.NewServer(version, client, store, analysis.NewRegistry(), *baseURL)
+	// Reopen the persisted analysis workspace next to the artifact index, so
+	// contexts and their annotations survive a restart.
+	contexts, err := analysis.OpenRegistry(*artifactDir)
+	if err != nil {
+		log.Fatal(err)
+	}
+	mcpServer := mcp.NewServer(version, client, store, contexts, *baseURL)
 	mcpServer.SetStatesDir(*statesDir)
 	mcpServer.StartFreezeSweeper()
 	experimentRunner, err := experiment.NewRunner(experiment.Config{

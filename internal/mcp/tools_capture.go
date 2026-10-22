@@ -199,29 +199,54 @@ func runMemorySnapshotCapture(tc toolContext, args json.RawMessage) map[string]a
 		}, tc.modern)
 	}
 
-	// Observe the initial run state and frame token.
-	initialState := initialRunStateLabel(tc.server)
+	// Observe the initial run state and frame token. A run state that no
+	// source established stays unknown, and the window then never resumes it.
+	initialState, initialKnown := observedRunState(tc)
 	initialToken := currentFrameToken(tc)
 	generationBefore := tc.server.target.Generation()
 
-	// The pause/resume mutations carry the effective control id (acquired or
-	// caller-provided) so the exclusive window never rejects its own actions.
-	windowGuard := mutationGuard{ControlID: controlID}
-	if parsed.ExpectedTargetGeneration != nil {
-		windowGuard.ExpectedGeneration = *parsed.ExpectedTargetGeneration
-		windowGuard.HasExpectedGeneration = true
+	// The first mutation of the window carries the caller's expected
+	// generation; every follow-up mutation carries only the effective control
+	// id (acquired or caller-provided) so the exclusive window never rejects
+	// its own actions and the pause's generation advance does not invalidate
+	// the restore that closes the window.
+	openGuard := newWindowOpenGuard(controlID, parsed.ExpectedTargetGeneration)
+	closeGuard := windowCloseGuard(controlID)
+	restoreRunState := func() (map[string]any, *toolFailure) {
+		payload, _, _, failure := tc.server.executeMutation(tc.ctx, mutationCall{
+			tool:      "memory_snapshot_capture",
+			operation: "cpu_control",
+			params:    map[string]string{"action": "run"},
+			guard:     closeGuard,
+			contextID: context.ID,
+			detail:    map[string]any{"action": "run", "reason": "capture restore"},
+		})
+		if failure != nil {
+			return nil, failure
+		}
+		tc.server.runState.setByMCP(true)
+		return payload, nil
 	}
 
-	// Pause exactly once when the system is running.
+	window := &captureWindow{
+		Mode:            captureModePaused,
+		InitialRunState: initialState,
+		InitialKnown:    initialKnown,
+		InitialToken:    initialToken,
+	}
+
+	// Pause exactly once when the system is running (or when its state could
+	// not be established, so the sample is still atomic).
 	running, known := tc.server.runState.currentState()
 	wasRunning := !known || running
 	pauseResumeCycle := 0
+	window.PausedByTool = wasRunning
 	if wasRunning {
-		_, _, _, failure := tc.server.executeMutation(tc.ctx, mutationCall{
+		pausedPayload, _, _, failure := tc.server.executeMutation(tc.ctx, mutationCall{
 			tool:      "memory_snapshot_capture",
 			operation: "cpu_control",
 			params:    map[string]string{"action": "pause"},
-			guard:     windowGuard,
+			guard:     openGuard,
 			contextID: context.ID,
 			detail:    map[string]any{"action": "pause", "reason": "paused composite capture"},
 		})
@@ -230,20 +255,27 @@ func runMemorySnapshotCapture(tc toolContext, args json.RawMessage) map[string]a
 		}
 		tc.server.runState.setByMCP(false)
 		pauseResumeCycle = 1
+		if state, ok := payloadRunState(pausedPayload); ok {
+			window.PauseVerified = state == runStatePaused
+		}
 	}
 
-	// Read every range while paused; all artifacts share one capture id.
+	// Every artifact of the window is written after the guard's own pause, so
+	// the window reports the generation the sample belongs to.
+	window.TargetGeneration = tc.server.target.Generation()
+	// Read every range while paused; all artifacts share one capture id and
+	// the window's single capture-consistency object.
 	captureID := newCaptureID()
 	capturedAt := time.Now().UTC()
 	atomicConsistency := &artifact.CaptureConsistency{
 		State:                 consistencyAtomic,
 		ExecutionPausedByTool: wasRunning,
-		ExecutionResumedAfter: false,
 		InitialRunState:       initialState,
 		InitialFrameToken:     initialToken,
 	}
+	window.Consistency = atomicConsistency
 	readRanges := make([]map[string]any, 0, len(ranges))
-	restoreFailed := false
+	captureComponents := make([]artifact.CaptureComponent, 0, len(ranges))
 	for _, entry := range ranges {
 		params := map[string]string{
 			"space":   space,
@@ -253,19 +285,17 @@ func runMemorySnapshotCapture(tc toolContext, args json.RawMessage) map[string]a
 		payload, failure := tc.server.executeCommand(tc.ctx, "mem_read", params)
 		if failure != nil {
 			// Restore the prior run state so a partial capture never leaks a
-			// paused system.
-			if pauseResumeCycle == 1 {
-				if _, _, _, restoreFailure := tc.server.executeMutation(tc.ctx, mutationCall{
-					tool:      "memory_snapshot_capture",
-					operation: "cpu_control",
-					params:    map[string]string{"action": "run"},
-					contextID: context.ID,
-					detail:    map[string]any{"action": "run", "reason": "capture abort restore"},
-				}); restoreFailure == nil {
-					tc.server.runState.setByMCP(true)
-				}
+			// paused system, and report the restore outcome with the failure.
+			window.closeWindow(tc, restoreRunState)
+			annotated := annotateSpaceRangeFailure(tc, failure, space)
+			if annotated.Data == nil {
+				annotated.Data = map[string]any{}
 			}
-			return failureResult(annotateSpaceRangeFailure(tc, failure, space), tc.modern)
+			annotated.Data["run_state_restore"] = window.restoreView()
+			if window.RestoreFailure != nil {
+				annotated.Data[runStateRestoreFailed] = true
+			}
+			return failureResult(annotated, tc.modern)
 		}
 		rawDataBase64, _ := payload["data"].(string)
 		raw, err := base64.StdEncoding.DecodeString(rawDataBase64)
@@ -277,6 +307,7 @@ func runMemorySnapshotCapture(tc toolContext, args json.RawMessage) map[string]a
 		if err != nil {
 			return failureResult(&toolFailure{Code: "artifact_error", Message: err.Error()}, tc.modern)
 		}
+		window.track(stored)
 		rangeResult := map[string]any{
 			"name":                  entry.Name,
 			"space":                 space,
@@ -290,33 +321,13 @@ func runMemorySnapshotCapture(tc toolContext, args json.RawMessage) map[string]a
 		}
 		annotateAddressPair(rangeResult, space, entry.Address)
 		readRanges = append(readRanges, rangeResult)
+		captureComponents = append(captureComponents, captureComponentFromProvenance("memory:"+entry.Name, stored))
 	}
 
-	// Restore the prior run state.
-	if pauseResumeCycle == 1 {
-		if _, _, _, failure := tc.server.executeMutation(tc.ctx, mutationCall{
-			tool:      "memory_snapshot_capture",
-			operation: "cpu_control",
-			params:    map[string]string{"action": "run"},
-			guard:     windowGuard,
-			contextID: context.ID,
-			detail:    map[string]any{"action": "run", "reason": "capture restore"},
-		}); failure != nil {
-			restoreFailed = true
-		} else {
-			tc.server.runState.setByMCP(true)
-		}
-	}
-	atomicConsistency.ExecutionResumedAfter = !restoreFailed
-	atomicConsistency.FinalRunState = initialState
-	atomicConsistency.FinalFrameToken = currentFrameToken(tc)
-	if restoreFailed {
-		atomicConsistency.Note = "WARNING: restoring the prior run state failed after the capture; the system may still be paused."
-	} else if pauseResumeCycle == 0 {
-		atomicConsistency.Note = "The system was already paused; the capture added exactly one pause window of zero length and no run-state change."
-	} else {
-		atomicConsistency.Note = fmt.Sprintf("Exactly one pause/resume cycle: the system was paused for the reads and restored to %s afterwards; all ranges describe one temporally atomic instant.", initialState)
-	}
+	// Restore the prior run state and complete the window object once; the
+	// response and every artifact describe this same finalized window.
+	window.closeWindow(tc, restoreRunState)
+	restore := window.restoreView()
 	generationAfter := tc.server.target.Generation()
 
 	// Manifest artifact linking every range to the capture id.
@@ -331,15 +342,20 @@ func runMemorySnapshotCapture(tc toolContext, args json.RawMessage) map[string]a
 		"space":                    space,
 		"ranges":                   readRanges,
 		"internal_lock_acquired":   internalLock,
+		"run_state_restore":        restore,
 	}
-	manifestBytes, err := json.MarshalIndent(manifest, "", "  ")
-	if err != nil {
-		return failureResult(&toolFailure{Code: "artifact_error", Message: err.Error()}, tc.modern)
-	}
+	// The manifest embeds the range descriptors, which were built while the
+	// window was open: re-stamp them before writing the durable manifest so it
+	// cannot carry a provisional window state.
+	view := tc.server.captureConsistencyViewFor(atomicConsistency, window.generation())
+	// The durable manifest carries the same complete object shape as the
+	// response, not the frozen struct's subset.
+	manifest["capture_consistency"] = view
+	restampCaptureProvenance(manifest, view, atomicConsistency.State)
 	manifestProvenance := genericProvenance(tc.server, captureKind, capturedAt)
 	manifestProvenance.CaptureID = captureID
 	manifestProvenance.CaptureConsistency = atomicConsistency
-	storedManifest, err := tc.server.store.PutWithProvenance(context.ID, captureKind, "application/json", manifestBytes, manifestProvenance)
+	storedManifest, err := putJSONArtifact(tc.server, context.ID, captureKind, manifest, manifestProvenance)
 	if err != nil {
 		return failureResult(&toolFailure{Code: "artifact_error", Message: err.Error()}, tc.modern)
 	}
@@ -355,7 +371,7 @@ func runMemorySnapshotCapture(tc toolContext, args json.RawMessage) map[string]a
 		"summary": map[string]any{
 			"kind":                     captureKind,
 			"capture_id":               captureID,
-			"capture_consistency":      captureConsistencyToMap(atomicConsistency),
+			"capture_consistency":      view,
 			"pause_resume_cycle":       pauseResumeCycle,
 			"target_generation_before": generationBefore,
 			"target_generation_after":  generationAfter,
@@ -364,13 +380,42 @@ func runMemorySnapshotCapture(tc toolContext, args json.RawMessage) map[string]a
 			"bytes_captured":           sumCaptureBytes(readRanges),
 			"internal_lock_acquired":   internalLock,
 			"manifest_sha256":          storedManifest.SHA256,
+			"run_state_restore":        restore,
+			"initial_run_state":        window.InitialRunState,
+			"final_run_state":          window.FinalRunState,
+			"resumed":                  window.Resumed,
 		},
-		"manifest":  artifactDescriptor(tc.server, storedManifest, context.ID),
-		"ranges":    readRanges,
-		"artifacts": artifacts,
+		"manifest":          artifactDescriptor(tc.server, storedManifest, context.ID),
+		"ranges":            readRanges,
+		"artifacts":         artifacts,
+		"run_state_restore": restore,
 	}
-	if restoreFailed {
-		result["run_state_restore_failed"] = true
+	if window.ResumeSkippedReason != "" {
+		result["resume_skipped_reason"] = window.ResumeSkippedReason
+		result["summary"].(map[string]any)["resume_skipped_reason"] = window.ResumeSkippedReason
+	}
+	if window.RestoreFailure != nil {
+		result[runStateRestoreFailed] = true
+	}
+	// The range artifacts were written before the window closed: complete
+	// their stored provenance, then re-stamp the response views, so the
+	// durable artifact and the response never describe different windows.
+	tc.server.store.FinalizeCaptureConsistency(window.ids(), atomicConsistency)
+	restampCaptureProvenance(result, view, atomicConsistency.State)
+	// The manifest and every range artifact now exist: index the capture so
+	// capture_get can resolve it later without this response.
+	generation := generationBefore
+	if failure := registerCapture(tc.server.store, artifact.Capture{
+		CaptureID:        captureID,
+		ContextID:        context.ID,
+		ProducerTool:     "memory_snapshot_capture",
+		ManifestArtifact: storedManifest.ID,
+		Components:       captureComponents,
+		FrameToken:       window.InitialToken,
+		TargetGeneration: &generation,
+		CreatedAt:        capturedAt,
+	}); failure != nil {
+		return failureResult(failure, tc.modern)
 	}
 	return okResult(stampGenerations(result, generationBefore, generationAfter), tc.modern)
 }

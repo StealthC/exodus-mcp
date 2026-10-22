@@ -65,6 +65,14 @@ type Event struct {
 	Bucket string `json:"aggregation,omitempty"`
 	Hits   uint64 `json:"hits,omitempty"`
 
+	// StoreSequence is this server's own monotonic event number, assigned when
+	// the event enters the bounded store and never reused. It orders events of
+	// both streams across drains and stays valid after older entries are
+	// evicted, so paging cursors name it instead of an array position that
+	// shifts as the ring drops the oldest event. Unlike Sequence (the engine's
+	// per-access record number) it exists for every event, including execution
+	// events.
+	StoreSequence uint64 `json:"store_sequence,omitempty"`
 	// Per-occurrence access fields. Sequence is the engine's process-monotonic
 	// record number: it is the only field a caller should use to order or
 	// de-duplicate access events, and holes in it mean records were lost.
@@ -208,7 +216,11 @@ type Filter struct {
 	HasSequence bool
 	SequenceMin uint64
 	SequenceMax uint64
-	Limit       int
+	// HasAfterSequence resumes a page strictly after one store sequence,
+	// which is the paging cursor of one event query.
+	HasAfterSequence bool
+	AfterSequence    uint64
+	Limit            int
 }
 
 // AddressCount is one entry of the per-address execution histogram.
@@ -240,6 +252,10 @@ type Session struct {
 	head   int
 	count  int
 	capMax int
+
+	// nextStoreSequence is the last StoreSequence handed out; it only grows, so
+	// a cursor naming one is never reused even across evictions.
+	nextStoreSequence uint64
 
 	totals    map[string]uint64
 	addresses map[uint64]uint64
@@ -373,6 +389,8 @@ func (session *Session) AddEvents(events []Event) {
 func (session *Session) addEventsLocked(events []Event) {
 	for _, event := range events {
 		event = session.normalizeEvent(event)
+		session.nextStoreSequence++
+		event.StoreSequence = session.nextStoreSequence
 		if session.count == session.capMax {
 			session.ring[session.head] = event
 			session.head = (session.head + 1) % session.capMax
@@ -705,6 +723,60 @@ func (session *Session) Select(filter Filter) []Event {
 		}
 	}
 	return out
+}
+
+// SelectPage is one page of a filtered query plus the facts a caller needs to
+// page through the retained store: how many retained events the filter matches
+// in total, how many of those are at or after the cursor, and the store
+// sequence window of the retained events (so a caller can tell that entries
+// before its cursor were evicted instead of silently skipped).
+type SelectPage struct {
+	// Events are the matched events after the cursor, in capture order,
+	// bounded by the filter limit.
+	Events []Event
+	// Total counts every matching retained event, cursor-independent.
+	Total int
+	// Remaining counts matching retained events after the cursor, ignoring
+	// the limit. It is the size of the result set this cursor still reaches.
+	Remaining int
+	// OldestSequence and NewestSequence are the store sequences of the oldest
+	// and newest retained events; both are zero when the store is empty.
+	OldestSequence uint64
+	NewestSequence uint64
+}
+
+// SelectPage returns one cursor page of the retained events matching the
+// filter. The cursor is the monotonically assigned store sequence, never an
+// array position, so a new drain cannot shift a page boundary and an eviction
+// only skips events the caller could no longer read anyway.
+func (session *Session) SelectPage(filter Filter) SelectPage {
+	session.mu.Lock()
+	defer session.mu.Unlock()
+	page := SelectPage{}
+	limit := filter.Limit
+	for index := 0; index < session.count; index++ {
+		event := session.ring[(session.head+index)%session.capMax]
+		if index == 0 {
+			page.OldestSequence = event.StoreSequence
+		}
+		page.NewestSequence = event.StoreSequence
+		if !matchesFilter(event, filter) {
+			continue
+		}
+		page.Total++
+		if filter.HasAfterSequence && event.StoreSequence <= filter.AfterSequence {
+			continue
+		}
+		page.Remaining++
+		if limit > 0 && len(page.Events) >= limit {
+			continue
+		}
+		page.Events = append(page.Events, event)
+	}
+	if page.Events == nil {
+		page.Events = []Event{}
+	}
+	return page
 }
 
 func matchesFilter(event Event, filter Filter) bool {

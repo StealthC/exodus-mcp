@@ -146,14 +146,34 @@ func TestMemorySearchSnapshotMismatch(t *testing.T) {
 	server := newTestServer(t, client)
 	dump := structured(postToolCall(t, server, "memory_dump", `{"space":"m68k-bus","address":0,"length":4}`))
 	artifactID := dump["artifact"].(map[string]any)["id"].(string)
-	result := structured(postToolCall(t, server, "memory_search", fmt.Sprintf(`{"space":"m68k-bus","pattern":"01","snapshot_id":%q,"length":3}`, artifactID)))
-	if result["code"] != "provenance_conflict" {
-		t.Fatalf("length assertion mismatch must be provenance_conflict: %v", result)
+	// A shorter length is a NARROWER question about the same proven bytes, not
+	// a contradiction: the snapshot stays the provenance source and the search
+	// reports the range it actually scanned (roadmap issue #11).
+	narrowed := structured(postToolCall(t, server, "memory_search", fmt.Sprintf(`{"space":"m68k-bus","pattern":"01","snapshot_id":%q,"length":3}`, artifactID)))
+	if narrowed["code"] != nil {
+		t.Fatalf("a subset of the captured range must narrow, not conflict: %v", narrowed)
+	}
+	narrowedSummary := narrowed["summary"].(map[string]any)
+	searched := narrowedSummary["searched_range"].(map[string]any)
+	if searched["byte_length"] != float64(3) || searched["narrowed"] != true {
+		t.Fatalf("narrowed search must report the range it scanned: %v", searched)
 	}
 	// The same length as the snapshot is an assertion that passes.
 	ok := structured(postToolCall(t, server, "memory_search", fmt.Sprintf(`{"space":"m68k-bus","pattern":"01","snapshot_id":%q,"length":4}`, artifactID)))
 	if ok["code"] != nil {
 		t.Fatalf("matching assertion must pass: %v", ok)
+	}
+	// A range that leaves the captured bytes contradicts the snapshot.
+	overrun := structured(postToolCall(t, server, "memory_search", fmt.Sprintf(`{"space":"m68k-bus","pattern":"01","snapshot_id":%q,"length":5}`, artifactID)))
+	if overrun["code"] != "provenance_conflict" {
+		t.Fatalf("a range outside the capture must be provenance_conflict: %v", overrun)
+	}
+	outsideStart := structured(postToolCall(t, server, "memory_search", fmt.Sprintf(`{"space":"m68k-bus","pattern":"01","snapshot_id":%q,"start_address":4}`, artifactID)))
+	if outsideStart["code"] != "provenance_conflict" {
+		t.Fatalf("a start outside the capture must be provenance_conflict: %v", outsideStart)
+	}
+	if got := countCalls(client, "mem_read"); got != 1 {
+		t.Fatalf("narrowing and rejections must not read the bridge: mem_read = %d", got)
 	}
 }
 
@@ -679,7 +699,7 @@ func TestCpuTraceCaptureWatchpointPassesParams(t *testing.T) {
 	}
 	content := structured(callTool(t, client, "cpu_trace_capture_watchpoint", `{"watchpoint_id":3,"max_entries":2,"timeout_ms":900}`))
 	summary := content["summary"].(map[string]any)
-	if summary["stopped_on_watchpoint"] != true || summary["stop_reason"] != "watchpoint_hit" {
+	if summary["stopped_on_watchpoint"] != true || summary["native_stop_reason"] != "watchpoint_hit" {
 		t.Fatalf("stop fields wrong: %v", summary)
 	}
 	hits := summary["watchpoint_ids_hit"].([]any)

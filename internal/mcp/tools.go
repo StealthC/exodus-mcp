@@ -71,6 +71,7 @@ func buildToolRegistry() []toolSpec {
 	specs = append(specs, resetToolSpecs()...)
 	specs = append(specs, runUntilToolSpecs()...)
 	specs = append(specs, systemSnapshotToolSpec())
+	specs = append(specs, captureGetToolSpecs()...)
 	specs = append(specs, audioToolSpecs()...)
 	specs = append(specs, traceSessionToolSpecs()...)
 	sort.Slice(specs, func(i, j int) bool { return specs[i].name < specs[j].name })
@@ -89,17 +90,36 @@ func lookupTool(name string) *toolSpec {
 	return nil
 }
 
-// toolSchemas renders deterministic tool descriptors shared by both eras.
+// toolSchemas renders deterministic tool descriptors shared by both eras. The
+// emitted vocabularies are published next to every inputSchema (as the
+// `x-response-vocabularies` extension) so a client can validate what the server
+// may return instead of learning it per tool from prose.
 func toolSchemas() []map[string]any {
 	schemas := make([]map[string]any, 0, len(toolRegistry))
 	for _, spec := range toolRegistry {
 		schemas = append(schemas, map[string]any{
 			"name":        spec.name,
 			"description": spec.description,
-			"inputSchema": spec.schema,
+			"inputSchema": publishedSchema(spec.schema),
 		})
 	}
 	return schemas
+}
+
+// publishedSchema decorates one input schema with the response contract
+// annotations. The handler's own schema is never mutated: dispatch-time enum
+// validation reads it directly.
+func publishedSchema(schema map[string]any) map[string]any {
+	if schema == nil {
+		return nil
+	}
+	published := make(map[string]any, len(schema)+2)
+	for key, value := range schema {
+		published[key] = value
+	}
+	published[responseVocabularySchemaKey] = responseVocabularyDeclaration()
+	published[responseDeprecationSchemaKey] = responseDeprecationDeclaration()
+	return published
 }
 
 func (server *Server) callTool(ctx context.Context, params json.RawMessage, modern bool) map[string]any {
@@ -117,13 +137,39 @@ func (server *Server) callTool(ctx context.Context, params json.RawMessage, mode
 	if len(call.Arguments) == 0 {
 		call.Arguments = json.RawMessage("{}")
 	}
+	// Closed vocabularies are enforced from the published schema before the
+	// handler can substitute a default for an unsupported value.
+	if failure := validateToolArguments(spec, call.Arguments); failure != nil {
+		return failureResult(failure, modern)
+	}
 	result := spec.run(toolContext{server: server, ctx: ctx, modern: modern}, call.Arguments)
+	result = annotateContractFailure(result, call.Name)
 	failed, _ := result["isError"].(bool)
 	server.metrics.recordCall(call.Name, failed)
 	result = injectResultType(result, call.Name)
 	// Every result carries the target generation observed at response
 	// completion; mutations additionally report before/after.
 	return injectTargetGeneration(server, result)
+}
+
+// annotateContractFailure names the addressed tool on an unsupported_parameter
+// rejection: the decode-time failure cannot know it, and the caller needs to
+// know which tool's contract it violated.
+func annotateContractFailure(result map[string]any, toolName string) map[string]any {
+	if result == nil {
+		return result
+	}
+	structured, ok := result["structuredContent"].(map[string]any)
+	if !ok {
+		return result
+	}
+	if code, _ := structured["code"].(string); code != "unsupported_parameter" {
+		return result
+	}
+	if _, present := structured["tool"]; !present {
+		structured["tool"] = toolName
+	}
+	return result
 }
 
 func injectResultType(result map[string]any, toolName string) map[string]any {
@@ -187,7 +233,18 @@ func errorResult(code, message string, modern bool) map[string]any {
 }
 
 func failureResult(failure *toolFailure, modern bool) map[string]any {
-	structured := map[string]any{"code": failure.Code, "message": failure.Message}
+	code := failure.Code
+	structured := map[string]any{}
+	// Every error response carries a declared code and its class. A handler that
+	// invented a code cannot publish it: the declared fallback is reported and
+	// the original value is preserved so the defect stays diagnosable.
+	if !isDeclaredErrorCode(code) {
+		structured["undeclared_code"] = code
+		code = errorCodeInternalFallback
+	}
+	structured["code"] = code
+	structured["message"] = failure.Message
+	structured["error_class"] = errorClassOf(code)
 	for key, value := range failure.Data {
 		structured[key] = value
 	}
@@ -271,9 +328,10 @@ func contextProperty() map[string]any {
 
 // captureModeProperty is the optional capture guard: "paused" pauses once
 // before the read and restores the prior run state (temporally atomic, but
-// perturbs real-time behavior); "live" (default) never pauses.
+// perturbs real-time behavior); "live" (default) never pauses. The schema
+// property and the decoder both read captureModeVocab.
 func captureModeProperty() map[string]any {
-	return enumProperty("Capture guard. \"paused\" pauses once before the read and restores the prior run state (temporally atomic, perturbs timing-sensitive software); \"live\" (default) never pauses and samples a possibly inconsistent instant.", []string{"live", "paused"})
+	return captureModeVocab.property("Capture guard. \"paused\" pauses once before the read, samples, and restores the prior run state it observed (temporally atomic, perturbs timing-sensitive software); a target whose pre-call run state could not be observed is left paused and the response reports run_state_restore.code resume_skipped_initial_run_state_unknown. \"live\" (default) never pauses and samples a possibly inconsistent instant.")
 }
 
 // ----------------------------------------------------------------------------------------------------------------------
@@ -291,15 +349,6 @@ func decodeArgs[T any](args json.RawMessage) (*T, *toolFailure) {
 		return nil, &toolFailure{Code: "invalid_params", Message: "invalid arguments: " + err.Error()}
 	}
 	return &parsed, nil
-}
-
-func isGloballyAllowedField(key string) bool {
-	switch key {
-	case "context", "control_id", "expected_target_generation":
-		return true
-	default:
-		return false
-	}
 }
 
 // strictValidateArgs rejects unknown JSON properties with a full JSON path such as $.ranges[0].address.
@@ -322,16 +371,32 @@ func strictValidateArgs(raw json.RawMessage, typ reflect.Type, path string) *too
 			return nil
 		}
 		allowed := structFieldMap(typ)
-		for key, value := range fields {
-			if isGloballyAllowedField(key) {
-				continue
-			}
+		acceptedNames := sortedArgumentFieldNames(allowed)
+		keys := make([]string, 0, len(fields))
+		for key := range fields {
+			keys = append(keys, key)
+		}
+		sort.Strings(keys)
+		for _, key := range keys {
+			value := fields[key]
 			fieldType, ok := allowed[key]
 			if !ok {
+				// A mediation field the tool does not consume is a contract
+				// lie, not a typo: report it as unsupported so the caller
+				// never believes a guard was applied.
+				if isContractGuardField(key) {
+					return unsupportedParameterFailure(key, path+"."+key, acceptedNames)
+				}
+				data := map[string]any{"field": key, "path": path + "." + key}
+				if path == "$" {
+					// Name the accepted top-level fields so a caller can tell
+					// a typo from an argument the tool never had.
+					data["accepted_fields"] = acceptedNames
+				}
 				return &toolFailure{
 					Code:    "invalid_params",
 					Message: fmt.Sprintf("unknown field %q at %s.%s", key, path, key),
-					Data:    map[string]any{"field": key, "path": path + "." + key},
+					Data:    data,
 				}
 			}
 			// Recurse into known field value.
@@ -615,17 +680,20 @@ func resolveContext(server *Server, handle string) (*analysis.Context, *toolFail
 }
 
 func artifactDescriptor(server *Server, stored artifact.Artifact, contextID string) map[string]any {
+	// resource_uri was removed in roadmap issue #10: the server never served
+	// exodus://artifacts/<id> (there is no MCP resources endpoint), so
+	// advertising it promised a retrieval path that did not exist. The
+	// loopback URL is the only served path.
 	descriptor := map[string]any{
-		"id":           stored.ID,
-		"kind":         stored.Kind,
-		"mime_type":    stored.MimeType,
-		"size_bytes":   stored.SizeBytes,
-		"sha256":       stored.SHA256,
-		"url":          fmt.Sprintf("%s/artifacts/%s?context=%s", server.baseURL, stored.ID, contextID),
-		"resource_uri": "exodus://artifacts/" + stored.ID,
+		"id":         stored.ID,
+		"kind":       stored.Kind,
+		"mime_type":  stored.MimeType,
+		"size_bytes": stored.SizeBytes,
+		"sha256":     stored.SHA256,
+		"url":        fmt.Sprintf("%s/artifacts/%s?context=%s", server.baseURL, stored.ID, contextID),
 	}
 	if stored.Provenance != nil {
-		descriptor["provenance"] = provenanceEnvelopeView(*stored.Provenance)
+		descriptor["provenance"] = server.provenanceEnvelopeView(*stored.Provenance)
 		descriptor["provenance_state"] = stored.Provenance.State
 	} else {
 		descriptor["provenance"] = provenanceUnknownView()

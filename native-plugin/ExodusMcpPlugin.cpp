@@ -2661,16 +2661,29 @@ bool ExodusMcpPlugin::BuildWatchpointSetData(const BridgeRequest& request, std::
 	watchpoint->SetOnRead(access == "read" || access == "any");
 	watchpoint->SetOnWrite(access == "write" || access == "any");
 	watchpoint->SetLocationMask(processor->GetAddressBusMask());
+	// Range semantics are start-address based, exactly like the processor: the
+	// core evaluates one location per access (the access start address) and
+	// never reports the transfer width, so a range watchpoint matches when the
+	// access starts inside [address, address+length-1]. The Go side documents
+	// and echoes this contract as range_semantics.
 	if (length == 1)
 	{
 		watchpoint->SetLocationCondition(IWatchpoint::Condition::Equal);
 		watchpoint->SetLocationConditionData1((unsigned int)address);
 	}
+	else if (address == 0)
+	{
+		// A range starting at 0 cannot express an inclusive lower bound with the
+		// strict ">" condition (data1 would underflow to the bus mask and the
+		// watchpoint could never fire). No masked location is below zero, so the
+		// inclusive [0, length-1] range is exactly location < length.
+		watchpoint->SetLocationCondition(IWatchpoint::Condition::Less);
+		watchpoint->SetLocationConditionData1((unsigned int)(address + length));
+	}
 	else
 	{
 		// Exodus range conditions are strict (location > data1 && location < data2),
 		// so an inclusive [address, address+length-1] range needs the neighbors.
-		// A range starting at 0 cannot be expressed because data1 would wrap.
 		watchpoint->SetLocationCondition(IWatchpoint::Condition::GreaterAndLess);
 		watchpoint->SetLocationConditionData1((unsigned int)(address - 1));
 		watchpoint->SetLocationConditionData2((unsigned int)(address + length));
@@ -4096,6 +4109,7 @@ void ExodusMcpPlugin::TraceSessionThread()
 			if (_traceSessionActive && _traceSessionCapturing)
 			{
 				RotateTraceSessionSegmentLocked(true);
+				ArmTraceSessionTraceLocked();
 			}
 			LeaveCriticalSection(&_traceSessionLock);
 			continue;
@@ -4222,6 +4236,24 @@ void ExodusMcpPlugin::RotateTraceSessionSegmentLocked(bool rotateAccessStream)
 	if (rotateAccessStream && _traceSessionAccessEnabled)
 	{
 		RotateTraceSessionAccessSegmentLocked();
+	}
+}
+
+//----------------------------------------------------------------------------------------------------------------------
+void ExodusMcpPlugin::ArmTraceSessionTraceLocked()
+{
+	// A seal/rotate boundary closes the engine's trace file, so the caller
+	// disables the trace gate first and lets one commit interval flush. Only the
+	// sampled window path used to re-arm the gate afterwards; a continuous
+	// session therefore stopped recording after its first drain while still
+	// reporting capturing: true. Every continuous rotation re-arms it here.
+	if (!_traceSessionActive || !_traceSessionCapturing || _traceSessionMode != "continuous" || _traceSessionProcessor == 0)
+	{
+		return;
+	}
+	if (!_traceSessionProcessor->GetTraceEnabled())
+	{
+		_traceSessionProcessor->SetTraceEnabled(true);
 	}
 }
 
@@ -4804,6 +4836,11 @@ bool ExodusMcpPlugin::BuildTraceSessionDrainData(const BridgeRequest& request, s
 		if (_traceSessionMode == "continuous")
 		{
 			RotateTraceSessionSegmentLocked(true);
+			// The gate above was disabled only to flush the closing file. A
+			// continuous session must keep recording after the drain; without
+			// this the first drain silently ends capture while the status still
+			// reports capturing: true.
+			ArmTraceSessionTraceLocked();
 		}
 		else
 		{

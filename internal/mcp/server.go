@@ -2,11 +2,14 @@
 package mcp
 
 import (
+	"bytes"
 	"context"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"net/url"
 	"os"
@@ -29,6 +32,18 @@ const (
 	LegacyProtocolVersion = "2025-11-25"
 	serverName            = "exodus-mcp"
 	statusCacheTTL        = 5 * time.Second
+
+	// maxRequestBodyBytes bounds one JSON-RPC request envelope. A memory_write
+	// or experiment_run payload is the largest legitimate request; the bound
+	// keeps a client from streaming unbounded data into memory. A body over the
+	// bound is rejected explicitly and never truncated: truncating it turns a
+	// well-formed request into undecodable bytes, which the client then sees as
+	// an unexplained "parse error".
+	maxRequestBodyBytes = 1 << 20
+
+	// parseErrorSnippetBytes is how much of an undecodable body the -32700
+	// diagnostic quotes back so the failing payload is identifiable.
+	parseErrorSnippetBytes = 160
 )
 
 type request struct {
@@ -114,6 +129,11 @@ type Server struct {
 	// nil only before NewServer finishes construction.
 	freezes *freezeRegistry
 
+	// inputs records the button set this server last commanded per controller
+	// port. The plugin exposes no input read, so input_status reports this
+	// ledger explicitly instead of claiming an observation.
+	inputs *inputLedger
+
 	// runState attributes the emulator run state to MCP actions or external
 	// actors and records externally observed transitions in the audit stream.
 	runState *runStateTracker
@@ -152,6 +172,7 @@ func NewServer(version string, client bridge.Client, store *artifact.Store, cont
 		breakpoints: make(map[uint64]debugResourceMeta),
 		watchpoints: make(map[uint64]debugResourceMeta),
 		freezes:     newFreezeRegistry(),
+		inputs:      newInputLedger(),
 		runState:    &runStateTracker{},
 		romIdentity: newROMIdentityProvider(),
 		metrics:     newMetricsStore(),
@@ -259,15 +280,38 @@ func metricsHandler(server *Server, w http.ResponseWriter, r *http.Request) {
 
 func dispatch(server *Server, w http.ResponseWriter, r *http.Request) {
 	defer r.Body.Close()
-	body, err := io.ReadAll(io.LimitReader(r.Body, 1<<20))
+	// MaxBytesReader, not a bare LimitReader: an oversized body has to fail as
+	// oversized. A silent truncation would answer a well-formed request with
+	// -32700, the same code a genuinely malformed body earns, leaving the
+	// client no way to tell a size problem from its own encoding bug.
+	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, maxRequestBodyBytes))
 	if err != nil {
-		writeError(w, http.StatusBadRequest, nil, -32700, "unable to read request", nil)
+		var oversized *http.MaxBytesError
+		if errors.As(err, &oversized) {
+			log.Printf("mcp: rejecting request body from %s: larger than the %d-byte limit", r.RemoteAddr, maxRequestBodyBytes)
+			data := map[string]any{"limit_bytes": maxRequestBodyBytes}
+			appendRequestIdentity(data, body)
+			writeError(w, http.StatusRequestEntityTooLarge, salvageID(body), -32600,
+				fmt.Sprintf("request body exceeds the %d-byte server limit", maxRequestBodyBytes), data)
+			return
+		}
+		writeError(w, http.StatusBadRequest, nil, -32700, "unable to read request", map[string]any{
+			"reason": err.Error(),
+		})
 		return
 	}
 
 	var req request
-	if err := json.Unmarshal(body, &req); err != nil || req.JSONRPC != "2.0" || req.Method == "" {
-		writeError(w, http.StatusBadRequest, nil, -32700, "parse error", nil)
+	if err := json.Unmarshal(body, &req); err != nil {
+		server.writeParseError(w, r, body, "invalid JSON: "+err.Error())
+		return
+	}
+	if req.JSONRPC != "2.0" {
+		server.writeParseError(w, r, body, fmt.Sprintf("jsonrpc field is %q, want \"2.0\"", req.JSONRPC))
+		return
+	}
+	if req.Method == "" {
+		server.writeParseError(w, r, body, "method field is missing or empty")
 		return
 	}
 
@@ -282,6 +326,132 @@ func dispatch(server *Server, w http.ResponseWriter, r *http.Request) {
 	}
 	dispatchLegacy(server, w, r, req)
 }
+
+// writeParseError answers an undecodable request with -32700 plus a diagnostic
+// that identifies it. A bare "parse error" cannot be acted on: with several
+// tools in flight over keep-alive connections, a client cannot tell which call
+// failed or why, so a client-side encoding bug looks exactly like a transport
+// fault. The diagnostic recovers the id and method from bytes that still carry
+// them, quotes the head of the body, and mirrors the same facts into the server
+// log.
+func (server *Server) writeParseError(w http.ResponseWriter, r *http.Request, body []byte, reason string) {
+	data := map[string]any{
+		"reason":     reason,
+		"body_bytes": len(body),
+		"snippet":    bodySnippet(body),
+	}
+	appendRequestIdentity(data, body)
+	method, _ := data["method"].(string)
+	log.Printf("mcp: parse error from %s: %s (body %d bytes, method %q)", r.RemoteAddr, reason, len(body), method)
+	writeError(w, http.StatusBadRequest, salvageID(body), -32700, "parse error", data)
+}
+
+// appendRequestIdentity adds the request identity that survives in an
+// undecodable body, so the failure names the call instead of the transport.
+func appendRequestIdentity(data map[string]any, body []byte) {
+	if method := salvageString(body, "method"); method != "" {
+		data["method"] = method
+	}
+	if tool := salvageString(body, "name"); tool != "" {
+		data["tool"] = tool
+	}
+}
+
+// bodySnippet quotes the head of an undecodable body so the response shows the
+// payload the server could not decode.
+func bodySnippet(body []byte) string {
+	if len(body) <= parseErrorSnippetBytes {
+		return string(body)
+	}
+	return string(body[:parseErrorSnippetBytes]) + "…"
+}
+
+// salvageID returns the id of an undecodable body, or nil when the body does
+// not carry one. Echoing a recovered id attributes the parse error to the call
+// that caused it.
+func salvageID(body []byte) json.RawMessage {
+	return salvageValue(body, "id")
+}
+
+// salvageString returns the string value of the named field in an undecodable
+// body, or "" when it is absent or not a string.
+func salvageString(body []byte, key string) string {
+	value := salvageValue(body, key)
+	if len(value) == 0 || value[0] != '"' {
+		return ""
+	}
+	var decoded string
+	if err := json.Unmarshal(value, &decoded); err != nil {
+		return ""
+	}
+	return decoded
+}
+
+// salvageValue returns the lexically complete JSON value of the first field
+// named key anywhere in body, or nil. It exists only for diagnostics: a body
+// that does not decode as a whole (a client-side encoding bug such as an
+// unquoted argument, or a write cut short before the last request) can still
+// identify the request it was meant to carry.
+func salvageValue(body []byte, key string) []byte {
+	needle := []byte(`"` + key + `"`)
+	for search := 0; search < len(body); {
+		index := bytes.Index(body[search:], needle)
+		if index < 0 {
+			return nil
+		}
+		position := skipJSONSpace(body, search+index+len(needle))
+		if position < len(body) && body[position] == ':' {
+			if value := scanJSONScalar(body, skipJSONSpace(body, position+1)); value != nil && json.Valid(value) {
+				return value
+			}
+		}
+		search += index + len(needle)
+	}
+	return nil
+}
+
+// skipJSONSpace advances over JSON whitespace.
+func skipJSONSpace(body []byte, position int) int {
+	for position < len(body) {
+		switch body[position] {
+		case ' ', '\t', '\r', '\n':
+			position++
+		default:
+			return position
+		}
+	}
+	return position
+}
+
+// scanJSONScalar returns the complete scalar starting at position, or nil when
+// the value is not a scalar or runs past the end of the body.
+func scanJSONScalar(body []byte, position int) []byte {
+	if position >= len(body) {
+		return nil
+	}
+	if body[position] == '"' {
+		for index := position + 1; index < len(body); index++ {
+			switch body[index] {
+			case '\\':
+				index++
+			case '"':
+				return body[position : index+1]
+			}
+		}
+		return nil
+	}
+	end := position
+	for end < len(body) && strings.IndexByte(jsonScalarTerminators, body[end]) < 0 {
+		end++
+	}
+	if end == position {
+		return nil
+	}
+	return body[position:end]
+}
+
+// jsonScalarTerminators ends an unquoted JSON scalar.
+const jsonScalarTerminators = ",}] \t\r\n"
 
 func dispatchModern(server *Server, w http.ResponseWriter, r *http.Request, req request, protocolVersion string) {
 	if protocolVersion != ModernProtocolVersion {
@@ -356,7 +526,13 @@ func (server *Server) modernResult(r *http.Request, req request) (map[string]any
 }
 
 func capabilities() map[string]any {
-	return map[string]any{"tools": map[string]any{"listChanged": false}}
+	return map[string]any{
+		"tools": map[string]any{"listChanged": false},
+		// The closed failure taxonomy, published once per session so a client
+		// can build one conditional over every tool error without scraping
+		// per-tool catalogs.
+		"x-error-codes": errorCodeDeclaration(),
+	}
 }
 
 func (server *Server) serverInfo() map[string]string {
@@ -407,7 +583,10 @@ func (server *Server) runCommand(ctx context.Context, operation string, params m
 	if err != nil {
 		var commandErr *bridge.CommandError
 		if errors.As(err, &commandErr) {
-			return nil, &toolFailure{Code: commandErr.Code, Message: commandErr.Message}, false
+			// Native failure codes are part of the declared taxonomy; an
+			// unknown one is preserved as native_code instead of publishing a
+			// code no client can know.
+			return nil, normalizeNativeFailure(commandErr.Code, commandErr.Message), false
 		}
 		// A transport-class failure means the cached status may describe a
 		// dead or restarted bridge; force the next command to re-probe.
@@ -487,7 +666,10 @@ func (server *Server) setROMPath(path string) {
 // the audited mutation path once its native hit counter proves a break fired
 // (roadmap Phase 9). BreakCounter is the N of break_on_counter (1 when the
 // instrument always breaks on every hit); a break fired exactly when
-// hit_count is a positive multiple of it.
+// hit_count is a positive multiple of it. DeferRemoval keeps the paused-state
+// sweep from removing the instrument: a run_until window owns the removal so
+// the tool can report the real outcome instead of trusting the background
+// sweep.
 type debugResourceMeta struct {
 	ContextID        string
 	ControlID        string
@@ -495,7 +677,70 @@ type debugResourceMeta struct {
 	CreatedAt        time.Time
 	ROMPath          string
 	OneShot          bool
+	DeferRemoval     bool
 	BreakCounter     uint64
+}
+
+// Provenance vocabulary for a stop's triggering PC. The value is either read
+// from the processor registers while the CPU was paused at the stop
+// (register_read) or unknown. "Why the CPU stopped" is a separate fact and
+// lives in stop_source, never here.
+const (
+	pcSourceRegisterRead = "register_read"
+	pcSourceUnknown      = "unknown"
+)
+
+// Provenance vocabulary for why a stop event happened. Every recorded event is
+// a managed instrument stop: the server only records a stop it proved with a
+// managed breakpoint/watchpoint hit counter. The same four-plus-one values are
+// published for emulator_status and run_until_*, so one conditional answers
+// "why did execution stop" on every surface (see stopSourceVocab).
+const (
+	stopSourceInstrument = "instrument"
+	stopSourceExternal   = "external"
+	stopSourceMCP        = "mcp"
+	stopSourceNone       = "none"
+	stopSourceUnknown    = "unknown"
+)
+
+// Provenance vocabulary for who produced the current run state (pause_source).
+// It is a different question from stop_source: pause_source names the actor
+// that left the machine in its state, stop_source names why execution stopped.
+const (
+	pauseSourceBreakpointOrWatchpoint = "breakpoint_or_watchpoint"
+	pauseSourceMCP                    = "mcp"
+	pauseSourceUIOrExternal           = "ui_or_external"
+	pauseSourceUnknown                = "unknown"
+)
+
+// eventStopSource names why an event exists from its resource kind. An event is
+// only recorded for a managed breakpoint/watchpoint stop, so the same value a
+// run_until_* response reports for its own instrument.
+func eventStopSource(kind string) string {
+	switch kind {
+	case "breakpoint", "watchpoint":
+		return stopSourceInstrument
+	default:
+		return stopSourceUnknown
+	}
+}
+
+// observedDirection derives the direction a stop proves from the access the
+// instrument was configured with. A single-direction watchpoint can only fire
+// on that direction, and an execution breakpoint always stops execution. An
+// "any" watchpoint is ambiguous: the Exodus processor watchpoint API evaluates
+// only the access start address and never reports the transfer direction, so
+// the observed value stays unknown (nil) instead of repeating the
+// configuration.
+func observedDirection(configuredAccess string) *string {
+	direction := ""
+	switch configuredAccess {
+	case "read", "write", "execute":
+		direction = configuredAccess
+	default:
+		return nil
+	}
+	return &direction
 }
 
 // debugEvent is one structured breakpoint/watchpoint stop event.
@@ -503,26 +748,39 @@ type debugResourceMeta struct {
 // Stop/resume and duplicate-hit semantics: a breaking watchpoint increments its
 // native hit counter once per confirmed access and then pauses the CPU. While
 // the CPU stays paused no further access can occur, so repeated observations of
-// the same resource, hit count, direction, and triggering PC are the same event,
-// not new hits: they are folded into RepeatCount with LastSeenAt updated. A
-// resumed CPU (cpu_run) produces a new counter value on the next confirmed hit
-// and therefore a new event. Events whose counter value cannot be proven are
-// never synthesized.
+// the same resource, hit count, and direction are the same event, not new hits:
+// they are folded into RepeatCount with LastSeenAt updated. A resumed CPU
+// (cpu_run) produces a new counter value on the next confirmed hit and
+// therefore a new event. Events whose counter value cannot be proven are never
+// synthesized.
 type debugEvent struct {
-	ID               uint64
-	ResourceKind     string
-	ResourceID       uint64
-	ContextID        string
-	CPU              string
-	TriggeringPC     uint64
-	AddressSpace     string
-	WatchedAddress   uint64
-	AccessDirection  string
-	RequestedLength  uint64
-	HitCount         uint64
-	TargetGeneration uint64
-	FrameToken       *uint64
-	Timestamp        time.Time
+	ID             uint64
+	ResourceKind   string
+	ResourceID     uint64
+	ContextID      string
+	CPU            string
+	TriggeringPC   uint64
+	AddressSpace   string
+	WatchedAddress uint64
+	// AccessDirection is the access the instrument was CONFIGURED with
+	// ("read"/"write"/"any"/"execute"), never an observation. ObservedDirection
+	// is the direction the stop proves, or nil when the core cannot tell (an
+	// "any" watchpoint hit). Filters use the observed value.
+	AccessDirection   string
+	ObservedDirection *string
+	RequestedLength   uint64
+	HitCount          uint64
+	TargetGeneration  uint64
+	FrameToken        *uint64
+	// TriggeringPCSource explains TriggeringPC: register_read when the PC was
+	// read while paused at the stop, unknown when no read succeeded (the
+	// numeric field is then meaningless and rendered as null).
+	TriggeringPCSource string
+	// StopSource explains why execution stopped (instrument | external | mcp),
+	// never where the PC came from. Every recorded event is a managed
+	// instrument stop.
+	StopSource string
+	Timestamp  time.Time
 	// FirstSeenAt and LastSeenAt bracket a folded duplicate observation.
 	FirstSeenAt time.Time
 	LastSeenAt  time.Time
@@ -572,6 +830,25 @@ func (server *Server) forgetDebugResource(kind string, id uint64) {
 	}
 }
 
+// setDebugResourceDeferRemoval marks whether the paused-state housekeeping
+// sweep may remove this instrument. A run_until window owns its instrument's
+// removal (so it can report the real outcome); when that removal fails, the
+// tool clears the flag so the sweep retries instead of leaking the instrument.
+func (server *Server) setDebugResourceDeferRemoval(kind string, id uint64, deferRemoval bool) {
+	server.debugMu.Lock()
+	defer server.debugMu.Unlock()
+	targets := server.breakpoints
+	if kind == "watchpoint" {
+		targets = server.watchpoints
+	}
+	meta, present := targets[id]
+	if !present {
+		return
+	}
+	meta.DeferRemoval = deferRemoval
+	targets[id] = meta
+}
+
 // debugResourceIDs returns the ids of every tracked resource of both kinds,
 // for the audited invalidation batch on rom_load.
 func (server *Server) debugResourceIDs() []uint64 {
@@ -599,19 +876,35 @@ func (server *Server) purgeDebugResources() {
 const maxDebugEvents = 100
 
 // pushDebugEvent records one stop observation, folding a repeat of the same
-// paused hit (same resource, hit count, direction, and PC) into the existing
-// event instead of creating a duplicate record.
+// paused hit (same resource, hit count, and direction) into the existing event
+// instead of creating a duplicate record. The native hit counter is the
+// identity of a stop: it increments once per confirmed access and strictly
+// increases across a resume, so an observation that repeats the counter value
+// is the same paused stop even if the reported PC moved after it (for example
+// when a later MCP pause reads a different PC). The observed direction and the
+// triggering-PC source are always explicit: a producer that cannot prove them
+// leaves them unknown rather than copying the configuration.
 func (server *Server) pushDebugEvent(event debugEvent) uint64 {
 	server.debugEventsMu.Lock()
 	defer server.debugEventsMu.Unlock()
+	if event.ObservedDirection == nil {
+		event.ObservedDirection = observedDirection(event.AccessDirection)
+	}
+	if event.TriggeringPCSource == "" {
+		event.TriggeringPCSource = pcSourceUnknown
+	}
+	if event.StopSource == "" {
+		event.StopSource = eventStopSource(event.ResourceKind)
+	}
 	now := time.Now().UTC()
 	for index := len(server.debugEvents) - 1; index >= 0; index-- {
 		existing := &server.debugEvents[index]
 		if existing.ResourceKind != event.ResourceKind || existing.ResourceID != event.ResourceID {
 			continue
 		}
-		if existing.HitCount == event.HitCount && existing.TriggeringPC == event.TriggeringPC &&
-			existing.AccessDirection == event.AccessDirection && existing.WatchedAddress == event.WatchedAddress {
+		if existing.HitCount == event.HitCount &&
+			existing.AccessDirection == event.AccessDirection && existing.WatchedAddress == event.WatchedAddress &&
+			sameOptionalString(existing.ObservedDirection, event.ObservedDirection) {
 			existing.RepeatCount++
 			existing.LastSeenAt = now
 			return existing.ID
@@ -640,6 +933,13 @@ func (server *Server) pushDebugEvent(event debugEvent) uint64 {
 	return event.ID
 }
 
+func sameOptionalString(left, right *string) bool {
+	if left == nil || right == nil {
+		return left == nil && right == nil
+	}
+	return *left == *right
+}
+
 // debugEventFilter selects retained stop events. Every field is optional; an
 // empty filter matches everything.
 type debugEventFilter struct {
@@ -647,9 +947,14 @@ type debugEventFilter struct {
 	ResourceID   uint64
 	ContextID    string
 	CPU          string
-	Direction    string
-	EventIDMin   uint64
-	EventIDMax   uint64
+	// Direction filters on the observed access direction, never on the
+	// instrument's configuration. "any" matches every event (including events
+	// whose observed direction is unknown) and an empty value does not filter.
+	// A concrete value never matches an event whose direction could not be
+	// observed.
+	Direction  string
+	EventIDMin uint64
+	EventIDMax uint64
 }
 
 func (filter debugEventFilter) matches(event debugEvent) bool {
@@ -665,8 +970,10 @@ func (filter debugEventFilter) matches(event debugEvent) bool {
 	if filter.CPU != "" && event.CPU != filter.CPU {
 		return false
 	}
-	if filter.Direction != "" && event.AccessDirection != filter.Direction {
-		return false
+	if filter.Direction != "" && filter.Direction != "any" {
+		if event.ObservedDirection == nil || *event.ObservedDirection != filter.Direction {
+			return false
+		}
 	}
 	if filter.EventIDMin != 0 && event.ID < filter.EventIDMin {
 		return false
@@ -678,26 +985,47 @@ func (filter debugEventFilter) matches(event debugEvent) bool {
 }
 
 // debugEventHistory is the explicit completeness statement of the retained
-// history: capacity, records recorded, records dropped, and the id span.
+// history: capacity, records recorded, records dropped, and the id span. The
+// scope fields keep the counters consistent with what a query can return:
+// retained is the whole ring, scope_retained is the ring restricted to the
+// query's context scope, and matching is exactly the number of events the same
+// query can page through.
 type debugEventHistory struct {
-	Capacity   int    `json:"capacity"`
-	Retained   int    `json:"retained"`
-	Recorded   uint64 `json:"recorded"`
-	Dropped    uint64 `json:"dropped"`
-	FirstEvent uint64 `json:"first_event_id,omitempty"`
-	LastEvent  uint64 `json:"last_event_id,omitempty"`
-	Complete   bool   `json:"complete"`
+	Capacity      int    `json:"capacity"`
+	Scope         string `json:"scope"`
+	Retained      int    `json:"retained"`
+	ScopeRetained int    `json:"scope_retained"`
+	Matching      int    `json:"matching"`
+	Recorded      uint64 `json:"recorded"`
+	Dropped       uint64 `json:"dropped"`
+	FirstEvent    uint64 `json:"first_event_id,omitempty"`
+	LastEvent     uint64 `json:"last_event_id,omitempty"`
+	Complete      bool   `json:"complete"`
 }
 
-func (server *Server) debugEventHistory() debugEventHistory {
+// debugEventHistoryFor describes the retained history from the perspective of
+// one query. scope names the context scope the query used.
+func (server *Server) debugEventHistoryFor(filter debugEventFilter, scope string) debugEventHistory {
 	server.debugEventsMu.Lock()
 	defer server.debugEventsMu.Unlock()
 	history := debugEventHistory{
 		Capacity: maxDebugEvents,
+		Scope:    scope,
 		Retained: len(server.debugEvents),
 		Recorded: server.debugEventsTotal,
 		Dropped:  server.debugEventsDropped,
 		Complete: server.debugEventsDropped == 0,
+	}
+	// The context scope alone explains how many retained events are even
+	// eligible; matching then applies every filter of the query.
+	scopeFilter := debugEventFilter{ContextID: filter.ContextID}
+	for _, event := range server.debugEvents {
+		if scopeFilter.matches(event) {
+			history.ScopeRetained++
+		}
+		if filter.matches(event) {
+			history.Matching++
+		}
 	}
 	if len(server.debugEvents) > 0 {
 		history.FirstEvent = server.debugEvents[0].ID

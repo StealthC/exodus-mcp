@@ -15,7 +15,12 @@ import (
 const systemSnapshotSchema = "system-snapshot/1"
 
 type systemSnapshotArgs struct {
-	Space                    string             `json:"space"`
+	Space string `json:"space"`
+	// AddressSpace is the published optional domain of the supplied address
+	// (injected by objectSchema because the tool has vram_address). The decoder
+	// must accept it: rejecting a property the schema advertises made the field
+	// unusable for every client that followed the published contract.
+	AddressSpace             string             `json:"address_space"`
 	MemoryRanges             []captureRangeArgs `json:"memory_ranges"`
 	IncludeM68K              *bool              `json:"include_m68k_registers"`
 	IncludeZ80               *bool              `json:"include_z80_registers"`
@@ -34,7 +39,7 @@ type systemSnapshotArgs struct {
 
 func systemSnapshotToolSpec() toolSpec {
 	boolProp := func(text string) map[string]any { return booleanProperty(text) }
-	return toolSpec{name: "system_snapshot_capture", description: "Capture a temporally atomic, artifact-first snapshot of memory, CPU registers, VDP state, and the rendered frame. The server pauses once when needed, performs all selected reads in that window, and restores the prior run state. The versioned system-snapshot/1 manifest links every component with one capture_id and records consistency, generation, ROM identity, byte order, address domains, and omitted/unavailable components. This tool has no live mode.", schema: objectSchema(map[string]any{
+	return toolSpec{name: "system_snapshot_capture", description: "Capture a temporally atomic, artifact-first snapshot of memory, CPU registers, VDP state, and the rendered frame. The server pauses once when needed, performs all selected reads in that window, and restores the prior run state. The versioned system-snapshot/1 manifest links every component with one capture_id and records consistency, generation, ROM identity, byte order, address domains, and omitted/unavailable components. This tool has no live mode. Each memory range declares its own space or falls back to the top-level space; address_space is the optional domain of vram_address only, and every memory component records the real space id, device, and space-relative plus bus start address in its provenance.", schema: objectSchema(map[string]any{
 		"space":                  stringProperty("Default memory space id for ranges that omit space."),
 		"memory_ranges":          map[string]any{"type": "array", "description": fmt.Sprintf("Named memory ranges (1-%d; total capped at %d bytes).", captureMaxRanges, dumpCapBytes), "items": map[string]any{"type": "object", "additionalProperties": false, "properties": map[string]any{"name": stringProperty("Range name."), "address": addressProperty(), "address_space": stringProperty("Address domain; omitted means space."), "length": integerProperty("Range length.", 1), "space": stringProperty("Memory space id; defaults to the address domain.")}, "required": []string{"name", "address", "length"}}, "minItems": 1, "maxItems": captureMaxRanges},
 		"include_m68k_registers": boolProp("Include M68K registers (default true)."), "include_z80_registers": boolProp("Include Z80 registers (default true)."), "include_vdp_status": boolProp("Include VDP status (default true)."), "include_frame": boolProp("Include rendered PNG frame (default true)."), "include_cram": boolProp("Include CRAM bytes (default true)."), "include_vsram": boolProp("Include VSRAM bytes (default true)."), "include_vram": boolProp("Include VRAM range (default false)."), "vram_address": addressProperty(), "vram_length": integerProperty("VRAM length, capped at 131072 bytes.", 1), "include_sprite_table": boolProp("Include sprite-table data when available (default true)."),
@@ -63,7 +68,9 @@ func runSystemSnapshot(tc toolContext, args json.RawMessage) map[string]any {
 			return failureResult(f, tc.modern)
 		}
 	}
-	// A named range carries its own space; require it explicitly so domains cannot be guessed.
+	// A named range carries its own space; default only from the explicit
+	// top-level space. Promoting address_space into space silently ignored the
+	// caller's address domain and skipped translation.
 	ranges := make([]captureRange, 0, len(p.MemoryRanges))
 	seen := map[string]bool{}
 	var total uint64
@@ -71,20 +78,18 @@ func runSystemSnapshot(tc toolContext, args json.RawMessage) map[string]any {
 		return failureResult(&toolFailure{Code: "invalid_params", Message: "memory_ranges must hold between 1 and 16 entries"}, tc.modern)
 	}
 	for i, r := range p.MemoryRanges {
-		if r.Space == "" {
-			r.Space = r.AddressSpace
+		space := r.Space
+		if space == "" {
+			space = p.Space
 		}
-		if r.Space == "" {
-			r.Space = p.Space
-		}
-		if r.Space == "" {
+		if space == "" {
 			return failureResult(&toolFailure{Code: "invalid_params", Message: fmt.Sprintf("memory_ranges[%d].space is required", i)}, tc.modern)
 		}
 		if seen[r.Name] {
 			return failureResult(&toolFailure{Code: "invalid_params", Message: "memory range names must be unique"}, tc.modern)
 		}
 		seen[r.Name] = true
-		addr, f := resolveAddress(r.Address, r.AddressSpace, r.Space)
+		addr, f := resolveAddress(r.Address, r.AddressSpace, space)
 		if f != nil {
 			return failureResult(f, tc.modern)
 		}
@@ -92,7 +97,7 @@ func runSystemSnapshot(tc toolContext, args json.RawMessage) map[string]any {
 			return failureResult(&toolFailure{Code: "invalid_params", Message: "memory_ranges exceed the per-range or total byte cap"}, tc.modern)
 		}
 		total += r.Length
-		ranges = append(ranges, captureRange{Name: r.Name, Space: r.Space, Address: addr, Length: r.Length})
+		ranges = append(ranges, captureRange{Name: r.Name, Space: space, Address: addr, Length: r.Length})
 	}
 	vramLen := p.VRAMLength
 	if vramLen == 0 {
@@ -103,7 +108,7 @@ func runSystemSnapshot(tc toolContext, args json.RawMessage) map[string]any {
 	}
 	vramAddr := uint64(0)
 	if p.VRAMAddress != nil {
-		vramAddr, failure = resolveAddress(p.VRAMAddress, "mem-vdp-vram", "mem-vdp-vram")
+		vramAddr, failure = resolveAddress(p.VRAMAddress, p.AddressSpace, "mem-vdp-vram")
 		if failure != nil {
 			return failureResult(failure, tc.modern)
 		}
@@ -127,69 +132,90 @@ func runSystemSnapshot(tc toolContext, args json.RawMessage) map[string]any {
 	} else if !tc.server.controls.Valid(controlID) {
 		return failureResult(&toolFailure{Code: "target_control_held", Message: "control_id does not own the active target control lock"}, tc.modern)
 	}
-	initial := initialRunStateLabel(tc.server)
+	initial, initialKnown := observedRunState(tc)
 	initialToken := currentFrameToken(tc)
 	genBefore := tc.server.target.Generation()
+	// The pause is the only mutation that may carry the caller's expected
+	// generation; the restore that closes the window carries the control id
+	// alone, because the pause already advanced the generation.
+	openGuard := newWindowOpenGuard(controlID, p.ExpectedTargetGeneration)
+	closeGuard := windowCloseGuard(controlID)
+	resume := func() (map[string]any, *toolFailure) {
+		payload, _, _, f := tc.server.executeMutation(tc.ctx, mutationCall{tool: "system_snapshot_capture", operation: "cpu_control", params: map[string]string{"action": "run"}, guard: closeGuard, contextID: ctx.ID})
+		if f != nil {
+			return nil, f
+		}
+		tc.server.runState.setByMCP(true)
+		return payload, nil
+	}
+	window := &captureWindow{
+		Mode:            captureModePaused,
+		InitialRunState: initial,
+		InitialKnown:    initialKnown,
+		InitialToken:    initialToken,
+	}
 	running, known := tc.server.runState.currentState()
 	wasRunning := !known || running
-	guard := mutationGuard{ControlID: controlID}
-	if p.ExpectedTargetGeneration != nil {
-		guard.ExpectedGeneration = *p.ExpectedTargetGeneration
-		guard.HasExpectedGeneration = true
-	}
+	window.PausedByTool = wasRunning
 	if wasRunning {
-		_, _, _, failure = tc.server.executeMutation(tc.ctx, mutationCall{tool: "system_snapshot_capture", operation: "cpu_control", params: map[string]string{"action": "pause"}, guard: guard, contextID: ctx.ID})
+		pausedPayload, _, _, failure := tc.server.executeMutation(tc.ctx, mutationCall{tool: "system_snapshot_capture", operation: "cpu_control", params: map[string]string{"action": "pause"}, guard: openGuard, contextID: ctx.ID})
 		if failure != nil {
 			return failureResult(failure, tc.modern)
 		}
 		tc.server.runState.setByMCP(false)
+		if state, ok := payloadRunState(pausedPayload); ok {
+			window.PauseVerified = state == runStatePaused
+		}
 	}
+	// The components are read after the guard's own pause: the window reports
+	// the generation the sample belongs to.
+	window.TargetGeneration = tc.server.target.Generation()
 	captureID := newCaptureID()
 	at := time.Now().UTC()
 	consistency := &artifact.CaptureConsistency{State: consistencyAtomic, ExecutionPausedByTool: wasRunning, InitialRunState: initial, InitialFrameToken: initialToken}
+	window.Consistency = consistency
 	components := map[string]any{}
 	artifacts := []map[string]any{}
-	restore := func() *toolFailure {
-		if !wasRunning {
-			consistency.FinalRunState = "paused"
-			consistency.ExecutionResumedAfter = true
-			return nil
+	captureComponents := []artifact.CaptureComponent{}
+	var captureFrameToken *uint64
+	// markSkipped records a component the producer did not capture, in the
+	// manifest and in the capture index, so capture_get lists it instead of
+	// hiding it.
+	markSkipped := func(name string, unavailable bool, reason string) {
+		entry := map[string]any{"omitted": true}
+		if unavailable {
+			entry = map[string]any{"unavailable": true}
 		}
-		_, _, _, f := tc.server.executeMutation(tc.ctx, mutationCall{tool: "system_snapshot_capture", operation: "cpu_control", params: map[string]string{"action": "run"}, guard: guard, contextID: ctx.ID})
-		if f == nil {
-			tc.server.runState.setByMCP(true)
-			consistency.ExecutionResumedAfter = true
-			consistency.FinalRunState = initial
-		} else {
-			consistency.Note = "WARNING: restoring the prior run state failed; the system may still be paused."
+		if reason != "" {
+			entry["reason"] = reason
 		}
-		return f
+		components[name] = entry
+		captureComponents = append(captureComponents, omittedCaptureComponent(name, !unavailable, unavailable, reason))
 	}
 	fail := func(f *toolFailure) map[string]any {
-		if restoreFailure := restore(); restoreFailure != nil {
-			if f.Data == nil {
-				f.Data = map[string]any{}
-			}
-			f.Data["run_state_restore_failed"] = true
-			f.Data["restore_error"] = restoreFailure.Message
+		window.closeWindow(tc, resume)
+		if f.Data == nil {
+			f.Data = map[string]any{}
+		}
+		f.Data["run_state_restore"] = window.restoreView()
+		if window.RestoreFailure != nil {
+			f.Data[runStateRestoreFailed] = true
 		}
 		return failureResult(f, tc.modern)
 	}
-	addJSON := func(name, kind string, value any) *toolFailure {
-		b, e := json.MarshalIndent(value, "", "  ")
-		if e != nil {
-			return &toolFailure{Code: "artifact_error", Message: e.Error()}
-		}
+	addJSON := func(name, kind string, value map[string]any) *toolFailure {
 		prov := genericProvenance(tc.server, kind, at)
 		prov.CaptureID = captureID
 		prov.CaptureConsistency = consistency
-		a, e := tc.server.store.PutWithProvenance(ctx.ID, kind, "application/json", b, prov)
+		a, e := putJSONArtifact(tc.server, ctx.ID, kind, value, prov)
 		if e != nil {
 			return &toolFailure{Code: "artifact_error", Message: e.Error()}
 		}
+		window.track(a)
 		d := artifactDescriptor(tc.server, a, ctx.ID)
 		components[name] = d
 		artifacts = append(artifacts, d)
+		captureComponents = append(captureComponents, captureComponentFromProvenance(name, a))
 		return nil
 	}
 	addRaw := func(name, kind, space string, addr uint64, raw []byte, payload map[string]any) *toolFailure {
@@ -198,9 +224,11 @@ func runSystemSnapshot(tc toolContext, args json.RawMessage) map[string]any {
 		if e != nil {
 			return &toolFailure{Code: "artifact_error", Message: e.Error()}
 		}
+		window.track(a)
 		d := artifactDescriptor(tc.server, a, ctx.ID)
 		components[name] = d
 		artifacts = append(artifacts, d)
+		captureComponents = append(captureComponents, captureComponentFromProvenance(name, a))
 		return nil
 	}
 	for _, r := range ranges {
@@ -212,7 +240,10 @@ func runSystemSnapshot(tc toolContext, args json.RawMessage) map[string]any {
 		if e != nil {
 			return fail(&toolFailure{Code: "bridge_error", Message: e.Error()})
 		}
-		if f = addRaw("memory:"+r.Name, "system-memory", r.Name, r.Address, raw, payload); f != nil {
+		// The range name is a label, never an address domain: provenance carries
+		// the real space id, its device, and both the space-relative and bus form
+		// of the start address through the shared memory-range envelope builder.
+		if f = addRaw("memory:"+r.Name, "system-memory", r.Space, r.Address, raw, payload); f != nil {
 			return fail(f)
 		}
 	}
@@ -228,21 +259,21 @@ func runSystemSnapshot(tc toolContext, args json.RawMessage) map[string]any {
 			return fail(f)
 		}
 	} else {
-		components["m68k_registers"] = map[string]any{"omitted": true, "reason": "include_m68k_registers=false"}
+		markSkipped("m68k_registers", false, "include_m68k_registers=false")
 	}
 	if systemBool(p.IncludeZ80, true) {
 		if f := readJSON("z80_registers", "regs_get", map[string]string{"cpu": "z80"}, "system-z80-registers"); f != nil {
 			return fail(f)
 		}
 	} else {
-		components["z80_registers"] = map[string]any{"omitted": true}
+		markSkipped("z80_registers", false, "include_z80_registers=false")
 	}
 	if systemBool(p.IncludeVDPStatus, true) {
 		if f := readJSON("vdp_status", "vdp_status", nil, "system-vdp-status"); f != nil {
 			return fail(f)
 		}
 	} else {
-		components["vdp_status"] = map[string]any{"omitted": true}
+		markSkipped("vdp_status", false, "include_vdp_status=false")
 	}
 	for _, spec := range []struct {
 		name, target string
@@ -258,15 +289,15 @@ func runSystemSnapshot(tc toolContext, args json.RawMessage) map[string]any {
 				return fail(f)
 			}
 		} else {
-			components[spec.name] = map[string]any{"omitted": true, "reason": "not requested"}
+			markSkipped(spec.name, false, "not requested")
 		}
 	}
 	if systemBool(p.IncludeSpriteTable, true) {
 		// The native bridge does not expose a raw sprite-table operation. Do not
 		// substitute a status read and label it as sprite data.
-		components["sprite_table"] = map[string]any{"unavailable": true, "reason": "the native bridge does not expose sprite-table capture; use vdp_sprite_table after this manifest"}
+		markSkipped("sprite_table", true, "the native bridge does not expose sprite-table capture; use vdp_sprite_table after this manifest")
 	} else {
-		components["sprite_table"] = map[string]any{"omitted": true, "reason": "include_sprite_table=false"}
+		markSkipped("sprite_table", false, "include_sprite_table=false")
 	}
 	if systemBool(p.IncludeFrame, true) {
 		payload, f := tc.server.executeCommand(tc.ctx, "frame_capture", nil)
@@ -297,41 +328,72 @@ func runSystemSnapshot(tc toolContext, args json.RawMessage) map[string]any {
 		if e != nil {
 			return fail(&toolFailure{Code: "artifact_error", Message: e.Error()})
 		}
+		window.track(a)
 		d := artifactDescriptor(tc.server, a, ctx.ID)
 		components["frame"] = d
 		artifacts = append(artifacts, d)
+		captureComponents = append(captureComponents, captureComponentFromProvenance("frame", a))
+		if t != 0 {
+			captureFrameToken = &t
+		}
 	} else {
-		components["frame"] = map[string]any{"omitted": true}
+		markSkipped("frame", false, "include_frame=false")
 	}
 	// Keep the renderer-facing relationship explicit and bounded. This is a
 	// derived artifact, not a second read window.
-	if f := addJSON("render_manifest", "system-render-manifest", map[string]any{"schema_version": "render-manifest/1", "capture_id": captureID, "frame": components["frame"], "vdp_status": components["vdp_status"], "palette": components["cram"], "scroll": components["vsram"], "sprites": components["sprite_table"]}); f != nil {
+	if f := addJSON("render_manifest", "system-render-manifest", map[string]any{"capture_id": captureID, "frame": components["frame"], "vdp_status": components["vdp_status"], "palette": components["cram"], "scroll": components["vsram"], "sprites": components["sprite_table"]}); f != nil {
 		return fail(f)
 	}
-	restoreFailure := restore()
-	consistency.FinalFrameToken = currentFrameToken(tc)
+	// Close the window once: restore the prior run state, complete the single
+	// capture-consistency object, and report the restore outcome.
+	window.closeWindow(tc, resume)
+	restore := window.restoreView()
 	genAfter := tc.server.target.Generation()
-	consistency.FinalRunState = initial
-	if restoreFailure != nil {
-		consistency.Note = "WARNING: restoring the prior run state failed; the system may still be paused."
-	}
-	manifest := map[string]any{"schema_version": systemSnapshotSchema, "kind": "system-snapshot", "capture_id": captureID, "captured_at": at, "capture_consistency": consistency, "target_generation_before": genBefore, "target_generation_after": genAfter, "rom_identity": tc.server.romIdentityView(0), "byte_order": map[string]any{"m68k": "big-endian", "z80": "little-endian", "raw": "address-order"}, "components": components, "artifacts": artifacts}
-	b, err := json.MarshalIndent(manifest, "", "  ")
-	if err != nil {
-		return failureResult(&toolFailure{Code: "artifact_error", Message: err.Error()}, tc.modern)
-	}
+	manifest := map[string]any{"kind": "system-snapshot", "capture_id": captureID, "captured_at": at, "capture_consistency": consistency, "run_state_restore": restore, "target_generation_before": genBefore, "target_generation_after": genAfter, "rom_identity": tc.server.romIdentityView(0), "byte_order": map[string]any{"m68k": "big-endian", "z80": "little-endian", "raw": "address-order"}, "components": components, "artifacts": artifacts}
+	// The manifest embeds the component descriptors, which were built while the
+	// window was open: re-stamp them before writing the durable manifest so it
+	// cannot carry a provisional window state.
+	view := tc.server.captureConsistencyViewFor(consistency, window.generation())
+	// The durable manifest carries the same complete object shape as the
+	// response, not the frozen struct's subset.
+	manifest["capture_consistency"] = view
+	restampCaptureProvenance(manifest, view, consistency.State)
 	prov := genericProvenance(tc.server, "system-snapshot-manifest", at)
 	prov.CaptureID = captureID
 	prov.CaptureConsistency = consistency
-	stored, e := tc.server.store.PutWithProvenance(ctx.ID, "system-snapshot-manifest", "application/json", b, prov)
+	stored, e := putJSONArtifact(tc.server, ctx.ID, "system-snapshot-manifest", manifest, prov)
 	if e != nil {
 		return failureResult(&toolFailure{Code: "artifact_error", Message: e.Error()}, tc.modern)
 	}
 	md := artifactDescriptor(tc.server, stored, ctx.ID)
 	artifacts = append(artifacts, md)
-	result := map[string]any{"summary": map[string]any{"kind": "system-snapshot", "schema_version": systemSnapshotSchema, "capture_id": captureID, "capture_consistency": captureConsistencyToMap(consistency), "pause_resume_cycle": map[bool]int{true: 1, false: 0}[wasRunning], "target_generation_before": genBefore, "target_generation_after": genAfter, "artifact_count": len(artifacts), "internal_lock_acquired": internal}, "manifest": md, "components": components, "artifacts": artifacts}
-	if restoreFailure != nil {
-		result["run_state_restore_failed"] = true
+	summary := map[string]any{"kind": "system-snapshot", "schema_version": systemSnapshotSchema, "capture_id": captureID, "capture_consistency": view, "run_state_restore": restore, "initial_run_state": window.InitialRunState, "final_run_state": window.FinalRunState, "resumed": window.Resumed, "pause_resume_cycle": map[bool]int{true: 1, false: 0}[wasRunning], "target_generation_before": genBefore, "target_generation_after": genAfter, "artifact_count": len(artifacts), "internal_lock_acquired": internal}
+	if window.ResumeSkippedReason != "" {
+		summary["resume_skipped_reason"] = window.ResumeSkippedReason
+	}
+	result := map[string]any{"summary": summary, "manifest": md, "components": components, "artifacts": artifacts, "run_state_restore": restore}
+	if window.RestoreFailure != nil {
+		result[runStateRestoreFailed] = true
+	}
+	// Every component artifact was written while the window was open:
+	// complete its stored provenance, then re-stamp the response views.
+	tc.server.store.FinalizeCaptureConsistency(window.ids(), consistency)
+	restampCaptureProvenance(result, view, consistency.State)
+	// Every component and the manifest now exist: index the capture so
+	// capture_get resolves it without this response.
+	generation := genBefore
+	if failure := registerCapture(tc.server.store, artifact.Capture{
+		CaptureID:        captureID,
+		ContextID:        ctx.ID,
+		ProducerTool:     "system_snapshot_capture",
+		ManifestArtifact: stored.ID,
+		SchemaVersion:    systemSnapshotSchema,
+		Components:       captureComponents,
+		FrameToken:       captureFrameToken,
+		TargetGeneration: &generation,
+		CreatedAt:        at,
+	}); failure != nil {
+		return failureResult(failure, tc.modern)
 	}
 	return okResult(stampGenerations(result, genBefore, genAfter), tc.modern)
 }

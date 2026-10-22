@@ -8,6 +8,24 @@ open work; completed, rejected, and deferred ideas are not tracked here.
 ## Phase 5 — Advanced analysis
 
 - [ ] Multi-instance orchestration for real parallel experiments.
+- [ ] Native batch disassembly: one request that carries a list of addresses.
+  `cpu_coverage_capture` already decodes one sweep per contiguous run and the
+  disassemble tools accept a bounded `addresses` batch, but an arbitrary
+  address set still costs one native sweep per run because the plugin's
+  `disasm` operation takes a single start address and a count.
+
+## Analysis workspace
+
+Delivered: persisted contexts and annotations with `context_prune` and
+`state_delete` reclamation. Open work:
+
+- [ ] Retention policy for the workspace itself: `context_prune` is explicit,
+  so a long-lived install with many finished contexts keeps their annotation
+  documents until someone prunes them. A TTL sweep (the artifact sweep's
+  shape) needs a policy for a closed context that still owns unexpired
+  artifacts.
+- [ ] Persist symbols, or a versioned symbol import/export artifact: symbols
+  are re-declared with `symbols_set` after every restart today.
 
 ## Phase 6 — Audio analysis
 
@@ -44,6 +62,11 @@ restart recovery, and ROM-hash-bound symbol resolution. See
   processor access hook.
 
 ## Phase 9 — Workflow ergonomics
+
+- [ ] Native controller-state read. `input_status` reports the server's command
+  ledger because the pinned plugin only implements `input_set` (a write); a pad
+  read operation would let it report an observation, including presses made in
+  the UI or by a saved state.
 
 ## Operations
 
