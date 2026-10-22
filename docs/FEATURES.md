@@ -721,7 +721,10 @@ documented in [TRACE-SESSIONS.md](TRACE-SESSIONS.md).
 - `trace_session_status`: drains both native streams into the bounded event
   store and reports the configuration, limits, native counters, segment tables,
   access-stream counters, watch counter deltas, per-kind totals, and the explicit
-  loss object.
+  loss object. Draining never disarms capture: in `continuous` mode the native
+  plugin re-arms the engine's trace gate after each seal/rotate, so the default
+  `collect: true` of `trace_session_status`/`trace_session_events` cannot end a
+  live session.
 - `trace_session_events`: bounded inline events plus a per-address execution
   histogram, filtered by `kind`, `direction`, address/PC/cycle/sequence range,
   and effective value (`value_equals`, `value_min`/`value_max`,
@@ -745,11 +748,18 @@ unfiltered because the engine cannot filter natively); access events are
 per-occurrence records whose value semantics are stated (`value_state: "read" |
 "written"`), and a write's pre-write value is reported only when the engine
 captured it (`previous_known`); access records carry cycle and emulated time but
-no per-record VDP frame token; every filter applies after capture; and any loss
-(dropped events, malformed or truncated lines, evicted undrained segments, holes
-in the access sequence) is reported with `loss.complete: false`. Symbols are
-bound to the cartridge SHA-256 they were recorded against and resolution is
-suppressed when a different ROM is loaded.
+no per-record VDP frame token; every filter applies after capture. `loss.complete`
+has one definition — the capture covered the requested window with no gaps — so
+it is true only for a `continuous` session with zero loss. A sampled session
+always reports `loss.complete: false` plus machine-readable coverage
+(`loss.capture_is_sampled`, `loss.sampled_mode_gaps`, `loss.capture.duty_cycle`/
+`window_ms`/`interval_ms`/`untraced_ms_per_interval`, and
+`loss.incomplete_reasons`), so a 1 % sample can never be presented as an
+execution record; any loss (dropped events, malformed or truncated lines, evicted
+undrained segments, holes in the access sequence) also makes `loss.complete`
+false with the reason listed. Symbols are bound to the cartridge SHA-256 they
+were recorded against and resolution is suppressed when a different ROM is
+loaded.
 
 ## Phase 9 workflow ergonomics (delivered: atomic snapshots, reset, input, exports, instrumentation, and state override)
 

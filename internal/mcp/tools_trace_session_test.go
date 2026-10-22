@@ -647,3 +647,210 @@ func TestTraceSessionRetiredOnROMLoad(t *testing.T) {
 		t.Fatalf("retained events must stay queryable: %v", events["event_count"])
 	}
 }
+
+// traceSessionLossFixture builds one session for the completeness contract
+// tests. It never touches the native bridge: loss.complete is computed from the
+// session configuration and loss counters alone.
+func traceSessionLossFixture(mode string, windowMs, intervalMs uint64) *tracing.Session {
+	return tracing.NewSession("trs_loss", "ctx", "m68k", "m68k-bus", tracing.Config{
+		CPU: "m68k", Mode: mode, WindowMs: windowMs, IntervalMs: intervalMs, MaxEvents: 64,
+	})
+}
+
+// TestTraceSessionLossCompletenessByMode pins the definition of loss.complete:
+// the capture covered the requested window with no gaps. A sampled session is
+// never complete; a continuous session is complete only while nothing was lost.
+func TestTraceSessionLossCompletenessByMode(t *testing.T) {
+	cases := []struct {
+		name         string
+		mode         string
+		windowMs     uint64
+		intervalMs   uint64
+		loseData     bool
+		wantComplete bool
+		wantSampled  bool
+		wantDuty     float64
+		wantUntraced uint64
+		wantReason   string
+	}{
+		{
+			name: "sampled default is never complete", mode: "sampled",
+			windowMs: 100, intervalMs: 10000,
+			wantComplete: false, wantSampled: true, wantDuty: 0.01, wantUntraced: 9900,
+			wantReason: "sampled_mode",
+		},
+		{
+			name: "sampled with loss keeps the sampled reason first", mode: "sampled",
+			windowMs: 100, intervalMs: 1000, loseData: true,
+			wantComplete: false, wantSampled: true, wantDuty: 0.1, wantUntraced: 900,
+			wantReason: "malformed_lines",
+		},
+		{
+			name: "continuous without loss is complete", mode: "continuous",
+			windowMs: 100, intervalMs: 10000,
+			wantComplete: true, wantSampled: false, wantDuty: 1, wantUntraced: 0,
+		},
+		{
+			name: "continuous with loss is incomplete", mode: "continuous",
+			windowMs: 100, intervalMs: 10000, loseData: true,
+			wantComplete: false, wantSampled: false, wantDuty: 1, wantUntraced: 0,
+			wantReason: "malformed_lines",
+		},
+		{
+			name: "unknown mode is treated as sampled",
+			mode: "", windowMs: 0, intervalMs: 0,
+			wantComplete: false, wantSampled: true, wantDuty: 0, wantUntraced: 0,
+			wantReason: "sampled_mode",
+		},
+	}
+	for _, testCase := range cases {
+		t.Run(testCase.name, func(t *testing.T) {
+			session := traceSessionLossFixture(testCase.mode, testCase.windowMs, testCase.intervalMs)
+			if testCase.loseData {
+				session.AddParseStats(tracing.ParseStats{Malformed: 1})
+			}
+			view := traceSessionLossView(session)
+			if view["complete"] != testCase.wantComplete {
+				t.Fatalf("complete = %v, want %v (%v)", view["complete"], testCase.wantComplete, view)
+			}
+			if view["capture_is_sampled"] != testCase.wantSampled {
+				t.Fatalf("capture_is_sampled = %v, want %v", view["capture_is_sampled"], testCase.wantSampled)
+			}
+			if view["sampled_mode_gaps"] != testCase.wantSampled {
+				t.Fatalf("sampled_mode_gaps = %v, want %v", view["sampled_mode_gaps"], testCase.wantSampled)
+			}
+			definition, _ := view["complete_definition"].(string)
+			if !strings.Contains(definition, "covered the requested window with no gaps") {
+				t.Fatalf("complete_definition must state the coverage definition: %q", definition)
+			}
+			capture, _ := view["capture"].(map[string]any)
+			if capture == nil {
+				t.Fatalf("capture coverage facts missing: %v", view)
+			}
+			wantMode := "continuous"
+			if testCase.wantSampled {
+				wantMode = "sampled"
+			}
+			if capture["mode"] != wantMode {
+				t.Fatalf("capture.mode = %v, want %v", capture["mode"], wantMode)
+			}
+			duty, _ := capture["duty_cycle"].(float64)
+			if duty != testCase.wantDuty {
+				t.Fatalf("capture.duty_cycle = %v, want %v", duty, testCase.wantDuty)
+			}
+			if capture["untraced_ms_per_interval"] != testCase.wantUntraced {
+				t.Fatalf("capture.untraced_ms_per_interval = %v, want %v", capture["untraced_ms_per_interval"], testCase.wantUntraced)
+			}
+			reasons, _ := view["incomplete_reasons"].([]string)
+			if testCase.wantComplete {
+				if len(reasons) != 0 {
+					t.Fatalf("a complete capture must list no reasons: %v", reasons)
+				}
+				if _, exists := view["note"]; exists {
+					t.Fatalf("a complete capture must not carry a loss note: %v", view["note"])
+				}
+				return
+			}
+			if len(reasons) == 0 {
+				t.Fatalf("an incomplete capture must list its reasons: %v", view)
+			}
+			if testCase.wantReason != "" {
+				found := false
+				for _, reason := range reasons {
+					if reason == testCase.wantReason {
+						found = true
+					}
+				}
+				if !found {
+					t.Fatalf("incomplete_reasons = %v, want %q", reasons, testCase.wantReason)
+				}
+			}
+			if _, exists := view["note"]; !exists {
+				t.Fatalf("an incomplete capture must explain itself: %v", view)
+			}
+		})
+	}
+}
+
+// TestTraceSessionStatusReportsCaptureCoverage checks the same contract through
+// the tools: the default sampled session can never report a complete capture,
+// while a continuous session reports completeness and its full duty cycle, and
+// the default collect=true call leaves the session queryable as live.
+func TestTraceSessionStatusReportsCaptureCoverage(t *testing.T) {
+	sampledFake := newTraceSessionFake(fakeTraceSegment([3]string{"00FF0000", "NOP", ""}))
+	sampledServer := newTestServer(t, sampledFake.client())
+	if result := structured(postToolCall(t, sampledServer, "trace_session_start", `{"cpu":"m68k"}`)); result["code"] != nil {
+		t.Fatalf("sampled start failed: %v", result)
+	}
+	sampled := structured(postToolCall(t, sampledServer, "trace_session_status", `{}`))
+	if sampled["code"] != nil {
+		t.Fatalf("sampled status failed: %v", sampled)
+	}
+	sampledLoss, _ := sampled["loss"].(map[string]any)
+	if sampledLoss == nil {
+		t.Fatalf("sampled loss missing: %v", sampled)
+	}
+	if sampledLoss["complete"] != false {
+		t.Fatalf("a sampled session must never report a complete capture: %v", sampledLoss)
+	}
+	if sampledLoss["capture_is_sampled"] != true || sampledLoss["sampled_mode_gaps"] != true {
+		t.Fatalf("sampled capture flags wrong: %v", sampledLoss)
+	}
+	sampledCapture, _ := sampledLoss["capture"].(map[string]any)
+	if sampledCapture == nil || sampledCapture["mode"] != "sampled" {
+		t.Fatalf("sampled capture facts wrong: %v", sampledLoss)
+	}
+	// Defaults: window_ms 100 of every interval_ms 10000 → a 1 % duty cycle.
+	if sampledCapture["duty_cycle"] != 0.01 || sampledCapture["untraced_ms_per_interval"] != float64(9900) {
+		t.Fatalf("sampled coverage must state the 1%% duty cycle: %v", sampledCapture)
+	}
+	sampledReasons, _ := sampledLoss["incomplete_reasons"].([]any)
+	if len(sampledReasons) != 1 || sampledReasons[0] != "sampled_mode" {
+		t.Fatalf("sampled incomplete_reasons = %v", sampledReasons)
+	}
+	drained, _ := sampled["drained"].(map[string]any)
+	if drained["complete"] != true {
+		t.Fatalf("the drain itself must still be complete: %v", drained)
+	}
+	if definition, _ := drained["complete_definition"].(string); !strings.Contains(definition, "drain cursor") {
+		t.Fatalf("drained.complete must state its own scope: %q", definition)
+	}
+
+	continuousFake := newTraceSessionFake(fakeTraceSegment([3]string{"00FF0000", "NOP", ""}))
+	continuousServer := newTestServer(t, continuousFake.client())
+	started := structured(postToolCall(t, continuousServer, "trace_session_start",
+		`{"cpu":"m68k","mode":"continuous","segment_ms":250}`))
+	if started["code"] != nil {
+		t.Fatalf("continuous start failed: %v", started)
+	}
+	startLoss, _ := started["loss"].(map[string]any)
+	if startLoss["complete"] != true || startLoss["capture_is_sampled"] != false {
+		t.Fatalf("a fresh continuous session is complete: %v", startLoss)
+	}
+	// Two default status calls, each draining, must leave the session live and
+	// its capture complete: collect must never be reported as ending capture.
+	for attempt := 0; attempt < 2; attempt++ {
+		status := structured(postToolCall(t, continuousServer, "trace_session_status", `{}`))
+		if status["code"] != nil {
+			t.Fatalf("continuous status %d failed: %v", attempt, status)
+		}
+		loss, _ := status["loss"].(map[string]any)
+		if loss["complete"] != true || loss["capture_is_sampled"] != false {
+			t.Fatalf("continuous status %d must stay complete: %v", attempt, loss)
+		}
+		if reasons, _ := loss["incomplete_reasons"].([]any); len(reasons) != 0 {
+			t.Fatalf("continuous status %d reported reasons: %v", attempt, reasons)
+		}
+		capture, _ := loss["capture"].(map[string]any)
+		if capture["duty_cycle"] != float64(1) {
+			t.Fatalf("continuous capture duty_cycle = %v, want 1", capture["duty_cycle"])
+		}
+		session, _ := status["session"].(map[string]any)
+		if session["state"] != "live" || session["stopped"] != false {
+			t.Fatalf("collect must not end a continuous session: %v", session["state"])
+		}
+		if events, _ := status["drained"].(map[string]any); events["complete"] != true {
+			t.Fatalf("continuous drain %d incomplete: %v", attempt, events)
+		}
+	}
+}

@@ -68,7 +68,7 @@ func traceSessionToolSpecs() []toolSpec {
 	return []toolSpec{
 		{
 			name:        "trace_session_start",
-			description: "Start a persistent, non-pausing trace session. It remains active until trace_session_stop, processor removal, or an explicitly configured stop_after_vdp_frames threshold; there is no wall-clock expiry, so time spent paused does not consume the frame threshold. The threshold counts completed rendered VDP frames, not instruction executions, and requires a VDP. The monitor may observe the threshold several frames late; vdp_frames_elapsed reports the actual count. Reaching the threshold stops capture, not emulation. The native plugin captures execution trace lines in sampled windows (default) or continuously, and can also record each read/write access. Set access_capture to \"ranges\" to record individual accesses overlapping the configured watches, or \"all\" to record every access; the default \"off\" keeps only aggregate watch counters. Per-access records include monotonic sequence, cycle, PC, direction, width, transferred value, and (by default for ranges) a same-instant register snapshot. Access ranges are filtered natively; execution-trace address filters are post-capture. Storage remains bounded by segment/event/byte caps with explicit loss reporting. Starting a new session retires the previous one. Accepts optional expected_target_generation and control_id.",
+			description: "Start a persistent, non-pausing trace session. It remains active until trace_session_stop, processor removal, or an explicitly configured stop_after_vdp_frames threshold; there is no wall-clock expiry, so time spent paused does not consume the frame threshold. The threshold counts completed rendered VDP frames, not instruction executions, and requires a VDP. The monitor may observe the threshold several frames late; vdp_frames_elapsed reports the actual count. Reaching the threshold stops capture, not emulation. The native plugin captures execution trace lines in sampled windows (default) or continuously, and can also record each read/write access. Set access_capture to \"ranges\" to record individual accesses overlapping the configured watches, or \"all\" to record every access; the default \"off\" keeps only aggregate watch counters. Per-access records include monotonic sequence, cycle, PC, direction, width, transferred value, and (by default for ranges) a same-instant register snapshot. Access ranges are filtered natively; execution-trace address filters are post-capture. Storage remains bounded by segment/event/byte caps with explicit loss reporting; the response's loss object states the completeness contract, where loss.complete is true only for a continuous session with zero loss whereas a sampled session always reports loss.complete false plus loss.capture_is_sampled and loss.capture (window_ms, interval_ms, duty_cycle). Starting a new session retires the previous one. Accepts optional expected_target_generation and control_id.",
 			schema: objectSchema(map[string]any{
 				"cpu":                   enumProperty("Processor to trace.", []string{"m68k", "z80"}),
 				"mode":                  enumProperty("sampled (default) captures window_ms of every interval_ms and leaves the engine untouched in between; continuous keeps the trace writer enabled and rotates only by segment_ms.", []string{"sampled", "continuous"}),
@@ -108,10 +108,10 @@ func traceSessionToolSpecs() []toolSpec {
 		},
 		{
 			name:        "trace_session_status",
-			description: "Report the live trace session and, by default, drain every sealed native segment into the server-side event store first. The response carries the session configuration, native capture counters, per-segment table, watched read/write counter deltas, the bounded store's totals, and a machine-readable loss object (dropped events, malformed/truncated trace lines, evicted undrained segments). Native elapsed_ms is wall-clock telemetry only; sessions have no wall-clock auto-expiry. stop_after_vdp_frames/vdp_frames_elapsed count completed VDP rendered frames, independently of instruction-event counts, and do not advance while paused. Never mutates the target and never pauses the system.",
+			description: "Report the live trace session and, by default, drain every sealed native segment into the server-side event store first. Draining only reads sealed segments and never ends capture: a continuous session keeps tracing across the segment boundary because the plugin re-arms its trace gate after every seal/rotate. The response carries the session configuration, native capture counters, per-segment table, watched read/write counter deltas, the bounded store's totals, and a machine-readable loss object (dropped events, malformed/truncated trace lines, evicted undrained segments). loss.complete is true only when the capture covered the requested window with no gaps: a sampled session is never complete, and loss.capture_is_sampled plus loss.capture (mode, window_ms, interval_ms, duty_cycle, untraced_ms_per_interval) and loss.incomplete_reasons state what was actually captured and why it is or is not complete. Native elapsed_ms is wall-clock telemetry only; sessions have no wall-clock auto-expiry. stop_after_vdp_frames/vdp_frames_elapsed count completed VDP rendered frames, independently of instruction-event counts, and do not advance while paused. Never mutates the target and never pauses the system.",
 			schema: objectSchema(map[string]any{
 				"session_id":           stringProperty("Optional session id; when present it must match the live session."),
-				"collect":              booleanProperty("Drain sealed native segments before reporting (default true)."),
+				"collect":              booleanProperty("Drain sealed native segments before reporting (default true). Draining never disarms capture: a continuous session keeps tracing across the sealed segment boundary."),
 				"max_collect_bytes":    integerProperty(fmt.Sprintf("Per-call drain budget in bytes (default %d, cap %d).", traceSessionDefaultCollectBudget, traceSessionMaxCollectBudget), 1),
 				"request_watch_report": booleanProperty("Request the watchpoint counter report and fold its deltas into the store (default true)."),
 				"context":              contextProperty(),
@@ -120,7 +120,7 @@ func traceSessionToolSpecs() []toolSpec {
 		},
 		{
 			name:        "trace_session_events",
-			description: "Query accumulated trace-session data: bounded execution events and histogram, aggregate watch-counter samples, and—when access_capture was set to \"ranges\" or \"all\"—individual read/write access events with PC, cycle, width, value, and optional registers. Filters and optional JSONL export operate on retained events; access ranges are filtered natively, while execution-address filters are post-capture. Drains native segments first unless collect=false. Never pauses the system.",
+			description: "Query accumulated trace-session data: bounded execution events and histogram, aggregate watch-counter samples, and—when access_capture was set to \"ranges\" or \"all\"—individual read/write access events with PC, cycle, width, value, and optional registers. Filters and optional JSONL export operate on retained events; access ranges are filtered natively, while execution-address filters are post-capture. Drains native segments first unless collect=false; the drain never ends a continuous session. loss.complete means the capture covered the requested window with no gaps, so a sampled session reports loss.complete false with capture_is_sampled and its capture duty cycle; drained.complete is only about this call's drain cursor, not capture coverage. Never pauses the system.",
 			schema: objectSchema(map[string]any{
 				"kind":                   enumProperty("Event kind to select.", []string{"execute", "read", "write", "any"}),
 				"address_range_start":    addressProperty(),
@@ -143,7 +143,7 @@ func traceSessionToolSpecs() []toolSpec {
 				"include_address_counts": booleanProperty("Include the per-address execution histogram (default true)."),
 				"address_limit":          integerProperty(fmt.Sprintf("Inline histogram entries (default %d, cap %d).", traceSessionInlineAddresses, traceSessionMaxInlineAddresses), 1),
 				"export":                 booleanProperty("Store every retained matching event as a versioned JSONL artifact (default false)."),
-				"collect":                booleanProperty("Drain sealed native segments before querying (default true)."),
+				"collect":                booleanProperty("Drain sealed native segments before querying (default true). Draining never disarms capture: a continuous session keeps tracing across the sealed segment boundary."),
 				"max_collect_bytes":      integerProperty(fmt.Sprintf("Per-call drain budget in bytes (default %d, cap %d).", traceSessionDefaultCollectBudget, traceSessionMaxCollectBudget), 1),
 				"context":                contextProperty(),
 			}, nil),
@@ -770,17 +770,18 @@ func traceSessionNativeStatus(tc toolContext) (map[string]any, *toolFailure) {
 // within one per-call byte budget.
 func collectTraceSession(tc toolContext, session *tracing.Session, budget uint64, collect bool, stream string) (map[string]any, *toolFailure) {
 	summary := map[string]any{
-		"requested":    collect,
-		"stream":       streamOrDefault(stream),
-		"bytes_read":   uint64(0),
-		"bytes_parsed": uint64(0),
-		"segments":     uint64(0),
-		"events":       uint64(0),
-		"malformed":    uint64(0),
-		"truncated":    uint64(0),
-		"budget_bytes": budget,
-		"complete":     !collect,
-		"calls":        0,
+		"requested":           collect,
+		"stream":              streamOrDefault(stream),
+		"bytes_read":          uint64(0),
+		"bytes_parsed":        uint64(0),
+		"segments":            uint64(0),
+		"events":              uint64(0),
+		"malformed":           uint64(0),
+		"truncated":           uint64(0),
+		"budget_bytes":        budget,
+		"complete":            !collect,
+		"complete_definition": "drained.complete reports only that this call's drain cursor consumed every sealed segment; it says nothing about capture coverage, which is loss.complete.",
+		"calls":               0,
 	}
 	if !collect {
 		summary["note"] = "collect=false: sealed native segments were left on disk for a later drain."
@@ -923,14 +924,15 @@ func accessCaptureActive(session *tracing.Session) bool {
 // line-delimited but their record contracts, carries, and counters differ.
 func collectTraceSessionAccess(tc toolContext, session *tracing.Session, budget uint64) (map[string]any, *toolFailure) {
 	summary := map[string]any{
-		"stream":       "access",
-		"bytes_read":   uint64(0),
-		"bytes_parsed": uint64(0),
-		"events":       uint64(0),
-		"malformed":    uint64(0),
-		"budget_bytes": budget,
-		"complete":     false,
-		"calls":        0,
+		"stream":              "access",
+		"bytes_read":          uint64(0),
+		"bytes_parsed":        uint64(0),
+		"events":              uint64(0),
+		"malformed":           uint64(0),
+		"budget_bytes":        budget,
+		"complete":            false,
+		"complete_definition": "drained.access.complete reports only that this call's drain cursor consumed every sealed access segment; it says nothing about capture coverage.",
+		"calls":               0,
 	}
 	var readBytes, parsedBytes, events, malformed uint64
 	calls := 0
@@ -1649,21 +1651,59 @@ func traceSessionConsistency(tc toolContext, session *tracing.Session, native ma
 
 // traceSessionLossView renders the explicit loss contract, including whether
 // the retained data is complete.
+//
+// `complete` has exactly one meaning here: the capture covered the requested
+// window with no gaps. A sampled session leaves the processor untraced between
+// its capture windows by construction, so it can never be complete; its
+// coverage is stated in `capture` and `capture_is_sampled` so a consumer can
+// decide what to do with a sample instead of mistaking it for a record.
 func traceSessionLossView(session *tracing.Session) map[string]any {
 	if session == nil {
-		return map[string]any{"complete": true, "note": "no session"}
+		return map[string]any{
+			"complete":           false,
+			"capture_is_sampled": false,
+			"incomplete_reasons": []string{"no_session"},
+			"note":               "no session",
+		}
 	}
 	loss := session.LossView()
-	complete := loss.DroppedEvents == 0 &&
-		loss.MalformedLines == 0 &&
-		loss.TruncatedLines == 0 &&
-		loss.EvictedUnreadSegments == 0 &&
-		loss.DroppedAddressCounts == 0 &&
-		loss.AccessMalformedLines == 0 &&
-		loss.EvictedUnreadAccessSegments == 0 &&
-		loss.AccessSequenceGaps == 0
+	capture := traceSessionCaptureFacts(session)
+	sampled, _ := capture["sampled"].(bool)
+	reasons := make([]string, 0, 4)
+	if sampled {
+		reasons = append(reasons, "sampled_mode")
+	}
+	if loss.DroppedEvents != 0 {
+		reasons = append(reasons, "dropped_events")
+	}
+	if loss.MalformedLines != 0 {
+		reasons = append(reasons, "malformed_lines")
+	}
+	if loss.TruncatedLines != 0 {
+		reasons = append(reasons, "truncated_lines")
+	}
+	if loss.EvictedUnreadSegments != 0 {
+		reasons = append(reasons, "evicted_unread_segments")
+	}
+	if loss.DroppedAddressCounts != 0 {
+		reasons = append(reasons, "dropped_address_counts")
+	}
+	if loss.AccessMalformedLines != 0 {
+		reasons = append(reasons, "access_malformed_lines")
+	}
+	if loss.EvictedUnreadAccessSegments != 0 {
+		reasons = append(reasons, "evicted_unread_access_segments")
+	}
+	if loss.AccessSequenceGaps != 0 {
+		reasons = append(reasons, "access_sequence_gaps")
+	}
+	complete := len(reasons) == 0
 	view := map[string]any{
 		"complete":                       complete,
+		"complete_definition":            "complete is true only when the capture covered the requested window with no gaps: the session ran in continuous mode and every loss counter is zero. Sampled mode leaves the processor untraced between windows, so a sampled session is never complete and reports its coverage in capture.",
+		"incomplete_reasons":             reasons,
+		"capture":                        capture,
+		"capture_is_sampled":             sampled,
 		"dropped_events":                 loss.DroppedEvents,
 		"dropped_address_counts":         loss.DroppedAddressCounts,
 		"dropped_watch_samples":          loss.DroppedWatchSamples,
@@ -1680,12 +1720,57 @@ func traceSessionLossView(session *tracing.Session) map[string]any {
 		"access_sequence_gaps":           loss.AccessSequenceGaps,
 		"access_sequence_gap_samples":    loss.AccessSequenceGapSamples,
 		"notes":                          loss.Notes,
-		"sampled_mode_gaps":              session.Config.Mode == "sampled",
+		"sampled_mode_gaps":              sampled,
 	}
 	if !complete {
-		view["note"] = "The session lost data in at least one dimension; do not present the retained events as a complete record of execution."
+		switch {
+		case sampled && len(reasons) == 1:
+			view["note"] = "Sampled mode leaves the processor untraced between capture windows, so the retained events are a sample of execution, not a complete record; capture.duty_cycle states the fraction of the session that was traced."
+		case sampled:
+			view["note"] = "The session is sampled and lost data in at least one further dimension; the retained events are neither a sample of known coverage nor a complete record. See incomplete_reasons."
+		default:
+			view["note"] = "The session lost data in at least one dimension; do not present the retained events as a complete record of execution. See incomplete_reasons."
+		}
 	}
 	return view
+}
+
+// traceSessionCaptureFacts renders what slice of the emulated timeline the
+// session actually traced, independently of how much was lost. An unknown mode
+// is treated as sampled: claiming continuous coverage is the unsafe direction.
+func traceSessionCaptureFacts(session *tracing.Session) map[string]any {
+	mode := session.Config.Mode
+	if mode != "continuous" {
+		mode = "sampled"
+	}
+	sampled := mode == "sampled"
+	windowMs := session.Config.WindowMs
+	intervalMs := session.Config.IntervalMs
+	dutyCycle := 1.0
+	untracedMs := uint64(0)
+	if sampled {
+		switch {
+		case intervalMs == 0 || windowMs == 0:
+			// A session without a usable window/interval pair cannot claim any
+			// traced fraction.
+			dutyCycle = 0
+			untracedMs = intervalMs
+		case windowMs >= intervalMs:
+			dutyCycle = 1
+		default:
+			dutyCycle = float64(windowMs) / float64(intervalMs)
+			untracedMs = intervalMs - windowMs
+		}
+	}
+	return map[string]any{
+		"mode":                     mode,
+		"sampled":                  sampled,
+		"window_ms":                windowMs,
+		"interval_ms":              intervalMs,
+		"duty_cycle":               dutyCycle,
+		"untraced_ms_per_interval": untracedMs,
+		"note":                     "duty_cycle is the fraction of wall-clock time the processor write was traced (1 in continuous mode); untraced_ms_per_interval is how long each sampled interval runs untraced. Both describe the capture mode, not the data that survived retention.",
+	}
 }
 
 // traceSessionLimitations states the honest capability boundary of the
