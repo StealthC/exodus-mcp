@@ -121,7 +121,7 @@ func traceSessionToolSpecs() []toolSpec {
 		},
 		{
 			name:        "trace_session_events",
-			description: "Query accumulated trace-session data: bounded execution events and histogram, aggregate watch-counter samples, and—when access_capture was set to \"ranges\" or \"all\"—individual read/write access events with PC, cycle, width, value, and optional registers. Filters and optional JSONL export operate on retained events; access ranges are filtered natively, while execution-address filters are post-capture. Drains native segments first unless collect=false; the drain never ends a continuous session. Events page in capture order by cursor: the first page starts at the oldest retained event and each next_cursor resumes strictly after the last returned event's store sequence, so pages advance to exhaustion instead of repeating the oldest window. " + pagingNote + " loss.complete means the capture covered the requested window with no gaps, which is only decidable once the session has ended (loss.final): a running session reports loss.complete false with the reason session_running, a sampled session reports loss.complete false with capture_is_sampled and its capture duty cycle, and loss.estimated_eviction_risk states whether a finite retention cap will run out first. drained.complete is only about this call's drain cursor, not capture coverage. Never pauses the system.",
+			description: "Query accumulated trace-session data: bounded execution events and histogram, aggregate watch-counter samples, and—when access_capture was set to \"ranges\" or \"all\"—individual read/write access events with PC, cycle, width, value, and optional registers. Filters and optional JSONL export operate on retained events; access ranges are filtered natively, while execution-address filters are post-capture. Drains native segments first unless collect=false; the drain never ends a continuous session. Events page in capture order by cursor: the first page starts at the oldest retained event and each next_cursor resumes strictly after the last returned event's store sequence, so pages advance to exhaustion instead of repeating the oldest window. The cursor also carries the event filter, so a later page returns the same filtered events. " + cursorSteppingNote + " " + pagingNote + " loss.complete means the capture covered the requested window with no gaps, which is only decidable once the session has ended (loss.final): a running session reports loss.complete false with the reason session_running, a sampled session reports loss.complete false with capture_is_sampled and its capture duty cycle, and loss.estimated_eviction_risk states whether a finite retention cap will run out first. drained.complete is only about this call's drain cursor, not capture coverage. Never pauses the system.",
 			schema: objectSchema(map[string]any{
 				"kind":                   enumProperty("Event kind to select.", []string{"execute", "read", "write", "any"}),
 				"address_range_start":    addressProperty(),
@@ -146,7 +146,7 @@ func traceSessionToolSpecs() []toolSpec {
 				"export":                 booleanProperty("Store every retained matching event as a versioned JSONL artifact (default false). The artifact descriptor reports truncated_by_store (with truncation_reasons) when events were evicted from the bounded store or a sealed segment was evicted before it was drained, so an export is never mistaken for the whole capture."),
 				"collect":                booleanProperty("Drain sealed native segments before querying (default true). Draining never disarms capture: a continuous session keeps tracing across the sealed segment boundary."),
 				"max_collect_bytes":      integerProperty(fmt.Sprintf("Per-call drain budget in bytes (default %d, cap %d).", traceSessionDefaultCollectBudget, traceSessionMaxCollectBudget), 1),
-				"cursor":                 stringProperty("next_cursor from a previous trace_session_events call; resumes strictly after that event's store sequence in capture order. Omit to start at the oldest retained event. Pages advance, so repeated calls never return the same page."),
+				"cursor":                 stringProperty("next_cursor from a previous trace_session_events call. The cursor carries the session, the event filter, and the position, so a later page needs only the cursor; any filter supplied alongside it must match the cursor. Omit to start at the oldest retained event. Pages advance, so repeated calls never return the same page."),
 				"context":                contextProperty(),
 			}, nil),
 			run: runTraceSessionEvents,
@@ -565,20 +565,34 @@ func runTraceSessionEvents(tc toolContext, args json.RawMessage) map[string]any 
 	if limit > traceSessionMaxInlineEvents {
 		limit = traceSessionMaxInlineEvents
 	}
-	// A cursor resumes strictly after one store sequence. The store sequence is
-	// this server's monotonic event number, so a drain between pages inserts
-	// new events after the cursor instead of shifting the page boundary the way
-	// a row offset in a bounded ring would.
+	// A cursor resumes strictly after one store sequence and carries the filter
+	// that produced the page. The store sequence is this server's monotonic event
+	// number, so a drain between pages inserts new events after the cursor
+	// instead of shifting the page boundary the way a row offset in a bounded
+	// ring would.
 	afterSequence := uint64(0)
-	if parsed.Cursor != "" {
-		cursorSession, cursorSequence, failure := parseTraceEventsCursor(parsed.Cursor)
-		if failure != nil {
-			return failureResult(failure, tc.modern)
+	// The query identity starts as the caller's filter, so the first page issues a
+	// cursor that reproduces exactly this result set.
+	cursorQuery := newTraceEventsCursorQuery(filter)
+	cursorPage := parsed.Cursor != ""
+	if cursorPage {
+		cursorSession, cursorSequence, query, cursorFailure := parseTraceEventsCursor(parsed.Cursor)
+		if cursorFailure != nil {
+			return failureResult(cursorFailure, tc.modern)
 		}
 		if cursorSession != session.ID {
 			return failureResult(invalidCursorFailure(fmt.Sprintf("this cursor pages session %q, not %q", cursorSession, session.ID)), tc.modern)
 		}
 		afterSequence = cursorSequence
+		cursorQuery = query
+		// The cursor is the request: the filter it carries applies unless the
+		// caller re-sent a filter, in which case it must match.
+		if traceSessionFilterArgsSupplied(*parsed) {
+			if conflict := reconcileTraceEventsCursorFilter(filter, cursorQuery); conflict != nil {
+				return failureResult(conflict, tc.modern)
+			}
+		}
+		filter = cursorQuery.filter()
 	}
 	sampleFilter := filter
 	sampleFilter.Limit = limit
@@ -594,8 +608,11 @@ func runTraceSessionEvents(tc toolContext, args json.RawMessage) map[string]any 
 	}
 	nextCursor := ""
 	if page.Remaining > len(inline) && len(sample) > 0 {
-		nextCursor = encodeCursor(traceEventsCursorPrefix,
-			session.ID, strconv.FormatUint(sample[len(sample)-1].StoreSequence, 10))
+		next, nextFailure := encodeTraceEventsCursor(session.ID, sample[len(sample)-1].StoreSequence, cursorQuery.filter())
+		if nextFailure != nil {
+			return failureResult(nextFailure, tc.modern)
+		}
+		nextCursor = next
 	}
 	paging := pagingPage{
 		Returned:   len(inline),
@@ -686,18 +703,168 @@ func runTraceSessionEvents(tc toolContext, args json.RawMessage) map[string]any 
 	return okResult(result, tc.modern)
 }
 
-// parseTraceEventsCursor decodes the (session id, store sequence) cursor of one
-// trace_session_events enumeration.
-func parseTraceEventsCursor(raw string) (string, uint64, *toolFailure) {
-	parts, failure := decodeCursor(raw, traceEventsCursorPrefix, 2)
+// traceEventsCursorQuery is the filter identity of one trace_session_events
+// enumeration. A cursor reproduces it, so a later page returns the same filtered
+// events instead of the unfiltered stream.
+type traceEventsCursorQuery struct {
+	Kind           string `json:"kind"`
+	HasRange       bool   `json:"has_range"`
+	Start          uint64 `json:"start"`
+	End            uint64 `json:"end"`
+	HasCycle       bool   `json:"has_cycle"`
+	CycleMin       uint64 `json:"cycle_min"`
+	CycleMax       uint64 `json:"cycle_max"`
+	Direction      string `json:"direction,omitempty"`
+	HasValueEquals bool   `json:"has_value_equals"`
+	ValueEquals    uint64 `json:"value_equals"`
+	HasValueRange  bool   `json:"has_value_range"`
+	ValueMin       uint64 `json:"value_min"`
+	ValueMax       uint64 `json:"value_max"`
+	HasPrevious    bool   `json:"has_previous"`
+	PreviousEquals uint64 `json:"previous_equals"`
+	HasPC          bool   `json:"has_pc"`
+	PCStart        uint64 `json:"pc_start"`
+	PCEnd          uint64 `json:"pc_end"`
+	HasSequence    bool   `json:"has_sequence"`
+	SequenceMin    uint64 `json:"sequence_min"`
+	SequenceMax    uint64 `json:"sequence_max"`
+}
+
+// newTraceEventsCursorQuery renders the paging-relevant part of one event filter.
+func newTraceEventsCursorQuery(filter tracing.Filter) traceEventsCursorQuery {
+	return traceEventsCursorQuery{
+		Kind:           filter.Kind,
+		HasRange:       filter.HasRange,
+		Start:          filter.Start,
+		End:            filter.End,
+		HasCycle:       filter.HasCycle,
+		CycleMin:       filter.CycleMin,
+		CycleMax:       filter.CycleMax,
+		Direction:      filter.Direction,
+		HasValueEquals: filter.HasValueEquals,
+		ValueEquals:    filter.ValueEquals,
+		HasValueRange:  filter.HasValueRange,
+		ValueMin:       filter.ValueMin,
+		ValueMax:       filter.ValueMax,
+		HasPrevious:    filter.HasPrevious,
+		PreviousEquals: filter.PreviousEquals,
+		HasPC:          filter.HasPC,
+		PCStart:        filter.PCStart,
+		PCEnd:          filter.PCEnd,
+		HasSequence:    filter.HasSequence,
+		SequenceMin:    filter.SequenceMin,
+		SequenceMax:    filter.SequenceMax,
+	}
+}
+
+// filter rebuilds the event filter this cursor pages.
+func (query traceEventsCursorQuery) filter() tracing.Filter {
+	return tracing.Filter{
+		Kind:           query.Kind,
+		HasRange:       query.HasRange,
+		Start:          query.Start,
+		End:            query.End,
+		HasCycle:       query.HasCycle,
+		CycleMin:       query.CycleMin,
+		CycleMax:       query.CycleMax,
+		Direction:      query.Direction,
+		HasValueEquals: query.HasValueEquals,
+		ValueEquals:    query.ValueEquals,
+		HasValueRange:  query.HasValueRange,
+		ValueMin:       query.ValueMin,
+		ValueMax:       query.ValueMax,
+		HasPrevious:    query.HasPrevious,
+		PreviousEquals: query.PreviousEquals,
+		HasPC:          query.HasPC,
+		PCStart:        query.PCStart,
+		PCEnd:          query.PCEnd,
+		HasSequence:    query.HasSequence,
+		SequenceMin:    query.SequenceMin,
+		SequenceMax:    query.SequenceMax,
+	}
+}
+
+// encodeTraceEventsCursor renders the (session, store sequence, filter) token of
+// one trace_session_events page.
+func encodeTraceEventsCursor(sessionID string, storeSequence uint64, filter tracing.Filter) (string, *toolFailure) {
+	encodedQuery, failure := encodeCursorQuery(newTraceEventsCursorQuery(filter))
 	if failure != nil {
-		return "", 0, failure
+		return "", failure
+	}
+	return encodeCursor(traceEventsCursorPrefix, sessionID, strconv.FormatUint(storeSequence, 10), encodedQuery), nil
+}
+
+// parseTraceEventsCursor decodes the (session id, store sequence, filter) cursor
+// of one trace_session_events enumeration.
+func parseTraceEventsCursor(raw string) (string, uint64, traceEventsCursorQuery, *toolFailure) {
+	parts, failure := decodeCursor(raw, traceEventsCursorPrefix, 3)
+	if failure != nil {
+		return "", 0, traceEventsCursorQuery{}, failure
 	}
 	sequence, err := strconv.ParseUint(parts[1], 10, 64)
 	if err != nil || parts[0] == "" {
-		return "", 0, invalidCursorFailure(fmt.Sprintf("%q is not a cursor this server issued", raw))
+		return "", 0, traceEventsCursorQuery{}, invalidCursorFailure(fmt.Sprintf("%q is not a cursor this server issued", raw))
 	}
-	return parts[0], sequence, nil
+	query := traceEventsCursorQuery{}
+	if failure := decodeCursorQuery(parts[2], &query, raw); failure != nil {
+		return "", 0, traceEventsCursorQuery{}, failure
+	}
+	if query.Kind == "" {
+		return "", 0, traceEventsCursorQuery{}, invalidCursorFailure(fmt.Sprintf("%q is not a cursor this server issued", raw))
+	}
+	return parts[0], sequence, query, nil
+}
+
+// traceSessionFilterArgsSupplied reports whether the caller supplied any event
+// filter, which decides between "use the cursor's filter" and "the caller's
+// filter must match the cursor".
+func traceSessionFilterArgsSupplied(parsed traceSessionEventsArgs) bool {
+	return parsed.Kind != "" ||
+		parsed.AddressRangeStart != nil || parsed.AddressRangeEnd != nil ||
+		parsed.CycleMin != 0 || parsed.CycleMax != 0 ||
+		parsed.Direction != "" ||
+		parsed.ValueEquals != nil || parsed.ValueMin != nil || parsed.ValueMax != nil ||
+		parsed.PreviousEquals != nil ||
+		parsed.PCStart != nil || parsed.PCEnd != nil ||
+		parsed.SequenceMin != 0 || parsed.SequenceMax != 0 ||
+		parsed.AddressSpace != ""
+}
+
+// reconcileTraceEventsCursorFilter rejects a caller filter that contradicts the
+// filter a cursor pages, naming the field that differs.
+func reconcileTraceEventsCursorFilter(provided tracing.Filter, cursor traceEventsCursorQuery) *toolFailure {
+	expected := cursor.filter()
+	switch {
+	case provided.Kind != expected.Kind:
+		return cursorConflictFailure("kind", expected.Kind, provided.Kind)
+	case provided.Direction != expected.Direction:
+		return cursorConflictFailure("direction", expected.Direction, provided.Direction)
+	case provided.HasRange != expected.HasRange || (expected.HasRange && (provided.Start != expected.Start || provided.End != expected.End)):
+		return cursorConflictFailure("address_range_start/address_range_end",
+			fmt.Sprintf("%s..%s", canonicalHex(expected.Start), canonicalHex(expected.End)),
+			fmt.Sprintf("%s..%s", canonicalHex(provided.Start), canonicalHex(provided.End)))
+	case provided.HasCycle != expected.HasCycle || (expected.HasCycle && (provided.CycleMin != expected.CycleMin || provided.CycleMax != expected.CycleMax)):
+		return cursorConflictFailure("cycle_min/cycle_max",
+			fmt.Sprintf("%d..%d", expected.CycleMin, expected.CycleMax),
+			fmt.Sprintf("%d..%d", provided.CycleMin, provided.CycleMax))
+	case provided.HasSequence != expected.HasSequence || (expected.HasSequence && (provided.SequenceMin != expected.SequenceMin || provided.SequenceMax != expected.SequenceMax)):
+		return cursorConflictFailure("sequence_min/sequence_max",
+			fmt.Sprintf("%d..%d", expected.SequenceMin, expected.SequenceMax),
+			fmt.Sprintf("%d..%d", provided.SequenceMin, provided.SequenceMax))
+	case provided.HasPC != expected.HasPC || (expected.HasPC && (provided.PCStart != expected.PCStart || provided.PCEnd != expected.PCEnd)):
+		return cursorConflictFailure("pc_start/pc_end",
+			fmt.Sprintf("%s..%s", canonicalHex(expected.PCStart), canonicalHex(expected.PCEnd)),
+			fmt.Sprintf("%s..%s", canonicalHex(provided.PCStart), canonicalHex(provided.PCEnd)))
+	case provided.HasValueEquals != expected.HasValueEquals || (expected.HasValueEquals && provided.ValueEquals != expected.ValueEquals):
+		return cursorConflictFailure("value_equals", expected.ValueEquals, provided.ValueEquals)
+	case provided.HasValueRange != expected.HasValueRange || (expected.HasValueRange && (provided.ValueMin != expected.ValueMin || provided.ValueMax != expected.ValueMax)):
+		return cursorConflictFailure("value_min/value_max",
+			fmt.Sprintf("%d..%d", expected.ValueMin, expected.ValueMax),
+			fmt.Sprintf("%d..%d", provided.ValueMin, provided.ValueMax))
+	case provided.HasPrevious != expected.HasPrevious || (expected.HasPrevious && provided.PreviousEquals != expected.PreviousEquals):
+		return cursorConflictFailure("previous_equals", expected.PreviousEquals, provided.PreviousEquals)
+	}
+	return nil
 }
 
 func runTraceSessionStop(tc toolContext, args json.RawMessage) map[string]any {
