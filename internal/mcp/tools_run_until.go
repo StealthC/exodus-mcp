@@ -36,7 +36,7 @@ func runUntilToolSpecs() []toolSpec {
 	return []toolSpec{
 		{
 			name:        "run_until_breakpoint",
-			description: "Set a one-shot execution breakpoint, run the system until it fires, and pause with the stop evidence: the stop reason, triggering PC, hit count, and registers. The instrument is removed automatically (and audited), so no armed instrumentation is left behind; the call ends paused at the stop. A foreign pause preempts the call with the instrument removed, and a timeout removes it too. Optional `condition`, `break_on_counter`, and `break_counter` match cpu_breakpoint_set; `timeout_ms` bounds the window (default 30000, cap 120000). Runs under exclusive control for the whole window (caller control_id reused, otherwise an internal lock is acquired and released). Accepts optional expected_target_generation and control_id.",
+			description: "Set a one-shot execution breakpoint, run the system until it fires, and pause with the stop evidence: the stop reason, triggering PC, hit count, and registers. Stop provenance is split: `stop_source` says why execution stopped (`instrument` when this call's breakpoint fired, `external` for a foreign pause, `mcp` for an MCP pause, `none` when the window ended without a stop), while `triggering_pc_source` says where the PC came from (`register_read`; the PC is null when no read proved it) and never carries the stop reason (`pc_source` is a deprecated alias with the same value). `debug_event_id` names the structured debug event recorded for the stop (`debug_event_ids` lists every event when the stop produced more than one), so the response joins directly to cpu_debug_events_list. The instrument is removed automatically (and audited), so no armed instrumentation is left behind; the call ends paused at the stop. A foreign pause preempts the call with the instrument removed, and a timeout removes it too. Optional `condition`, `break_on_counter`, and `break_counter` match cpu_breakpoint_set; `timeout_ms` bounds the window (default 30000, cap 120000). Runs under exclusive control for the whole window (caller control_id reused, otherwise an internal lock is acquired and released). Accepts optional expected_target_generation and control_id.",
 			schema: objectSchema(map[string]any{
 				"cpu":                        enumProperty("Processor to break.", []string{"m68k", "z80"}),
 				"address":                    addressProperty(),
@@ -53,7 +53,7 @@ func runUntilToolSpecs() []toolSpec {
 		},
 		{
 			name:        "run_until_watchpoint",
-			description: "Set a one-shot read and/or write watchpoint, run the system until it fires, and pause with the stop evidence: the stop reason, triggering PC, watched address, access direction, hit count, and registers. The instrument is removed automatically (and audited), so no armed instrumentation is left behind; the call ends paused at the stop. A foreign pause preempts the call with the instrument removed, and a timeout removes it too. `access` matches cpu_watchpoint_set (default any); `timeout_ms` bounds the window (default 30000, cap 120000). Runs under exclusive control for the whole window (caller control_id reused, otherwise an internal lock is acquired and released). Accepts optional expected_target_generation and control_id.",
+			description: "Set a one-shot read and/or write watchpoint, run the system until it fires, and pause with the stop evidence: the stop reason, triggering PC, watched address, access direction, hit count, and registers. Stop provenance is split: `stop_source` says why execution stopped (`instrument` when this call's watchpoint fired, `external` for a foreign pause, `mcp` for an MCP pause, `none` when the window ended without a stop), while `triggering_pc_source` says where the PC came from (`register_read`; the PC is null when no read proved it) and never carries the stop reason (`pc_source` is a deprecated alias with the same value). `debug_event_id` names the structured debug event recorded for the stop (`debug_event_ids` lists every event when the stop produced more than one), so the response joins directly to cpu_debug_events_list. The watched range matches access start addresses exactly like cpu_watchpoint_set. The instrument is removed automatically (and audited), so no armed instrumentation is left behind; the call ends paused at the stop. A foreign pause preempts the call with the instrument removed, and a timeout removes it too. `access` matches cpu_watchpoint_set (default any); `timeout_ms` bounds the window (default 30000, cap 120000). Runs under exclusive control for the whole window (caller control_id reused, otherwise an internal lock is acquired and released). Accepts optional expected_target_generation and control_id.",
 			schema: objectSchema(map[string]any{
 				"cpu":                        enumProperty("Processor to watch.", []string{"m68k", "z80"}),
 				"address":                    addressProperty(),
@@ -257,6 +257,9 @@ type runUntilPlan struct {
 	guard            mutationGuard
 	setDetail        map[string]any
 	generationBefore uint64
+	// eventCursor is the highest debug-event id when the window opened; the
+	// stop's events are the ones recorded after it.
+	eventCursor uint64
 }
 
 // runUntil is the shared run-until choreography: arm a one-shot instrument,
@@ -298,6 +301,9 @@ func runUntil(tc toolContext, ac *analysis.Context, plan runUntilPlan) map[strin
 	}
 	windowGuard := mutationGuard{ControlID: controlID}
 	plan.generationBefore = server.target.Generation()
+	// Events recorded after this boundary belong to this window; the tool
+	// reports their ids so a caller can join the response to the event rows.
+	plan.eventCursor = server.lastDebugEventID()
 
 	// 1. Arm the instrument with one-shot semantics.
 	setPayload, _, _, failure := server.executeMutation(tc.ctx, mutationCall{
@@ -399,7 +405,7 @@ func runUntil(tc toolContext, ac *analysis.Context, plan runUntilPlan) map[strin
 		if err := tc.ctx.Err(); err != nil {
 			removal := removeInstrument()
 			data := map[string]any{
-				"stop_source": "none",
+				"stop_source": stopSourceNone,
 				"elapsed_ms":  time.Since(started).Milliseconds(),
 				"poll_count":  polls,
 			}
@@ -417,7 +423,7 @@ func runUntil(tc toolContext, ac *analysis.Context, plan runUntilPlan) map[strin
 		polls++
 		if failure != nil {
 			removal := removeInstrument()
-			data := map[string]any{"stop_source": "unknown"}
+			data := map[string]any{"stop_source": stopSourceUnknown}
 			applyInstrumentRemoval(data, removal)
 			if failure.Data == nil {
 				failure.Data = map[string]any{}
@@ -460,7 +466,7 @@ func runUntil(tc toolContext, ac *analysis.Context, plan runUntilPlan) map[strin
 		if time.Now().After(deadline) {
 			removal := removeInstrument()
 			data := map[string]any{
-				"stop_source":         "none",
+				"stop_source":         stopSourceNone,
 				"last_system_running": status.SystemRunning,
 				"poll_count":          polls,
 				"elapsed_ms":          time.Since(started).Milliseconds(),
@@ -524,15 +530,16 @@ func removalSentence(removal instrumentRemoval) string {
 
 // stopSourceForPause classifies why the system is paused: a managed
 // instrument fired, an MCP run-state action explains it, or an external actor
-// paused the machine.
+// paused the machine. It answers "why did execution stop" only; where the PC
+// came from is reported separately as triggering_pc_source.
 func stopSourceForPause(pauseSource string, stop *stopAttributionInfo) string {
 	switch {
-	case pauseSource == "mcp":
-		return "mcp"
+	case pauseSource == stopSourceMCP:
+		return stopSourceMCP
 	case stop != nil:
-		return "instrument"
+		return stopSourceInstrument
 	default:
-		return "external"
+		return stopSourceExternal
 	}
 }
 
@@ -542,24 +549,39 @@ func runUntilSuccess(tc toolContext, plan runUntilPlan, status *emulatorStatusDa
 	server := tc.server
 	elapsed := time.Since(started).Milliseconds()
 	pauseSource, pauseNote, _, _ := runStateView(server, status)
-	event := server.debugEventForResource(plan.kind, id)
+	// The stop's events are the ones this window recorded; the newest one is
+	// the stop that ended it.
+	windowEvents := server.debugEventsForResourceSince(plan.kind, id, plan.eventCursor)
+	var event *debugEvent
+	if len(windowEvents) > 0 {
+		last := windowEvents[len(windowEvents)-1]
+		event = &last
+	} else if fallback := server.debugEventForResource(plan.kind, id); fallback != nil {
+		event = fallback
+		windowEvents = []debugEvent{*fallback}
+	}
+	stopSource := stopSourceForPause(pauseSource, stop)
 	registers := fetchCPURegisters(tc, plan.cpu)
 	pc, pcSource := stopTriggeringPC(event, registers)
 	result := map[string]any{
-		"stop_reason":       plan.kind + "_hit",
-		"stop_source":       "instrument",
-		"resource_kind":     plan.kind,
-		"resource_id":       id,
-		"hit_count":         stop.HitCount,
-		"one_shot":          true,
-		"pc_source":         pcSource,
-		"address_space":     plan.cpu + "-bus",
-		"pause_source":      pauseSource,
-		"pause_source_note": pauseNote,
-		"system_running":    false,
-		"poll_count":        polls,
-		"elapsed_ms":        elapsed,
-		"note":              "The system is paused at the instrument's stop; call cpu_run to resume.",
+		"stop_reason":   plan.kind + "_hit",
+		"stop_source":   stopSource,
+		"resource_kind": plan.kind,
+		"resource_id":   id,
+		"hit_count":     stop.HitCount,
+		"one_shot":      true,
+		// triggering_pc_source answers "where did the PC come from" on every
+		// surface; pc_source is its deprecated alias and carries the same
+		// value.
+		"triggering_pc_source": pcSource,
+		"pc_source":            pcSource,
+		"address_space":        plan.cpu + "-bus",
+		"pause_source":         pauseSource,
+		"pause_source_note":    pauseNote,
+		"system_running":       false,
+		"poll_count":           polls,
+		"elapsed_ms":           elapsed,
+		"note":                 "The system is paused at the instrument's stop; call cpu_run to resume.",
 	}
 	if pcSource == pcSourceUnknown {
 		// 0x000000 is a plausible vector address; an unreadable PC is reported
@@ -576,8 +598,21 @@ func runUntilSuccess(tc toolContext, plan runUntilPlan, status *emulatorStatusDa
 	if registers != nil {
 		result["registers"] = registers
 	}
+	if len(windowEvents) > 0 {
+		ids := make([]uint64, 0, len(windowEvents))
+		for _, recorded := range windowEvents {
+			ids = append(ids, recorded.ID)
+		}
+		// debug_event_id is the join key back to cpu_debug_events_list; the
+		// array carries every event the stop produced.
+		result["debug_event_id"] = ids[len(ids)-1]
+		if len(ids) > 1 {
+			result["debug_event_ids"] = ids
+		}
+		// event_id predates the debug_event_id name and keeps its value.
+		result["event_id"] = ids[len(ids)-1]
+	}
 	if event != nil {
-		result["event_id"] = event.ID
 		result["configured_access"] = event.AccessDirection
 		// access_direction is the historical name of configured_access and keeps
 		// its old value for compatibility.
@@ -642,13 +677,14 @@ func fetchCPUCurrentPCSourced(tc toolContext, cpu string) (uint64, string) {
 	return 0, pcSourceUnknown
 }
 
-// stopTriggeringPC returns the PC proven for one managed stop. The value the
-// stop event recorded while the CPU was paused at the instrument wins (the PC
-// cannot have moved since), otherwise the registers read in the tool path are
-// used.
+// stopTriggeringPC returns the PC proven for one managed stop and where that
+// value came from. The value the stop event recorded while the CPU was paused
+// at the instrument wins (the PC cannot have moved since) and is still a
+// register read; otherwise the registers read in the tool path are used. The
+// second return value is the PC source, never the stop reason.
 func stopTriggeringPC(event *debugEvent, registers map[string]any) (uint64, string) {
 	if event != nil && event.TriggeringPCSource == pcSourceRegisterRead {
-		return event.TriggeringPC, pcSourceInstrument
+		return event.TriggeringPC, pcSourceRegisterRead
 	}
 	if value, ok := registerPC(registers); ok {
 		return value, pcSourceRegisterRead
@@ -869,4 +905,28 @@ func (server *Server) debugEventForResource(kind string, id uint64) *debugEvent 
 		}
 	}
 	return nil
+}
+
+// lastDebugEventID returns the highest event id handed out so far, or 0. A
+// caller that looks at the events recorded after this boundary observes only
+// the stops produced by its own window.
+func (server *Server) lastDebugEventID() uint64 {
+	server.debugEventsMu.Lock()
+	defer server.debugEventsMu.Unlock()
+	return server.nextEventID
+}
+
+// debugEventsForResourceSince returns the retained events of one managed
+// resource recorded after a boundary id, oldest first. It is the join between a
+// run_until_* window and the events its stop produced.
+func (server *Server) debugEventsForResourceSince(kind string, id, since uint64) []debugEvent {
+	server.debugEventsMu.Lock()
+	defer server.debugEventsMu.Unlock()
+	var out []debugEvent
+	for _, event := range server.debugEvents {
+		if event.ID > since && event.ResourceKind == kind && event.ResourceID == id {
+			out = append(out, event)
+		}
+	}
+	return out
 }

@@ -6,6 +6,7 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/StealthC/exodus-mcp/internal/analysis"
 	"github.com/StealthC/exodus-mcp/internal/bridge"
@@ -34,6 +35,10 @@ type runUntilFake struct {
 	removeErrorCode string
 	// regsError makes regs_get fail, so the triggering PC cannot be read.
 	regsError bool
+	// regsSequence overrides the reported PC per regs_get call (the last value
+	// repeats), so tests can model a PC that moved after the stop was recorded.
+	regsSequence []uint64
+	regsCalls    int
 
 	bpHits    map[uint64]uint64
 	removedBP map[uint64]bool
@@ -149,7 +154,16 @@ func (fake *runUntilFake) execute() func(context.Context, string, map[string]str
 			if fake.regsError {
 				return nil, &bridge.CommandError{Code: "cpu_unavailable", Message: "no processor is available"}
 			}
-			return json.RawMessage("{\"cpu\":\"m68k\",\"byte_order\":\"not-applicable\",\"registers\":{\"pc\":4096,\"d0\":0,\"a7\":16711680}}"), nil
+			pc := uint64(4096)
+			if len(fake.regsSequence) > 0 {
+				index := fake.regsCalls
+				if index >= len(fake.regsSequence) {
+					index = len(fake.regsSequence) - 1
+				}
+				pc = fake.regsSequence[index]
+			}
+			fake.regsCalls++
+			return json.RawMessage("{\"cpu\":\"m68k\",\"byte_order\":\"not-applicable\",\"registers\":{\"pc\":" + strconv.FormatUint(pc, 10) + ",\"d0\":0,\"a7\":16711680}}"), nil
 		case "vdp_status":
 			return json.RawMessage("{\"image_buffer\":{\"last_rendered_frame_token\":0}}"), nil
 		}
@@ -271,14 +285,25 @@ func TestRunUntilBreakpointFiresAndLeavesNoResidue(t *testing.T) {
 	if content["stop_source"] != "instrument" {
 		t.Fatalf("stop_source = %v, want instrument", content["stop_source"])
 	}
-	if content["pc_source"] != "instrument" {
-		t.Fatalf("pc_source = %v, want instrument (the value recorded at the stop)", content["pc_source"])
+	// The PC source says where the value came from (it is a register read on
+	// every surface), never why the CPU stopped.
+	if content["triggering_pc_source"] != "register_read" {
+		t.Fatalf("triggering_pc_source = %v, want register_read", content["triggering_pc_source"])
+	}
+	if content["pc_source"] != content["triggering_pc_source"] {
+		t.Fatalf("pc_source is a deprecated alias and must carry the same value: %v vs %v", content["pc_source"], content["triggering_pc_source"])
 	}
 	if content["pause_source"] != "breakpoint_or_watchpoint" {
 		t.Fatalf("pause_source = %v, want breakpoint_or_watchpoint", content["pause_source"])
 	}
 	if content["event_id"] == nil {
 		t.Fatalf("a debug event must record the stop: %v", content)
+	}
+	if content["debug_event_id"] == nil || content["debug_event_id"] != content["event_id"] {
+		t.Fatalf("debug_event_id must name the recorded event (event_id is the legacy alias): %v / %v", content["debug_event_id"], content["event_id"])
+	}
+	if _, present := content["debug_event_ids"]; present {
+		t.Fatalf("a single-event stop must not report an id array: %v", content["debug_event_ids"])
 	}
 	registers, _ := content["registers"].(map[string]any)
 	if registers["pc"] != float64(4096) {
@@ -315,6 +340,102 @@ func TestRunUntilBreakpointFiresAndLeavesNoResidue(t *testing.T) {
 	}
 	if sweeps, _ := server.audit.Query(analysis.AuditFilter{Tool: "one_shot_sweep"}); len(sweeps) != 0 {
 		t.Fatalf("the sweep must not remove a run_until instrument: %v", sweeps)
+	}
+}
+
+// TestRunUntilEventJoinUsesSharedVocabulary reproduces the live inconsistency
+// where the same stop reported pc_source "instrument" through run_until and
+// triggering_pc_source "register_read" through the event. The stop reason lives
+// in stop_source; the PC source is the same value on both surfaces, and
+// debug_event_id joins them.
+func TestRunUntilEventJoinUsesSharedVocabulary(t *testing.T) {
+	fake := newRunUntilFake(t)
+	fake.fireOnStatusCall = 2
+	// The sweep records the PC while paused at the stop (2882); the tool's own
+	// register read afterwards returns a different value. run_until must reuse
+	// the recorded stop PC and label it as a register read, not re-read a moved
+	// PC and not claim the stop reason as the source.
+	fake.regsSequence = []uint64{2882, 3000}
+	server := fake.server(t)
+
+	result := postToolCall(t, server, "run_until_watchpoint", `{"cpu":"m68k","address":4096,"access":"write","timeout_ms":2000}`)
+	content := structured(result)
+	if result["isError"] == true {
+		t.Fatalf("run_until_watchpoint failed: %v", content)
+	}
+	if content["triggering_pc"] != float64(2882) || content["triggering_pc_source"] != "register_read" {
+		t.Fatalf("tool PC evidence = %v/%v, want 2882/register_read", content["triggering_pc"], content["triggering_pc_source"])
+	}
+	if content["stop_source"] != "instrument" {
+		t.Fatalf("stop_source = %v, want instrument", content["stop_source"])
+	}
+	if content["pc_source"] != "register_read" {
+		t.Fatalf("the pc_source alias must equal triggering_pc_source, got %v", content["pc_source"])
+	}
+
+	eventID := content["debug_event_id"]
+	if eventID == nil {
+		t.Fatalf("run_until must expose the join key: %v", content)
+	}
+	events := structured(postToolCall(t, server, "cpu_debug_events_list", `{"limit":100}`))
+	rows, _ := events["events"].([]any)
+	if len(rows) != 1 {
+		t.Fatalf("expected the one recorded stop event: %v", events)
+	}
+	row, _ := rows[0].(map[string]any)
+	if row["event_id"] != eventID {
+		t.Fatalf("debug_event_id %v does not match the event row %v", eventID, row["event_id"])
+	}
+	if row["triggering_pc"] != content["triggering_pc"] || row["triggering_pc_source"] != content["triggering_pc_source"] {
+		t.Fatalf("the two surfaces disagree: tool=%v/%v event=%v/%v",
+			content["triggering_pc"], content["triggering_pc_source"], row["triggering_pc"], row["triggering_pc_source"])
+	}
+	if row["stop_source"] != content["stop_source"] {
+		t.Fatalf("event stop_source = %v, tool stop_source = %v", row["stop_source"], content["stop_source"])
+	}
+	if row["stop_source"] == "instrument" && row["triggering_pc_source"] == "instrument" {
+		t.Fatalf("the stop reason must never appear as the PC source: %v", row)
+	}
+}
+
+// TestRunUntilDebugEventIDsJoin covers the multi-event form of the join key: a
+// window that produced more than one event reports the newest as
+// debug_event_id plus the full debug_event_ids array.
+func TestRunUntilDebugEventIDsJoin(t *testing.T) {
+	server := newTestServer(t, &fakeBridgeClient{status: newFakeStatus()})
+	kind, id := "watchpoint", uint64(7)
+	older := server.pushDebugEvent(debugEvent{
+		ResourceKind: kind, ResourceID: id, CPU: "m68k", AccessDirection: "write",
+		WatchedAddress: 4096, HitCount: 1, TriggeringPC: 2882, TriggeringPCSource: pcSourceRegisterRead,
+	})
+	cursor := server.lastDebugEventID()
+	if cursor != older {
+		t.Fatalf("cursor = %d, want the last recorded event %d", cursor, older)
+	}
+	first := server.pushDebugEvent(debugEvent{
+		ResourceKind: kind, ResourceID: id, CPU: "m68k", AccessDirection: "write",
+		WatchedAddress: 4096, HitCount: 2, TriggeringPC: 2882, TriggeringPCSource: pcSourceRegisterRead,
+	})
+	second := server.pushDebugEvent(debugEvent{
+		ResourceKind: kind, ResourceID: id, CPU: "m68k", AccessDirection: "write",
+		WatchedAddress: 4096, HitCount: 3, TriggeringPC: 2882, TriggeringPCSource: pcSourceRegisterRead,
+	})
+	result := structured(runUntilSuccess(
+		toolContext{ctx: context.Background(), server: server, modern: true},
+		runUntilPlan{kind: kind, cpu: "m68k", eventCursor: cursor},
+		&emulatorStatusData{SystemRunning: false},
+		id,
+		&stopAttributionInfo{Kind: kind, ResourceID: id, HitCount: 3},
+		instrumentRemoval{Removed: true, Result: instrumentRemovalRemoved},
+		2,
+		time.Now(),
+	))
+	if got, _ := numberAsUint64(result["debug_event_id"]); got != second {
+		t.Fatalf("debug_event_id = %v, want the newest event %d", result["debug_event_id"], second)
+	}
+	ids, _ := result["debug_event_ids"].([]uint64)
+	if len(ids) != 2 || ids[0] != first || ids[1] != second {
+		t.Fatalf("debug_event_ids = %v, want [%d %d] (the pre-window event %d must be excluded)", result["debug_event_ids"], first, second, older)
 	}
 }
 
@@ -367,8 +488,11 @@ func TestRunUntilTriggeringPCUnknownIsNull(t *testing.T) {
 	if result["isError"] == true {
 		t.Fatalf("run_until_breakpoint failed: %v", content)
 	}
+	if content["triggering_pc_source"] != "unknown" {
+		t.Fatalf("triggering_pc_source = %v, want unknown", content["triggering_pc_source"])
+	}
 	if content["pc_source"] != "unknown" {
-		t.Fatalf("pc_source = %v, want unknown", content["pc_source"])
+		t.Fatalf("pc_source = %v, want the deprecated alias to carry the same value", content["pc_source"])
 	}
 	if content["triggering_pc"] != nil || content["triggering_pc_hex"] != nil {
 		t.Fatalf("an unreadable PC must be null, got %v/%v", content["triggering_pc"], content["triggering_pc_hex"])
@@ -719,6 +843,11 @@ func TestNonOneShotBreakpointAttributedButNotRemoved(t *testing.T) {
 	}
 	if event["triggering_pc"] != float64(4096) || event["triggering_pc_source"] != "register_read" {
 		t.Fatalf("the event must carry the PC read at the stop: %v", event)
+	}
+	// The event row carries the same stop vocabulary a run_until response
+	// reports, separate from the PC source.
+	if event["stop_source"] != "instrument" {
+		t.Fatalf("event stop_source = %v, want instrument", event["stop_source"])
 	}
 	// The event agrees with what emulator_status reported for the same pause.
 	if status["pause_source"] != "breakpoint_or_watchpoint" || event["run_state"] != "paused" {

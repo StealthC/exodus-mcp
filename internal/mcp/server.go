@@ -502,15 +502,37 @@ type debugResourceMeta struct {
 	BreakCounter     uint64
 }
 
-// Provenance vocabulary for a stop event's triggering PC. A recorded value is
-// either read from the processor registers while the CPU was paused at the
-// stop (register_read) or unknown; run_until additionally reports instrument
-// when it reuses the value the stop event recorded.
+// Provenance vocabulary for a stop's triggering PC. The value is either read
+// from the processor registers while the CPU was paused at the stop
+// (register_read) or unknown. "Why the CPU stopped" is a separate fact and
+// lives in stop_source, never here.
 const (
-	pcSourceInstrument   = "instrument"
 	pcSourceRegisterRead = "register_read"
 	pcSourceUnknown      = "unknown"
 )
+
+// Provenance vocabulary for why a stop event happened. Every recorded event is
+// a managed instrument stop: the server only records a stop it proved with a
+// managed breakpoint/watchpoint hit counter.
+const (
+	stopSourceInstrument = "instrument"
+	stopSourceExternal   = "external"
+	stopSourceMCP        = "mcp"
+	stopSourceNone       = "none"
+	stopSourceUnknown    = "unknown"
+)
+
+// eventStopSource names why an event exists from its resource kind. An event is
+// only recorded for a managed breakpoint/watchpoint stop, so the same value a
+// run_until_* response reports for its own instrument.
+func eventStopSource(kind string) string {
+	switch kind {
+	case "breakpoint", "watchpoint":
+		return stopSourceInstrument
+	default:
+		return stopSourceUnknown
+	}
+}
 
 // observedDirection derives the direction a stop proves from the access the
 // instrument was configured with. A single-direction watchpoint can only fire
@@ -563,7 +585,11 @@ type debugEvent struct {
 	// read while paused at the stop, unknown when no read succeeded (the
 	// numeric field is then meaningless and rendered as null).
 	TriggeringPCSource string
-	Timestamp          time.Time
+	// StopSource explains why execution stopped (instrument | external | mcp),
+	// never where the PC came from. Every recorded event is a managed
+	// instrument stop.
+	StopSource string
+	Timestamp  time.Time
 	// FirstSeenAt and LastSeenAt bracket a folded duplicate observation.
 	FirstSeenAt time.Time
 	LastSeenAt  time.Time
@@ -675,6 +701,9 @@ func (server *Server) pushDebugEvent(event debugEvent) uint64 {
 	}
 	if event.TriggeringPCSource == "" {
 		event.TriggeringPCSource = pcSourceUnknown
+	}
+	if event.StopSource == "" {
+		event.StopSource = eventStopSource(event.ResourceKind)
 	}
 	now := time.Now().UTC()
 	for index := len(server.debugEvents) - 1; index >= 0; index-- {
