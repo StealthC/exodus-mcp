@@ -54,6 +54,20 @@ authenticated loopback URL streams its raw bytes, optionally by HTTP range.
 The corresponding MCP resource remains available for metadata and bounded
 previews, not as the default bulk transfer mechanism.
 
+## Request transport and error attribution
+
+One request body is bounded at 1 MiB. A larger body is rejected with HTTP 413
+and JSON-RPC `-32600` naming the limit; it is never truncated, because a
+truncated body is indistinguishable from corrupt input and would surface as a
+spurious parse error for a well-formed request.
+
+A body the server cannot decode is answered with `-32700` plus a `data`
+diagnostic: `reason`, `body_bytes`, `snippet`, and the `method` / `tool` and
+`id` recovered from the bytes when they are still present. A bare `parse error`
+is unattributable — with several tools in flight over keep-alive connections a
+client cannot tell which call failed, so a client-side encoding bug looks
+exactly like a transport fault.
+
 ## Test policy
 
 - Maintain fixture-based conformance tests for modern request headers, `_meta`,
