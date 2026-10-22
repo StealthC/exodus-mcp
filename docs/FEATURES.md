@@ -251,8 +251,11 @@ is available; unavailable native features are documented explicitly (see
   annotate every line whose instruction address or operand literal resolves
   against the analysis context's symbols — per-line `symbol` (own address)
   plus `targets` (operand literals that matched), with a documented
-  `annotation_method` (24-bit 68K / 16-bit Z80 bus mask). Symbols from other
-  address spaces never annotate.
+  `annotation_method` (24-bit 68K / 16-bit Z80 bus mask). Annotation matches
+  the processor-bus coordinate, so a symbol stored space-relative
+  (`mem-ram`, `mem-rom`, `z80-bus`, ...) annotates at its resolved bus address;
+  `symbols_set` rejects a space id that has no documented CPU-bus mapping
+  instead of storing an inert symbol.
 - Deterministic processor control: `cpu_pause`, `cpu_run`, `cpu_step_over`,
   `cpu_step_out` — with live running-state reporting.
 - Execution breakpoints: `cpu_breakpoint_set`, `cpu_breakpoint_list`,
@@ -327,7 +330,9 @@ is available; unavailable native features are documented explicitly (see
   `decoded_events`, `unique_addresses`, `blocks`, `edges`) — a trace
   ring/timeout limit is never reported as complete coverage.
 - Symbols: `symbols_set`, `symbols_list`, `symbols_clear`, scoped to an
-  analysis context.
+  analysis context. Every symbol keeps both coordinates — the supplied
+  `space_id` plus address, and the resolved processor-bus `bus_space_id` plus
+  address — and both are echoed by `symbols_set` and `symbols_list`.
 
 ## VDP and graphics (Phase 3)
 

@@ -45,3 +45,45 @@ func TestSetRejectsEmptyNames(t *testing.T) {
 		t.Fatalf("nil batch must be a no-op: %v", err)
 	}
 }
+
+// TestSetPreservesBothCoordinates guards the data model: a symbol stored
+// space-relative must keep the space coordinate the caller supplied next to the
+// resolved processor-bus coordinate. Set previously rebuilt symbols field by
+// field, which silently dropped anything added to Symbol.
+func TestSetPreservesBothCoordinates(t *testing.T) {
+	store := NewStore()
+	written, err := store.Set([]Symbol{{
+		Name:       "score",
+		SpaceID:    "mem-ram",
+		Address:    0x1000,
+		BusSpaceID: "m68k-bus",
+		BusAddress: 0xFF1000,
+	}})
+	if err != nil || written != 1 {
+		t.Fatalf("set failed: %d %v", written, err)
+	}
+	stored := store.List("")[0]
+	if stored.SpaceID != "mem-ram" || stored.Address != 0x1000 {
+		t.Fatalf("space coordinate lost: %+v", stored)
+	}
+	if stored.BusSpaceID != "m68k-bus" || stored.BusAddress != 0xFF1000 {
+		t.Fatalf("bus coordinate lost: %+v", stored)
+	}
+	if spaceID, address, ok := stored.BusCoordinate(); !ok || spaceID != "m68k-bus" || address != 0xFF1000 {
+		t.Fatalf("BusCoordinate() = %q, %#x, %v", spaceID, address, ok)
+	}
+}
+
+// TestBusCoordinateAbsentForLegacySymbol pins the backward-compatibility rule:
+// a symbol written with only SpaceID/Address reports no recorded bus
+// coordinate, so resolution derives it from the space mapping.
+func TestBusCoordinateAbsentForLegacySymbol(t *testing.T) {
+	legacy := Symbol{Name: "main", SpaceID: "m68k-bus", Address: 0x2064}
+	if _, _, ok := legacy.BusCoordinate(); ok {
+		t.Fatalf("legacy symbol must not report a recorded bus coordinate: %+v", legacy)
+	}
+	untyped := Symbol{Name: "raw", Address: 0x100}
+	if _, _, ok := untyped.BusCoordinate(); ok {
+		t.Fatalf("untyped symbol must not report a bus coordinate: %+v", untyped)
+	}
+}

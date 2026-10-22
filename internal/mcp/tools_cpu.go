@@ -79,7 +79,7 @@ func cpuToolSpecs() []toolSpec {
 		},
 		{
 			name:        "symbols_set",
-			description: "Upsert named addresses in an analysis context. Symbols are server-side labels only; emulator state is untouched.",
+			description: "Upsert named addresses in an analysis context. Symbols are server-side labels only; emulator state is untouched. Every symbol is stored with two coordinates: the space the caller supplied (space_id plus the address in that space) and the processor-bus coordinate resolved from it (bus_space_id plus bus address), which is what disassembly and backtrace annotation compare against. The response echoes the stored symbols with both coordinates.",
 			schema: objectSchema(map[string]any{
 				"symbols": map[string]any{
 					"type":        "array",
@@ -89,8 +89,8 @@ func cpuToolSpecs() []toolSpec {
 						"additionalProperties": false,
 						"properties": map[string]any{
 							"name":          stringProperty("Symbol label."),
-							"space_id":      stringProperty("Address space id from memory_spaces_list."),
-							"address_space": stringProperty("Optional domain of this symbol address; omitted means space_id."),
+							"space_id":      stringProperty("Address space id from memory_spaces_list (for example mem-ram, mem-rom, m68k-bus, z80-bus). Validated against the documented CPU-bus mapping; an id without one fails with invalid_params because the symbol could never annotate disassembly. Omit both space_id and address_space for an untyped symbol that applies to the raw address on every processor bus."),
+							"address_space": stringProperty("Optional domain of this symbol address; omitted means space_id. Supplying it without space_id makes that space the symbol's own space."),
 							"address":       addressProperty(),
 						},
 						"required": []string{"name", "address"},
@@ -356,17 +356,10 @@ func annotateDisassemblySymbols(context *analysis.Context, cpu, romSHA256 string
 	}
 	mask := disasmSymbolMask(cpu)
 	spaceID := disasmSpaceID(cpu)
-	byAddress := make(map[uint64]string)
-	for _, symbol := range context.Symbols.ListForROM("", romSHA256) {
-		if symbol.SpaceID != "" && symbol.SpaceID != spaceID {
-			continue
-		}
-		address := symbol.Address & mask
-		if _, exists := byAddress[address]; !exists {
-			byAddress[address] = symbol.Name
-		}
-	}
-	if len(byAddress) == 0 {
+	// Symbols are indexed by their processor-bus coordinate, so a symbol stored
+	// space-relative (mem-ram 0x1000) annotates the instruction at 0xFF1000.
+	symbolIndex := newSymbolBusIndex(context.Symbols, romSHA256, spaceID)
+	if symbolIndex.empty() {
 		return payload, false
 	}
 
@@ -386,14 +379,14 @@ func annotateDisassemblySymbols(context *analysis.Context, cpu, romSHA256 string
 		if line.Comment != "" {
 			entry["comment"] = line.Comment
 		}
-		if name, exists := byAddress[line.Address&mask]; exists {
+		if name, exists := symbolIndex.lookup(line.Address & mask); exists {
 			entry["symbol"] = name
 			applied = true
 		}
 		var targets []symbolTarget
 		for _, literal := range operandHexLiterals(line.Operands) {
 			masked := literal & mask
-			if name, exists := byAddress[masked]; exists {
+			if name, exists := symbolIndex.lookup(masked); exists {
 				targets = append(targets, symbolTarget{Name: name, Address: masked, AddressHex: canonicalHex(masked)})
 			}
 		}
@@ -879,34 +872,11 @@ func runSymbolsSet(tc toolContext, args json.RawMessage) map[string]any {
 	}
 	prepared := make([]storedSymbolInput, 0, len(parsed.Symbols))
 	for index, symbol := range parsed.Symbols {
-		spaceID := symbol.SpaceID
-		inputSpace := symbol.AddressSpace
-		if spaceID == "" {
-			// Untyped symbols historically annotate both CPU buses. Preserve
-			// that behavior; only translate when the caller supplied a domain.
-			var address uint64
-			if inputSpace == "" {
-				address, failure = parseAddress(symbol.Address)
-			} else {
-				address, failure = resolveAddress(symbol.Address, inputSpace, inputSpace)
-			}
-			if failure != nil {
-				return failureResult(&toolFailure{Code: "invalid_params", Message: fmt.Sprintf("symbols[%d].address: %s", index, failure.Message)}, tc.modern)
-			}
-			prepared = append(prepared, storedSymbolInput{Name: symbol.Name, SpaceID: spaceID, Address: address})
-			continue
-		}
-		if inputSpace == "" {
-			inputSpace = spaceID
-		}
-		address, failure := resolveAddress(symbol.Address, inputSpace, spaceID)
+		entry, failure := prepareSymbolInput(tc, index, symbol)
 		if failure != nil {
-			return failureResult(&toolFailure{
-				Code:    "invalid_params",
-				Message: fmt.Sprintf("symbols[%d].address: %s", index, failure.Message),
-			}, tc.modern)
+			return failureResult(failure, tc.modern)
 		}
-		prepared = append(prepared, storedSymbolInput{Name: symbol.Name, SpaceID: spaceID, Address: address})
+		prepared = append(prepared, entry)
 	}
 	romSHA256 := tc.server.currentROMSHA256()
 	bound := toStoreSymbols(prepared, romSHA256)
@@ -915,9 +885,11 @@ func runSymbolsSet(tc toolContext, args json.RawMessage) map[string]any {
 		return failureResult(&toolFailure{Code: "invalid_params", Message: err.Error()}, tc.modern)
 	}
 	result := map[string]any{
-		"upserted":   written,
-		"rom_sha256": romSHA256,
-		"rom_bound":  romSHA256 != "",
+		"upserted":        written,
+		"symbols":         symbolsView(bound),
+		"rom_sha256":      romSHA256,
+		"rom_bound":       romSHA256 != "",
+		"coordinate_note": "Each symbol reports the space the caller supplied (space_id/address) and the processor-bus coordinate annotation uses (bus_space_id/bus_address).",
 	}
 	if romSHA256 == "" {
 		result["note"] = "No readable cartridge was loaded, so these symbols are unbound and apply to any target; reload the ROM and set them again to bind them to a specific cartridge hash."
@@ -927,10 +899,100 @@ func runSymbolsSet(tc toolContext, args json.RawMessage) map[string]any {
 	return okResult(result, tc.modern)
 }
 
+// prepareSymbolInput resolves one caller-supplied symbol into the two
+// coordinates the store keeps: the space the caller named and the processor bus
+// that space maps to. A symbol without any space stays untyped and keeps its
+// historical meaning (raw address, every processor bus). A space id the server
+// cannot map to a CPU bus is rejected here instead of being stored inert.
+func prepareSymbolInput(tc toolContext, index int, symbol symbolInput) (storedSymbolInput, *toolFailure) {
+	spaceID := strings.TrimSpace(symbol.SpaceID)
+	inputSpace := strings.TrimSpace(symbol.AddressSpace)
+	declaredSpaceField := "space_id"
+	if spaceID == "" {
+		declaredSpaceField = "address_space"
+	}
+	if spaceID == "" && inputSpace == "" {
+		address, failure := parseAddress(symbol.Address)
+		if failure != nil {
+			return storedSymbolInput{}, symbolFieldFailure(index, "address", failure.Message)
+		}
+		return storedSymbolInput{Name: symbol.Name, Address: address}, nil
+	}
+	if spaceID == "" {
+		// address_space alone names the space the address lives in.
+		spaceID = inputSpace
+	}
+	busSpaceID, mapped := symbolBusSpaceFor(spaceID)
+	if !mapped {
+		return storedSymbolInput{}, symbolFieldFailure(index, declaredSpaceField, symbolSpaceRejection(tc, spaceID))
+	}
+	if inputSpace == "" {
+		inputSpace = spaceID
+	}
+	// Translate the caller's address into the named space, then into that
+	// space's processor bus. Passing the space as both input and target (the
+	// previous behavior) returned the raw value and left bus symbols inert.
+	spaceAddress, failure := resolveAddress(symbol.Address, inputSpace, spaceID)
+	if failure != nil {
+		return storedSymbolInput{}, symbolFieldFailure(index, "address", failure.Message)
+	}
+	busAddress, failure := resolveAddress(symbol.Address, inputSpace, busSpaceID)
+	if failure != nil {
+		return storedSymbolInput{}, symbolFieldFailure(index, "address_space", failure.Message)
+	}
+	return storedSymbolInput{
+		Name:       symbol.Name,
+		SpaceID:    spaceID,
+		Address:    spaceAddress,
+		BusSpaceID: busSpaceID,
+		BusAddress: busAddress,
+	}, nil
+}
+
+func symbolFieldFailure(index int, field, message string) *toolFailure {
+	return &toolFailure{Code: "invalid_params", Message: fmt.Sprintf("symbols[%d].%s: %s", index, field, message)}
+}
+
+// symbolSpaceRejection explains why a space id cannot carry a symbol. A space
+// the server knows but cannot map is reported with its documented reason; an
+// unknown id is checked against the live catalog so a typo and a genuinely new
+// device space produce different messages.
+func symbolSpaceRejection(tc toolContext, spaceID string) string {
+	if note := symbolSpaceNote(spaceID); note != "" {
+		return fmt.Sprintf("space %q has no CPU-bus coordinate: %s", spaceID, note)
+	}
+	if spaceListedLive(tc, spaceID) {
+		return fmt.Sprintf("space %q exists but has no documented CPU-bus mapping, so a symbol there would never annotate disassembly", spaceID)
+	}
+	return fmt.Sprintf("unknown address space %q; use a space id from memory_spaces_list that has a documented CPU-bus mapping (for example mem-ram, mem-rom, m68k-bus, z80-bus)", spaceID)
+}
+
+// spaceListedLive reports whether the live space catalog contains the id. It is
+// used only to phrase a rejection, so an unavailable bridge is not an error.
+func spaceListedLive(tc toolContext, spaceID string) bool {
+	payload, failure := tc.server.executeCommand(tc.ctx, "mem_spaces", nil)
+	if failure != nil {
+		return false
+	}
+	spaces, ok := payload["spaces"].([]any)
+	if !ok {
+		return false
+	}
+	for _, entry := range spaces {
+		space, ok := entry.(map[string]any)
+		if ok && spaceIDFromEntry(space) == spaceID {
+			return true
+		}
+	}
+	return false
+}
+
 type storedSymbolInput struct {
-	Name    string
-	SpaceID string
-	Address uint64
+	Name       string
+	SpaceID    string
+	Address    uint64
+	BusSpaceID string
+	BusAddress uint64
 }
 
 // toStoreSymbols converts parsed input to stored symbols, stamping each with the
@@ -938,7 +1000,14 @@ type storedSymbolInput struct {
 func toStoreSymbols(inputs []storedSymbolInput, romSHA256 string) []symbols.Symbol {
 	prepared := make([]symbols.Symbol, 0, len(inputs))
 	for _, input := range inputs {
-		prepared = append(prepared, symbols.Symbol{Name: input.Name, SpaceID: input.SpaceID, Address: input.Address, ROMSHA256: romSHA256})
+		prepared = append(prepared, symbols.Symbol{
+			Name:       input.Name,
+			SpaceID:    input.SpaceID,
+			Address:    input.Address,
+			BusSpaceID: input.BusSpaceID,
+			BusAddress: input.BusAddress,
+			ROMSHA256:  romSHA256,
+		})
 	}
 	return prepared
 }
@@ -958,20 +1027,9 @@ func runSymbolsList(tc toolContext, args json.RawMessage) map[string]any {
 	stored := context.Symbols.List(parsed.Filter)
 	views := make([]map[string]any, 0, len(stored))
 	for _, symbol := range stored {
-		view := map[string]any{
-			"name":          symbol.Name,
-			"space_id":      symbol.SpaceID,
-			"address":       symbol.Address,
-			"address_hex":   canonicalHex(symbol.Address),
-			"address_space": symbol.SpaceID,
-			"rom_sha256":    symbol.ROMSHA256,
-			"rom_bound":     symbol.ROMSHA256 != "",
-		}
-		annotateAddressPair(view, symbol.SpaceID, symbol.Address)
-		if width, mask := addressBusWidthMask(symbol.SpaceID); width != 0 {
-			view["address_width_bits"] = width
-			view["address_mask_hex"] = canonicalHex(mask)
-		}
+		view := symbolView(symbol)
+		view["rom_sha256"] = symbol.ROMSHA256
+		view["rom_bound"] = symbol.ROMSHA256 != ""
 		views = append(views, view)
 	}
 	return okResult(map[string]any{
@@ -979,6 +1037,7 @@ func runSymbolsList(tc toolContext, args json.RawMessage) map[string]any {
 		"count":             len(views),
 		"rom_sha256":        tc.server.currentROMSHA256(),
 		"rom_bound_symbols": context.Symbols.CountBound(),
+		"coordinate_note":   "Symbols report the space the caller supplied (space_id/address) and the processor-bus coordinate annotation uses (bus_space_id/bus_address).",
 	}, tc.modern)
 }
 
