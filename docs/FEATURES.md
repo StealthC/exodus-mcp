@@ -184,9 +184,15 @@ claim to the exact test function or smoke-script check that proves it.
   effective-address echo, `system_paused_during_read`, the standardized
   `capture_consistency` object, and decode validation against the declared
   byte order. Optional `capture_mode: "paused"` makes the sample temporally
-  atomic (pauses once, restores); the default `"live"` never pauses.
+  atomic (pauses once, restores); the default `"live"` never pauses. The
+  response echoes the request next to the effective values:
+  `requested_address`/`requested_address_hex`, `requested_address_space` and
+  `address_translated` when the caller addressed through another domain, plus
+  `requested_length`, `effective_length`, and `length_clamped`.
 - `memory_dump`: artifact-first range output with hash and direct URL
-  (8 MiB per-call cap); the summary reports `effective_address`,
+  (8 MiB per-call cap); the summary reports `effective_address`, the request
+  echo (`requested_address`, `requested_address_space`,
+  `requested_length`, `effective_length`, `length_clamped`),
   `system_paused_during_read`, the `capture_consistency` object, and the full
   capture-provenance envelope on the artifact. Optional `capture_mode:
   "paused"` makes the dump a temporally atomic snapshot.
@@ -209,8 +215,12 @@ claim to the exact test function or smoke-script check that proves it.
   artifact (or an existing dump/snapshot by id) — bounded inline matches plus
   a full-results artifact. With `snapshot_id` the space, start address, byte
   length, and byte order **derive from the snapshot's capture provenance**;
-  caller parameters that duplicate provenance are assertions and are rejected
-  with `provenance_conflict` on mismatch. Snapshots without provenance
+  the snapshot is the provenance source, so a caller-supplied
+  `start_address`/`length` inside the captured range **narrows** the search
+  (a subset is a smaller question about the same bytes) and the response
+  echoes `requested_range` next to the `searched_range` it actually scanned,
+  while a window that leaves the captured range stays `provenance_conflict`.
+  Snapshots without provenance
   (legacy) warn as `provenance_unknown` and fall back to caller addressing.
   Patterns support explicit wildcards (`??`/`?` nibble/byte masks) and
   optional power-of-two `alignment`; the result artifact serializes the parsed
@@ -218,6 +228,11 @@ claim to the exact test function or smoke-script check that proves it.
   reproducible, and the exact-byte mode is unchanged. Reports
   `system_paused_during_read` when the snapshot's live read paused the
   system, with a note explaining the flag source when a snapshot is reused.
+  Matches page by cursor: the cursor carries the snapshot id, the searched
+  window, the pattern, and the resume byte offset, so every page after the
+  first reuses the same immutable snapshot (no second read, no resend) and the
+  envelope `{returned, total, truncated, has_more, next_cursor}` walks the
+  result set to exhaustion without repeats or gaps.
 - `memory_diff`: cheat-finder comparison between two consistent snapshots.
   Cell widths byte/word/long with explicit byte order (default big-endian,
   derived from the before snapshot's captured byte order when it has
@@ -229,7 +244,13 @@ claim to the exact test function or smoke-script check that proves it.
   `allow_incompatible_provenance` forces the comparison with a prominent
   warning naming both source manifests — a common address origin is never
   fabricated. Reports both capture ids when the snapshots belong to composite
-  captures. Bounded inline matches plus a `memory-diff-results` artifact.
+  captures. Bounded inline matches plus a `memory-diff-results` artifact, and
+  the same paging envelope as `memory_search`: a cursor names **both snapshot
+  artifacts** plus the cell semantics and the resume byte offset, so a page
+  after the first compares exactly the bytes the first page compared — a fresh
+  after read is stored once and reused (`fresh_after_read` is false on cursor
+  pages) instead of taking another live reading. `requested_comparison` echoes
+  the requested mode/width/byte order next to the `compared_range`.
 - `system_snapshot_capture`: bounded atomic cross-domain snapshot with a
   `system-snapshot/1` artifact manifest, shared capture provenance, explicit
   omitted/unavailable components, and one pause/resume window. **proven** for
@@ -494,7 +515,9 @@ claim to the exact test function or smoke-script check that proves it.
   regions never travel as Base64 through tool responses. Target caps are
   validated server-side (vram 65536, cram 128, vsram 80; length defaults to
   the full buffer); optional `capture_mode: "paused"` makes the sample
-  temporally atomic (one explicit pause/resume cycle).
+  temporally atomic (one explicit pause/resume cycle). The response echoes the
+  request next to the effective values: `requested_address`,
+  `requested_length`, `effective_address`, `effective_length`.
 - `vdp_tile_export`: consecutive 8x8 4bpp patterns as a scaled PNG plus a JSON
   pixel-index artifact, colored through a chosen CRAM palette line with
   optional transparent color 0 (high-nibble-left pixel order). Reports
@@ -603,11 +626,17 @@ claim to the exact test function or smoke-script check that proves it.
   generations before/after (or unknown), ROM identity, originating context,
   control-lock provenance, outcome, structured failures, and created or
   invalidated resource ids, with generation/time/tool/context/control filters,
-  pagination, and retained-window metadata on truncated responses. Externally
+  pagination, and retained-window metadata on truncated responses. Pages by
+  cursor (the monotonic operation id of the last entry, so an entry recorded
+  between pages never duplicates or skips a row) or by offset;
+  `has_more`, `next_cursor`, and `next_offset` agree, and both are null on the
+  last page instead of pointing at an empty page. Reported through the shared
+  `{returned, total, truncated, has_more, next_cursor}` envelope. Externally
   observed run-state transitions are recorded here as `run_state_change`
   events with the observed generation (never advancing it).
 - `context_mutation_log`: the per-context projection of the audit stream
-  (target mutations only; lock lifecycle stays global).
+  (target mutations only; lock lifecycle stays global). Same cursor, envelope,
+  and offset rules as `target_audit_log`.
 - `state_save`, `state_load`, `state_list`: context-scoped system snapshots
   through the emulator's native save-state path (ZIP format), each verified
   with SHA-256 and size and carrying provenance (context, target generation,
@@ -650,8 +679,12 @@ claim to the exact test function or smoke-script check that proves it.
   artifact. Checksum validation is honest about coverage: `complete`,
   `bytes_covered`, `expected_range`, and `cap_reason` (`none` |
   `dump_cap` | `declared_end_beyond_file` | `degenerate_declared_range`) state
-  exactly what was compared, and a partial comparison carries a note that it
-  is NOT full header-checksum validation. The response also reports the
+  exactly what was compared, and the verdict travels with that completeness —
+  `matches` (with `verified: true` and `verdict: "match"`/`"mismatch"`) is only
+  emitted for a complete comparison, while an incomplete one reports
+  `verified: false`, `verdict: "unverified"`, and `unverified_reason` instead of
+  a boolean a consumer could read as "checksum ok". The same rule applies to the
+  file-derived `rom_identity.checksum`. The response also reports the
   standardized `capture_consistency` object for the header reads, and the
   header artifact's legacy `consistency` label is derived from that object
   instead of being stamped as a literal `live`
@@ -689,7 +722,7 @@ claim to the exact test function or smoke-script check that proves it.
 ## Evidence annotations (P2)
 
 - `annotation_create`, `annotation_get`, `annotation_update`, `annotation_delete`: context-scoped evidence store for addresses and ranges. Each annotation carries title, text, tags, category, author/source, confidence, `kind` (`observation` vs `hypothesis`), creation/update timestamps, address space/range (flexible `$`/`0x`/`h` parsing), ROM identity (`rom_sha256`+path) and `target_generation` stamping at creation, and evidence links to artifacts, states, captures, trace events, symbols, and managed debug resources. Hypotheses never promote to symbols automatically.
-- `annotation_list`: bounded, paginated view (default 20, cap 100, `truncated`+`next_offset`) with filters for query substring, tags, category, kind, address space, and staleness (`stale`/`stale_reason` `rom_sha256_mismatch`/`target_generation_mismatch`, `stale_only`/`include_stale` with `stale_excluded` honesty). Preserves history across ROM loads.
+- `annotation_list`: bounded, paginated view (default 20, cap 100, `truncated`+`next_offset`) with filters for query substring, tags, category, kind, address space, and staleness (`stale`/`stale_reason` `rom_sha256_mismatch`/`target_generation_mismatch`, `stale_only`/`include_stale` with `stale_excluded` honesty). Preserves history across ROM loads. Pages by cursor (a keyset anchor on the immutable `created_at`+`id` pair of the last returned annotation, so a concurrent create, edit, or delete never repeats or skips a row) or by offset (mutually exclusive with `cursor`), and reports the shared `{returned, total, truncated, has_more, next_cursor}` envelope; `next_offset` is null on the last page.
 - `annotation_export` / `annotation_import`: versioned `annotation-export/1` artifact (`application/json`, provenance via `genericProvenance`) and import with conflict detection (`overwrite` flag, per-id `conflicts` list, 500-per-context cap). Import honors the same staleness and provenance rules.
 
 ## Advanced debugging (Phase 7)
@@ -714,6 +747,11 @@ claim to the exact test function or smoke-script check that proves it.
   raw snapshot files byte-by-byte (per-byte counts, contiguous diff regions,
   bounded inline before/after hex, first-1KB previews, 8 MiB comparison cap),
   and reports identical true/false plus an artifact-first full report. The
+  verdict includes completeness: `identical` is true only when both snapshot
+  files were compared in full, and a comparison cut by the 8 MiB cap reports
+  `comparison.complete: false`, `verdict_scope: "prefix"`, the truncation
+  reasons, and `file_diff.complete: false` instead of a positive verdict over
+  a prefix. The
   register/memory/VDP semantic sections are reported as explicitly requested
   but not performed: decoding them would require loading each snapshot into
   the emulator (`state_load`, a target mutation), which is out of scope for
@@ -832,9 +870,17 @@ documented in [TRACE-SESSIONS.md](TRACE-SESSIONS.md).
   histogram, filtered by `kind`, `direction`, address/PC/cycle/sequence range,
   and effective value (`value_equals`, `value_min`/`value_max`,
   `previous_equals`); effective-value filters select records without ever
-  dropping a raw event from the store. Optional `trace-session-event/1` /
-  `trace-session-access/1` JSONL artifact with full `artifact-provenance/2`
-  metadata, plus ROM-hash-bound symbol resolution of access PCs.
+  dropping a raw event from the store. Events page in capture order by
+  `cursor`: the first page starts at the oldest retained event and each
+  `next_cursor` resumes strictly after the last returned event's monotonic
+  `store_sequence`, so pages advance to exhaustion instead of returning the
+  same oldest window, and the shared `{returned, total, truncated, has_more,
+  next_cursor}` envelope plus `paging.skipped_evicted` state what was skipped
+  when the bounded store evicted events between pages. Optional
+  `trace-session-event/1` / `trace-session-access/1` JSONL artifact with full
+  `artifact-provenance/2` metadata, plus ROM-hash-bound symbol resolution of
+  access PCs. The artifact descriptor's `truncated_by_store` covers evicted
+  segments (`truncation_reasons` names them), not only inline caps.
 - `trace_session_stop`: final drain of both streams, disable the writers,
   restore the processor's prior trace flags, delete the session's watchpoints
   and segment files, and report the final totals, watch counters, and loss;
@@ -1018,6 +1064,7 @@ named subset are asserted by `internal/mcp/server_test.go`
 | Backtrace heuristics, symbol resolution, frame cap | `internal/mcp/tools_backtrace_test.go` |
 | Register-condition parser and evaluator | `internal/mcp/tools_register_condition_test.go` |
 | Sprite-table chain divergence, cycle detection, paused flag, paging | `internal/mcp/tools_sprite_table_test.go`, `internal/mcp/tools_test.go` |
+| Paging envelope on every list/search/diff tool, cursor paging to exhaustion without repeats or gaps, cursor stability while new operations land between pages, snapshot-range narrowing, request echoes, truncated-diff and incomplete-checksum verdicts, evicted-segment truncation accounting | `internal/mcp/tools_paging_verdict_test.go`, `internal/tracing/paging_test.go` |
 | VDP memory export artifact, defaults, validation, paused mode | `internal/mcp/tools_vdp_export_test.go` |
 | VDP DMA status native observation and unsupported-plugin path; soft-reset interface gating | `internal/mcp/tools_vdp_command_dma_test.go` |
 | Reset tools: hard reload path, older-plugin soft fallback, preconditions | `internal/mcp/tools_reset_test.go` |

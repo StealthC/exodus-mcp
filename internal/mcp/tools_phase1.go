@@ -512,10 +512,44 @@ type memoryReadArgs struct {
 	Context        string         `json:"context"`
 }
 
+// readRequestEcho carries the caller's requested coordinates so a read that
+// translated the address into another domain, or that returned fewer bytes than
+// requested, can state both the request and the effective values.
+type readRequestEcho struct {
+	Address      uint64
+	AddressSpace string
+	Length       uint64
+	HasAddress   bool
+	HasLength    bool
+}
+
+// apply writes the request echo onto one read or dump summary. The effective
+// values already on the summary (effective_address, effective_length) stay the
+// authoritative ones; the requested_* fields are what the caller sent.
+func (echo readRequestEcho) apply(summary map[string]any, targetSpace string, effectiveAddress, effectiveLength uint64) {
+	if echo.HasAddress {
+		summary["requested_address"] = echo.Address
+		summary["requested_address_hex"] = canonicalHex(echo.Address)
+		if echo.AddressSpace != "" {
+			summary["requested_address_space"] = echo.AddressSpace
+			summary["address_translated"] = echo.AddressSpace != targetSpace
+		}
+	}
+	if echo.HasLength {
+		summary["requested_length"] = echo.Length
+	}
+	summary["effective_address"] = effectiveAddress
+	summary["effective_address_hex"] = canonicalHex(effectiveAddress)
+	summary["effective_length"] = effectiveLength
+	if echo.HasLength {
+		summary["length_clamped"] = effectiveLength != echo.Length
+	}
+}
+
 // readMemoryValue executes mem_read and renders the bounded inline
 // representation, returning the value map and any failure. The standardized
 // capture_consistency object is attached from the bridge payload.
-func readMemoryValue(tc toolContext, spaceID string, address uint64, length uint64, representation string, decode *decodeRequest, window *captureWindow) (map[string]any, *toolFailure) {
+func readMemoryValue(tc toolContext, spaceID string, address uint64, length uint64, representation string, decode *decodeRequest, window *captureWindow, echo readRequestEcho) (map[string]any, *toolFailure) {
 	if length < 1 || length > inlineReadCapBytes {
 		return nil, &toolFailure{
 			Code:    "length_exceeds_inline_cap",
@@ -559,6 +593,7 @@ func readMemoryValue(tc toolContext, spaceID string, address uint64, length uint
 		"capture_consistency":       captureConsistencyToMap(window.consistencyFor(tc.server, payload)),
 		"representation":            representation,
 	}
+	echo.apply(value, spaceID, uint64(effective), uint64(len(raw)))
 	annotateAddressPair(value, spaceID, address)
 	if width, mask := addressBusWidthMask(spaceID); width != 0 {
 		value["address_width_bits"] = width
@@ -588,10 +623,17 @@ func readMemoryValue(tc toolContext, spaceID string, address uint64, length uint
 	return value, nil
 }
 
-// readMemory renders one inline read, honoring the optional capture guard.
+// readMemory renders one inline read, honoring the optional capture guard. The
+// request echo is omitted: callers that need it use readMemoryWithEcho.
 func readMemory(tc toolContext, spaceID string, address uint64, length uint64, representation string, decode *decodeRequest, guard captureGuard) map[string]any {
+	return readMemoryWithEcho(tc, spaceID, address, length, representation, decode, guard, readRequestEcho{})
+}
+
+// readMemoryWithEcho renders one inline read together with the echo of the
+// caller's request.
+func readMemoryWithEcho(tc toolContext, spaceID string, address uint64, length uint64, representation string, decode *decodeRequest, guard captureGuard, echo readRequestEcho) map[string]any {
 	return withCaptureGuard(tc, guard, func(window *captureWindow) (map[string]any, *toolFailure) {
-		return readMemoryValue(tc, spaceID, address, length, representation, decode, window)
+		return readMemoryValue(tc, spaceID, address, length, representation, decode, window, echo)
 	})
 }
 
@@ -611,7 +653,11 @@ func runMemoryRead(tc toolContext, args json.RawMessage) map[string]any {
 	if failure != nil {
 		return failureResult(failure, tc.modern)
 	}
-	return readMemory(tc, parsed.Space, address, parsed.Length, parsed.Representation, parsed.Decode, guard)
+	echo := readRequestEcho{HasAddress: true, HasLength: parsed.Length != 0, Length: parsed.Length, AddressSpace: addressSpaceFromArgs(args)}
+	if requested, failure := parseAddress(parsed.Address); failure == nil {
+		echo.Address = requested
+	}
+	return readMemoryWithEcho(tc, parsed.Space, address, parsed.Length, parsed.Representation, parsed.Decode, guard, echo)
 }
 
 func decodeValues(raw []byte, spaceOrder string, decode *decodeRequest) (map[string]any, *toolFailure) {
@@ -708,7 +754,7 @@ type memoryDumpArgs struct {
 // provenance, and renders the bounded summary. The standardized
 // capture_consistency object is derived from the read payload; the optional
 // capture guard overrides it at the result level.
-func memoryDumpValue(tc toolContext, context *analysis.Context, spaceID string, address uint64, length uint64, window *captureWindow) (map[string]any, *toolFailure) {
+func memoryDumpValue(tc toolContext, context *analysis.Context, spaceID string, address uint64, length uint64, window *captureWindow, echo readRequestEcho) (map[string]any, *toolFailure) {
 	if length < 1 || length > dumpCapBytes {
 		return nil, &toolFailure{
 			Code:    "length_out_of_range",
@@ -765,6 +811,7 @@ func memoryDumpValue(tc toolContext, context *analysis.Context, spaceID string, 
 		"sha256":                    stored.SHA256,
 		"provenance_state":          stored.Provenance.State,
 	}
+	echo.apply(summary, spaceID, uint64(effective), uint64(len(raw)))
 	annotateAddressPair(summary, spaceID, address)
 	if width, mask := addressBusWidthMask(spaceID); width != 0 {
 		summary["address_width_bits"] = width
@@ -793,8 +840,12 @@ func runMemoryDump(tc toolContext, args json.RawMessage) map[string]any {
 	if failure = guard.resolve(); failure != nil {
 		return failureResult(failure, tc.modern)
 	}
+	echo := readRequestEcho{HasAddress: true, HasLength: parsed.Length != 0, Length: parsed.Length, AddressSpace: addressSpaceFromArgs(args)}
+	if requested, failure := parseAddress(parsed.Address); failure == nil {
+		echo.Address = requested
+	}
 	return withCaptureGuard(tc, guard, func(window *captureWindow) (map[string]any, *toolFailure) {
-		return memoryDumpValue(tc, context, parsed.Space, address, parsed.Length, window)
+		return memoryDumpValue(tc, context, parsed.Space, address, parsed.Length, window, echo)
 	})
 }
 

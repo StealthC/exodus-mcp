@@ -128,6 +128,13 @@ type AnnotationFilter struct {
 	StaleOnly    bool
 	Offset       int
 	Limit        int
+	// AfterCreatedAt/AfterID form the keyset paging anchor: when AfterCreatedAt
+	// is set, List starts strictly after that (created_at, id) position in the
+	// newest-first order. The anchor is a pair of immutable fields, never an
+	// array index, so a concurrent create, edit, or delete cannot make a page
+	// boundary repeat or skip an annotation.
+	AfterCreatedAt time.Time
+	AfterID        string
 }
 
 // AnnotationUpdate carries the optional fields changed by Update. Nil
@@ -308,6 +315,11 @@ func (store *AnnotationStore) Delete(ctxID, id string) error {
 
 // List returns one filtered page of annotations plus pagination facts. The
 // current target identity drives staleness filtering and flags.
+//
+// Pages are ordered by creation time descending, then by id, and the store's
+// own creation order is irrelevant: the sort key is immutable, so a page
+// boundary anchored on (created_at, id) stays valid while other annotations are
+// created, edited, or deleted.
 func (store *AnnotationStore) List(ctxID string, filter AnnotationFilter, current AnnotationTarget) AnnotationListResult {
 	if filter.Limit <= 0 {
 		filter.Limit = DefaultAnnotationLimit
@@ -336,18 +348,48 @@ func (store *AnnotationStore) List(ctxID string, filter AnnotationFilter, curren
 		}
 		matched = append(matched, ann)
 	}
+	sort.SliceStable(matched, func(left, right int) bool {
+		if matched[left].CreatedAt.Equal(matched[right].CreatedAt) {
+			return matched[left].ID > matched[right].ID
+		}
+		return matched[left].CreatedAt.After(matched[right].CreatedAt)
+	})
 	total := len(matched)
 	result := AnnotationListResult{Total: total, StaleExcluded: staleExcluded}
-	if filter.Offset >= len(matched) {
-		return result
+	if filter.AfterCreatedAt.IsZero() && filter.AfterID == "" {
+		if filter.Offset >= len(matched) {
+			return result
+		}
+		matched = matched[filter.Offset:]
+	} else {
+		// Keyset resume: keep only annotations strictly older than the anchor.
+		start := len(matched)
+		for index, ann := range matched {
+			if annotationAfterAnchor(ann, filter.AfterCreatedAt, filter.AfterID) {
+				start = index
+				break
+			}
+		}
+		matched = matched[start:]
 	}
-	matched = matched[filter.Offset:]
 	if len(matched) > filter.Limit {
 		matched = matched[:filter.Limit]
 		result.Truncated = true
 	}
 	result.Annotations = matched
 	return result
+}
+
+// annotationAfterAnchor reports whether ann sorts strictly after the
+// (createdAt, id) anchor in the newest-first order.
+func annotationAfterAnchor(ann Annotation, anchorTime time.Time, anchorID string) bool {
+	if ann.CreatedAt.Before(anchorTime) {
+		return true
+	}
+	if ann.CreatedAt.After(anchorTime) {
+		return false
+	}
+	return ann.ID < anchorID
 }
 
 // Export returns every annotation of a context, newest first, as a stable
