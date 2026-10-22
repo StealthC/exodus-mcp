@@ -283,7 +283,7 @@ func (executor *experimentExecutor) Call(ctx context.Context, tool string, argum
 	if failure := validateToolArguments(spec, raw); failure != nil {
 		return nil, &experiment.ToolError{Code: failure.Code, Message: failure.Message}
 	}
-	result := injectTargetGeneration(executor.server, injectResultType(spec.run(toolContext{server: executor.server, ctx: ctx, modern: true}, raw), tool))
+	result := injectTargetGeneration(executor.server, injectResultType(spec.run(toolContext{server: executor.server, ctx: ctx, modern: true, invokedAs: tool}, raw), tool))
 	if failed, _ := result["isError"].(bool); failed {
 		content, _ := result["structuredContent"].(map[string]any)
 		code, _ := content["code"].(string)

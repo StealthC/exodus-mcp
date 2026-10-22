@@ -62,6 +62,7 @@ var artifactSchemaVersions = map[string]string{
 	"debug-event":              "debug-event/1",
 	"replay-manifest":          replayManifestVer,
 	"annotation-export":        analysis.AnnotationExportSchema,
+	"sound-status":             "sound-status/1",
 }
 
 // artifactSchemaVersion returns the declared version of one JSON artifact kind.
