@@ -17,34 +17,39 @@ The default is **artifact-first**:
 
 ## Tool result contract
 
-Tools that can produce significant output will return an object shaped like:
+Tools that can produce significant output return a descriptor built by
+`artifactDescriptor` (`internal/mcp/tools.go`):
 
 ```json
 {
   "summary": {
-    "kind": "m68k-disassembly",
+    "kind": "memory-dump",
     "address_space": "m68k-bus",
-    "start_address": "0x000100",
+    "effective_address": 16711680,
+    "byte_length": 4096,
     "byte_order": "big-endian",
-    "lines": 18420,
-    "preview": "000100: move.l d0,(a0)\n...",
-    "preview_truncated": true
+    "sha256": "..."
   },
   "artifact": {
     "id": "art_01J...",
-    "mime_type": "text/plain; charset=utf-8",
+    "kind": "memory-dump",
+    "mime_type": "application/octet-stream",
     "size_bytes": 1124059,
     "sha256": "...",
-    "url": "http://127.0.0.1:8768/artifacts/art_01J...",
-    "resource_uri": "exodus://artifacts/art_01J..."
+    "url": "http://127.0.0.1:8768/artifacts/art_01J...?context=default",
+    "resource_uri": "exodus://artifacts/art_01J...",
+    "provenance_state": "complete",
+    "provenance": { "artifact_schema": "artifact-provenance/2", "...": "..." }
   }
 }
 ```
 
 The exact response is MCP `structuredContent` where the negotiated protocol
 permits it, with a concise `content` text summary for clients that do not parse
-structured results. The artifact ID is opaque and never derived from a user
-file path.
+structured results. Every successful result additionally carries
+`result_type` and `schema_version: "1"` (the *tool response* schema), which is
+independent of the artifact kind schemas below. The artifact ID is opaque and
+never derived from a user file path.
 
 ## Byte-order contract
 
@@ -88,22 +93,140 @@ caller-specified maximum. It is never the implicit default for binary data.
 
 ## HTTP artifact endpoint
 
-The planned endpoint is:
+The endpoint is implemented by `internal/artifact` (`Store.Handler`):
 
 ```text
-GET /artifacts/{artifact-id}
+GET|HEAD /artifacts/{artifact-id}?context={context-id}
 ```
 
-It returns the original content type, `Content-Length`, `ETag` derived from the
-SHA-256, `Accept-Ranges: bytes`, and supports normal HTTP byte-range requests.
-It uses the same local authentication policy as the MCP endpoint. The service
-binds to loopback by default; a remote bind requires explicit configuration,
-authentication, and Origin validation.
+Behavior as implemented:
 
-The endpoint will not accept filesystem paths, glob patterns, or arbitrary
-URLs. IDs are server-generated, capability-like values and artifacts are scoped
-to their analysis context. Retention limits, explicit deletion, and process-exit
-cleanup will prevent unbounded disk growth.
+- `Content-Type` is the stored MIME type; `ETag` is `"sha256-<digest>"`, and
+  `If-None-Match` with that value answers `304 Not Modified`.
+- `Accept-Ranges: bytes` with single-range `Range` support (`206 Partial
+  Content`, `416` plus `Content-Range: bytes */N` on an unsatisfiable range).
+  Multiple ranges in one request are rejected.
+- `Cache-Control: private, max-age=3600`.
+- The context comes from the `?context=` query parameter, or the
+  `X-Exodus-Context` header; an artifact of another context, an unknown id, or
+  a structurally invalid id answers `404`. Every request is subject to the
+  server-wide loopback bind and `Origin` validation
+  (`internal/mcp/server.go`, `Handler`); there is no per-artifact token.
+- `HEAD` returns the same headers without a body.
+
+The endpoint never accepts filesystem paths, glob patterns, or arbitrary URLs.
+IDs are server-generated, capability-like values and artifacts are scoped to
+their analysis context.
+
+Retention today: `--artifact-ttl` / `EXODUS_MCP_ARTIFACT_TTL` expires artifacts
+on a startup sweep and a background sweep (`Store.ExpireOlderThan`). Two
+mechanisms named in earlier revisions are **not implemented**: explicit
+artifact deletion (no tool or HTTP method deletes an artifact) and cleanup at
+process exit (nothing runs on exit), so with unlimited retention the artifact
+directory grows until it is removed by hand.
+
+## Artifact kinds
+
+Every kind below is produced by the listed tool. `schema_version` refers to a
+version field *inside the artifact payload*, not to the tool response schema;
+`none` marks a gap recorded in [Schema version gaps](#schema-version-gaps).
+
+### Raw byte artifacts (`application/octet-stream`)
+
+| Kind | Producer | Payload | `schema_version` |
+| --- | --- | --- | --- |
+| `memory-dump` | `memory_dump` | Requested address range, address order | none (raw bytes) |
+| `memory-snapshot` | `memory_search`, `memory_diff` (internal snapshot), `memory_snapshot_capture` (per named range) | Consistent snapshot bytes | none (raw bytes) |
+| `rom-header` | `rom_info` | 256 header bytes read at cart offset `0x100` | none (raw bytes) |
+| `vdp-memory-export` | `vdp_memory_export` | Requested VRAM/CRAM/VSRAM range, device order | none (raw bytes) |
+| `vdp-cram`, `vdp-vsram`, `vdp-vram` | `vdp_capture` | Device buffers copied during the capture | none (raw bytes) |
+| `system-memory` | `system_snapshot_capture` | One named memory range | none (raw bytes) |
+| `system-vdp-cram`, `system-vdp-vsram`, `system-vdp-vram` | `system_snapshot_capture` | VDP buffers copied inside the pause window | none (raw bytes) |
+| `audio-capture` | `audio_capture` | RIFF/WAVE PCM (declared `little-endian PCM`, sample-interleaved) | n/a — **never produced**: the pinned plugin answers every `audio_capture` call with `audio_unavailable` |
+
+### Image artifacts
+
+| Kind | Producer | MIME | Payload | `schema_version` |
+| --- | --- | --- | --- | --- |
+| `frame-capture` | `frame_capture`, `vdp_capture` (frame component) | `image/png` | Rendered frame | none (PNG) |
+| `vdp-tiles` | `vdp_tile_export` | `image/png` | Scaled tile strip, CRAM palette line | none (PNG) |
+| `vdp-plane` | `vdp_plane_export` | `image/png` | Rendered scroll plane | none (PNG) |
+| `vdp-palette` | `vdp_palette_export` | `image/png` | Four 16-color swatch lines | none (PNG) |
+| `system-frame` | `system_snapshot_capture` | `image/png` | Frame captured inside the pause window | none (PNG) |
+
+### Text and JSONL artifacts
+
+| Kind | Producer | MIME | Payload | `schema_version` |
+| --- | --- | --- | --- | --- |
+| `cpu-trace` | `cpu_trace_capture`, `cpu_trace_capture_watchpoint` | `text/plain; charset=utf-8` | Human-readable engine trace lines | none (text) |
+| `experiment-output` | `experiment_run` | `text/plain; charset=utf-8` | Capped, sanitized script stderr | none (text) |
+| `cpu-trace-jsonl` | `cpu_trace_capture`, `cpu_trace_capture_watchpoint` | `application/jsonl` | One JSON object per executed instruction | `trace-event/1` per line (`cpu`, `address_space`, `pc`, `pc_hex`, `cycle`, `target_generation`, `capture_id`, optional `frame_token`, `mnemonic`, `operands`, `opcode_bytes`/`opcode_bytes_hex`, `instruction_length`, `decode_confidence`, and a `control_flow` object whose facts are `null`/`unknown` when the trace does not provide them) |
+| `trace-session-jsonl` | `trace_session_events`, `trace_session_stop` | `application/jsonl` | Every retained session event | `trace-session-event/1` for execution/watches, `trace-session-access/1` for access records |
+
+### JSON documents
+
+| Kind | Producer | Payload | `schema_version` |
+| --- | --- | --- | --- |
+| `memory-search-results` | `memory_search` | `kind`, `address_space`, `pattern_hex`, `pattern_mask_hex`, `pattern_length_bytes`, `alignment`, `interpretation`, `source_snapshot`, `source_range`, `range{start_address,byte_length}`, `matches_total`, `truncated`, `addresses`, `parsed_pattern` | none — has `kind` only |
+| `memory-diff-results` | `memory_diff` | `kind`, `mode`, `width`, `width_bytes`, `byte_order`, `alignment`, `interpretation`, `range`, `before_snapshot`, `after_snapshot`, `fresh_after_read`, `matches_total`, `truncated`, `matches`, optional `provenance_warning`, `before_capture_id`, `after_capture_id`, `capture_consistency`, mode value fields | none — has `kind` only |
+| `cpu-coverage` | `cpu_coverage_capture` | Executed addresses with counts, instruction-aware `blocks`, observed `edges`, legacy `ranges`, filters, truncation facts | `cpu-coverage/2` |
+| `debug-event` | any managed breakpoint/watchpoint stop | `kind` is `"watchpoint-event"` (the artifact kind is `debug-event`), plus `event_id`, `resource_kind`, `resource_id`, `context_id`, `cpu`, `triggering_pc`(+hex), `address_space`, `watched_address`(+hex), `access_direction`, `requested_length`, `hit_count`, `target_generation`, `timestamp`, optional `frame_token`, explicit `null` access width/values with a note | `debug-event/1` |
+| `experiment-manifest` | `experiment_run` | `experiment_id`, `script{name,kind,sha256}`, `context_id`, `started_at`, `duration_ms`, `status`, `exit_code`, `arguments`, `initial_state_id`, `final_state_id`, `summary`, `steps`, `artifacts`, `error` | none |
+| `annotation-export` | `annotation_export` | Export time, target ROM identity, target generation, annotations with their creation stamps and evidence links | `annotation-export/1` |
+| `replay-manifest` | `deterministic_replay` | Both runs, per-step frame tokens, final registers, named checks, methodology | `replay-manifest/1` |
+| `state-diff-results` | `state_diff` | Snapshot metadata and byte-level diff report | none — has `kind` only |
+| `capture-manifest` | `memory_snapshot_capture` | `kind`, `capture_id`, `capture_consistency`, `pause_resume_cycle`, generations, `rom_identity`, `space`, `ranges`, `internal_lock_acquired` | none — has `kind` only |
+| `system-snapshot-manifest` | `system_snapshot_capture` | `schema_version`, `kind`, `capture_id`, `captured_at`, `capture_consistency`, generations, `rom_identity`, `byte_order`, `components`, `artifacts` | `system-snapshot/1` |
+| `system-render-manifest` | `system_snapshot_capture` | `schema_version`, `capture_id`, and references to the frame, status, palette, scroll, and sprite components | `render-manifest/1` |
+| `system-m68k-registers`, `system-z80-registers`, `system-vdp-status` | `system_snapshot_capture` | The raw native command payload, pretty-printed | none |
+| `vdp-status` | `vdp_capture` | The raw native `vdp_status` payload (24 registers plus decoded fields) | none |
+| `vdp-capture-manifest` | `vdp_capture` | `kind`, `capture_id`, `captured_at`, `capture_consistency`, `components`, `artifacts`, `artifact_count`, `vdp_status` | none — has `kind` only |
+| `vdp-render-manifest` | `vdp_capture` | `kind`, `capture_id`, and four note-only sections (`display_geometry`, `palette_state`, `sprite_state`, `scroll_state`) | none — has `kind` only |
+| `vdp-palette-json` | `vdp_palette_export` | `kind`, `color_format`, `byte_order`, `lines` (four lines of 16 `{index,word,rgb333_r_g_b,rgb888_hex}`) | none — has `kind` only |
+| `vdp-tiles-json` | `vdp_tile_export` | `kind`, `pixel_order` (`high-nibble-left`), `byte_order`, `palette_line`, `tiles[]` (`index`, VRAM `address`, 8x8 row-major pixel indices) | none — has `kind` only |
+| `vdp-plane-json` | `vdp_plane_export` | `kind`, `plane`, `byte_order`, `name_entry_format`, `name_table_base`, `size_cells`, `distinct_tiles`, `priority_entries`, `invalid_entries`, `truncated` | none — has `kind` only |
+| script-defined (for example `experiment-observations`) | `experiment_run` script `artifact` message | Bounded derived bytes declared by the script (kind must match `^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$`, MIME type parsed and validated) | script-declared |
+
+## Provenance envelope
+
+Every artifact produced from capture data carries `artifact-provenance/2`
+(`ProvenanceSchema` in `internal/artifact/artifact.go`) with
+`state: "complete"`. An artifact
+whose producer attached no metadata is reported as `provenance_unknown` by
+`artifact_describe` and by the descriptor (`provenance_state`), and no field is
+invented. The envelope fields are:
+
+- `kind`, `state`, `artifact_schema`;
+- address domain: `start_address`, `effective_address` (decimal), the matching
+  `*_hex` canonical forms, `byte_length`, `address_space`, `space_kind`
+  (`bus` / `memory` / `timed-buffer`), `device`;
+- decoding: `byte_order`, `raw_byte_ordering` (`address-order` or the producer's
+  layout note);
+- target identity: `target_generation`, `rom_sha256`/`rom_path` when the file is
+  readable from the server host;
+- capture identity: `capture_id`, `frame_token`, `captured_at`,
+  `cpu_run_state`;
+- `capture_consistency` (`state` = `live` | `paused` | `atomic` |
+  `state_restored` | `composite_non_atomic`, pause/resume facts, initial/final
+  run states and frame tokens, note).
+
+## Schema version gaps
+
+These kinds carry no `schema_version`, so a consumer cannot detect a shape
+change. This document records them; adding the field is separate work:
+
+- `memory-search-results`, `memory-diff-results`, `experiment-manifest`,
+  `state-diff-results`, `capture-manifest`, `vdp-capture-manifest`,
+  `vdp-render-manifest`, `vdp-status`, `vdp-palette-json`, `vdp-tiles-json`,
+  `vdp-plane-json`, `system-m68k-registers`, `system-z80-registers`,
+  `system-vdp-status`.
+- Script-published experiment artifacts declare no schema version by design;
+  the script owns their shape.
+
+Raw byte, image, and text artifacts (including `cpu-trace`, `cpu-trace-jsonl`
+lines, and WAV) have no embedded header of our own, so they are deliberately
+out of scope for this gap list; `cpu-trace-jsonl` lines and
+`trace-session-jsonl` lines *do* carry a per-line schema.
 
 ## Sanitization and safety
 
@@ -118,22 +241,14 @@ cleanup will prevent unbounded disk growth.
 - A script may process artifacts directly, but its output returns through the
   same bounded summary/artifact policy.
 
-## Recognized artifact kinds
-
-| Kind | Producer | MIME | Contents |
-| --- | --- | --- | --- |
-| `memory-dump` | `memory_dump` | `application/octet-stream` | Raw memory range bytes |
-| `memory-snapshot` | `memory_search` (internal) | `application/octet-stream` | Consistent raw snapshot of the searched range |
-| `memory-search-results` | `memory_search` | `application/json` | Space, pattern, byte-order note, searched range, match addresses |
-| `cpu-trace` | `cpu_trace_capture`, `cpu_trace_capture_watchpoint` | `text/plain; charset=utf-8` | Executed instruction trace lines |
-| `cpu-coverage` | `cpu_coverage_capture` | `application/json` | Executed addresses, merged ranges, page histogram |
-| `rom-header` | `rom_info` | `application/octet-stream` | 256-byte cartridge header region at cart offset 0x100 |
-| `experiment-manifest` | `experiment_run` | `application/json` | Reproducible run metadata: script name/kind/SHA-256, arguments, per-step results (capped), artifacts produced, status and error |
-| `experiment-output` | `experiment_run` | `text/plain; charset=utf-8` | Capped, sanitized script stderr for diagnostics |
-| script-defined (`experiment-observations`, …) | `experiment_run` script `artifact` message | script-declared (validated) | Bounded derived bytes published by the script, one artifact per message |
-
 ## Testing requirements
 
 Artifact tests must cover: stable ID lookup, authentication, unknown IDs,
 context isolation, MIME type, byte count, SHA-256, byte ranges, cleanup, and
-the absence of raw bulk data from the default tool result.
+the absence of raw bulk data from the default tool result. Per-artifact
+authentication is not implemented (only loopback binding plus `Origin`
+validation); the remaining items are covered by `internal/artifact/artifact_test.go`
+(roundtrip, context scoping, preview caps and modes, text sanitization, TTL
+expiry, HTTP full and range requests with `ETag`, startup sweep, and
+`provenance_unknown` versus stamped provenance) and by
+`internal/mcp/server_test.go` `TestRejectsForeignOrigin` for origin handling.
