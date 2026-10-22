@@ -132,6 +132,7 @@ private:
 	void FinishTraceSessionLocked(const std::string& stopReason);
 	void SealTraceSessionSegmentLocked(bool closeFile);
 	void RotateTraceSessionSegmentLocked(bool rotateAccessStream);
+	void ArmTraceSessionTraceLocked();
 	void EvictTraceSessionSegmentsLocked();
 	bool HasSealedTraceSessionSegmentLocked(unsigned int fromSegment) const;
 	void SealTraceSessionAccessSegmentLocked();

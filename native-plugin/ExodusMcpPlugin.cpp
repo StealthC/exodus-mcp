@@ -4096,6 +4096,7 @@ void ExodusMcpPlugin::TraceSessionThread()
 			if (_traceSessionActive && _traceSessionCapturing)
 			{
 				RotateTraceSessionSegmentLocked(true);
+				ArmTraceSessionTraceLocked();
 			}
 			LeaveCriticalSection(&_traceSessionLock);
 			continue;
@@ -4222,6 +4223,24 @@ void ExodusMcpPlugin::RotateTraceSessionSegmentLocked(bool rotateAccessStream)
 	if (rotateAccessStream && _traceSessionAccessEnabled)
 	{
 		RotateTraceSessionAccessSegmentLocked();
+	}
+}
+
+//----------------------------------------------------------------------------------------------------------------------
+void ExodusMcpPlugin::ArmTraceSessionTraceLocked()
+{
+	// A seal/rotate boundary closes the engine's trace file, so the caller
+	// disables the trace gate first and lets one commit interval flush. Only the
+	// sampled window path used to re-arm the gate afterwards; a continuous
+	// session therefore stopped recording after its first drain while still
+	// reporting capturing: true. Every continuous rotation re-arms it here.
+	if (!_traceSessionActive || !_traceSessionCapturing || _traceSessionMode != "continuous" || _traceSessionProcessor == 0)
+	{
+		return;
+	}
+	if (!_traceSessionProcessor->GetTraceEnabled())
+	{
+		_traceSessionProcessor->SetTraceEnabled(true);
 	}
 }
 
@@ -4804,6 +4823,11 @@ bool ExodusMcpPlugin::BuildTraceSessionDrainData(const BridgeRequest& request, s
 		if (_traceSessionMode == "continuous")
 		{
 			RotateTraceSessionSegmentLocked(true);
+			// The gate above was disabled only to flush the closing file. A
+			// continuous session must keep recording after the drain; without
+			// this the first drain silently ends capture while the status still
+			// reports capturing: true.
+			ArmTraceSessionTraceLocked();
 		}
 		else
 		{

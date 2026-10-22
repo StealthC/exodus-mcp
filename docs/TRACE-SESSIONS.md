@@ -62,6 +62,15 @@ Consequences that shape the API:
   Use it for short, focused sessions; at ~7.6 MHz a 68K emits millions of lines
   per second.
 
+Either mode keeps capturing after a drain. Sealing a segment disables the
+engine's trace gate for one commit interval (8 ms) so its pending entries are
+flushed and the file can be read; in continuous mode the plugin re-arms the gate
+as soon as it has rotated to the next segment, so the default `collect: true` of
+`trace_session_status` and `trace_session_events` never ends a capture. The
+instructions executed during that flush interval are not traced and are not
+counted as loss, so `complete` describes the capture mode plus the accounted
+loss, not cycle-exact continuity.
+
 Segments are plain engine trace files (execution) and per-access log files
 (`access-NNNNNN.log`, contract in
 [`MemoryAccessLog.h`](../vendor/exodus/ExodusSDK/Processor/MemoryAccessLog.h)).
@@ -105,9 +114,12 @@ machine:
 
 `trace_session_drain` returns the oldest not-yet-drained sealed segment of the
 selected `stream` (`trace` default, `access`) in chunks (default 1 MiB, max
-8 MiB) with a persistent per-stream cursor. `trace_session_stop` disables both
-writers, restores the processor's prior trace flags, deletes the session's
-watchpoints and (by default) its segment files.
+8 MiB) with a persistent per-stream cursor. `drained.complete` (and
+`drained.access.complete`) report only that the call's drain cursor consumed
+every sealed segment of that stream; they say nothing about capture coverage,
+which is `loss.complete`. `trace_session_stop` disables both writers, restores
+the processor's prior trace flags, deletes the session's watchpoints and (by
+default) its segment files.
 
 ## Server-side event store
 
@@ -127,9 +139,18 @@ watchpoints and (by default) its segment files.
   `evicted_access_segments`, `evicted_access_bytes`, and
   `evicted_unread_access_segments` are reported separately from the execution
   trace counters, so a caller can tell which stream lost data.
-- **Explicit loss object.** Every response carries `loss` with `complete: false`
-  plus the reason list when anything was lost, and the native notes that explain
-  it.
+- **Explicit loss object.** Every response carries `loss`. `loss.complete` has
+  exactly one meaning: *the capture covered the requested window with no gaps*.
+  It is true only for a continuous session whose loss counters are all zero.
+  Sampled mode deliberately leaves the processor untraced between windows, so a
+  sampled session always reports `loss.complete: false` together with
+  machine-readable coverage — `capture_is_sampled`, `sampled_mode_gaps`,
+  `incomplete_reasons`, and `capture` (`mode`, `window_ms`, `interval_ms`,
+  `duty_cycle` as the traced fraction of wall-clock time, and
+  `untraced_ms_per_interval`). A caller that needs a full execution record must
+  use `mode: "continuous"` and require `complete: true` with an empty
+  `incomplete_reasons`; a caller that accepts a sample should read
+  `capture.duty_cycle` instead of treating the events as continuous history.
 - **Retention across sessions.** Starting a new session retires the previous one
   and reports what it discarded (`retired_session`).
 
@@ -229,6 +250,12 @@ file paths make safe.
   `capture_consistency` object).
 - `session.capture_consistency.state` is `live_windowed`: capture never paused
   the CPU for the capture itself.
+- `loss`: `complete`, `complete_definition`, `incomplete_reasons`,
+  `capture_is_sampled`, `sampled_mode_gaps`, `capture` (`mode`, `sampled`,
+  `window_ms`, `interval_ms`, `duty_cycle`, `untraced_ms_per_interval`), plus the
+  per-dimension counters (`dropped_events`, `dropped_address_counts`,
+  `malformed_lines`, `truncated_lines`, `evicted_*`, the access-stream counters,
+  `access_sequence_gaps`, and the native `notes`).
 
 ## Validation
 
@@ -246,7 +273,9 @@ file paths make safe.
 - `internal/mcp` tool tests cover the full start → status → events → stop
   lifecycle, access capture and drain, effective filters, symbol suppression,
   manifest recovery, drain budgeting, watch encoding, artifact export and
-  provenance, and the debug event history's duplicate/gap semantics.
+  provenance, the debug event history's duplicate/gap semantics, and mode-aware
+  completeness (`loss.complete` is never true for a sampled session and states
+  its coverage in `loss.capture`).
 - Live validation exercises the native streams: `live-smoke.sh --full` starts a
   session with `access_capture: "ranges"`, asserts the native access stream is
   reported, checks that per-access writes accumulate with no sequence gaps, and
