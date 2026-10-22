@@ -2,11 +2,14 @@
 package mcp
 
 import (
+	"bytes"
 	"context"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"net/url"
 	"os"
@@ -29,6 +32,18 @@ const (
 	LegacyProtocolVersion = "2025-11-25"
 	serverName            = "exodus-mcp"
 	statusCacheTTL        = 5 * time.Second
+
+	// maxRequestBodyBytes bounds one JSON-RPC request envelope. A memory_write
+	// or experiment_run payload is the largest legitimate request; the bound
+	// keeps a client from streaming unbounded data into memory. A body over the
+	// bound is rejected explicitly and never truncated: truncating it turns a
+	// well-formed request into undecodable bytes, which the client then sees as
+	// an unexplained "parse error".
+	maxRequestBodyBytes = 1 << 20
+
+	// parseErrorSnippetBytes is how much of an undecodable body the -32700
+	// diagnostic quotes back so the failing payload is identifiable.
+	parseErrorSnippetBytes = 160
 )
 
 type request struct {
@@ -259,15 +274,38 @@ func metricsHandler(server *Server, w http.ResponseWriter, r *http.Request) {
 
 func dispatch(server *Server, w http.ResponseWriter, r *http.Request) {
 	defer r.Body.Close()
-	body, err := io.ReadAll(io.LimitReader(r.Body, 1<<20))
+	// MaxBytesReader, not a bare LimitReader: an oversized body has to fail as
+	// oversized. A silent truncation would answer a well-formed request with
+	// -32700, the same code a genuinely malformed body earns, leaving the
+	// client no way to tell a size problem from its own encoding bug.
+	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, maxRequestBodyBytes))
 	if err != nil {
-		writeError(w, http.StatusBadRequest, nil, -32700, "unable to read request", nil)
+		var oversized *http.MaxBytesError
+		if errors.As(err, &oversized) {
+			log.Printf("mcp: rejecting request body from %s: larger than the %d-byte limit", r.RemoteAddr, maxRequestBodyBytes)
+			data := map[string]any{"limit_bytes": maxRequestBodyBytes}
+			appendRequestIdentity(data, body)
+			writeError(w, http.StatusRequestEntityTooLarge, salvageID(body), -32600,
+				fmt.Sprintf("request body exceeds the %d-byte server limit", maxRequestBodyBytes), data)
+			return
+		}
+		writeError(w, http.StatusBadRequest, nil, -32700, "unable to read request", map[string]any{
+			"reason": err.Error(),
+		})
 		return
 	}
 
 	var req request
-	if err := json.Unmarshal(body, &req); err != nil || req.JSONRPC != "2.0" || req.Method == "" {
-		writeError(w, http.StatusBadRequest, nil, -32700, "parse error", nil)
+	if err := json.Unmarshal(body, &req); err != nil {
+		server.writeParseError(w, r, body, "invalid JSON: "+err.Error())
+		return
+	}
+	if req.JSONRPC != "2.0" {
+		server.writeParseError(w, r, body, fmt.Sprintf("jsonrpc field is %q, want \"2.0\"", req.JSONRPC))
+		return
+	}
+	if req.Method == "" {
+		server.writeParseError(w, r, body, "method field is missing or empty")
 		return
 	}
 
@@ -282,6 +320,132 @@ func dispatch(server *Server, w http.ResponseWriter, r *http.Request) {
 	}
 	dispatchLegacy(server, w, r, req)
 }
+
+// writeParseError answers an undecodable request with -32700 plus a diagnostic
+// that identifies it. A bare "parse error" cannot be acted on: with several
+// tools in flight over keep-alive connections, a client cannot tell which call
+// failed or why, so a client-side encoding bug looks exactly like a transport
+// fault. The diagnostic recovers the id and method from bytes that still carry
+// them, quotes the head of the body, and mirrors the same facts into the server
+// log.
+func (server *Server) writeParseError(w http.ResponseWriter, r *http.Request, body []byte, reason string) {
+	data := map[string]any{
+		"reason":     reason,
+		"body_bytes": len(body),
+		"snippet":    bodySnippet(body),
+	}
+	appendRequestIdentity(data, body)
+	method, _ := data["method"].(string)
+	log.Printf("mcp: parse error from %s: %s (body %d bytes, method %q)", r.RemoteAddr, reason, len(body), method)
+	writeError(w, http.StatusBadRequest, salvageID(body), -32700, "parse error", data)
+}
+
+// appendRequestIdentity adds the request identity that survives in an
+// undecodable body, so the failure names the call instead of the transport.
+func appendRequestIdentity(data map[string]any, body []byte) {
+	if method := salvageString(body, "method"); method != "" {
+		data["method"] = method
+	}
+	if tool := salvageString(body, "name"); tool != "" {
+		data["tool"] = tool
+	}
+}
+
+// bodySnippet quotes the head of an undecodable body so the response shows the
+// payload the server could not decode.
+func bodySnippet(body []byte) string {
+	if len(body) <= parseErrorSnippetBytes {
+		return string(body)
+	}
+	return string(body[:parseErrorSnippetBytes]) + "…"
+}
+
+// salvageID returns the id of an undecodable body, or nil when the body does
+// not carry one. Echoing a recovered id attributes the parse error to the call
+// that caused it.
+func salvageID(body []byte) json.RawMessage {
+	return salvageValue(body, "id")
+}
+
+// salvageString returns the string value of the named field in an undecodable
+// body, or "" when it is absent or not a string.
+func salvageString(body []byte, key string) string {
+	value := salvageValue(body, key)
+	if len(value) == 0 || value[0] != '"' {
+		return ""
+	}
+	var decoded string
+	if err := json.Unmarshal(value, &decoded); err != nil {
+		return ""
+	}
+	return decoded
+}
+
+// salvageValue returns the lexically complete JSON value of the first field
+// named key anywhere in body, or nil. It exists only for diagnostics: a body
+// that does not decode as a whole (a client-side encoding bug such as an
+// unquoted argument, or a write cut short before the last request) can still
+// identify the request it was meant to carry.
+func salvageValue(body []byte, key string) []byte {
+	needle := []byte(`"` + key + `"`)
+	for search := 0; search < len(body); {
+		index := bytes.Index(body[search:], needle)
+		if index < 0 {
+			return nil
+		}
+		position := skipJSONSpace(body, search+index+len(needle))
+		if position < len(body) && body[position] == ':' {
+			if value := scanJSONScalar(body, skipJSONSpace(body, position+1)); value != nil && json.Valid(value) {
+				return value
+			}
+		}
+		search += index + len(needle)
+	}
+	return nil
+}
+
+// skipJSONSpace advances over JSON whitespace.
+func skipJSONSpace(body []byte, position int) int {
+	for position < len(body) {
+		switch body[position] {
+		case ' ', '\t', '\r', '\n':
+			position++
+		default:
+			return position
+		}
+	}
+	return position
+}
+
+// scanJSONScalar returns the complete scalar starting at position, or nil when
+// the value is not a scalar or runs past the end of the body.
+func scanJSONScalar(body []byte, position int) []byte {
+	if position >= len(body) {
+		return nil
+	}
+	if body[position] == '"' {
+		for index := position + 1; index < len(body); index++ {
+			switch body[index] {
+			case '\\':
+				index++
+			case '"':
+				return body[position : index+1]
+			}
+		}
+		return nil
+	}
+	end := position
+	for end < len(body) && strings.IndexByte(jsonScalarTerminators, body[end]) < 0 {
+		end++
+	}
+	if end == position {
+		return nil
+	}
+	return body[position:end]
+}
+
+// jsonScalarTerminators ends an unquoted JSON scalar.
+const jsonScalarTerminators = ",}] \t\r\n"
 
 func dispatchModern(server *Server, w http.ResponseWriter, r *http.Request, req request, protocolVersion string) {
 	if protocolVersion != ModernProtocolVersion {
