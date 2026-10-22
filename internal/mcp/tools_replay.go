@@ -16,34 +16,39 @@ import (
 )
 
 // deterministic_replay (roadmap P8): execute one declarative input sequence
-// twice from the same saved state under exclusive control, capture per-step
-// frame-token deltas and M68K registers for both runs, and report whether the
-// runs matched frame-for-frame. The manifest artifact (schema replay-manifest/3)
-// records the normalized steps, both runs' observables, the determinism checks,
-// and the methodology. This is both the input recording (run 1) and the replay
-// verification (run 2) in one tool: recording and replay share the identical
-// code path, so a gating mismatch is a real emulator nondeterminism signal
-// rather than a harness artifact.
+// three times from the same saved state under exclusive control, capture
+// per-step frame-token deltas and M68K registers for every run, and report
+// whether the compared runs matched frame-for-frame. The manifest artifact
+// (schema replay-manifest/4) records the normalized steps, every run's
+// observables, the determinism checks, and the methodology. All passes share the
+// identical code path, so a gating mismatch is a real emulator nondeterminism
+// signal rather than a harness artifact.
+//
+// The first pass is a warm-up and only runs 2 and 3 decide the verdict: a target
+// that was stopped to enter the window still carries state the emulator does not
+// restore, which can shift the first post-load instruction boundary. run 1's
+// differences are reported as observations (warmup_divergences) and never as
+// failures.
 //
 // The VDP render counter is not part of a saved state and is never reset by
-// state_load: it keeps counting across the restore between the two runs.
-// Absolute per-step tokens are therefore not comparable run-to-run, and only
-// the distance each step advanced from a baseline captured at the start of its
-// own run is compared. An axis whose data could not be read is reported as
-// unproven and never counted as a match.
+// state_load: it keeps counting across each restore. Absolute per-step tokens are
+// therefore not comparable run-to-run, and only the distance each step advanced
+// from a baseline captured at the start of its own run is compared. An axis whose
+// data could not be read is reported as unproven and never counted as a match.
 //
 // state_load is not proven bit-exact either. Each run fingerprints the machine
-// state its restore produced (pc/a7/d0 plus the render token) before any input,
-// and a register difference only counts against the sequence when the two
-// fingerprints are identical: otherwise the restores themselves differed by an
-// instruction boundary and the difference is advisory evidence.
+// state its restore produced (pc/a7/d0, the condition codes, and the render
+// token) before any input, and a register difference only counts against the
+// sequence when the compared fingerprints are identical: otherwise the restores
+// themselves differed by an instruction boundary and the difference is advisory
+// evidence.
 
 const (
 	maxReplaySteps     = 64
 	minReplayFrames    = 1
 	maxReplayFrames    = maxFrameAdvance // 60
 	replayManifestKind = "replay-manifest"
-	replayManifestVer  = "replay-manifest/3"
+	replayManifestVer  = "replay-manifest/4"
 
 	// replayTokenComparison names the comparison the verdict rests on, so a
 	// caller can tell a delta comparison from an absolute one.
@@ -53,6 +58,16 @@ const (
 	// qualify the register fields a divergence names.
 	replayStepRegisterDivergencePrefix  = "step_registers"
 	replayFinalRegisterDivergencePrefix = "final_registers"
+
+	// replayRuns is how many times the input sequence is executed. The first
+	// pass is a warm-up: a target that was stopped to enter the window still
+	// carries state the emulator does not restore, so its samples are reported
+	// but never decide the verdict. Runs 2 and 3 are the compared pair.
+	replayRuns = 3
+
+	// m68kConditionCodeMask selects the X/N/Z/V/C bits of the M68K status
+	// register, the fallback source of the condition-code fingerprint.
+	m68kConditionCodeMask = 0x1F
 
 	// restoreFidelity* classify how faithfully the two restores reproduced the
 	// machine state the runs start from. Only an exact restore lets a register
@@ -66,13 +81,22 @@ const (
 	// verdict.
 	registerComparisonGating   = "gating"
 	registerComparisonAdvisory = "advisory"
+
+	// determinismScope* name what a verdict covers: the frame axis always, the
+	// register axis only when the compared restores were proven identical.
+	determinismScopeFrameAndRegister = "frame_and_register"
+	determinismScopeFrameOnly        = "frame_only"
+
+	// replayRun2Phase and replayRun3Phase are the phases the verdict compares.
+	replayRun2Phase = "run_2"
+	replayRun3Phase = "run_3"
 )
 
 func replayToolSpecs() []toolSpec {
 	return []toolSpec{
 		{
 			name:        "deterministic_replay",
-			description: "Record and replay one declarative input sequence to verify frame-for-frame determinism: run the same steps twice from the same saved state under exclusive control, capture per-step frame-token deltas, per-step M68K register samples and final M68K registers for both runs, then report deterministic true/false plus a replay-manifest/3 artifact. Each step holds the listed buttons down for the given number of frames (input_set down, frame_advance x N, input_set up). If the target is running when the call arrives the replay pauses it BEFORE the first restore, so no frame executes between the restore and the first step and a running start does not make a deterministic target look nondeterministic; pause_resume_cycle and per-run initial_run_state_verified report that pause and are informational only. The verdict splits frame-level and register-level evidence: per-step frame-token deltas and the frames advanced always count, while register differences count only when restore_fidelity is exact, i.e. when the two restores were proven bit-identical on m68k pc/a7/d0 (restore_fingerprints). A restore that is not_exact shifts an instruction boundary, so those differences are reported in advisory_divergences (with both values and the step) and register_comparison is advisory instead of accusing the sequence. The VDP render counter is not part of a saved state, so every step is compared as a delta from a baseline token captured at the start of its own run (frame_token_baseline), never as an absolute token. A gating difference is reported in diverged_step (step, field, run1, run2) when it belongs to one step and in divergences otherwise; an axis that could not be read is listed in unproven and never counts as a match. initial_state_id is optional: omitting it snapshots the current machine state first. The initial state is restored afterwards and the target is left in the run state it had before the call (a running target runs again, a paused target stays paused). Accepts optional expected_target_generation and control_id; without control_id the server acquires an internal lock for the whole window.",
+			description: "Record and replay one declarative input sequence to verify frame-for-frame determinism: run the same steps THREE times from the same saved state under exclusive control, capture per-step frame-token deltas, per-step M68K register samples and final M68K registers for every run, then report deterministic true/false plus a replay-manifest/4 artifact. run_1 is a warm-up pass (warmup:true): the target was stopped to enter the window and still carries state the emulator does not restore, so run_1 differences are reported in warmup_divergences as observations and never fail the verdict, while warmup_restore_fidelity compares the run_1 and run_2 fingerprints. The verdict compares run_2 vs run_3 (runs_compared). Each step holds the listed buttons down for the given number of frames (input_set down, frame_advance x N, input_set up). If the target is running when the call arrives the replay pauses it BEFORE the first restore, so no frame executes between the restore and the first step; pause_resume_cycle and per-run initial_run_state_verified report that pause and are informational only. determinism_scope states what the verdict covers: frame_and_register when the register axis gates, frame_only when it is advisory. Frame-level evidence (per-step frame-token deltas, frames advanced) always counts; register differences count only when restore_fidelity is exact, i.e. when the run_2 and run_3 fingerprints agree on m68k pc/a7/d0 and the condition codes (see restore_fidelity_compare for what was compared). A restore that is not_exact shifts an instruction boundary, so those differences are reported in advisory_divergences with both values and the step instead of accusing the sequence. The VDP render counter is not part of a saved state, so every step is compared as a delta from a baseline token captured at the start of its own run (frame_token_baseline), never as an absolute token. A gating difference is reported in diverged_step (step, field, run1, run2) when it belongs to one step and in divergences otherwise; an axis that could not be read is listed in unproven and never counts as a match. initial_state_id is optional: omitting it snapshots the current machine state first. The initial state is restored afterwards and the target is left in the run state it had before the call (a running target runs again, a paused target stays paused). Accepts optional expected_target_generation and control_id; without control_id the server acquires an internal lock for the whole window.",
 			schema: objectSchema(map[string]any{
 				"initial_state_id": stringProperty("Optional state id saved through this analysis context; omitting it snapshots the current machine state first."),
 				"steps": map[string]any{
@@ -167,18 +191,35 @@ func (registers replayRegisters) view() map[string]any {
 	return view
 }
 
+// readReplayRegisterPayload reads the raw M68K register map the native
+// registers command returned and reports whether the read itself succeeded.
+func readReplayRegisterPayload(tc toolContext) (map[string]any, bool) {
+	payload, failure := tc.server.executeCommand(tc.ctx, "regs_get", map[string]string{"cpu": "m68k"})
+	if failure != nil {
+		return nil, false
+	}
+	registers, ok := payload["registers"].(map[string]any)
+	if !ok {
+		return nil, false
+	}
+	return registers, true
+}
+
 // readReplayRegisters reads the M68K register subset the replay compares and
 // reports whether the read itself succeeded. A failed read yields an empty,
 // incomplete set rather than zeroed registers.
 func readReplayRegisters(tc toolContext) (replayRegisters, bool) {
-	payload, failure := tc.server.executeCommand(tc.ctx, "regs_get", map[string]string{"cpu": "m68k"})
-	if failure != nil {
-		return replayRegisters{}, false
-	}
-	registers, ok := payload["registers"].(map[string]any)
+	registers, ok := readReplayRegisterPayload(tc)
 	if !ok {
 		return replayRegisters{}, false
 	}
+	observed := replayRegistersFromPayload(registers)
+	return observed, observed.complete()
+}
+
+// replayRegistersFromPayload extracts the compared register subset from a
+// register map.
+func replayRegistersFromPayload(registers map[string]any) replayRegisters {
 	observed := replayRegisters{}
 	if pc, ok := registerValue(registers, "pc"); ok {
 		observed.PC = &pc
@@ -189,7 +230,22 @@ func readReplayRegisters(tc toolContext) (replayRegisters, bool) {
 	if d0, ok := registerValue(registers, "d0"); ok {
 		observed.D0 = &d0
 	}
-	return observed, observed.complete()
+	return observed
+}
+
+// readReplayConditionCodes reads the M68K condition codes from a register map:
+// the ccr field the native registers command exposes, or the low five bits of sr
+// when a build reports no ccr. A build that exposes neither leaves them
+// unreadable instead of inventing flags.
+func readReplayConditionCodes(registers map[string]any) *uint64 {
+	if ccr, ok := registerValue(registers, "ccr"); ok {
+		return &ccr
+	}
+	if sr, ok := registerValue(registers, "sr"); ok {
+		ccr := sr & m68kConditionCodeMask
+		return &ccr
+	}
+	return nil
 }
 
 // replayRunResult is every observable of one run plus the facts that decide
@@ -232,16 +288,24 @@ type replayRunResult struct {
 	// is not proof that the input sequence is nondeterministic.
 	RestoreFingerprint replayFingerprint
 
+	// Warmup marks the first pass, whose differences are reported as
+	// observations instead of deciding the verdict.
+	Warmup bool
+
 	// Unproven records every axis this run could not observe, so the verdict
 	// never silently drops an axis it failed to read.
 	Unproven []string
 }
 
 // replayFingerprint is the post-restore machine state one run starts from: the
-// M68K registers plus the absolute VDP render token. It is measured before the
-// run's first input, so it describes what state_load actually produced.
+// M68K registers, the condition codes, and the absolute VDP render token. It is
+// measured before the run's first input, so it describes what state_load
+// actually produced. The condition codes matter because a restore that leaves
+// the flags behind can shift the first executed instruction without changing
+// pc/a7/d0.
 type replayFingerprint struct {
 	Registers  replayRegisters
+	CCR        *uint64
 	FrameToken *uint64
 }
 
@@ -249,18 +313,27 @@ type replayFingerprint struct {
 // invented.
 func (fingerprint replayFingerprint) view() map[string]any {
 	view := fingerprint.Registers.view()
+	if fingerprint.CCR != nil {
+		view["ccr"] = *fingerprint.CCR
+	}
 	if fingerprint.FrameToken != nil {
 		view["frame_token"] = *fingerprint.FrameToken
 	}
 	return view
 }
 
-// readReplayFingerprint measures the state a restore produced. It reads the
-// absolute token through vdp_status, the only operation that exposes the render
+// readReplayFingerprint measures the state a restore produced from one register
+// read plus one vdp_status read, the only operation that exposes the render
 // counter without advancing a frame.
 func readReplayFingerprint(tc toolContext) replayFingerprint {
-	registers, _ := readReplayRegisters(tc)
-	return replayFingerprint{Registers: registers, FrameToken: replayFrameTokenBaseline(tc)}
+	fingerprint := replayFingerprint{FrameToken: replayFrameTokenBaseline(tc)}
+	raw, ok := readReplayRegisterPayload(tc)
+	if !ok {
+		return fingerprint
+	}
+	fingerprint.Registers = replayRegistersFromPayload(raw)
+	fingerprint.CCR = readReplayConditionCodes(raw)
+	return fingerprint
 }
 
 // replayRunStart is the run-state evidence one run begins with.
@@ -385,27 +458,37 @@ func runDeterministicReplay(tc toolContext, args json.RawMessage) map[string]any
 	if initialRestore.PausedByTool {
 		pauseResumeCycles++
 	}
-	run1Start := newReplayRunStart(initialRestore, "the initial restore", pausedBeforeRestore)
 
-	run1, failure := replayRunSequence(tc, context.ID, steps, windowGuard, run1Start, "run_1")
-	if failure != nil {
-		_, _ = replayCloseWindow(tc, context.ID, initialSnapshot.Path, windowGuard, "abort_restore", entryRunState, entryKnown)
-		return failureResult(failure, tc.modern)
+	// The sequence runs three times from the same snapshot. Pass 1 is a warm-up:
+	// a target the replay had to stop still carries state the emulator does not
+	// restore, which can shift the first post-load instruction boundary, so its
+	// samples are reported but never decide the verdict.
+	runs := make([]*replayRunResult, 0, replayRuns)
+	for pass := 0; pass < replayRuns; pass++ {
+		start := newReplayRunStart(initialRestore, "the initial restore", pausedBeforeRestore)
+		if pass > 0 {
+			restorePhase := fmt.Sprintf("between_runs_restore_%d", pass)
+			between, failure := replayRestoreState(tc, context.ID, initialSnapshot.Path, windowGuard, restorePhase, true)
+			if failure != nil {
+				return failureResult(failure, tc.modern)
+			}
+			if between.PausedByTool {
+				pauseResumeCycles++
+			}
+			start = newReplayRunStart(between, "the between-runs restore", false)
+		}
+		phase := fmt.Sprintf("run_%d", pass+1)
+		run, failure := replayRunSequence(tc, context.ID, steps, windowGuard, start, phase)
+		if failure != nil {
+			_, _ = replayCloseWindow(tc, context.ID, initialSnapshot.Path, windowGuard, "abort_restore", entryRunState, entryKnown)
+			return failureResult(failure, tc.modern)
+		}
+		run.Warmup = pass == 0
+		runs = append(runs, run)
 	}
-	betweenRuns, failure := replayRestoreState(tc, context.ID, initialSnapshot.Path, windowGuard, "between_runs_restore", true)
-	if failure != nil {
-		return failureResult(failure, tc.modern)
-	}
-	if betweenRuns.PausedByTool {
-		pauseResumeCycles++
-	}
-	run2Start := newReplayRunStart(betweenRuns, "the between-runs restore", false)
-
-	run2, failure := replayRunSequence(tc, context.ID, steps, windowGuard, run2Start, "run_2")
-	if failure != nil {
-		_, _ = replayCloseWindow(tc, context.ID, initialSnapshot.Path, windowGuard, "abort_restore", entryRunState, entryKnown)
-		return failureResult(failure, tc.modern)
-	}
+	warmupRun := runs[0]
+	run2 := runs[1]
+	run3 := runs[2]
 	// Reload the initial snapshot so the machine describes it again, and leave
 	// the target in the run state this call found it in: a target that was
 	// running runs again, a paused target stays paused. A failed restore or a
@@ -416,7 +499,10 @@ func runDeterministicReplay(tc toolContext, args json.RawMessage) map[string]any
 	finalRunStateVerified := closure.FinalRunStateVerified
 	generationAfter := tc.server.target.Generation()
 
-	comparison := compareReplayRuns(run1, run2)
+	// Only runs 2 and 3 decide the verdict; run 1 is reported for transparency.
+	comparison := compareReplayRuns(run2, run3)
+	warmupComparison := compareReplayRuns(warmupRun, run2)
+	warmupView := replayWarmupView(warmupComparison)
 
 	stepsView := make([]map[string]any, 0, len(steps))
 	for index, step := range steps {
@@ -433,8 +519,11 @@ func runDeterministicReplay(tc toolContext, args json.RawMessage) map[string]any
 		"initial_state_id":        initialSnapshot.ID,
 		"initial_state_name":      initialSnapshot.Name,
 		"steps":                   stepsView,
-		"run_1":                   replayRunView(run1),
+		"run_1":                   replayRunView(warmupRun),
 		"run_2":                   replayRunView(run2),
+		"run_3":                   replayRunView(run3),
+		"warmup":                  true,
+		"warmup_note":             replayWarmupNote,
 		"deterministic":           comparison.Deterministic,
 		"checks":                  comparison.Checks,
 		"unproven":                comparison.Unproven,
@@ -451,6 +540,9 @@ func runDeterministicReplay(tc toolContext, args json.RawMessage) map[string]any
 	for key, value := range comparisonView {
 		manifest[key] = value
 	}
+	for key, value := range warmupView {
+		manifest[key] = value
+	}
 	manifestBytes, err := json.Marshal(manifest)
 	if err != nil {
 		return failureResult(&toolFailure{Code: "artifact_error", Message: err.Error()}, tc.modern)
@@ -465,13 +557,18 @@ func runDeterministicReplay(tc toolContext, args json.RawMessage) map[string]any
 	result := map[string]any{
 		"kind":                     replayManifestKind,
 		"deterministic":            comparison.Deterministic,
+		"determinism_scope":        comparison.DeterminismScope,
+		"runs_compared":            comparison.RunsCompared,
 		"checks":                   comparison.Checks,
 		"unproven":                 comparison.Unproven,
 		"frame_token_comparison":   replayTokenComparison,
 		"steps":                    len(steps),
 		"frames_total":             totalFrames,
-		"run_1":                    replayRunView(run1),
+		"run_1":                    replayRunView(warmupRun),
 		"run_2":                    replayRunView(run2),
+		"run_3":                    replayRunView(run3),
+		"warmup":                   true,
+		"warmup_note":              replayWarmupNote,
 		"entry_run_state":          entryRunState,
 		"pause_resume_cycle":       pauseResumeCycles,
 		"pause_resume_cycle_note":  replayPauseCycleNote,
@@ -488,14 +585,20 @@ func runDeterministicReplay(tc toolContext, args json.RawMessage) map[string]any
 	for key, value := range comparisonView {
 		result[key] = value
 	}
+	for key, value := range warmupView {
+		result[key] = value
+	}
 	switch {
 	case !restored:
-		result["restore_warning"] = "WARNING: restoring the initial state after the replay failed; the emulator still describes the end of run 2."
+		result["restore_warning"] = "WARNING: restoring the initial state after the replay failed; the emulator still describes the end of the last run."
 	case closureFailure != nil:
 		result["restore_warning"] = "WARNING: the initial state was restored, but restoring the run state observed before the call failed (" + closureFailure.Message + "); the target stays paused."
 	}
 	return okResult(stampGenerations(result, generationBefore, generationAfter), tc.modern)
 }
+
+// replayWarmupNote explains why the first pass exists and what it is used for.
+const replayWarmupNote = "The input sequence runs three times from the same snapshot and only run_2 vs run_3 decide the verdict. run_1 is a warm-up pass: the target was stopped to enter the window and still carries state the emulator does not restore (the VDP render counter is proven not to be restored, and residual CPU state can shift an instruction boundary), so a difference that only shows up in run_1 is reported in warmup_divergences as an observation and never as a failure. warmup_restore_fidelity compares the run_1 and run_2 fingerprints and is the direct measure of that residual state. A difference between run_2 and run_3 is a genuine nondeterminism verdict."
 
 // replayPauseCycleNote states what pause_resume_cycle counts and why a call that
 // had to pause a running target is still expected to be deterministic.
@@ -530,7 +633,7 @@ func replayConsistency(entryRunState string, entryKnown, pausedByTool bool, clos
 	if !deterministic {
 		verdict = "not deterministic for the observed steps"
 	}
-	note := "The replay ran both input sequences on a paused machine and restored the initial state; the verdict is " + verdict + "."
+	note := "The replay ran the input sequence three times on a paused machine (run 1 as a warm-up), compared run 2 against run 3, and restored the initial state; the verdict is " + verdict + "."
 	if pausedByTool {
 		note += " The target was running when the call arrived and was paused before the first restore, so no frame executed between the restore and the first step."
 	}
@@ -548,7 +651,7 @@ func replayConsistency(entryRunState string, entryKnown, pausedByTool bool, clos
 	return consistency
 }
 
-const replayMethodology = "Two identical input sequences (input_set down, frame_advance x N, input_set up per step) executed from the same saved state under exclusive control. If the target is running when the call arrives it is paused before the initial restore, so nothing executes between the restore and the first step; every restore that precedes stepping ends paused, so no frame advances outside the replay's own steps, and each run reports initial_run_state, initial_run_state_verified (was the machine already paused before this run changed anything), paused_start_confirmed (did the native echo prove the run began paused) and initial_run_state_note. A pause the replay had to perform is informational and does not weaken the verdict. Each run also fingerprints the state its restore produced, before any input: M68K pc/a7/d0 plus the absolute VDP render token (restore_fingerprints). The verdict splits the evidence: the per-step frame-token deltas and the frames advanced always gate, and the register samples (per-step and final) gate only when restore_fidelity is exact, i.e. when the two fingerprints agree on pc/a7/d0. A not_exact restore shifts an instruction boundary, so register differences are reported in advisory_divergences with both values and the step, register_comparison is advisory, and they do not accuse the input sequence; an unreadable fingerprint is unverified, which likewise cannot gate. The render token is recorded in every fingerprint but excluded from the fidelity test because it is not part of a saved state and always moves across the window: per-step tokens are compared as deltas from a frame_token_baseline captured at the start of each run, never as absolute values, and a token below its run's baseline proves the counter was reset or wrapped and is reported unproven. Per-step M68K register samples (pc/a7/d0) and the final register set are compared field by field. An unreadable token or register set is reported as unproven and never counted as a match. The final restore reloads the initial snapshot and leaves the target in the run state observed before the call. Demonstrated determinism holds for this emulator build and this ROM only; it does not guarantee cross-build reproducibility."
+const replayMethodology = "The input sequence (input_set down, frame_advance x N, input_set up per step) is executed three times from the same saved state under exclusive control. run_1 is a warm-up pass: a target stopped to enter the window still carries state the emulator does not restore (the VDP render counter is proven not to be restored, and residual CPU state can shift an instruction boundary), so run_1 differences are reported in warmup_divergences as observations and warmup_restore_fidelity compares the run_1 and run_2 fingerprints. The verdict compares run_2 vs run_3 (runs_compared) and determinism_scope states what it covers. If the target is running when the call arrives it is paused before the initial restore, so nothing executes between the restore and the first step; every restore that precedes stepping ends paused, so no frame advances outside the replay's own steps, and each run reports initial_run_state, initial_run_state_verified (was the machine already paused before this run changed anything), paused_start_confirmed (did the native echo prove the run began paused) and initial_run_state_note. A pause the replay had to perform is informational and does not weaken the verdict. Each run also fingerprints the state its restore produced, before any input: M68K pc/a7/d0, the condition codes when the register payload exposes them, and the absolute VDP render token (restore_fingerprints). The verdict splits the evidence: the per-step frame-token deltas and the frames advanced always gate, and the register samples (per-step and final) gate only when restore_fidelity is exact, i.e. when the run_2 and run_3 fingerprints agree on the compared fields (restore_fidelity_compare). A not_exact restore shifts an instruction boundary, so register differences are reported in advisory_divergences with both values and the step, register_comparison is advisory, and they do not accuse the input sequence; an unreadable fingerprint is unverified, which likewise cannot gate. The render token is recorded in every fingerprint but excluded from the fidelity test because it is not part of a saved state and always moves between runs: per-step tokens are compared as deltas from a frame_token_baseline captured at the start of each run, never as absolute values, and a token below its run's baseline proves the counter was reset or wrapped and is reported unproven. Per-step M68K register samples (pc/a7/d0) and the final register set are compared field by field. An unreadable token or register set is reported as unproven and never counted as a match. The final restore reloads the initial snapshot and leaves the target in the run state observed before the call. Demonstrated determinism holds for this emulator build and this ROM only; it does not guarantee cross-build reproducibility."
 
 // replayRunView renders one run's observables.
 func replayRunView(run *replayRunResult) map[string]any {
@@ -571,6 +674,7 @@ func replayRunView(run *replayRunResult) map[string]any {
 		"initial_run_state_note":     run.InitialRunStateNote,
 		"paused_start_confirmed":     run.PausedStartConfirmed,
 		"restore_fingerprint":        run.RestoreFingerprint.view(),
+		"warmup":                     run.Warmup,
 		"final_registers":            run.FinalRegisters.view(),
 	}
 	if len(run.Unproven) > 0 {
@@ -593,12 +697,18 @@ type replayComparison struct {
 	Unproven            []string
 
 	// RestoreFidelity is exact, not_exact, or unverified; RestoreFidelityFields
-	// names the fingerprint fields that differed.
-	RestoreFidelity       string
-	RestoreFidelityFields []string
-	RestoreFingerprints   map[string]any
+	// names the fingerprint fields that differed and RestoreFidelityCompare
+	// names the ones the comparison actually covered.
+	RestoreFidelity        string
+	RestoreFidelityFields  []string
+	RestoreFidelityCompare []string
+	RestoreFingerprints    map[string]any
 	// RegisterComparison is gating only when the restore was proven exact.
 	RegisterComparison string
+	// DeterminismScope is frame_and_register when the register axis gates and
+	// frame_only when it does not; RunsCompared names the compared phases.
+	DeterminismScope string
+	RunsCompared     []string
 }
 
 // view renders the comparison fields that travel with the response and the
@@ -606,13 +716,16 @@ type replayComparison struct {
 // when a difference is attributable to one step.
 func (comparison replayComparison) view() map[string]any {
 	view := map[string]any{
-		"unproven":                comparison.Unproven,
-		"advisory_divergences":    comparison.AdvisoryDivergences,
-		"restore_fidelity":        comparison.RestoreFidelity,
-		"restore_fidelity_fields": comparison.RestoreFidelityFields,
-		"restore_fidelity_note":   replayFidelityNote,
-		"restore_fingerprints":    comparison.RestoreFingerprints,
-		"register_comparison":     comparison.RegisterComparison,
+		"unproven":                 comparison.Unproven,
+		"advisory_divergences":     comparison.AdvisoryDivergences,
+		"restore_fidelity":         comparison.RestoreFidelity,
+		"restore_fidelity_fields":  comparison.RestoreFidelityFields,
+		"restore_fidelity_compare": comparison.RestoreFidelityCompare,
+		"restore_fidelity_note":    replayFidelityNote,
+		"restore_fingerprints":     comparison.RestoreFingerprints,
+		"register_comparison":      comparison.RegisterComparison,
+		"determinism_scope":        comparison.DeterminismScope,
+		"runs_compared":            comparison.RunsCompared,
 	}
 	if len(comparison.Divergences) > 0 {
 		view["divergences"] = comparison.Divergences
@@ -623,9 +736,9 @@ func (comparison replayComparison) view() map[string]any {
 	return view
 }
 
-// replayFidelityNote states why the VDP frame token sits in the fingerprint but
-// not in the fidelity test.
-const replayFidelityNote = "restore_fidelity compares the M68K registers each restore produced (pc/a7/d0) before any input. The VDP render counter is recorded in every fingerprint but excluded from that comparison: it is not part of a saved state and always moves across the window, so per-step frame-token deltas are compared instead. exact means the two restores were bit-identical on the compared registers and register differences count against the verdict; not_exact means they were not, so register differences are reported as advisory_divergences instead of accusing the input sequence; unverified means the fingerprint could not be read on one side, which is reported as unproven (never as a match) and also makes the register axis advisory."
+// replayFidelityNote states what restore_fidelity covers and why the VDP frame
+// token sits in the fingerprint but not in the comparison.
+const replayFidelityNote = "restore_fidelity compares the M68K registers (pc/a7/d0) and, when the register payload exposes them, the condition codes (ccr, or sr's low five bits) that each restore produced before any input; restore_fidelity_compare lists the fields that were actually compared, so a build without ccr is visible instead of assumed. The VDP render counter is recorded in every fingerprint but excluded: it is not part of a saved state and always moves between runs, so per-step frame-token deltas are compared instead. exact means the compared fields were identical and register differences count against the verdict; not_exact means they were not, so register differences are reported as advisory_divergences instead of accusing the input sequence; unverified means a compared register could not be read on one side, which is reported as unproven (never as a match) and also makes the register axis advisory."
 
 // firstStepDivergence returns the first divergence that belongs to one step, or
 // nil when every divergence is an end-of-run observation.
@@ -664,13 +777,16 @@ func compareReplayRuns(run1, run2 *replayRunResult) replayComparison {
 		comparison.Checks = append(comparison.Checks, map[string]any{"name": name, "gating": gating, "passed": passed, "detail": detail})
 	}
 
-	// 0. How faithful was the restore both runs started from?
-	comparison.RestoreFidelity, comparison.RestoreFidelityFields, comparison.RestoreFingerprints = compareRestoreFingerprints(run1, run2)
+	// 0. How faithful was the restore both compared runs started from?
+	comparison.RestoreFidelity, comparison.RestoreFidelityFields, comparison.RestoreFidelityCompare, comparison.RestoreFingerprints = compareRestoreFingerprints(run1, run2)
 	registersGating := comparison.RestoreFidelity == restoreFidelityExact
+	comparison.RunsCompared = []string{run1.Phase, run2.Phase}
 	if registersGating {
 		comparison.RegisterComparison = registerComparisonGating
+		comparison.DeterminismScope = determinismScopeFrameAndRegister
 	} else {
 		comparison.RegisterComparison = registerComparisonAdvisory
+		comparison.DeterminismScope = determinismScopeFrameOnly
 	}
 	if comparison.RestoreFidelity == restoreFidelityUnverified {
 		// Same rule as every other axis: data the replay could not read is
@@ -774,16 +890,18 @@ func (comparison *replayComparison) registerQualifier() string {
 	return ""
 }
 
-// compareRestoreFingerprints compares the state each restore produced and
-// classifies how faithful it was. Only the M68K registers decide the
-// classification: the VDP render counter is not part of a saved state, so it
-// always moves across the window and its per-step deltas are compared instead.
-func compareRestoreFingerprints(run1, run2 *replayRunResult) (string, []string, map[string]any) {
-	views := map[string]any{"run_1": run1.RestoreFingerprint.view(), "run_2": run2.RestoreFingerprint.view()}
+// compareRestoreFingerprints compares the state the two compared restores
+// produced and classifies how faithful they were. The register fields decide the
+// classification; the VDP render counter is recorded in each fingerprint but
+// excluded because it is not part of a saved state and always moves between
+// runs.
+func compareRestoreFingerprints(run1, run2 *replayRunResult) (string, []string, []string, map[string]any) {
+	views := map[string]any{run1.Phase: run1.RestoreFingerprint.view(), run2.Phase: run2.RestoreFingerprint.view()}
+	compared := make([]string, 0, 4)
+	differing := make([]string, 0, 4)
 	if !run1.RestoreFingerprint.Registers.complete() || !run2.RestoreFingerprint.Registers.complete() {
-		return restoreFidelityUnverified, []string{}, views
+		return restoreFidelityUnverified, differing, compared, views
 	}
-	differing := make([]string, 0, 3)
 	for _, pair := range []struct {
 		name          string
 		first, second *uint64
@@ -792,14 +910,39 @@ func compareRestoreFingerprints(run1, run2 *replayRunResult) (string, []string, 
 		{"m68k_a7", run1.RestoreFingerprint.Registers.A7, run2.RestoreFingerprint.Registers.A7},
 		{"m68k_d0", run1.RestoreFingerprint.Registers.D0, run2.RestoreFingerprint.Registers.D0},
 	} {
+		compared = append(compared, pair.name)
 		if *pair.first != *pair.second {
 			differing = append(differing, pair.name)
 		}
 	}
-	if len(differing) > 0 {
-		return restoreFidelityNotExact, differing, views
+	// The condition codes are compared only when the payload exposes them; a
+	// build without ccr/sr says so through restore_fidelity_compare instead of
+	// pretending the flags were checked.
+	if run1.RestoreFingerprint.CCR != nil && run2.RestoreFingerprint.CCR != nil {
+		compared = append(compared, "ccr")
+		if *run1.RestoreFingerprint.CCR != *run2.RestoreFingerprint.CCR {
+			differing = append(differing, "ccr")
+		}
 	}
-	return restoreFidelityExact, differing, views
+	if len(differing) > 0 {
+		return restoreFidelityNotExact, differing, compared, views
+	}
+	return restoreFidelityExact, differing, compared, views
+}
+
+// replayWarmupView renders what the discarded warm-up pass observed, so a
+// caller can see the residual state that motivated it without any of it
+// counting against the verdict. run1/run2 in these divergences are the warm-up
+// pass and the first gating pass.
+func replayWarmupView(comparison replayComparison) map[string]any {
+	divergences := make([]map[string]any, 0, len(comparison.Divergences)+len(comparison.AdvisoryDivergences))
+	divergences = append(divergences, comparison.Divergences...)
+	divergences = append(divergences, comparison.AdvisoryDivergences...)
+	return map[string]any{
+		"warmup_divergences":             divergences,
+		"warmup_restore_fidelity":        comparison.RestoreFidelity,
+		"warmup_restore_fidelity_fields": comparison.RestoreFidelityFields,
+	}
 }
 
 // compareReplayDeltas compares the per-step frame-token deltas and reports how
