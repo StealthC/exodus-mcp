@@ -5,7 +5,7 @@ grouped by capability, and records how far each behavior is verified. Only
 open work is tracked in [ROADMAP.md](ROADMAP.md); the
 [CHANGELOG.md](../CHANGELOG.md) records the delivery history.
 
-The MCP server currently exposes **97 tools** spanning roadmap phases 0-10:
+The MCP server currently exposes **100 tools** spanning roadmap phases 0-10:
 bridge and context foundations, memory and artifact access, both processors,
 VDP graphics, deterministic controlled experimentation, advanced analysis,
 evidence annotations, advanced debugging, deterministic replay, workflow
@@ -65,6 +65,19 @@ claim to the exact test function or smoke-script check that proves it.
   integer or supported string notation), and tool arguments are strictly
   decoded: unknown properties are rejected with `invalid_params` naming the
   full JSON path (`additionalProperties: false` on every object schema).
+- **Persisted analysis workspace.** The artifact index, the contexts, and the
+  annotations now outlive the process: `<artifact-dir>/analysis/contexts.json`
+  and `<artifact-dir>/analysis/annotations/<context>.json` are loaded by
+  `analysis.OpenRegistry` at startup, so the default context keeps its handle,
+  `context_list` reports the previous session's contexts, and
+  `annotation_list`/`artifact_list` find yesterday's work through the same
+  handles. Writes are atomic, an undecodable document fails startup instead of
+  silently starting empty, and symbols stay explicitly in-memory.
+  `context_prune` reclaims one closed context (registry entry, annotation
+  document, artifacts, capture entries, saved state files), and `state_delete`
+  reclaims one snapshot. Proven by `internal/analysis/persist_test.go`,
+  `internal/mcp/tools_persistence_test.go`, and
+  `TestArtifactIndexSurvivesStoreReopen`.
 - **Stable response contract.** Every successful `structuredContent` (and
   legacy `content`) carries `result_type` (the tool name) and
   `schema_version: "1"`. Address-bearing outputs normalize to numeric
@@ -261,8 +274,13 @@ exactly the vocabularies the code enforces.
   (unknown, because only the MCP `rom_load` module creation computes it).
 - `target_info`: emulator identity, device summary, and a `target_info.rom`
   summary of the loaded cartridge.
-- Analysis contexts: `context_create`, `context_list`, `context_close` with
-  an implicit default context and protected close semantics.
+- Analysis contexts: `context_create`, `context_list`, `context_close`,
+  `context_prune` with an implicit default context and protected close
+  semantics. Contexts are persisted (see
+  [Persisted analysis workspace](#cross-cutting-behavior)), so `context_list`
+  after a restart reports the contexts an earlier session created;
+  `context_prune` is the only way to reclaim a closed one, and it refuses the
+  default context and any still-open context.
 - Authenticated local named-pipe bridge with capability-gated plugin access,
   a serialized command queue (single pipe thread, stop-event responsive),
   deadline-based cancellation, clean shutdown, and transient full-buffer
@@ -425,8 +443,11 @@ exactly the vocabularies the code enforces.
   their reasons. Unknown, expired, or foreign ids fail with `capture_not_found`.
 - The artifact and capture indexes are persisted in
   `<artifact-dir>/artifact-index.json` and reloaded at startup, so a restarted
-  server reopens the artifacts and captures it wrote; because context handles are
-  process-local, they are only reachable through a handle that exists again.
+  server reopens the artifacts and captures it wrote. Context handles are
+  persisted next to them (`<artifact-dir>/analysis/contexts.json`), so those
+  artifacts stay reachable through the same handle after a restart
+  (`TestArtifactsAndContextHandleSurviveServerRestart`,
+  `TestArtifactIndexSurvivesStoreReopen`).
 
 ## Audio observability (Phase 6, partial)
 
@@ -452,6 +473,12 @@ exactly the vocabularies the code enforces.
 - M68K: `m68k_registers`, `m68k_read_memory`, `m68k_disassemble`,
   `m68k_step` (single-instruction step).
 - Z80: `z80_registers`, `z80_read_memory`, `z80_disassemble`, `z80_step`.
+- Batched disassembly: `m68k_disassemble` and `z80_disassemble` accept
+  `addresses` (up to 32, mutually exclusive with `address`/`count`) and return
+  one `batches` entry per address with its own lines and symbol annotations, so
+  decorating a coverage report is one MCP call instead of one per address. The
+  native operation still takes one start address and a count, so each batch
+  entry is one sweep; proven by `TestDisassembleBatchAddresses`.
 - Symbol-aware disassembly: `m68k_disassemble` and `z80_disassemble`
   annotate every line whose instruction address or operand literal resolves
   against the analysis context's symbols — per-line `symbol` (own address)
@@ -570,12 +597,18 @@ exactly the vocabularies the code enforces.
   (`include_rom`/`include_ram`/`retain_repeated` plus
   `region_start`/`region_end`/`max_entries`), legacy `ranges` for
   compatibility, and per-section `truncation` facts (`source_events`,
-  `decoded_events`, `unique_addresses`, `blocks`, `edges`) — a trace
-  ring/timeout limit is never reported as complete coverage. The counts,
+  `decoded_events`, `unique_addresses`, `decode_sweeps`, `blocks`, `edges`) —
+  a trace ring/timeout limit is never reported as complete coverage.
+  Instruction lengths are decoded with one native sweep per contiguous run of
+  executed addresses instead of one call per unique address, and
+  `decode_sweeps` reports how many sweeps that took
+  (`TestCoverageDecodingIsBatched`: eight contiguous addresses decode in one
+  sweep and produce one block, with the same distinct count). The counts,
   filters, and artifact shape are **proven** by
   `internal/mcp/tools_phase5_test.go` (`TestCpuCoverageCaptureBuildsCoverage`,
-  `TestCpuCoverageCaptureRegionFilter`); the instruction-aware `blocks` and
-  `edges` structure is **unvalidated** — no test asserts either section.
+  `TestCpuCoverageCaptureRegionFilter`); block/edge structure is proven only
+  for a single contiguous run — multi-run boundaries and edge counts are
+  **unvalidated**.
 - Symbols: `symbols_set`, `symbols_list`, `symbols_clear`, scoped to an
   analysis context. Every symbol keeps both coordinates — the supplied
   `space_id` plus address, and the resolved processor-bus `bus_space_id` plus
@@ -746,7 +779,7 @@ exactly the vocabularies the code enforces.
 - `context_mutation_log`: the per-context projection of the audit stream
   (target mutations only; lock lifecycle stays global). Same cursor, envelope,
   and offset rules as `target_audit_log`.
-- `state_save`, `state_load`, `state_list`: context-scoped system snapshots
+- `state_save`, `state_load`, `state_list`, `state_delete`: context-scoped system snapshots
   through the emulator's native save-state path (ZIP format), each verified
   with SHA-256 and size and carrying provenance (context, target generation,
   ROM path and SHA-256, optional control id, and `saved_run_state` — the last
@@ -762,13 +795,28 @@ exactly the vocabularies the code enforces.
   native run-state echo, never asserted); observations describe the restored
   instant until the system runs again. Lists flag entries stale for the
   loaded ROM and generation-mismatched while preserving them for historical
-  analysis.
+  analysis. `state_load` accepts `state_id` or `name` (exactly one); a name
+  that matches several snapshots is refused with the candidate ids instead of
+  silently loading one. `state_delete` removes one snapshot record and its
+  file, is not a target mutation (no generation advance, no `control_id`), and
+  refuses an ambiguous name the same way.
 - `frame_advance`: pause, execute exactly N rendered VDP frames, pause —
   reports the final frame token, before/after target generations, and times
   out with a diagnostic when the display is not rendering.
 - `input_set`: press/release of up, down, left, right, a, b, c, start, x, y,
   z, and mode on a controller by player port, through the controller device
   input path.
+- `input_status`: the controller state this server last commanded per port —
+  held buttons, `controller_instance`/`pad_type` (from the native `input_set`
+  echo, `pad_type_source: "native_input_set_echo"`), the tool that set it,
+  when, and under which target generation. The pinned plugin exposes no
+  controller read, so this is a **command ledger, not an observation**:
+  `verified_by_emulator` is `false`, `state_from` is
+  `server_input_ledger`, an entry from another target generation is flagged
+  stale, `rom_load`/`target_reset` clear the ledger, and a port this server
+  never commanded is absent. Proven by
+  `TestInputStatusReportsTheServerLedger`; the native echo's exact pad name is
+  only observable on a live pair.
 - `input_sequence`: atomic multi-step controller scheduling — one call holds
   the listed buttons on one player port for N frames per step (1-64 steps,
   1-60 frames each; always down → advance → up so no input state is left
@@ -850,6 +898,17 @@ exactly the vocabularies the code enforces.
   tool never claims execution-verified call sites: the response states the
   stack may contain data, not return addresses, and reports the composite
   `capture_consistency` object for its live reads.
+- `z80_backtrace`: the Z80 counterpart of `m68k_backtrace`, resolving
+  candidates through the `z80-bus` coordinate model. Frame 0 is the live PC;
+  every other frame is a 2-byte stack slot decoded **little-endian** from SP,
+  kept when nonzero and labelled medium confidence inside Z80 work RAM
+  (`0x0000-0x1FFF`, where a sound driver's code lives) or low elsewhere. The
+  Z80 has no documented frame-pointer convention, so only the scan runs and
+  IX/IY are reported as registers, never as an invented chain; the response
+  states that the stack may hold data, carries `address_width_bits: 16` and
+  `address_mask_hex`, and reports the composite `capture_consistency` object.
+  Proven by `TestZ80BacktraceWalksTheStack`; the live plugin's Z80 register
+  payload shape is a **live check** (see [Validation](#validation)).
 - `state_diff`: read-only comparison of two `state_save` snapshots into a
   `state-diff-results` artifact. It diffs snapshot metadata (name, size,
   SHA-256, target generation, ROM identity, timestamps, control id) and the
@@ -1144,7 +1203,7 @@ the run of `scripts/live-smoke.sh --full` that produced it.
 
 ### Proven by automated tests
 
-The catalog contains 94 unique tool names (`grep -h 'name: *"' internal/mcp/tools*.go`
+The catalog contains 100 unique tool names (`grep -h 'name: *"' internal/mcp/tools*.go`
 excluding tests, deduplicated); determinism of `tools/list` and presence of a
 named subset are asserted by `internal/mcp/server_test.go`
 `TestToolsListDeterministicAndComplete`.
@@ -1188,6 +1247,11 @@ named subset are asserted by `internal/mcp/server_test.go`
 | Run-state attribution and externally observed transitions | `internal/mcp/runstate_test.go` |
 | Audit log bounds, filters, window metadata | `internal/analysis/audit_test.go` |
 | Context isolation and lifecycle | `internal/analysis/context_test.go` |
+| Context/annotation persistence, corrupt-document startup failure, prune reclamation, in-memory registry side effects | `internal/analysis/persist_test.go` |
+| Annotations and artifacts survive a server restart, `state_delete`, `state_load` by name, `context_prune` | `internal/mcp/tools_persistence_test.go` |
+| Artifact kind → `schema_version` declaration, single JSON write path, palette/system-snapshot versions, artifact index reopen, per-context reclamation | `internal/mcp/artifact_schema_test.go`, `internal/artifact/artifact_test.go` `TestDeleteContextReclaimsOneWorkspace` |
+| Error-code taxonomy: well-formedness, both scan directions, class on every code, undeclared/unknown-native normalization, registry-wide failure sweep, catalog publication | `internal/mcp/error_codes_test.go` |
+| `z80_backtrace`, `input_status`, batched `addresses` disassembly, batched coverage decoding | `internal/mcp/tools_workflows_test.go` |
 | Saved-state store provenance | `internal/analysis/states_test.go` |
 | Metrics endpoint | `internal/mcp/metrics_test.go` |
 | Symbol-aware disassembly for both CPUs, operand literal extraction, cross-space isolation | `internal/mcp/tools_disasm_symbols_test.go` |
@@ -1242,6 +1306,14 @@ Each label below is a `check` string in `scripts/live-smoke.sh`; run
   reported", "per-access write records are captured", "per-access sequence has
   no gaps in a short run", "trace session never pauses the CPU", "trace session
   restores trace flags", "trace session deletes its segments".
+- **Pending live checks** for the workflows delivered with issue #18 (their
+  logic is Go-tested; the native payload shapes below are not):
+  `z80_backtrace` on the pinned plugin (its Z80 `regs_get` payload and the
+  little-endian stack reads), `input_status` after `input_set` (that the native
+  echo reports a real controller instance name), batched `addresses`
+  disassembly on both CPUs, `cpu_coverage_capture` `decode_sweeps` and block
+  boundaries on a real trace, and a full restart (`stop-windows.sh` → run)
+  proving the default context id and its annotations survive.
 
 ### Unvalidated
 
@@ -1270,8 +1342,9 @@ behavior is unverified as of this revision:
 - Trace session `mode: "continuous"` and `stop_after_vdp_frames`: both tests
   and the live check use the default `sampled` window mode.
 - `cpu_coverage_capture` `blocks`/`edges`: the tests assert entry, distinct and
-  range counts and the artifact kind, not the instruction-aware block/edge
-  structure.
+  range counts, the artifact kind, and a single contiguous block built by one
+  decode sweep; multi-run block boundaries, block execution counts, and edge
+  counts have no assertion.
 - Frame liveness (frame token advancing while running): no automated
   assertion; only paused determinism is checked.
 - Decoding claims that were verified by looking at a title screen: tile and
