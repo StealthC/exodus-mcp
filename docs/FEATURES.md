@@ -646,7 +646,13 @@ documented in [TRACE-SESSIONS.md](TRACE-SESSIONS.md).
   bound native retention (oldest data is evicted and loss is reported, never
   silent), while `max_events` bounds the server-side store. Every start response
   carries a `volume` object with retention limits and measured trace throughput;
-  no total-volume estimate is claimed for an unbounded session. `start_guard: "quiet"`
+  no total-volume estimate is claimed for an unbounded session. Because those
+  caps are finite by default, the same response never claims completeness: the
+  session reports itself as running (`loss.complete: false`, `loss.final: false`,
+  `loss.incomplete_reasons: ["session_running"]`), and
+  `loss.estimated_eviction_risk` projects whether the estimated write rate
+  exhausts `max_total_bytes`/`max_segments` before the session window ends, with
+  `loss.estimated_eviction` carrying the horizons and the rule. `start_guard: "quiet"`
   stops the system for the configuration calls only and restores it; the default
   `"none"` arms capture on the running CPU.
 - `trace_session_status`: drains both native streams into the bounded event
@@ -680,8 +686,11 @@ per-occurrence records whose value semantics are stated (`value_state: "read" |
 "written"`), and a write's pre-write value is reported only when the engine
 captured it (`previous_known`); access records carry cycle and emulated time but
 no per-record VDP frame token; every filter applies after capture. `loss.complete`
-has one definition — the capture covered the requested window with no gaps — so
-it is true only for a `continuous` session with zero loss. A sampled session
+has one definition — the capture covered the requested window with no gaps and
+the session has ended — so it is false for every running session
+(`loss.final: false`, reason `session_running`; the same loss object states
+`estimated_eviction_risk` when a finite retention cap will run out first) and true
+only for a `continuous` session that stopped with zero loss. A sampled session
 always reports `loss.complete: false` plus machine-readable coverage
 (`loss.capture_is_sampled`, `loss.sampled_mode_gaps`, `loss.capture.duty_cycle`/
 `window_ms`/`interval_ms`/`untraced_ms_per_interval`, and

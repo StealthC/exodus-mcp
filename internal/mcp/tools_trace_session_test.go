@@ -650,7 +650,7 @@ func TestTraceSessionRetiredOnROMLoad(t *testing.T) {
 
 // traceSessionLossFixture builds one session for the completeness contract
 // tests. It never touches the native bridge: loss.complete is computed from the
-// session configuration and loss counters alone.
+// session configuration, its ended state, and its loss counters alone.
 func traceSessionLossFixture(mode string, windowMs, intervalMs uint64) *tracing.Session {
 	return tracing.NewSession("trs_loss", "ctx", "m68k", "m68k-bus", tracing.Config{
 		CPU: "m68k", Mode: mode, WindowMs: windowMs, IntervalMs: intervalMs, MaxEvents: 64,
@@ -658,48 +658,70 @@ func traceSessionLossFixture(mode string, windowMs, intervalMs uint64) *tracing.
 }
 
 // TestTraceSessionLossCompletenessByMode pins the definition of loss.complete:
-// the capture covered the requested window with no gaps. A sampled session is
-// never complete; a continuous session is complete only while nothing was lost.
+// the capture covered the requested window with no gaps and the session has
+// ended. A running session is never complete (session_running), a sampled
+// session is never complete (sampled_mode), and a continuous session is
+// complete only once it stopped with nothing lost.
 func TestTraceSessionLossCompletenessByMode(t *testing.T) {
 	cases := []struct {
 		name         string
 		mode         string
 		windowMs     uint64
 		intervalMs   uint64
+		stopped      bool
 		loseData     bool
 		wantComplete bool
+		wantFinal    bool
 		wantSampled  bool
 		wantDuty     float64
 		wantUntraced uint64
 		wantReason   string
 	}{
 		{
-			name: "sampled default is never complete", mode: "sampled",
+			name: "running continuous session is not final", mode: "continuous",
 			windowMs: 100, intervalMs: 10000,
-			wantComplete: false, wantSampled: true, wantDuty: 0.01, wantUntraced: 9900,
+			wantComplete: false, wantFinal: false, wantSampled: false, wantDuty: 1, wantUntraced: 0,
+			wantReason: "session_running",
+		},
+		{
+			name: "running continuous session with loss keeps session_running first", mode: "continuous",
+			windowMs: 100, intervalMs: 10000, loseData: true,
+			wantComplete: false, wantFinal: false, wantSampled: false, wantDuty: 1, wantUntraced: 0,
+			wantReason: "session_running",
+		},
+		{
+			name: "ended continuous session without loss is complete", mode: "continuous",
+			windowMs: 100, intervalMs: 10000, stopped: true,
+			wantComplete: true, wantFinal: true, wantSampled: false, wantDuty: 1, wantUntraced: 0,
+		},
+		{
+			name: "ended continuous session with loss is incomplete", mode: "continuous",
+			windowMs: 100, intervalMs: 10000, stopped: true, loseData: true,
+			wantComplete: false, wantFinal: true, wantSampled: false, wantDuty: 1, wantUntraced: 0,
+			wantReason: "malformed_lines",
+		},
+		{
+			name: "running sampled session reports both reasons", mode: "sampled",
+			windowMs: 100, intervalMs: 10000,
+			wantComplete: false, wantFinal: false, wantSampled: true, wantDuty: 0.01, wantUntraced: 9900,
 			wantReason: "sampled_mode",
 		},
 		{
-			name: "sampled with loss keeps the sampled reason first", mode: "sampled",
-			windowMs: 100, intervalMs: 1000, loseData: true,
-			wantComplete: false, wantSampled: true, wantDuty: 0.1, wantUntraced: 900,
+			name: "ended sampled session is never complete", mode: "sampled",
+			windowMs: 100, intervalMs: 10000, stopped: true,
+			wantComplete: false, wantFinal: true, wantSampled: true, wantDuty: 0.01, wantUntraced: 9900,
+			wantReason: "sampled_mode",
+		},
+		{
+			name: "ended sampled session with loss keeps the sampled reason first", mode: "sampled",
+			windowMs: 100, intervalMs: 1000, stopped: true, loseData: true,
+			wantComplete: false, wantFinal: true, wantSampled: true, wantDuty: 0.1, wantUntraced: 900,
 			wantReason: "malformed_lines",
 		},
 		{
-			name: "continuous without loss is complete", mode: "continuous",
-			windowMs: 100, intervalMs: 10000,
-			wantComplete: true, wantSampled: false, wantDuty: 1, wantUntraced: 0,
-		},
-		{
-			name: "continuous with loss is incomplete", mode: "continuous",
-			windowMs: 100, intervalMs: 10000, loseData: true,
-			wantComplete: false, wantSampled: false, wantDuty: 1, wantUntraced: 0,
-			wantReason: "malformed_lines",
-		},
-		{
-			name: "unknown mode is treated as sampled",
-			mode: "", windowMs: 0, intervalMs: 0,
-			wantComplete: false, wantSampled: true, wantDuty: 0, wantUntraced: 0,
+			name: "unknown mode is treated as sampled", mode: "",
+			windowMs: 0, intervalMs: 0, stopped: true,
+			wantComplete: false, wantFinal: true, wantSampled: true, wantDuty: 0, wantUntraced: 0,
 			wantReason: "sampled_mode",
 		},
 	}
@@ -709,9 +731,15 @@ func TestTraceSessionLossCompletenessByMode(t *testing.T) {
 			if testCase.loseData {
 				session.AddParseStats(tracing.ParseStats{Malformed: 1})
 			}
+			if testCase.stopped {
+				session.MarkStopped()
+			}
 			view := traceSessionLossView(session)
 			if view["complete"] != testCase.wantComplete {
 				t.Fatalf("complete = %v, want %v (%v)", view["complete"], testCase.wantComplete, view)
+			}
+			if view["final"] != testCase.wantFinal {
+				t.Fatalf("final = %v, want %v (%v)", view["final"], testCase.wantFinal, view)
 			}
 			if view["capture_is_sampled"] != testCase.wantSampled {
 				t.Fatalf("capture_is_sampled = %v, want %v", view["capture_is_sampled"], testCase.wantSampled)
@@ -722,6 +750,9 @@ func TestTraceSessionLossCompletenessByMode(t *testing.T) {
 			definition, _ := view["complete_definition"].(string)
 			if !strings.Contains(definition, "covered the requested window with no gaps") {
 				t.Fatalf("complete_definition must state the coverage definition: %q", definition)
+			}
+			if !strings.Contains(definition, "final is true") {
+				t.Fatalf("complete_definition must require a final session: %q", definition)
 			}
 			capture, _ := view["capture"].(map[string]any)
 			if capture == nil {
@@ -741,8 +772,15 @@ func TestTraceSessionLossCompletenessByMode(t *testing.T) {
 			if capture["untraced_ms_per_interval"] != testCase.wantUntraced {
 				t.Fatalf("capture.untraced_ms_per_interval = %v, want %v", capture["untraced_ms_per_interval"], testCase.wantUntraced)
 			}
+			if _, ok := view["estimated_eviction_risk"].(bool); !ok {
+				t.Fatalf("estimated_eviction_risk must always be stated: %v", view)
+			}
 			reasons, _ := view["incomplete_reasons"].([]string)
-			if testCase.wantComplete {
+			if !testCase.wantFinal {
+				if len(reasons) == 0 || reasons[0] != "session_running" {
+					t.Fatalf("a running session must report session_running first: %v", reasons)
+				}
+			} else if testCase.wantComplete {
 				if len(reasons) != 0 {
 					t.Fatalf("a complete capture must list no reasons: %v", reasons)
 				}
@@ -772,10 +810,109 @@ func TestTraceSessionLossCompletenessByMode(t *testing.T) {
 	}
 }
 
+// TestTraceSessionEvictionRiskProjection pins the estimated_eviction_risk rule:
+// a finite retention cap reached inside the session window is a risk, a
+// frame-limited window that ends first is not, and an ended session never
+// projects because its loss counters state what happened.
+func TestTraceSessionEvictionRiskProjection(t *testing.T) {
+	cases := []struct {
+		name       string
+		mode       string
+		frames     uint64
+		totalBytes uint64
+		maxSegment uint64
+		segmentMs  uint64
+		stopped    bool
+		wantRisk   bool
+	}{
+		{
+			name: "continuous default caps with no frame limit",
+			mode: "continuous", totalBytes: traceSessionDefaultTotalBytes,
+			maxSegment: traceSessionDefaultMaxSegments, segmentMs: traceSessionDefaultSegmentMs,
+			wantRisk: true,
+		},
+		{
+			name: "continuous small byte cap is exhausted almost immediately",
+			mode: "continuous", totalBytes: 1 << 20,
+			maxSegment: traceSessionDefaultMaxSegments, segmentMs: traceSessionDefaultSegmentMs,
+			wantRisk: true,
+		},
+		{
+			name: "small frame budget ends before the retention cap fills",
+			mode: "continuous", frames: 60, totalBytes: traceSessionMaxTotalBytes,
+			maxSegment: traceSessionMaxMaxSegments, segmentMs: traceSessionDefaultSegmentMs,
+			wantRisk: false,
+		},
+		{
+			name: "large frame budget outlives the retention cap",
+			mode: "continuous", frames: 60000, totalBytes: 1 << 20,
+			maxSegment: traceSessionDefaultMaxSegments, segmentMs: traceSessionDefaultSegmentMs,
+			wantRisk: true,
+		},
+		{
+			name: "ended session reports its outcome instead of a projection",
+			mode: "continuous", totalBytes: 1 << 20,
+			maxSegment: traceSessionDefaultMaxSegments, segmentMs: traceSessionDefaultSegmentMs,
+			stopped: true, wantRisk: false,
+		},
+	}
+	for _, testCase := range cases {
+		t.Run(testCase.name, func(t *testing.T) {
+			session := tracing.NewSession("trs_risk", "ctx", "m68k", "m68k-bus", tracing.Config{
+				CPU: "m68k", Mode: testCase.mode, WindowMs: 100, IntervalMs: 10000,
+				SegmentMs: testCase.segmentMs, StopAfterVdpFrames: testCase.frames,
+				MaxTotalBytes: testCase.totalBytes, MaxSegments: testCase.maxSegment, MaxEvents: 64,
+			})
+			if testCase.stopped {
+				session.MarkStopped()
+			}
+			view := traceSessionLossView(session)
+			if view["estimated_eviction_risk"] != testCase.wantRisk {
+				t.Fatalf("estimated_eviction_risk = %v, want %v (%v)",
+					view["estimated_eviction_risk"], testCase.wantRisk, view["estimated_eviction"])
+			}
+			basis, _ := view["estimated_eviction"].(map[string]any)
+			if basis == nil {
+				t.Fatalf("the projection must state its numbers: %v", view)
+			}
+			if rule, _ := basis["rule"].(string); !strings.Contains(rule, "estimated trace write rate") {
+				t.Fatalf("the projection must state its rule: %q", rule)
+			}
+			if basis["retention_bounded"] != true {
+				t.Fatalf("retention must be reported as bounded: %v", basis)
+			}
+			byteCap, _ := basis["byte_cap_seconds"].(float64)
+			if byteCap <= 0 {
+				t.Fatalf("a bounded byte cap must state its horizon: %v", basis)
+			}
+			if testCase.stopped {
+				if basis["verdict"] != "session_ended" || basis["applies_to"] != "ended_session" {
+					t.Fatalf("an ended session must not project a future risk: %v", basis)
+				}
+				return
+			}
+			if basis["applies_to"] != "running_session" {
+				t.Fatalf("a running session must label the projection: %v", basis)
+			}
+			if testCase.frames > 0 {
+				if basis["session_window_bounded"] != true || basis["session_window_seconds"] == float64(0) {
+					t.Fatalf("a frame limit must bound the session window: %v", basis)
+				}
+				if basis["assumed_frame_rate_hz"] != traceSessionBaselineFrameRateHz {
+					t.Fatalf("the projection must state the frame rate it assumes: %v", basis)
+				}
+			} else if basis["session_window_bounded"] != false {
+				t.Fatalf("a session without a frame limit has an unbounded window: %v", basis)
+			}
+		})
+	}
+}
+
 // TestTraceSessionStatusReportsCaptureCoverage checks the same contract through
-// the tools: the default sampled session can never report a complete capture,
-// while a continuous session reports completeness and its full duty cycle, and
-// the default collect=true call leaves the session queryable as live.
+// the tools: a running session can never report a complete capture, the default
+// sampled session states its 1 % duty cycle as a reason, a continuous session
+// becomes complete only after it stops with no loss, and a finite retention cap
+// under a full-speed write rate is flagged as an eviction risk at start.
 func TestTraceSessionStatusReportsCaptureCoverage(t *testing.T) {
 	sampledFake := newTraceSessionFake(fakeTraceSegment([3]string{"00FF0000", "NOP", ""}))
 	sampledServer := newTestServer(t, sampledFake.client())
@@ -793,6 +930,9 @@ func TestTraceSessionStatusReportsCaptureCoverage(t *testing.T) {
 	if sampledLoss["complete"] != false {
 		t.Fatalf("a sampled session must never report a complete capture: %v", sampledLoss)
 	}
+	if sampledLoss["final"] != false {
+		t.Fatalf("a running session is not final: %v", sampledLoss)
+	}
 	if sampledLoss["capture_is_sampled"] != true || sampledLoss["sampled_mode_gaps"] != true {
 		t.Fatalf("sampled capture flags wrong: %v", sampledLoss)
 	}
@@ -805,7 +945,7 @@ func TestTraceSessionStatusReportsCaptureCoverage(t *testing.T) {
 		t.Fatalf("sampled coverage must state the 1%% duty cycle: %v", sampledCapture)
 	}
 	sampledReasons, _ := sampledLoss["incomplete_reasons"].([]any)
-	if len(sampledReasons) != 1 || sampledReasons[0] != "sampled_mode" {
+	if len(sampledReasons) != 2 || sampledReasons[0] != "session_running" || sampledReasons[1] != "sampled_mode" {
 		t.Fatalf("sampled incomplete_reasons = %v", sampledReasons)
 	}
 	drained, _ := sampled["drained"].(map[string]any)
@@ -824,21 +964,34 @@ func TestTraceSessionStatusReportsCaptureCoverage(t *testing.T) {
 		t.Fatalf("continuous start failed: %v", started)
 	}
 	startLoss, _ := started["loss"].(map[string]any)
-	if startLoss["complete"] != true || startLoss["capture_is_sampled"] != false {
-		t.Fatalf("a fresh continuous session is complete: %v", startLoss)
+	// The defect this test pins: a start response advertised a complete capture
+	// while the same response advertised finite, lossy retention.
+	if startLoss["complete"] != false || startLoss["final"] != false {
+		t.Fatalf("a just-started session must not promise completeness: %v", startLoss)
+	}
+	startReasons, _ := startLoss["incomplete_reasons"].([]any)
+	if len(startReasons) != 1 || startReasons[0] != "session_running" {
+		t.Fatalf("a continuous start must report session_running: %v", startReasons)
+	}
+	if startLoss["estimated_eviction_risk"] != true {
+		t.Fatalf("a full-speed continuous session over the default caps is an eviction risk: %v", startLoss["estimated_eviction"])
+	}
+	if estimate, _ := startLoss["estimated_eviction"].(map[string]any); estimate["applies_to"] != "running_session" {
+		t.Fatalf("the risk projection must be labelled: %v", estimate)
 	}
 	// Two default status calls, each draining, must leave the session live and
-	// its capture complete: collect must never be reported as ending capture.
+	// still not final: collect must never be reported as ending capture.
 	for attempt := 0; attempt < 2; attempt++ {
 		status := structured(postToolCall(t, continuousServer, "trace_session_status", `{}`))
 		if status["code"] != nil {
 			t.Fatalf("continuous status %d failed: %v", attempt, status)
 		}
 		loss, _ := status["loss"].(map[string]any)
-		if loss["complete"] != true || loss["capture_is_sampled"] != false {
-			t.Fatalf("continuous status %d must stay complete: %v", attempt, loss)
+		if loss["complete"] != false || loss["final"] != false || loss["capture_is_sampled"] != false {
+			t.Fatalf("continuous status %d must stay live and incomplete: %v", attempt, loss)
 		}
-		if reasons, _ := loss["incomplete_reasons"].([]any); len(reasons) != 0 {
+		reasons, _ := loss["incomplete_reasons"].([]any)
+		if len(reasons) != 1 || reasons[0] != "session_running" {
 			t.Fatalf("continuous status %d reported reasons: %v", attempt, reasons)
 		}
 		capture, _ := loss["capture"].(map[string]any)
@@ -852,5 +1005,24 @@ func TestTraceSessionStatusReportsCaptureCoverage(t *testing.T) {
 		if events, _ := status["drained"].(map[string]any); events["complete"] != true {
 			t.Fatalf("continuous drain %d incomplete: %v", attempt, events)
 		}
+	}
+	// Only the end of the session can make the verdict final, and a clean
+	// continuous run is then the one shape that reports complete.
+	stopped := structured(postToolCall(t, continuousServer, "trace_session_stop", `{"export":false}`))
+	if stopped["code"] != nil {
+		t.Fatalf("continuous stop failed: %v", stopped)
+	}
+	stoppedLoss, _ := stopped["loss"].(map[string]any)
+	if stoppedLoss["complete"] != true || stoppedLoss["final"] != true {
+		t.Fatalf("a clean continuous session must be complete once stopped: %v", stoppedLoss)
+	}
+	if reasons, _ := stoppedLoss["incomplete_reasons"].([]any); len(reasons) != 0 {
+		t.Fatalf("a complete capture must list no reasons: %v", reasons)
+	}
+	if stoppedLoss["estimated_eviction_risk"] != false {
+		t.Fatalf("an ended session reports its outcome, not a projection: %v", stoppedLoss["estimated_eviction"])
+	}
+	if basis, _ := stoppedLoss["estimated_eviction"].(map[string]any); basis["verdict"] != "session_ended" {
+		t.Fatalf("ended-session projection verdict wrong: %v", basis)
 	}
 }
