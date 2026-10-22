@@ -34,19 +34,30 @@ type replayFakeConfig struct {
 	// resetTokenOnLoad models a counter reset across the restore. The replay
 	// must not depend on it: deltas are compared either way.
 	resetTokenOnLoad bool
-	// frameDriftStep adds frameDriftFrames to that step's advance in run 2,
-	// injecting a per-step token divergence.
+	// frameDriftStep adds frameDriftFrames to that step's advance on the restore
+	// selected by frameDriftLoad, injecting a per-step token divergence.
 	frameDriftStep   int
 	frameDriftFrames uint64
-	// registerDrift adds a pc offset to the samples taken after the run's first
-	// frame advance, injecting a CPU-state divergence without changing the frame
-	// count or the post-restore fingerprint.
+	// frameDriftLoad selects the restore whose frame advances drift (default 2).
+	frameDriftLoad int
+	// registerDrift adds a pc offset to the samples taken after the selected
+	// run's first frame advance, injecting a CPU-state divergence without
+	// changing the frame count or the post-restore fingerprint.
 	registerDrift bool
-	// restorePCBias adds that many bytes to every register sample of the second
-	// and later restores, modelling a state_load that is not bit-exact: the
-	// machine resumes one instruction earlier or later, so the post-restore
-	// fingerprint already differs and every later sample inherits the drift.
-	restorePCBias uint64
+	// registerDriftLoad selects the restore whose samples drift (default 2).
+	registerDriftLoad int
+	// restoreBiasLoad selects the restore whose machine state is off by biasPC
+	// and biasD0 bytes and whose condition codes are xored with biasCCR; 0
+	// disables it. This models a state_load that is not bit-exact: the machine
+	// resumes one instruction earlier or later, so the post-restore fingerprint
+	// already differs and every later sample inherits the drift.
+	restoreBiasLoad int
+	biasPC          uint64
+	biasD0          uint64
+	biasCCR         uint64
+	// omitCCR drops the condition codes from regs_get, modelling a bridge whose
+	// register payload does not expose flags.
+	omitCCR bool
 	// omitFrameToken makes frame_advance report no token at all.
 	omitFrameToken bool
 	// unreadableRegisters makes regs_get return no register map.
@@ -126,7 +137,7 @@ func replayFake(config replayFakeConfig) *fakeBridgeClient {
 			if err != nil {
 				return nil, err
 			}
-			if loads == 2 && advances == config.frameDriftStep {
+			if loads == driftLoad(config.frameDriftLoad) && advances == config.frameDriftStep {
 				frames += config.frameDriftFrames
 			}
 			advances++
@@ -142,20 +153,37 @@ func replayFake(config replayFakeConfig) *fakeBridgeClient {
 				return json.RawMessage(`{"cpu":"m68k","byte_order":"big-endian"}`), nil
 			}
 			pc := uint64(0x200) + executed*2
-			if loads >= 2 {
+			d0 := executed
+			ccr := uint64(0x04)
+			if loads == config.restoreBiasLoad {
 				// A state_load that is not bit-exact leaves the machine one
 				// instruction off, so the drift is already in the fingerprint.
-				pc += config.restorePCBias
+				pc += config.biasPC
+				d0 += config.biasD0
+				ccr ^= config.biasCCR
 			}
-			if config.registerDrift && loads == 2 && advances > 0 {
+			if config.registerDrift && loads == driftLoad(config.registerDriftLoad) && advances > 0 {
 				pc += 0x100
 			}
-			return json.RawMessage(fmt.Sprintf(`{"cpu":"m68k","byte_order":"not-applicable","system_paused_during_read":false,"registers":{"pc":%d,"a7":16776672,"d0":%d},"flags":{},"width_bits":32}`, pc, executed)), nil
+			conditionCodes := fmt.Sprintf(`,"ccr":%d`, ccr)
+			if config.omitCCR {
+				conditionCodes = ""
+			}
+			return json.RawMessage(fmt.Sprintf(`{"cpu":"m68k","byte_order":"not-applicable","system_paused_during_read":false,"registers":{"pc":%d,"a7":16776672,"d0":%d%s},"flags":{},"width_bits":32}`, pc, d0, conditionCodes)), nil
 		default:
 			return json.RawMessage(`{}`), nil
 		}
 	}
 	return client
+}
+
+// driftLoad resolves an optional restore selector: the zero value means the
+// second restore, which is the first compared run.
+func driftLoad(selected int) int {
+	if selected == 0 {
+		return 2
+	}
+	return selected
 }
 
 // replayContent calls the tool and returns its structured content, failing on
@@ -295,8 +323,9 @@ func TestDeterministicReplayDoesNotDependOnTokenReset(t *testing.T) {
 	}
 }
 
-// TestDeterministicReplayReportsDivergedStep injects a per-step difference and
-// asserts the response names the step and both observed values.
+// TestDeterministicReplayReportsDivergedStep injects a per-step difference in a
+// compared run and asserts the response names the step and both observed values.
+// run1/run2 in the divergence are the compared phases run_2 and run_3.
 func TestDeterministicReplayReportsDivergedStep(t *testing.T) {
 	content := replayContent(t, replayFake(replayFakeConfig{startToken: 10, frameDriftStep: 1, frameDriftFrames: 2}),
 		`{"steps":[{"inputs":{"1":["a"]},"frames":2},{"inputs":{"1":["b"]},"frames":1}]}`)
@@ -310,8 +339,8 @@ func TestDeterministicReplayReportsDivergedStep(t *testing.T) {
 	if diverged["step"] != float64(1) || diverged["field"] != "frame_token_delta" {
 		t.Fatalf("diverged_step = %v, want step 1 / frame_token_delta", diverged)
 	}
-	if diverged["run1"] != float64(3) || diverged["run2"] != float64(5) {
-		t.Fatalf("diverged_step values = run1 %v run2 %v, want 3 and 5", diverged["run1"], diverged["run2"])
+	if diverged["run1"] != float64(5) || diverged["run2"] != float64(3) {
+		t.Fatalf("diverged_step values = run_2 %v run_3 %v, want 5 and 3", diverged["run1"], diverged["run2"])
 	}
 	checks := replayChecks(content)
 	if check := checks["frame_token_deltas_match"]; check == nil || check["passed"] != false {
@@ -367,7 +396,7 @@ func TestDeterministicReplayRegistersAttributeDivergenceToStep(t *testing.T) {
 // sequence nondeterminism. The difference must stay visible as advisory
 // evidence instead of failing the verdict.
 func TestDeterministicReplayAdvisoryRegistersWhenRestoreIsNotExact(t *testing.T) {
-	content := replayContent(t, replayFake(replayFakeConfig{restorePCBias: 4}),
+	content := replayContent(t, replayFake(replayFakeConfig{restoreBiasLoad: 3, biasPC: 4}),
 		`{"steps":[{"inputs":{"1":["a"]},"frames":2}]}`)
 
 	if content["deterministic"] != true {
@@ -409,8 +438,8 @@ func TestDeterministicReplayAdvisoryRegistersWhenRestoreIsNotExact(t *testing.T)
 	// The fingerprints that justify the advisory comparison travel with the
 	// response, both values included.
 	fingerprints, _ := content["restore_fingerprints"].(map[string]any)
-	firstFingerprint, _ := fingerprints["run_1"].(map[string]any)
-	secondFingerprint, _ := fingerprints["run_2"].(map[string]any)
+	firstFingerprint, _ := fingerprints["run_2"].(map[string]any)
+	secondFingerprint, _ := fingerprints["run_3"].(map[string]any)
 	if firstFingerprint["m68k_pc"] == secondFingerprint["m68k_pc"] {
 		t.Fatalf("restore_fingerprints = %v, want differing pc values", fingerprints)
 	}
@@ -432,7 +461,7 @@ func TestDeterministicReplayAdvisoryRegistersWhenRestoreIsNotExact(t *testing.T)
 // frame axis always counts: an inexact restore never excuses a different
 // number of frames advanced.
 func TestDeterministicReplayFrameDriftGatesEvenWhenRestoreIsNotExact(t *testing.T) {
-	content := replayContent(t, replayFake(replayFakeConfig{restorePCBias: 4, frameDriftStep: 0, frameDriftFrames: 2}),
+	content := replayContent(t, replayFake(replayFakeConfig{restoreBiasLoad: 3, biasPC: 4, frameDriftStep: 0, frameDriftFrames: 2}),
 		`{"steps":[{"inputs":{"1":["a"]},"frames":2}]}`)
 	if content["deterministic"] != false {
 		t.Fatalf("deterministic = %v, want false", content["deterministic"])
@@ -450,6 +479,183 @@ func TestDeterministicReplayFrameDriftGatesEvenWhenRestoreIsNotExact(t *testing.
 	}
 	if advisories, _ := content["advisory_divergences"].([]any); len(advisories) == 0 {
 		t.Fatalf("advisory_divergences missing for an inexact restore: %v", content)
+	}
+}
+
+// TestDeterministicReplayWarmupAbsorbsFirstRunSkew is the regression test for the
+// third reported defect: run 1 carried residual state from the moment the tool
+// stopped a running target, which shifted one register by one count while the
+// frames matched. The warm-up pass must absorb it: run_1 differences are
+// observations, never failures.
+func TestDeterministicReplayWarmupAbsorbsFirstRunSkew(t *testing.T) {
+	content := replayContent(t, replayFake(replayFakeConfig{restoreBiasLoad: 1, biasD0: 1}),
+		`{"steps":[{"inputs":{"1":["a"]},"frames":3}]}`)
+
+	if content["deterministic"] != true {
+		t.Fatalf("deterministic = %v, want true: %v", content["deterministic"], content)
+	}
+	if content["warmup"] != true {
+		t.Fatalf("warmup = %v, want true", content["warmup"])
+	}
+	if note, _ := content["warmup_note"].(string); !strings.Contains(note, "warm-up pass") {
+		t.Fatalf("warmup_note does not explain the warm-up pass: %q", note)
+	}
+	if _, exists := content["diverged_step"]; exists {
+		t.Fatalf("diverged_step reported for a warm-up-only difference: %v", content["diverged_step"])
+	}
+	if divergences, exists := content["divergences"]; exists {
+		t.Fatalf("divergences = %v, want none: the skew belongs to the warm-up pass", divergences)
+	}
+	// The discarded pass is reported in full, with both values.
+	warmupDivergences, _ := content["warmup_divergences"].([]any)
+	if len(warmupDivergences) == 0 {
+		t.Fatalf("warmup_divergences missing: %v", content)
+	}
+	found := false
+	for _, entry := range warmupDivergences {
+		divergence, _ := entry.(map[string]any)
+		if divergence["field"] != "step_registers.m68k_d0" || divergence["step"] != float64(0) {
+			continue
+		}
+		found = true
+		if first, ok := divergence["run1"].(float64); !ok || first != 4 {
+			t.Fatalf("warmup divergence run1 = %v, want 4 (run_1: 3 frames plus the residual count)", divergence["run1"])
+		}
+		if second, ok := divergence["run2"].(float64); !ok || second != 3 {
+			t.Fatalf("warmup divergence run2 = %v, want 3 (run_2)", divergence["run2"])
+		}
+	}
+	if !found {
+		t.Fatalf("warmup_divergences do not name step_registers.m68k_d0 at step 0: %v", warmupDivergences)
+	}
+	if content["warmup_restore_fidelity"] != "not_exact" {
+		t.Fatalf("warmup_restore_fidelity = %v, want not_exact: the residual state shows in the run_1/run_2 fingerprints", content["warmup_restore_fidelity"])
+	}
+	if fields, _ := content["warmup_restore_fidelity_fields"].([]any); len(fields) != 1 || fields[0] != "m68k_d0" {
+		t.Fatalf("warmup_restore_fidelity_fields = %v, want [m68k_d0]", fields)
+	}
+	// The compared pair is runs 2 and 3, and their restores are identical.
+	if compared, _ := content["runs_compared"].([]any); len(compared) != 2 || compared[0] != "run_2" || compared[1] != "run_3" {
+		t.Fatalf("runs_compared = %v, want [run_2 run_3]", content["runs_compared"])
+	}
+	if content["restore_fidelity"] != "exact" || content["register_comparison"] != "gating" {
+		t.Fatalf("restore_fidelity = %v register_comparison = %v, want exact/gating for runs 2 and 3", content["restore_fidelity"], content["register_comparison"])
+	}
+	if content["determinism_scope"] != "frame_and_register" {
+		t.Fatalf("determinism_scope = %v, want frame_and_register", content["determinism_scope"])
+	}
+	for key, want := range map[string]bool{"run_1": true, "run_2": false, "run_3": false} {
+		if run := replayRun(t, content, key); run["warmup"] != want {
+			t.Fatalf("%s warmup = %v, want %v", key, run["warmup"], want)
+		}
+	}
+}
+
+// TestDeterministicReplayGatesOnRunsTwoAndThree asserts a difference between the
+// compared runs is a genuine nondeterminism verdict, named with run 2 and run 3
+// values.
+func TestDeterministicReplayGatesOnRunsTwoAndThree(t *testing.T) {
+	content := replayContent(t, replayFake(replayFakeConfig{registerDrift: true, registerDriftLoad: 3}),
+		`{"steps":[{"inputs":{"1":["a"]},"frames":1}]}`)
+	if content["deterministic"] != false {
+		t.Fatalf("deterministic = %v, want false: %v", content["deterministic"], content)
+	}
+	if content["determinism_scope"] != "frame_and_register" || content["restore_fidelity"] != "exact" {
+		t.Fatalf("determinism_scope = %v restore_fidelity = %v, want frame_and_register/exact", content["determinism_scope"], content["restore_fidelity"])
+	}
+	diverged, ok := content["diverged_step"].(map[string]any)
+	if !ok {
+		t.Fatalf("diverged_step missing: %v", content)
+	}
+	if diverged["field"] != "step_registers.m68k_pc" || diverged["step"] != float64(0) {
+		t.Fatalf("diverged_step = %v, want step 0 / step_registers.m68k_pc", diverged)
+	}
+	if diverged["run1"] == diverged["run2"] {
+		t.Fatalf("diverged_step reports identical values: %v", diverged)
+	}
+	// The warm-up pair agreed, so its observations are empty.
+	if warmup, _ := content["warmup_divergences"].([]any); len(warmup) != 0 {
+		t.Fatalf("warmup_divergences = %v, want none", warmup)
+	}
+	if content["warmup_restore_fidelity"] != "exact" {
+		t.Fatalf("warmup_restore_fidelity = %v, want exact", content["warmup_restore_fidelity"])
+	}
+}
+
+// TestDeterministicReplayFrameDriftBetweenRunsTwoAndThree proves frame-token
+// drift inside the compared pair still fails, and stays out of the warm-up
+// observations.
+func TestDeterministicReplayFrameDriftBetweenRunsTwoAndThree(t *testing.T) {
+	content := replayContent(t, replayFake(replayFakeConfig{frameDriftStep: 0, frameDriftFrames: 2, frameDriftLoad: 3}),
+		`{"steps":[{"inputs":{"1":["a"]},"frames":2}]}`)
+	if content["deterministic"] != false {
+		t.Fatalf("deterministic = %v, want false", content["deterministic"])
+	}
+	diverged, ok := content["diverged_step"].(map[string]any)
+	if !ok || diverged["field"] != "frame_token_delta" {
+		t.Fatalf("diverged_step = %v, want a gating frame_token_delta divergence", content["diverged_step"])
+	}
+	if diverged["run1"] != float64(2) || diverged["run2"] != float64(4) {
+		t.Fatalf("diverged_step values = run_2 %v run_3 %v, want 2 and 4", diverged["run1"], diverged["run2"])
+	}
+	if warmup, _ := content["warmup_divergences"].([]any); len(warmup) != 0 {
+		t.Fatalf("warmup_divergences = %v, want none (the drift is in run 3)", warmup)
+	}
+}
+
+// TestDeterministicReplayCCRDifferenceDemotesRegisters covers the flag gap the
+// pc/a7/d0 fingerprint cannot see: a condition-code difference between the
+// compared restores must demote the register axis to advisory.
+func TestDeterministicReplayCCRDifferenceDemotesRegisters(t *testing.T) {
+	content := replayContent(t, replayFake(replayFakeConfig{restoreBiasLoad: 3, biasCCR: 0x01}),
+		`{"steps":[{"inputs":{"1":["a"]},"frames":2}]}`)
+	if content["deterministic"] != true {
+		t.Fatalf("deterministic = %v, want true (the frames match): %v", content["deterministic"], content)
+	}
+	if content["restore_fidelity"] != "not_exact" {
+		t.Fatalf("restore_fidelity = %v, want not_exact", content["restore_fidelity"])
+	}
+	if fields, _ := content["restore_fidelity_fields"].([]any); len(fields) != 1 || fields[0] != "ccr" {
+		t.Fatalf("restore_fidelity_fields = %v, want [ccr]", fields)
+	}
+	if compared, _ := content["restore_fidelity_compare"].([]any); len(compared) != 4 || compared[3] != "ccr" {
+		t.Fatalf("restore_fidelity_compare = %v, want pc/a7/d0 plus ccr", compared)
+	}
+	if content["register_comparison"] != "advisory" || content["determinism_scope"] != "frame_only" {
+		t.Fatalf("register_comparison = %v determinism_scope = %v, want advisory/frame_only", content["register_comparison"], content["determinism_scope"])
+	}
+	fingerprints, _ := content["restore_fingerprints"].(map[string]any)
+	first, _ := fingerprints["run_2"].(map[string]any)
+	second, _ := fingerprints["run_3"].(map[string]any)
+	if first["ccr"] == second["ccr"] {
+		t.Fatalf("restore_fingerprints = %v, want differing ccr values", fingerprints)
+	}
+	if pc := first["m68k_pc"]; pc != second["m68k_pc"] {
+		t.Fatalf("restore_fingerprints pc = %v / %v, want matching pc for a flag-only difference", pc, second["m68k_pc"])
+	}
+}
+
+// TestDeterministicReplayReportsMissingCCR asserts the response says which fields
+// the fidelity comparison covered, so a build without condition codes is visible
+// instead of assumed.
+func TestDeterministicReplayReportsMissingCCR(t *testing.T) {
+	content := replayContent(t, replayFake(replayFakeConfig{omitCCR: true}),
+		`{"steps":[{"inputs":{"1":["a"]},"frames":1}]}`)
+	if content["deterministic"] != true {
+		t.Fatalf("deterministic = %v, want true: %v", content["deterministic"], content)
+	}
+	compared, _ := content["restore_fidelity_compare"].([]any)
+	if len(compared) != 3 {
+		t.Fatalf("restore_fidelity_compare = %v, want only pc/a7/d0 (no ccr in the payload)", compared)
+	}
+	for _, entry := range compared {
+		if entry == "ccr" {
+			t.Fatalf("restore_fidelity_compare = %v claims ccr was compared", compared)
+		}
+	}
+	fingerprints, _ := content["restore_fingerprints"].(map[string]any)
+	if first, _ := fingerprints["run_2"].(map[string]any); first["ccr"] != nil {
+		t.Fatalf("restore_fingerprints = %v, want no invented ccr", fingerprints)
 	}
 }
 
@@ -578,14 +784,14 @@ func TestDeterministicReplayRunningTargetStaysDeterministic(t *testing.T) {
 			}
 		}
 	}
-	if len(loads) != 3 {
-		t.Fatalf("state_load calls = %d, want 3 (initial, between runs, final)", len(loads))
+	if len(loads) != 4 {
+		t.Fatalf("state_load calls = %d, want 4 (initial, two between runs, final)", len(loads))
 	}
 	if len(pauses) != 1 || pauses[0] > loads[0] {
 		t.Fatalf("pause calls = %v, want exactly one before the first state_load at call %d", pauses, loads[0])
 	}
-	if len(resumes) != 1 || resumes[0] < loads[2] {
-		t.Fatalf("run calls = %v, want exactly one after the final state_load at call %d", resumes, loads[2])
+	if len(resumes) != 1 || resumes[0] < loads[3] {
+		t.Fatalf("run calls = %v, want exactly one after the final state_load at call %d", resumes, loads[3])
 	}
 	// The target must be left in the run state it had before the call.
 	if content["entry_run_state"] != "running" {
@@ -734,8 +940,8 @@ func TestDeterministicReplayManifestRecordsBaselines(t *testing.T) {
 	if err := json.Unmarshal(raw, &manifest); err != nil {
 		t.Fatalf("decode manifest: %v", err)
 	}
-	if manifest["schema_version"] != "replay-manifest/3" {
-		t.Fatalf("schema_version = %v, want replay-manifest/3", manifest["schema_version"])
+	if manifest["schema_version"] != "replay-manifest/4" {
+		t.Fatalf("schema_version = %v, want replay-manifest/4", manifest["schema_version"])
 	}
 	if manifest["frame_token_comparison"] != "per_step_delta_from_run_baseline" {
 		t.Fatalf("frame_token_comparison = %v", manifest["frame_token_comparison"])
@@ -769,11 +975,34 @@ func TestDeterministicReplayManifestRecordsBaselines(t *testing.T) {
 		t.Fatalf("manifest advisory_discoveries = %v, want an empty array", manifest["advisory_divergences"])
 	}
 	fingerprints, _ := manifest["restore_fingerprints"].(map[string]any)
-	if first, _ := fingerprints["run_1"].(map[string]any); first["m68k_pc"] == nil {
+	if first, _ := fingerprints["run_2"].(map[string]any); first["m68k_pc"] == nil {
 		t.Fatalf("manifest restore_fingerprints = %v, want both fingerprints", fingerprints)
 	}
 	if note, _ := manifest["restore_fidelity_note"].(string); !strings.Contains(note, "excluded") {
 		t.Fatalf("manifest restore_fidelity_note does not explain the token exclusion: %q", note)
+	}
+	// The manifest records the three-pass protocol and which passes decided the
+	// verdict.
+	if manifest["warmup"] != true {
+		t.Fatalf("manifest warmup = %v, want true", manifest["warmup"])
+	}
+	if note, _ := manifest["warmup_note"].(string); !strings.Contains(note, "warm-up pass") {
+		t.Fatalf("manifest warmup_note does not explain the warm-up: %q", note)
+	}
+	if run3, ok := manifest["run_3"].(map[string]any); !ok || run3["phase"] != "run_3" {
+		t.Fatalf("manifest run_3 = %v, want the third pass", manifest["run_3"])
+	}
+	if compared, _ := manifest["runs_compared"].([]any); len(compared) != 2 || compared[0] != "run_2" || compared[1] != "run_3" {
+		t.Fatalf("manifest runs_compared = %v, want [run_2 run_3]", manifest["runs_compared"])
+	}
+	if manifest["determinism_scope"] != "frame_and_register" {
+		t.Fatalf("manifest determinism_scope = %v, want frame_and_register", manifest["determinism_scope"])
+	}
+	if fields, _ := manifest["restore_fidelity_compare"].([]any); len(fields) != 4 || fields[3] != "ccr" {
+		t.Fatalf("manifest restore_fidelity_compare = %v, want pc/a7/d0 plus ccr", fields)
+	}
+	if warmup, ok := manifest["warmup_divergences"].([]any); !ok || len(warmup) != 0 {
+		t.Fatalf("manifest warmup_divergences = %v, want an empty array", manifest["warmup_divergences"])
 	}
 	// The artifact envelope must not claim a live sample of a paused window.
 	provenance := mustMap(t, mustMap(t, descriptor["provenance"], "artifact provenance")["capture_consistency"], "capture consistency")
