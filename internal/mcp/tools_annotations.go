@@ -316,6 +316,8 @@ func annotationStoreFailure(err error) *toolFailure {
 		return &toolFailure{Code: "unknown_annotation", Message: err.Error()}
 	case errors.Is(err, analysis.ErrAnnotationLimit):
 		return &toolFailure{Code: "annotation_limit_exceeded", Message: fmt.Sprintf("at most %d annotations per context", analysis.MaxAnnotationsPerContext)}
+	case errors.Is(err, analysis.ErrAnnotationStore):
+		return &toolFailure{Code: "annotation_store_error", Message: err.Error()}
 	default:
 		return &toolFailure{Code: "invalid_params", Message: err.Error()}
 	}

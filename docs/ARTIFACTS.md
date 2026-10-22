@@ -159,13 +159,29 @@ artifacts it describes. The capture
 index is stored in the same document and follows the same rules; a capture whose
 artifacts expired stops resolving.
 
-**Context scope limits what survives:** artifacts and captures are keyed by the
-analysis context that produced them, and context handles are process-local
-(`internal/analysis`), so a restarted server reopens the bytes and the index but
-only serves them to handles that exist again. Listing a previous session's
-artifacts under a new context is not possible by design. Making the default
-context id stable, or persisting contexts next to the artifacts, is separate
-work.
+**What survives a restart.** Artifacts and captures are keyed by the analysis
+context that produced them, so the context handle has to survive too. The
+analysis workspace is persisted next to the artifact index:
+
+```text
+<artifact-dir>/artifact-index.json                 artifact index (artifact-index/1)
+<artifact-dir>/analysis/contexts.json              contexts (analysis-contexts/1)
+<artifact-dir>/analysis/annotations/<context>.json  one context's annotations (annotations/1)
+```
+
+`analysis.OpenRegistry` loads the context registry and every annotation document
+at startup, so `context_list` reports the contexts of the previous session, the
+default context keeps its id, and `artifact_list`/`annotation_list` find
+yesterday's work through the same handles. The workspace lives in a
+subdirectory because the artifact store reclaims unknown *files* at startup but
+never descends into unknown directories. An undecodable document fails startup
+instead of silently starting empty; symbols are not persisted and are
+re-declared with `symbols_set`. `context_prune` is the reclamation path for a
+closed context: it removes the registry entry, the annotation document, the
+context's artifacts and capture entries (bytes included), and its saved state
+files, and reports what it removed. `state_delete` does the same for one saved
+snapshot, and `state_load` accepts a snapshot `name` when exactly one snapshot
+of the context carries it.
 
 Retention today: `--artifact-ttl` / `EXODUS_MCP_ARTIFACT_TTL` expires artifacts
 on a background sweep (`Store.ExpireOlderThan`, first tick after at most one

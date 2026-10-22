@@ -73,6 +73,41 @@ func (store *StateStore) Get(contextID, id string) (*Snapshot, error) {
 	return nil, fmt.Errorf("unknown state %q in context %q", id, contextID)
 }
 
+// Delete removes one snapshot record and reports it. The caller removes the
+// backing file: the store only tracks metadata.
+func (store *StateStore) Delete(contextID, id string) (*Snapshot, error) {
+	store.mu.Lock()
+	defer store.mu.Unlock()
+	list := store.snapshots[contextID]
+	for index, snapshot := range list {
+		if snapshot.ID != id {
+			continue
+		}
+		store.snapshots[contextID] = append(list[:index], list[index+1:]...)
+		return snapshot, nil
+	}
+	return nil, fmt.Errorf("unknown state %q in context %q", id, contextID)
+}
+
+// FindByName returns the snapshots of a context that carry exactly this name,
+// newest first. Name is not a unique key: the caller decides whether an
+// ambiguous match is an error.
+func (store *StateStore) FindByName(contextID, name string) []*Snapshot {
+	store.mu.Lock()
+	defer store.mu.Unlock()
+	matches := make([]*Snapshot, 0, 2)
+	if name == "" {
+		return matches
+	}
+	for _, snapshot := range store.snapshots[contextID] {
+		if snapshot.Name == name {
+			matches = append(matches, snapshot)
+		}
+	}
+	sort.Slice(matches, func(i, j int) bool { return matches[i].CreatedAt.After(matches[j].CreatedAt) })
+	return matches
+}
+
 // List returns the snapshots of a context, newest first.
 func (store *StateStore) List(contextID string) []*Snapshot {
 	store.mu.Lock()

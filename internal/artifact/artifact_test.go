@@ -272,3 +272,45 @@ func TestPutWithNilProvenanceIsUnknown(t *testing.T) {
 func httpNewRequest(method, url string) (*http.Request, error) {
 	return http.NewRequest(method, url, nil)
 }
+
+// TestDeleteContextReclaimsOneWorkspace covers the reclamation path a pruned
+// analysis context uses: the bytes, the index entries, and the capture records
+// of one context go away while another context is untouched.
+func TestDeleteContextReclaimsOneWorkspace(t *testing.T) {
+	store, err := NewStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	kept, err := store.PutWithProvenance("ctx_keep", "memory-dump", "application/octet-stream", []byte{1, 2}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	doomed, err := store.PutWithProvenance("ctx_doomed", "memory-dump", "application/octet-stream", []byte{3, 4}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.PutCapture(Capture{CaptureID: "cap_doomed", ContextID: "ctx_doomed", ProducerTool: "vdp_capture", ManifestArtifact: doomed.ID}); err != nil {
+		t.Fatal(err)
+	}
+	artifactsRemoved, capturesRemoved, err := store.DeleteContext("ctx_doomed")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if artifactsRemoved != 1 || capturesRemoved != 1 {
+		t.Fatalf("removed %d artifacts and %d captures", artifactsRemoved, capturesRemoved)
+	}
+	if _, _, err := store.Bytes(doomed.ID, "ctx_doomed"); err == nil {
+		t.Fatal("the removed artifact must not resolve")
+	}
+	if _, _, err := store.Bytes(kept.ID, "ctx_keep"); err != nil {
+		t.Fatalf("another context's artifact must survive: %v", err)
+	}
+	// The removal is durable: reopening the store must not resurrect it.
+	reopened, err := NewStore(store.Dir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := reopened.Metadata(doomed.ID, "ctx_doomed"); err == nil {
+		t.Fatal("a removed artifact reappeared after a reopen")
+	}
+}

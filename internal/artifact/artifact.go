@@ -605,3 +605,34 @@ func newID() (string, error) {
 	}
 	return "art_" + base64URLEncode(buffer), nil
 }
+
+// DeleteContext removes every artifact and capture indexed under one analysis
+// context and deletes their backing bytes, then persists the index. It is the
+// reclamation path for a pruned workspace: artifacts are immutable, but an
+// unreachable context's bytes must not accumulate forever. It returns how many
+// artifacts and captures were removed.
+func (store *Store) DeleteContext(contextID string) (artifacts int, captures int, err error) {
+	store.mu.Lock()
+	defer store.mu.Unlock()
+	for id, artifact := range store.artifacts {
+		if artifact.ContextID != contextID {
+			continue
+		}
+		if removal := os.Remove(store.path(id)); removal != nil && !errors.Is(removal, os.ErrNotExist) {
+			return artifacts, captures, fmt.Errorf("remove artifact bytes: %w", removal)
+		}
+		delete(store.artifacts, id)
+		artifacts++
+	}
+	for id, capture := range store.captures {
+		if capture.ContextID != contextID {
+			continue
+		}
+		delete(store.captures, id)
+		captures++
+	}
+	if artifacts == 0 && captures == 0 {
+		return 0, 0, nil
+	}
+	return artifacts, captures, store.persistIndexLocked()
+}
