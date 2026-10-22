@@ -144,7 +144,7 @@ func TestConsolidatedCatalogHasNoDuplicateConcept(t *testing.T) {
 
 // consolidatedCanonicalTools is the merged catalog. Each consolidation group
 // appends its canonical concept here.
-var consolidatedCanonicalTools = []string{"target_status", "memory_map", "memory_read", "disassemble", "cpu_step", "debug_instrument", "events_list", "vdp_memory_read", "vdp_render_export", "capture", "snapshot_diff"}
+var consolidatedCanonicalTools = []string{"target_status", "memory_map", "memory_read", "disassemble", "cpu_step", "debug_instrument", "events_list", "vdp_memory_read", "vdp_render_export", "capture", "snapshot_diff", "trace_session_query", "trace"}
 
 // payloadView strips the fields the dispatcher injects into every response and
 // the alias' own deprecation marker, so two payloads can be compared field by
@@ -888,6 +888,9 @@ var volatileAuditFields = map[string]bool{
 	// A manifest embeds the capture id and wall-clock timestamps, so its own
 	// digest cannot match between two runs.
 	"manifest_sha256": true,
+	// The JSONL trace view embeds per-event capture timestamps.
+	"jsonl_sha256":            true,
+	"linked_trace_capture_id": true,
 }
 
 // cursorPrefix returns the family prefix of one cursor, the part that names the
@@ -1089,7 +1092,7 @@ func TestVDPRenderExportRejectsAnArgumentOutsideTheMode(t *testing.T) {
 // and byte size vary even when the compared inputs are identical.
 func isPerRunReportKind(kind string) bool {
 	switch kind {
-	case stateDiffKind, "memory-diff-results", "state-diff":
+	case stateDiffKind, "memory-diff-results", "state-diff", "cpu-trace", "cpu-trace-jsonl", "cpu-coverage", "debug-event":
 		return true
 	}
 	return strings.HasSuffix(kind, "manifest")
@@ -1207,5 +1210,134 @@ func TestSnapshotDiffSelectsAndRejectsBySection(t *testing.T) {
 	empty := structured(postToolCall(t, server, "snapshot_diff", `{"sections":[]}`))
 	if empty["code"] != "invalid_params" {
 		t.Fatalf("empty sections must be rejected: %v", empty)
+	}
+}
+
+// ----------------------------------------------------------------------------------------------------------------------
+// trace_session_query / trace alias parity (group 12)
+// ----------------------------------------------------------------------------------------------------------------------
+
+// TestTraceSessionQueryAbsorbsTheSessionViews proves both session views are the
+// same query with include selecting them.
+func TestTraceSessionQueryAbsorbsTheSessionViews(t *testing.T) {
+	fake := newTraceSessionFake(fakeTraceSegment(
+		[3]string{"00FF0000", "NOP", ""},
+		[3]string{"00FF0002", "NOP", ""},
+		[3]string{"00FF0004", "NOP", ""},
+	))
+	server := newTestServer(t, fake.client())
+	if start := structured(postToolCall(t, server, "trace_session_start", `{"cpu":"m68k"}`)); start["code"] != nil {
+		t.Fatalf("trace_session_start failed: %v", start)
+	}
+
+	status := canonicalPayloadWithServer(t, server, "trace_session_status", `{"collect":false}`)
+	queryStatus := canonicalPayloadWithServer(t, server, "trace_session_query", `{"include":["status"],"collect":false}`)
+	assertSectionParity(t, "status", queryStatus, status)
+
+	events := canonicalPayloadWithServer(t, server, "trace_session_events", `{"collect":false,"limit":2}`)
+	queryEvents := canonicalPayloadWithServer(t, server, "trace_session_query", `{"include":["events"],"collect":false,"limit":2}`)
+	assertSectionParity(t, "events", queryEvents, events)
+
+	queryCursor, _ := queryEvents["next_cursor"].(string)
+	legacyCursor, _ := events["next_cursor"].(string)
+	if legacyCursor == "" {
+		if queryCursor != "" {
+			t.Fatalf("merged query invented a cursor the view did not publish: %q", queryCursor)
+		}
+	} else if cursorPrefix(queryCursor) != cursorPrefix(legacyCursor) {
+		t.Fatalf("events cursor family = %q, trace_session_events says %q", cursorPrefix(queryCursor), cursorPrefix(legacyCursor))
+	}
+
+	// A view-specific argument is rejected when the other view is selected.
+	rejected := structured(postToolCall(t, server, "trace_session_query", `{"include":["status"],"limit":2}`))
+	if rejected["code"] != "unsupported_parameter" || rejected["field"] != "limit" {
+		t.Fatalf("expected unsupported_parameter for limit: %v", rejected)
+	}
+}
+
+// assertSectionParity compares one section of a merged query with the alias
+// payload, normalizing per-run identity.
+func assertSectionParity(t *testing.T, section string, merged, legacy map[string]any) {
+	t.Helper()
+	sections, _ := merged["sections"].(map[string]any)
+	payload, _ := sections[section].(map[string]any)
+	if payload == nil {
+		t.Fatalf("merged query has no %s section: %v", section, merged)
+	}
+	if !jsonEqual(t, normalizeVolatile(payload), normalizeVolatile(legacy)) {
+		t.Fatalf("%s parity failed:\nsection = %v\nlegacy  = %v", section, payload, legacy)
+	}
+}
+
+// traceCaptureClient answers the native trace_capture operation for window,
+// watchpoint, and coverage captures.
+func traceCaptureClient() *fakeBridgeClient {
+	client := &fakeBridgeClient{status: newFakeStatus()}
+	client.executeFunc = func(_ context.Context, method string, params map[string]string) (json.RawMessage, error) {
+		switch method {
+		case "vdp_status":
+			return json.RawMessage(`{"image_buffer":{"last_rendered_frame_token":0}}`), nil
+		case "regs_get":
+			return json.RawMessage(`{"cpu":"m68k","registers":{"pc":8192}}`), nil
+		case "disasm":
+			return json.RawMessage(`{"cpu":"m68k","start_address":8192,"requested_count":1,"lines":[{"address":8192,"length":2,"bytes":"4E71","mnemonic":"nop","operands":""}]}`), nil
+		case "trace_capture":
+			watchpoint := params["watchpoint_id"] != ""
+			payload := fmt.Sprintf(`{"cpu":"m68k","requested_entries":2,"captured":2,"timed_out":false,"duration_ms":40,`+
+				`"watchpoint_mode":%t,"stopped_on_watchpoint":%t,"watchpoint_ids_hit":[3],`+
+				`"sample":[{"address":2064,"cycle":10,"text":"2064 10 move.l"}],"trace_text":%q}`,
+				watchpoint, watchpoint, "2064 10 move.l d0,-(sp)\n2066 22 rts")
+			return json.RawMessage(payload), nil
+		}
+		return json.RawMessage(`{}`), nil
+	}
+	return client
+}
+
+// TestTraceAbsorbsTheCaptureTools proves each legacy capture is one
+// analyze/until combination with the same payload under result.
+func TestTraceAbsorbsTheCaptureTools(t *testing.T) {
+	cases := []struct {
+		canonical string
+		alias     string
+		aliasArgs string
+	}{
+		{`{"analyze":"trace","until":"window","cpu":"m68k","max_entries":2}`, "cpu_trace_capture", `{"cpu":"m68k","max_entries":2}`},
+		{`{"analyze":"trace","until":"watchpoint","watchpoint_id":3,"max_entries":2,"timeout_ms":900}`, "cpu_trace_capture_watchpoint", `{"watchpoint_id":3,"max_entries":2,"timeout_ms":900}`},
+		{`{"analyze":"coverage","until":"window","cpu":"m68k","max_entries":2}`, "cpu_coverage_capture", `{"cpu":"m68k","max_entries":2}`},
+	}
+	for _, tc := range cases {
+		canonical := canonicalPayload(t, traceCaptureClient(), "trace", tc.canonical)
+		legacy := canonicalPayload(t, traceCaptureClient(), tc.alias, tc.aliasArgs)
+		result, _ := canonical["result"].(map[string]any)
+		if result == nil {
+			t.Fatalf("%s: trace produced no result: %v", tc.alias, canonical)
+		}
+		if !jsonEqual(t, normalizeVolatile(result), normalizeVolatile(legacy)) {
+			t.Fatalf("%s parity failed:\nresult = %v\nlegacy = %v", tc.alias, result, legacy)
+		}
+	}
+}
+
+// TestTraceInferenceAndRejections covers the selector contract.
+func TestTraceInferenceAndRejections(t *testing.T) {
+	// watchpoint_id without cpu means until=watchpoint.
+	inferred := canonicalPayload(t, traceCaptureClient(), "trace", `{"watchpoint_id":3,"max_entries":2,"timeout_ms":900}`)
+	if inferred["until"] != traceUntilWatchpoint {
+		t.Fatalf("until = %v, want watchpoint", inferred["until"])
+	}
+	// A window-only argument is rejected on a watchpoint capture.
+	rejected := canonicalPayload(t, traceCaptureClient(), "trace", `{"until":"watchpoint","watchpoint_id":3,"cpu":"m68k"}`)
+	sections, _ := rejected["sections"].(map[string]any)
+	_ = sections
+	server := newTestServer(t, traceCaptureClient())
+	payload := structured(postToolCall(t, server, "trace", `{"until":"watchpoint","watchpoint_id":3,"cpu":"m68k"}`))
+	if payload["code"] != "unsupported_parameter" || payload["field"] != "cpu" {
+		t.Fatalf("expected unsupported_parameter for cpu: %v", payload)
+	}
+	// coverage has no watchpoint form.
+	payload = structured(postToolCall(t, server, "trace", `{"analyze":"coverage","until":"watchpoint","watchpoint_id":3}`))
+	if payload["code"] != "invalid_params" {
+		t.Fatalf("coverage/watchpoint must be rejected: %v", payload)
 	}
 }

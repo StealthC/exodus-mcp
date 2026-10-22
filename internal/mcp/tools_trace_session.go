@@ -118,7 +118,7 @@ func traceSessionToolSpecs() []toolSpec {
 				"request_watch_report": booleanProperty("Request the watchpoint counter report and fold its deltas into the store (default true)."),
 				"context":              contextProperty(),
 			}, nil),
-			run: runTraceSessionStatus,
+			run: aliasRun("trace_session_status", runTraceSessionStatus),
 		},
 		{
 			name:        "trace_session_events",
@@ -150,7 +150,7 @@ func traceSessionToolSpecs() []toolSpec {
 				"cursor":                 stringProperty("next_cursor from a previous trace_session_events call. The cursor carries the session, the event filter, and the position, so a later page needs only the cursor; any filter supplied alongside it must match the cursor. Omit to start at the oldest retained event. Pages advance, so repeated calls never return the same page."),
 				"context":                contextProperty(),
 			}, nil),
-			run: runTraceSessionEvents,
+			run: aliasRun("trace_session_events", runTraceSessionEvents),
 		},
 		{
 			name:        "trace_session_stop",

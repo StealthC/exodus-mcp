@@ -48,7 +48,7 @@ func phase5ToolSpecs() []toolSpec {
 				"expected_target_generation": integerProperty("Optional target generation the caller last observed; fails with target_generation_conflict on mismatch.", 1),
 				"control_id":                 stringProperty("Optional control id from target_control_acquire; required while the control lock is active."),
 			}, []string{"cpu"}),
-			run: runCpuCoverageCapture,
+			run: aliasRun("cpu_coverage_capture", runCpuCoverageCapture),
 		},
 		{
 			name:        "cpu_trace_capture_watchpoint",
@@ -61,7 +61,7 @@ func phase5ToolSpecs() []toolSpec {
 				"expected_target_generation": integerProperty("Optional target generation the caller last observed; fails with target_generation_conflict on mismatch.", 1),
 				"control_id":                 stringProperty("Optional control id from target_control_acquire; required while the control lock is active."),
 			}, []string{"watchpoint_id"}),
-			run: runCpuTraceCaptureWatchpoint,
+			run: aliasRun("cpu_trace_capture_watchpoint", runCpuTraceCaptureWatchpoint),
 		},
 		{
 			name:        "memory_search",
@@ -2163,7 +2163,7 @@ func runCpuTraceCaptureWatchpoint(tc toolContext, args json.RawMessage) map[stri
 		"timeout_ms":    strconv.FormatUint(timeoutMs, 10),
 	}
 	payload, before, after, failure := tc.server.executeMutation(tc.ctx, mutationCall{
-		tool:      "cpu_trace_capture_watchpoint",
+		tool:      tc.toolName("cpu_trace_capture_watchpoint"),
 		operation: "trace_capture",
 		params:    params,
 		guard:     parsed.guard(),
@@ -2577,7 +2577,7 @@ func runCpuCoverageCapture(tc toolContext, args json.RawMessage) map[string]any 
 		"force_run": "true",
 	}
 	payload, before, after, failure := tc.server.executeMutation(tc.ctx, mutationCall{
-		tool:      "cpu_coverage_capture",
+		tool:      tc.toolName("cpu_coverage_capture"),
 		operation: "trace_capture",
 		params:    params,
 		guard:     parsed.guard(),

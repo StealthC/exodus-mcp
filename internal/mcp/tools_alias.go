@@ -65,6 +65,31 @@ var toolAliasRecords = []toolAliasRecord{
 		Mapping:     "mega_drive_memory_map returns the legacy {regions, note, live_spaces} object; memory_map.reference carries the same fields.",
 	},
 	{
+		Alias:       "trace_session_status",
+		Replacement: "trace_session_query",
+		Mapping:     "trace_session_status returns the legacy session report; trace_session_query{include:[\"status\"], ...} returns the same payload under sections.status.",
+	},
+	{
+		Alias:       "trace_session_events",
+		Replacement: "trace_session_query",
+		Mapping:     "trace_session_events returns the legacy event page; trace_session_query{include:[\"events\"], ...} accepts the same filters and cursor and returns the same payload under sections.events.",
+	},
+	{
+		Alias:       "cpu_trace_capture",
+		Replacement: "trace",
+		Mapping:     "cpu_trace_capture returns the legacy instruction trace payload; trace{analyze:\"trace\", until:\"window\", cpu, ...} runs the same capture and returns it under result.",
+	},
+	{
+		Alias:       "cpu_trace_capture_watchpoint",
+		Replacement: "trace",
+		Mapping:     "cpu_trace_capture_watchpoint returns the legacy event-driven trace payload; trace{analyze:\"trace\", until:\"watchpoint\", watchpoint_id, ...} runs the same capture and returns it under result.",
+	},
+	{
+		Alias:       "cpu_coverage_capture",
+		Replacement: "trace",
+		Mapping:     "cpu_coverage_capture returns the legacy coverage payload; trace{analyze:\"coverage\", until:\"window\", cpu, ...} maps duration_ms to timeout_ms and region_start/end to address_range_start/end, and returns the same payload under result.",
+	},
+	{
 		Alias:       "state_diff",
 		Replacement: "snapshot_diff",
 		Mapping:     "state_diff returns the legacy state comparison payload; snapshot_diff{sections:[\"state\"], snapshot_before_id, snapshot_after_id} returns the same payload under results.state.",
