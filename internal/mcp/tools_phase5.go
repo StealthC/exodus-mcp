@@ -99,7 +99,7 @@ func phase5ToolSpecs() []toolSpec {
 				"cursor":                        stringProperty("next_cursor from a previous memory_diff call. The cursor carries both snapshots, the mode, width, byte order, comparison values, and the alignment policy, so a later page needs only the cursor; any argument supplied alongside it must match the cursor. Omit to start at the first page."),
 				"context":                       contextProperty(),
 			}, nil),
-			run: runMemoryDiff,
+			run: aliasRun("memory_diff", runMemoryDiff),
 		},
 		{
 			name:        "rom_info",

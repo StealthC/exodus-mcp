@@ -65,6 +65,16 @@ var toolAliasRecords = []toolAliasRecord{
 		Mapping:     "mega_drive_memory_map returns the legacy {regions, note, live_spaces} object; memory_map.reference carries the same fields.",
 	},
 	{
+		Alias:       "state_diff",
+		Replacement: "snapshot_diff",
+		Mapping:     "state_diff returns the legacy state comparison payload; snapshot_diff{sections:[\"state\"], snapshot_before_id, snapshot_after_id} returns the same payload under results.state.",
+	},
+	{
+		Alias:       "memory_diff",
+		Replacement: "snapshot_diff",
+		Mapping:     "memory_diff returns the legacy memory comparison payload; snapshot_diff{sections:[\"memory\"], ...} accepts the same arguments and returns the same payload (and cursor family) under results.memory.",
+	},
+	{
 		Alias:       "memory_snapshot_capture",
 		Replacement: "capture",
 		Mapping:     "memory_snapshot_capture returns the legacy paused range capture; capture{components:[\"memory\"], space, ranges} returns the same capture_id, manifest, ranges and artifacts, with the producer payload under detail.",

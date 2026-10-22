@@ -5,6 +5,8 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"os"
+	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
@@ -142,7 +144,7 @@ func TestConsolidatedCatalogHasNoDuplicateConcept(t *testing.T) {
 
 // consolidatedCanonicalTools is the merged catalog. Each consolidation group
 // appends its canonical concept here.
-var consolidatedCanonicalTools = []string{"target_status", "memory_map", "memory_read", "disassemble", "cpu_step", "debug_instrument", "events_list", "vdp_memory_read", "vdp_render_export", "capture"}
+var consolidatedCanonicalTools = []string{"target_status", "memory_map", "memory_read", "disassemble", "cpu_step", "debug_instrument", "events_list", "vdp_memory_read", "vdp_render_export", "capture", "snapshot_diff"}
 
 // payloadView strips the fields the dispatcher injects into every response and
 // the alias' own deprecation marker, so two payloads can be compared field by
@@ -913,7 +915,7 @@ func normalizeVolatile(value any) any {
 			// timestamps, so both its digest and its byte size vary with the
 			// run. The digest and size of a deterministic payload (PNG, tile
 			// JSON, raw bytes) are still compared.
-			if strings.HasSuffix(kind, "manifest") && (key == "sha256" || key == "size_bytes") {
+			if isPerRunReportKind(kind) && (key == "sha256" || key == "size_bytes") {
 				normalized[key] = "<volatile>"
 				continue
 			}
@@ -1082,8 +1084,128 @@ func TestVDPRenderExportRejectsAnArgumentOutsideTheMode(t *testing.T) {
 	}
 }
 
+// isPerRunReportKind reports whether an artifact kind embeds run identity
+// (capture ids, state ids, timestamps) in its own payload, which makes its digest
+// and byte size vary even when the compared inputs are identical.
+func isPerRunReportKind(kind string) bool {
+	switch kind {
+	case stateDiffKind, "memory-diff-results", "state-diff":
+		return true
+	}
+	return strings.HasSuffix(kind, "manifest")
+}
+
 // jsonEqual compares two decoded JSON values structurally.
 func jsonEqual(t *testing.T, left, right any) bool {
 	t.Helper()
 	return jsonText(left) == jsonText(right)
+}
+
+// ----------------------------------------------------------------------------------------------------------------------
+// snapshot_diff alias parity (group 11)
+// ----------------------------------------------------------------------------------------------------------------------
+
+// stateDiffServer saves two distinct snapshots through a fake native writer, so
+// a real byte-level state comparison is possible in a unit test.
+func stateDiffServer(t *testing.T) (*Server, string, string) {
+	t.Helper()
+	client := &fakeBridgeClient{status: newFakeStatus()}
+	saves := 0
+	client.executeFunc = func(_ context.Context, method string, params map[string]string) (json.RawMessage, error) {
+		switch method {
+		case "state_save":
+			saves++
+			content := []byte("state-before-bytes")
+			if saves > 1 {
+				content = []byte("state-after-bytes!")
+			}
+			if err := os.MkdirAll(filepath.Dir(params["path"]), 0o755); err != nil {
+				return nil, err
+			}
+			if err := os.WriteFile(params["path"], content, 0o644); err != nil {
+				return nil, err
+			}
+			return json.RawMessage(`{"saved":true,"file_type":"zip","system_running":false}`), nil
+		case "emulator_status":
+			return json.RawMessage(`{"system_running":false,"modules":[],"devices":[]}`), nil
+		}
+		return json.RawMessage(`{}`), nil
+	}
+	server := newTestServer(t, client)
+	server.SetStatesDir(t.TempDir())
+	before := structured(postToolCall(t, server, "state_save", `{"name":"before"}`))["state_id"].(string)
+	after := structured(postToolCall(t, server, "state_save", `{"name":"after"}`))["state_id"].(string)
+	return server, before, after
+}
+
+// TestSnapshotDiffAbsorbsTheStateDiff compares both tools against the same
+// snapshot pair, so only the envelope differs.
+func TestSnapshotDiffAbsorbsTheStateDiff(t *testing.T) {
+	server, before, after := stateDiffServer(t)
+	arguments := fmt.Sprintf(`"snapshot_before_id":%q,"snapshot_after_id":%q`, before, after)
+	canonical := payloadView(t, postToolCall(t, server, "snapshot_diff", `{"sections":["state"],`+arguments+`}`))
+	legacy := payloadView(t, postToolCall(t, server, "state_diff", `{`+arguments+`}`))
+
+	results, _ := canonical["results"].(map[string]any)
+	section, _ := results["state"].(map[string]any)
+	if section == nil {
+		t.Fatalf("snapshot_diff has no state section: %v", canonical)
+	}
+	if !jsonEqual(t, normalizeVolatile(section), normalizeVolatile(legacy)) {
+		t.Fatalf("state parity failed:\nsection = %v\nlegacy = %v", section, legacy)
+	}
+	if canonical["identical"] != legacy["identical"] {
+		t.Fatalf("combined verdict = %v, state_diff says %v", canonical["identical"], legacy["identical"])
+	}
+}
+
+// TestSnapshotDiffAbsorbsTheMemoryDiff compares both tools against the same
+// memory snapshots and checks the shared cursor family.
+func TestSnapshotDiffAbsorbsTheMemoryDiff(t *testing.T) {
+	server := newTestServer(t, ramBlobClient([]byte{0x41, 0x42, 0x43, 0x44, 0x45, 0x46, 0x47, 0x48}))
+	before := structured(postToolCall(t, server, "memory_dump", `{"space":"mem-ram","address":"0xFF0000","length":8}`))["artifact"].(map[string]any)["id"].(string)
+	after := structured(postToolCall(t, server, "memory_dump", `{"space":"mem-ram","address":"0xFF0000","length":8}`))["artifact"].(map[string]any)["id"].(string)
+	arguments := fmt.Sprintf(`"snapshot_before_id":%q,"snapshot_after_id":%q,"mode":"unchanged","max_matches":2`, before, after)
+
+	canonical := payloadView(t, postToolCall(t, server, "snapshot_diff", `{"sections":["memory"],`+arguments+`}`))
+	legacy := payloadView(t, postToolCall(t, server, "memory_diff", `{`+arguments+`}`))
+
+	results, _ := canonical["results"].(map[string]any)
+	section, _ := results["memory"].(map[string]any)
+	if section == nil {
+		t.Fatalf("snapshot_diff has no memory section: %v", canonical)
+	}
+	if !jsonEqual(t, normalizeVolatile(section), normalizeVolatile(legacy)) {
+		t.Fatalf("memory parity failed:\nsection = %v\nlegacy = %v", section, legacy)
+	}
+	canonicalCursor, _ := canonical["next_cursor"].(string)
+	legacyCursor, _ := legacy["next_cursor"].(string)
+	if cursorPrefix(canonicalCursor) != cursorPrefix(legacyCursor) || canonicalCursor == "" {
+		t.Fatalf("cursor family = %q, memory_diff says %q", cursorPrefix(canonicalCursor), cursorPrefix(legacyCursor))
+	}
+	if canonical["returned"] != legacy["returned"] || canonical["total"] != legacy["total"] {
+		t.Fatalf("paging envelope = %v/%v, memory_diff says %v/%v", canonical["returned"], canonical["total"], legacy["returned"], legacy["total"])
+	}
+}
+
+// TestSnapshotDiffSelectsAndRejectsBySection covers the dispatcher contract.
+func TestSnapshotDiffSelectsAndRejectsBySection(t *testing.T) {
+	server := newTestServer(t, ramBlobClient([]byte{0x01, 0x02, 0x03, 0x04}))
+	artifactID := structured(postToolCall(t, server, "memory_dump", `{"space":"mem-ram","address":"0xFF0000","length":4}`))["artifact"].(map[string]any)["id"].(string)
+
+	// A memory-only argument selects the memory section without an explicit list.
+	inferred := structured(postToolCall(t, server, "snapshot_diff", fmt.Sprintf(`{"snapshot_before_id":%q,"mode":"changed"}`, artifactID)))
+	sections, _ := inferred["sections"].([]any)
+	if len(sections) != 1 || sections[0] != "memory" {
+		t.Fatalf("inferred sections = %v, want [memory]", inferred["sections"])
+	}
+
+	rejected := structured(postToolCall(t, server, "snapshot_diff", `{"sections":["state"],"mode":"changed"}`))
+	if rejected["code"] != "unsupported_parameter" || rejected["field"] != "mode" {
+		t.Fatalf("expected an unsupported_parameter rejection for mode: %v", rejected)
+	}
+	empty := structured(postToolCall(t, server, "snapshot_diff", `{"sections":[]}`))
+	if empty["code"] != "invalid_params" {
+		t.Fatalf("empty sections must be rejected: %v", empty)
+	}
 }
