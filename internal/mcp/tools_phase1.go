@@ -137,7 +137,7 @@ func phase1ToolSpecs() []toolSpec {
 			name:        "memory_spaces_list",
 			description: "Enumerate readable address spaces with owner device, size, entry width, permissions, declared byte order, and the processor bus mapping (bus, bus_base, bus_offset) for the loaded target. bus_address = bus_base + bus_offset + space_relative_address; spaces that are not linearly mapped on a CPU bus (VDP buffers) explain why in bus_mapping_note.",
 			schema:      objectSchema(map[string]any{}, nil),
-			run:         runMemorySpacesList,
+			run:         aliasRun("memory_spaces_list", runMemorySpacesList),
 		},
 		{
 			name:        "rom_load",

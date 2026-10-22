@@ -60,6 +60,16 @@ var toolAliasRecords = []toolAliasRecord{
 		Mapping:     "emulator_status returns the legacy flat object; target_status.run_state, devices and rom carry the same fields (modules and devices move under devices).",
 	},
 	{
+		Alias:       "mega_drive_memory_map",
+		Replacement: "memory_map",
+		Mapping:     "mega_drive_memory_map returns the legacy {regions, note, live_spaces} object; memory_map.reference carries the same fields.",
+	},
+	{
+		Alias:       "memory_spaces_list",
+		Replacement: "memory_map",
+		Mapping:     "memory_spaces_list returns the legacy {spaces, byte_order_policy, bus_address_formula} object; memory_map.live carries the same fields.",
+	},
+	{
 		Alias:       "target_info",
 		Replacement: "target_status",
 		Mapping:     "target_info returns the legacy flat object; target_status.emulator, devices, platform and rom (rom.summary) carry the same fields.",

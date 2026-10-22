@@ -135,7 +135,7 @@ func TestConsolidatedCatalogHasNoDuplicateConcept(t *testing.T) {
 
 // consolidatedCanonicalTools is the merged catalog. Each consolidation group
 // appends its canonical concept here.
-var consolidatedCanonicalTools = []string{"target_status"}
+var consolidatedCanonicalTools = []string{"target_status", "memory_map"}
 
 // payloadView strips the fields the dispatcher injects into every response and
 // the alias' own deprecation marker, so two payloads can be compared field by
@@ -323,6 +323,55 @@ func TestDeprecatedAliasesArePublishedAsDeprecated(t *testing.T) {
 		if names[index] != sorted[index] {
 			t.Fatalf("alias names are not sorted")
 		}
+	}
+}
+
+// ----------------------------------------------------------------------------------------------------------------------
+// memory_map alias parity (group 2)
+// ----------------------------------------------------------------------------------------------------------------------
+
+// TestMemoryMapAbsorbsTheMapTools proves the two legacy views are the two
+// sections of the merged tool.
+func TestMemoryMapAbsorbsTheMapTools(t *testing.T) {
+	client := &fakeBridgeClient{status: newFakeStatus()}
+	client.executeFunc = func(_ context.Context, method string, _ map[string]string) (json.RawMessage, error) {
+		if method == "mem_spaces" {
+			return json.RawMessage(memSpacesPayload()), nil
+		}
+		return json.RawMessage(`{}`), nil
+	}
+
+	canonical := canonicalPayload(t, client, "memory_map", `{}`)
+	reference := canonicalPayload(t, client, "mega_drive_memory_map", `{}`)
+	live := canonicalPayload(t, client, "memory_spaces_list", `{}`)
+
+	if !jsonEqual(t, canonical["reference"], reference) {
+		t.Fatalf("memory_map.reference = %v, mega_drive_memory_map says %v", canonical["reference"], reference)
+	}
+	if !jsonEqual(t, canonical["live"], live) {
+		t.Fatalf("memory_map.live = %v, memory_spaces_list says %v", canonical["live"], live)
+	}
+	spaces, _ := canonical["live"].(map[string]any)["spaces"].([]any)
+	if len(spaces) == 0 {
+		t.Fatalf("memory_map.live carries no spaces: %v", canonical["live"])
+	}
+	regions, _ := canonical["reference"].(map[string]any)["regions"].([]any)
+	if len(regions) == 0 {
+		t.Fatalf("memory_map.reference carries no regions: %v", canonical["reference"])
+	}
+}
+
+// TestMemoryMapValidatesTheContextKeepsTheInventory: the merged tool accepts the
+// legacy context argument and rejects an unknown handle instead of silently
+// ignoring it.
+func TestMemoryMapValidatesTheContext(t *testing.T) {
+	client := &fakeBridgeClient{status: newFakeStatus()}
+	client.executeFunc = func(_ context.Context, _ string, _ map[string]string) (json.RawMessage, error) {
+		return json.RawMessage(memSpacesPayload()), nil
+	}
+	result := postToolCall(t, newTestServer(t, client), "memory_map", `{"context":"ctx_missing"}`)
+	if structured(result)["code"] != "unknown_context" {
+		t.Fatalf("code = %v, want unknown_context", structured(result))
 	}
 }
 

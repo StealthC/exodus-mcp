@@ -116,7 +116,7 @@ func megaDriveMemoryMapSpec() toolSpec {
 		name:        "mega_drive_memory_map",
 		description: "Structured operational Mega Drive memory map combining the reference bus map with the live target. Each region states CPU-visible range, mirrors/mask, backing device, read/write capability, timing caveats, byte order, and I/O semantics. Distinct from memory_spaces_list inventory; does not imply all reference regions exist on every loaded system.",
 		schema:      objectSchema(map[string]any{"context": contextProperty()}, nil),
-		run:         runMegaDriveMemoryMap,
+		run:         aliasRun("mega_drive_memory_map", runMegaDriveMemoryMap),
 	}
 }
 

@@ -69,6 +69,7 @@ func init() {
 func buildToolRegistry() []toolSpec {
 	specs := append(phase1ToolSpecs(), cpuToolSpecs()...)
 	specs = append(specs, targetStatusSpec())
+	specs = append(specs, memoryMapSpec())
 	specs = append(specs, controlToolSpecs()...)
 	specs = append(specs, vdpToolSpecs()...)
 	specs = append(specs, vdpCommandDMAToolSpecs()...)
