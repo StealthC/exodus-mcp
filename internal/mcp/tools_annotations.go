@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strconv"
 	"strings"
 	"time"
 
@@ -80,7 +81,7 @@ func annotationToolSpecs() []toolSpec {
 		},
 		{
 			name:        "annotation_list",
-			description: "List the analyst annotations of a context, newest first, with bounded pagination. Every annotation is flagged stale (with stale_reason) when its creation-time ROM SHA-256 or target generation no longer matches the loaded target; stale annotations are preserved for historical analysis and by default excluded but counted in stale_excluded so nothing is dropped silently. include_stale keeps them in the results flagged; stale_only lists only stale ones. Filter by substring query (case-insensitive over title, text, tags), tags, category, kind, and address space.",
+			description: "List the analyst annotations of a context, newest first (created_at descending, then id), with bounded pagination. Every annotation is flagged stale (with stale_reason) when its creation-time ROM SHA-256 or target generation no longer matches the loaded target; stale annotations are preserved for historical analysis and by default excluded but counted in stale_excluded so nothing is dropped silently. include_stale keeps them in the results flagged; stale_only lists only stale ones. Filter by substring query (case-insensitive over title, text, tags), tags, category, kind, and address space. Pages by cursor (keyset anchor on the immutable created_at+id pair, so a concurrent create, edit, or delete never repeats or skips an annotation) or by offset. " + pagingNote,
 			schema: objectSchema(map[string]any{
 				"filter":        stringProperty("Case-insensitive substring matched against title, text, and tags."),
 				"tags":          stringArrayProperty("Only annotations carrying every listed tag."),
@@ -89,8 +90,9 @@ func annotationToolSpecs() []toolSpec {
 				"address_space": stringProperty("Only annotations in this address space."),
 				"stale_only":    booleanProperty("Only annotations whose ROM identity or target generation no longer matches the loaded target."),
 				"include_stale": booleanProperty("Keep stale annotations in the results, flagged (default false: they are excluded but counted in stale_excluded)."),
-				"offset":        integerProperty("Skip this many matching annotations (default 0).", 0),
+				"offset":        integerProperty("Skip this many matching annotations (default 0). Mutually exclusive with cursor.", 0),
 				"limit":         integerProperty(fmt.Sprintf("Maximum annotations returned (default %d, cap %d).", analysis.DefaultAnnotationLimit, analysis.MaxAnnotationLimit), 0),
+				"cursor":        stringProperty("next_cursor from a previous annotation_list call; resumes strictly after that annotation in the newest-first order. Omit to start at the first page; mutually exclusive with offset."),
 				"context":       contextProperty(),
 			}, nil),
 			run: runAnnotationList,
@@ -579,7 +581,34 @@ type annotationListArgs struct {
 	IncludeStale bool     `json:"include_stale"`
 	Offset       *uint64  `json:"offset"`
 	Limit        *uint64  `json:"limit"`
+	Cursor       string   `json:"cursor"`
 	Context      string   `json:"context"`
+}
+
+// annotationCursor is the keyset anchor of one annotation_list enumeration:
+// the (created_at, id) of the last annotation of the previous page. Both fields
+// are immutable, so concurrent creates, edits, and deletes cannot shift a page
+// boundary the way an offset does.
+type annotationCursor struct {
+	CreatedAt time.Time
+	ID        string
+}
+
+func (cursor annotationCursor) encode() string {
+	return encodeCursor(annotationCursorPrefix,
+		strconv.FormatInt(cursor.CreatedAt.UnixNano(), 10), cursor.ID)
+}
+
+func parseAnnotationCursor(raw string) (annotationCursor, *toolFailure) {
+	parts, failure := decodeCursor(raw, annotationCursorPrefix, 2)
+	if failure != nil {
+		return annotationCursor{}, failure
+	}
+	nanos, err := strconv.ParseInt(parts[0], 10, 64)
+	if err != nil || parts[1] == "" {
+		return annotationCursor{}, invalidCursorFailure(fmt.Sprintf("%q is not a cursor this server issued", raw))
+	}
+	return annotationCursor{CreatedAt: time.Unix(0, nanos).UTC(), ID: parts[1]}, nil
 }
 
 func runAnnotationList(tc toolContext, args json.RawMessage) map[string]any {
@@ -601,7 +630,17 @@ func runAnnotationList(tc toolContext, args json.RawMessage) map[string]any {
 		StaleOnly:    parsed.StaleOnly,
 		Limit:        analysis.DefaultAnnotationLimit,
 	}
-	if parsed.Offset != nil {
+	if parsed.Cursor != "" {
+		if parsed.Offset != nil {
+			return failureResult(invalidCursorFailure("pass either cursor or offset, not both: the cursor already names the position in the listing"), tc.modern)
+		}
+		cursor, failure := parseAnnotationCursor(parsed.Cursor)
+		if failure != nil {
+			return failureResult(failure, tc.modern)
+		}
+		filter.AfterCreatedAt = cursor.CreatedAt
+		filter.AfterID = cursor.ID
+	} else if parsed.Offset != nil {
 		filter.Offset = int(*parsed.Offset)
 	}
 	if parsed.Limit != nil {
@@ -615,7 +654,21 @@ func runAnnotationList(tc toolContext, args json.RawMessage) map[string]any {
 	for _, ann := range result.Annotations {
 		views = append(views, annotationView(tc.server, ann))
 	}
-	return okResult(map[string]any{
+	paging := pagingPage{
+		Returned: len(views),
+		Total:    result.Total,
+		// Truncated is exactly "more matching annotations follow this page".
+		Remaining: boolToRemaining(result.Truncated),
+	}
+	if result.Truncated && len(result.Annotations) > 0 {
+		last := result.Annotations[len(result.Annotations)-1]
+		paging.NextCursor = annotationCursor{CreatedAt: last.CreatedAt, ID: last.ID}.encode()
+	}
+	nextOffset := any(nil)
+	if paging.hasMore() && parsed.Cursor == "" {
+		nextOffset = filter.Offset + len(views)
+	}
+	response := map[string]any{
 		"annotations":    views,
 		"count":          len(views),
 		"total":          result.Total,
@@ -624,9 +677,25 @@ func runAnnotationList(tc toolContext, args json.RawMessage) map[string]any {
 		"pagination": map[string]any{
 			"offset":      filter.Offset,
 			"limit":       filter.Limit,
-			"next_offset": filter.Offset + len(views),
+			"next_offset": nextOffset,
+			"order":       "created_at_desc",
+			"cursor":      nil,
 		},
-	}, tc.modern)
+	}
+	if parsed.Cursor != "" {
+		response["pagination"].(map[string]any)["cursor"] = parsed.Cursor
+	}
+	paging.apply(response)
+	return okResult(response, tc.modern)
+}
+
+// boolToRemaining converts a "more rows follow" fact into the paging
+// envelope's remaining count.
+func boolToRemaining(more bool) int {
+	if more {
+		return 1
+	}
+	return 0
 }
 
 // ----------------------------------------------------------------------------------------------------------------------

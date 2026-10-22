@@ -102,6 +102,11 @@ func runVDPMemoryExport(tc toolContext, args json.RawMessage) map[string]any {
 	if failure != nil {
 		return failureResult(failure, tc.modern)
 	}
+	// Echo the caller's address expression before any domain translation.
+	requestedAddress := any(nil)
+	if parsedValue, failure := parseAddress(parsed.Address); failure == nil {
+		requestedAddress = parsedValue
+	}
 	length := parsed.Length
 	if length == 0 {
 		length = capBytes - address
@@ -139,6 +144,12 @@ func runVDPMemoryExport(tc toolContext, args json.RawMessage) map[string]any {
 		}
 		byteOrder, _ := payload["byte_order"].(string)
 		pausedDuringRead, _ := payload["system_paused_during_read"].(bool)
+		effective, hasEffective := payload["effective_address"].(float64)
+		if !hasEffective {
+			// The VDP read path reports no separate effective address: the
+			// buffer address is the effective one.
+			effective = float64(address)
+		}
 		capturedAt := time.Now().UTC()
 
 		provenance := genericProvenance(tc.server, vdpExportKind, capturedAt)
@@ -178,6 +189,13 @@ func runVDPMemoryExport(tc toolContext, args json.RawMessage) map[string]any {
 			"capture_consistency":       captureConsistencyToMap(consistencyObject),
 			"artifact":                  artifactDescriptor(tc.server, stored, context.ID),
 			"sha256":                    stored.SHA256,
+			// Request echo: the address and defaulted length the caller asked
+			// for next to the buffer address and byte count actually exported.
+			"requested_address":     requestedAddress,
+			"requested_length":      parsed.Length,
+			"effective_address":     uint64(effective),
+			"effective_address_hex": canonicalHex(uint64(effective)),
+			"effective_length":      len(raw),
 		}
 		annotateAddressPair(result, vdpExportSpaceForTarget(parsed.Target), address)
 		return result, nil

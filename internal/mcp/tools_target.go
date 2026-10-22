@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strconv"
 	"strings"
 	"time"
 
@@ -17,7 +18,7 @@ func targetToolSpecs() []toolSpec {
 	return []toolSpec{
 		{
 			name:        "target_audit_log",
-			description: "Query the bounded global target audit stream, newest first. Every target mutation (successful or failed), generation/control precondition conflict, control-lock lifecycle event, and externally observed run-state transition (run_state_change, UI-initiated pauses with the observed generation and frame token when available) is recorded with target generations, ROM identity, originating context, and control-lock provenance. Filter by operation, context, control id, generation range, or time range; a truncated response reports the retained window.",
+			description: "Query the bounded global target audit stream, newest first. Every target mutation (successful or failed), generation/control precondition conflict, control-lock lifecycle event, and externally observed run-state transition (run_state_change, UI-initiated pauses with the observed generation and frame token when available) is recorded with target generations, ROM identity, originating context, and control-lock provenance. Filter by operation, context, control id, generation range, or time range; a truncated response reports the retained window. Pages by cursor (the monotonic operation id of the last entry, so a mutation recorded between pages never duplicates or skips a row) or by offset; next_offset and next_cursor are null on the last page instead of pointing at an empty page. " + pagingNote,
 			schema: objectSchema(map[string]any{
 				"context":        contextProperty(),
 				"tool":           stringProperty("Filter by tool name, e.g. memory_write or rom_load."),
@@ -26,8 +27,9 @@ func targetToolSpecs() []toolSpec {
 				"generation_max": integerProperty("Only entries whose before/after target generation is at most this value.", 0),
 				"since":          stringProperty("Only entries at or after this UTC RFC3339 timestamp."),
 				"until":          stringProperty("Only entries at or before this UTC RFC3339 timestamp."),
-				"offset":         integerProperty("Skip this many matching entries (default 0).", 0),
+				"offset":         integerProperty("Skip this many matching entries (default 0). Mutually exclusive with cursor.", 0),
 				"limit":          integerProperty("Maximum entries returned (default 50, cap 200).", 0),
+				"cursor":         stringProperty("next_cursor from a previous target_audit_log call; resumes strictly after that operation id. Omit to start at the newest page; mutually exclusive with offset."),
 			}, nil),
 			run: runTargetAuditLog,
 		},
@@ -69,10 +71,12 @@ func targetToolSpecs() []toolSpec {
 		},
 		{
 			name:        "context_mutation_log",
-			description: "List the audited mutation trail of a context, newest first, as a filtered projection of the global target audit stream. Every mutating tool call records its target generations, echoed arguments, and timestamp here.",
+			description: "List the audited mutation trail of a context, newest first, as a filtered projection of the global target audit stream. Every mutating tool call records its target generations, echoed arguments, and timestamp here. Pages by cursor (the monotonic operation id of the last entry) or by offset. " + pagingNote,
 			schema: objectSchema(map[string]any{
 				"context": contextProperty(),
 				"limit":   integerProperty("Maximum entries returned (default 50, cap 200).", 0),
+				"offset":  integerProperty("Skip this many matching entries (default 0). Mutually exclusive with cursor.", 0),
+				"cursor":  stringProperty("next_cursor from a previous context_mutation_log call; resumes strictly after that operation id."),
 			}, nil),
 			run: runMutationLog,
 		},
@@ -252,6 +256,28 @@ type targetAuditLogArgs struct {
 	Until         string  `json:"until"`
 	Offset        uint64  `json:"offset"`
 	Limit         *uint64 `json:"limit"`
+	Cursor        string  `json:"cursor"`
+}
+
+// auditCursor is the paging anchor of one target_audit_log or
+// context_mutation_log enumeration: the monotonic operation id of the last
+// entry of the previous page. New entries take higher ids and therefore sort
+// before the anchor, so a concurrent mutation can never shift a page boundary
+// the way an offset does.
+func encodeAuditCursor(prefix string, operationID uint64) string {
+	return encodeCursor(prefix, strconv.FormatUint(operationID, 10))
+}
+
+func decodeAuditCursor(cursor, prefix string) (uint64, *toolFailure) {
+	parts, failure := decodeCursor(cursor, prefix, 1)
+	if failure != nil {
+		return 0, failure
+	}
+	operationID, err := strconv.ParseUint(parts[0], 10, 64)
+	if err != nil || operationID == 0 {
+		return 0, invalidCursorFailure(fmt.Sprintf("%q is not a cursor this server issued", cursor))
+	}
+	return operationID, nil
 }
 
 func runTargetAuditLog(tc toolContext, args json.RawMessage) map[string]any {
@@ -295,8 +321,34 @@ func runTargetAuditLog(tc toolContext, args json.RawMessage) map[string]any {
 		}
 		limit = *parsed.Limit
 	}
+	// A cursor resumes strictly after one operation id; an offset is the legacy
+	// equivalent. Mixing them would name two different positions.
+	cursorOperationID := uint64(0)
+	if parsed.Cursor != "" {
+		if parsed.Offset != 0 {
+			return failureResult(invalidCursorFailure("pass either cursor or offset, not both: the cursor already names the position in the stream"), tc.modern)
+		}
+		cursorOperationID, failure = decodeAuditCursor(parsed.Cursor, auditCursorPrefix)
+		if failure != nil {
+			return failureResult(failure, tc.modern)
+		}
+	}
 
 	entries, window := tc.server.audit.Query(filter)
+	total := len(entries)
+	if cursorOperationID != 0 {
+		// The stream is newest first, so the page continues at the first entry
+		// whose id is below the anchor. Entries evicted from the retained
+		// window simply no longer appear; nothing is invented.
+		start := len(entries)
+		for index, entry := range entries {
+			if entry.OperationID < cursorOperationID {
+				start = index
+				break
+			}
+		}
+		entries = entries[start:]
+	}
 	start := parsed.Offset
 	if start > uint64(len(entries)) {
 		start = uint64(len(entries))
@@ -311,14 +363,31 @@ func runTargetAuditLog(tc toolContext, args json.RawMessage) map[string]any {
 	for _, entry := range entries {
 		views = append(views, auditEntryView(entry))
 	}
-	return okResult(map[string]any{
+	paging := pagingPage{
+		Returned:  len(views),
+		Total:     total,
+		Remaining: boolToRemaining(truncated),
+	}
+	if truncated && len(entries) > 0 {
+		paging.NextCursor = encodeAuditCursor(auditCursorPrefix, entries[len(entries)-1].OperationID)
+	}
+	// next_offset and next_cursor are reported together and are null on the
+	// last page: an offset that yields nothing is a trap, not a convenience. A
+	// cursor page has no global offset to report, so only the cursor continues.
+	nextOffset := any(nil)
+	if paging.hasMore() && parsed.Cursor == "" {
+		nextOffset = start + uint64(len(views))
+	}
+	result := map[string]any{
 		"entries":   views,
 		"count":     len(views),
 		"truncated": truncated,
 		"pagination": map[string]any{
 			"offset":      start,
 			"limit":       limit,
-			"next_offset": start + uint64(len(views)),
+			"next_offset": nextOffset,
+			"cursor":      nil,
+			"order":       "operation_id_desc",
 		},
 		"retained": map[string]any{
 			"operation_id_min":      window.OldestOperationID,
@@ -328,7 +397,12 @@ func runTargetAuditLog(tc toolContext, args json.RawMessage) map[string]any {
 			"oldest_timestamp":      window.OldestTimestamp,
 			"newest_timestamp":      window.NewestTimestamp,
 		},
-	}, tc.modern)
+	}
+	if parsed.Cursor != "" {
+		result["pagination"].(map[string]any)["cursor"] = parsed.Cursor
+	}
+	paging.apply(result)
+	return okResult(result, tc.modern)
 }
 
 func auditEntryView(entry analysis.AuditEntry) map[string]any {
@@ -375,6 +449,8 @@ func runMutationLog(tc toolContext, args json.RawMessage) map[string]any {
 	parsed, failure := decodeArgs[struct {
 		Context string  `json:"context"`
 		Limit   *uint64 `json:"limit"`
+		Cursor  string  `json:"cursor"`
+		Offset  uint64  `json:"offset"`
 	}](args)
 	if failure != nil {
 		return failureResult(failure, tc.modern)
@@ -390,21 +466,67 @@ func runMutationLog(tc toolContext, args json.RawMessage) map[string]any {
 		}
 		limit = *parsed.Limit
 	}
+	cursorOperationID := uint64(0)
+	if parsed.Cursor != "" {
+		if parsed.Offset != 0 {
+			return failureResult(invalidCursorFailure("pass either cursor or offset, not both: the cursor already names the position in the stream"), tc.modern)
+		}
+		cursorOperationID, failure = decodeAuditCursor(parsed.Cursor, mutationCursorPrefix)
+		if failure != nil {
+			return failureResult(failure, tc.modern)
+		}
+	}
 	entries, _ := tc.server.audit.Query(analysis.AuditFilter{ContextID: context.ID})
-	views := make([]map[string]any, 0, len(entries))
+	// The projection is the context's mutation trail: control-lock lifecycle
+	// events stay in the global stream, not here.
+	mutations := make([]analysis.AuditEntry, 0, len(entries))
 	for _, entry := range entries {
-		// The projection is the context's mutation trail: control-lock
-		// lifecycle events stay in the global stream, not here.
 		if entry.Outcome == analysis.OutcomeLockEvent {
 			continue
 		}
-		if uint64(len(views)) >= limit {
-			break
+		mutations = append(mutations, entry)
+	}
+	total := len(mutations)
+	if cursorOperationID != 0 {
+		start := len(mutations)
+		for index, entry := range mutations {
+			if entry.OperationID < cursorOperationID {
+				start = index
+				break
+			}
 		}
+		mutations = mutations[start:]
+	}
+	if parsed.Offset < uint64(len(mutations)) {
+		mutations = mutations[parsed.Offset:]
+	} else {
+		mutations = nil
+	}
+	truncated := uint64(len(mutations)) > limit
+	if truncated {
+		mutations = mutations[:limit]
+	}
+	views := make([]map[string]any, 0, len(mutations))
+	for _, entry := range mutations {
 		views = append(views, auditEntryView(entry))
 	}
-	return okResult(map[string]any{
+	paging := pagingPage{
+		Returned:  len(views),
+		Total:     total,
+		Remaining: boolToRemaining(truncated),
+	}
+	if truncated && len(mutations) > 0 {
+		paging.NextCursor = encodeAuditCursor(mutationCursorPrefix, mutations[len(mutations)-1].OperationID)
+	}
+	result := map[string]any{
 		"context_id": context.ID,
 		"entries":    views,
-	}, tc.modern)
+		"pagination": map[string]any{
+			"offset": parsed.Offset,
+			"limit":  limit,
+			"order":  "operation_id_desc",
+		},
+	}
+	paging.apply(result)
+	return okResult(result, tc.modern)
 }

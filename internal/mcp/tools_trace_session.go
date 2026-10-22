@@ -121,7 +121,7 @@ func traceSessionToolSpecs() []toolSpec {
 		},
 		{
 			name:        "trace_session_events",
-			description: "Query accumulated trace-session data: bounded execution events and histogram, aggregate watch-counter samples, and—when access_capture was set to \"ranges\" or \"all\"—individual read/write access events with PC, cycle, width, value, and optional registers. Filters and optional JSONL export operate on retained events; access ranges are filtered natively, while execution-address filters are post-capture. Drains native segments first unless collect=false; the drain never ends a continuous session. loss.complete means the capture covered the requested window with no gaps, which is only decidable once the session has ended (loss.final): a running session reports loss.complete false with the reason session_running, a sampled session reports loss.complete false with capture_is_sampled and its capture duty cycle, and loss.estimated_eviction_risk states whether a finite retention cap will run out first. drained.complete is only about this call's drain cursor, not capture coverage. Never pauses the system.",
+			description: "Query accumulated trace-session data: bounded execution events and histogram, aggregate watch-counter samples, and—when access_capture was set to \"ranges\" or \"all\"—individual read/write access events with PC, cycle, width, value, and optional registers. Filters and optional JSONL export operate on retained events; access ranges are filtered natively, while execution-address filters are post-capture. Drains native segments first unless collect=false; the drain never ends a continuous session. Events page in capture order by cursor: the first page starts at the oldest retained event and each next_cursor resumes strictly after the last returned event's store sequence, so pages advance to exhaustion instead of repeating the oldest window. " + pagingNote + " loss.complete means the capture covered the requested window with no gaps, which is only decidable once the session has ended (loss.final): a running session reports loss.complete false with the reason session_running, a sampled session reports loss.complete false with capture_is_sampled and its capture duty cycle, and loss.estimated_eviction_risk states whether a finite retention cap will run out first. drained.complete is only about this call's drain cursor, not capture coverage. Never pauses the system.",
 			schema: objectSchema(map[string]any{
 				"kind":                   enumProperty("Event kind to select.", []string{"execute", "read", "write", "any"}),
 				"address_range_start":    addressProperty(),
@@ -143,9 +143,10 @@ func traceSessionToolSpecs() []toolSpec {
 				"limit":                  integerProperty(fmt.Sprintf("Inline event sample size (default %d, cap %d).", traceSessionInlineEvents, traceSessionMaxInlineEvents), 1),
 				"include_address_counts": booleanProperty("Include the per-address execution histogram (default true)."),
 				"address_limit":          integerProperty(fmt.Sprintf("Inline histogram entries (default %d, cap %d).", traceSessionInlineAddresses, traceSessionMaxInlineAddresses), 1),
-				"export":                 booleanProperty("Store every retained matching event as a versioned JSONL artifact (default false)."),
+				"export":                 booleanProperty("Store every retained matching event as a versioned JSONL artifact (default false). The artifact descriptor reports truncated_by_store (with truncation_reasons) when events were evicted from the bounded store or a sealed segment was evicted before it was drained, so an export is never mistaken for the whole capture."),
 				"collect":                booleanProperty("Drain sealed native segments before querying (default true). Draining never disarms capture: a continuous session keeps tracing across the sealed segment boundary."),
 				"max_collect_bytes":      integerProperty(fmt.Sprintf("Per-call drain budget in bytes (default %d, cap %d).", traceSessionDefaultCollectBudget, traceSessionMaxCollectBudget), 1),
+				"cursor":                 stringProperty("next_cursor from a previous trace_session_events call; resumes strictly after that event's store sequence in capture order. Omit to start at the oldest retained event. Pages advance, so repeated calls never return the same page."),
 				"context":                contextProperty(),
 			}, nil),
 			run: runTraceSessionEvents,
@@ -239,6 +240,7 @@ type traceSessionEventsArgs struct {
 	Export               bool   `json:"export"`
 	Collect              *bool  `json:"collect"`
 	MaxCollectBytes      uint64 `json:"max_collect_bytes"`
+	Cursor               string `json:"cursor"`
 	Context              string `json:"context"`
 }
 
@@ -563,12 +565,43 @@ func runTraceSessionEvents(tc toolContext, args json.RawMessage) map[string]any 
 	if limit > traceSessionMaxInlineEvents {
 		limit = traceSessionMaxInlineEvents
 	}
+	// A cursor resumes strictly after one store sequence. The store sequence is
+	// this server's monotonic event number, so a drain between pages inserts
+	// new events after the cursor instead of shifting the page boundary the way
+	// a row offset in a bounded ring would.
+	afterSequence := uint64(0)
+	if parsed.Cursor != "" {
+		cursorSession, cursorSequence, failure := parseTraceEventsCursor(parsed.Cursor)
+		if failure != nil {
+			return failureResult(failure, tc.modern)
+		}
+		if cursorSession != session.ID {
+			return failureResult(invalidCursorFailure(fmt.Sprintf("this cursor pages session %q, not %q", cursorSession, session.ID)), tc.modern)
+		}
+		afterSequence = cursorSequence
+	}
 	sampleFilter := filter
 	sampleFilter.Limit = limit
-	sample := session.Select(sampleFilter)
+	if afterSequence != 0 {
+		sampleFilter.HasAfterSequence = true
+		sampleFilter.AfterSequence = afterSequence
+	}
+	page := session.SelectPage(sampleFilter)
+	sample := page.Events
 	inline := make([]map[string]any, 0, len(sample))
 	for _, event := range sample {
 		inline = append(inline, traceEventView(event))
+	}
+	nextCursor := ""
+	if page.Remaining > len(inline) && len(sample) > 0 {
+		nextCursor = encodeCursor(traceEventsCursorPrefix,
+			session.ID, strconv.FormatUint(sample[len(sample)-1].StoreSequence, 10))
+	}
+	paging := pagingPage{
+		Returned:   len(inline),
+		Total:      page.Total,
+		Remaining:  page.Remaining - len(inline),
+		NextCursor: nextCursor,
 	}
 	resolveSymbols := true
 	if parsed.ResolveSymbols != nil {
@@ -587,6 +620,29 @@ func runTraceSessionEvents(tc toolContext, args json.RawMessage) map[string]any 
 		"symbols":     symbolView,
 		"recovery":    traceSessionManifestPersist(tc, session, status),
 		"limitations": traceSessionLimitations(),
+		"paging": map[string]any{
+			"returned":                 paging.Returned,
+			"total":                    paging.Total,
+			"truncated":                paging.hasMore(),
+			"has_more":                 paging.hasMore(),
+			"next_cursor":              nil,
+			"order":                    "store_sequence_asc",
+			"oldest_retained_sequence": page.OldestSequence,
+			"newest_retained_sequence": page.NewestSequence,
+			"cursor":                   nil,
+		},
+	}
+	if paging.hasMore() {
+		result["paging"].(map[string]any)["next_cursor"] = paging.NextCursor
+	}
+	if parsed.Cursor != "" {
+		result["paging"].(map[string]any)["cursor"] = parsed.Cursor
+		// A cursor whose events were evicted from the bounded store resumes at
+		// the oldest retained event; say how many rows that skipped instead of
+		// presenting a silent hole.
+		if page.OldestSequence > afterSequence+1 {
+			result["paging"].(map[string]any)["skipped_evicted"] = page.OldestSequence - afterSequence - 1
+		}
 	}
 	includeCounts := true
 	if parsed.IncludeAddressCounts != nil {
@@ -626,7 +682,22 @@ func runTraceSessionEvents(tc toolContext, args json.RawMessage) map[string]any 
 		}
 		result["artifact"] = artifactDesc
 	}
+	paging.apply(result)
 	return okResult(result, tc.modern)
+}
+
+// parseTraceEventsCursor decodes the (session id, store sequence) cursor of one
+// trace_session_events enumeration.
+func parseTraceEventsCursor(raw string) (string, uint64, *toolFailure) {
+	parts, failure := decodeCursor(raw, traceEventsCursorPrefix, 2)
+	if failure != nil {
+		return "", 0, failure
+	}
+	sequence, err := strconv.ParseUint(parts[1], 10, 64)
+	if err != nil || parts[0] == "" {
+		return "", 0, invalidCursorFailure(fmt.Sprintf("%q is not a cursor this server issued", raw))
+	}
+	return parts[0], sequence, nil
 }
 
 func runTraceSessionStop(tc toolContext, args json.RawMessage) map[string]any {
@@ -1296,7 +1367,22 @@ func exportTraceSessionEvents(tc toolContext, context *analysis.Context, session
 	descriptor := artifactDescriptor(tc.server, stored, context.ID)
 	descriptor["events"] = len(events)
 	descriptor["session_id"] = session.ID
-	descriptor["truncated_by_store"] = session.LossView().DroppedEvents > 0
+	// Truncation accounting: the export can only contain events the bounded
+	// store still retains, so an evicted or never-drained segment is as much a
+	// truncation as an inline cap. Reasons are listed so a consumer can tell
+	// why the artifact is not the whole capture.
+	loss := session.LossView()
+	reasons := []string{}
+	if loss.DroppedEvents > 0 {
+		reasons = append(reasons, fmt.Sprintf("%d event(s) were evicted from the bounded event store", loss.DroppedEvents))
+	}
+	if loss.EvictedUnreadSegments > 0 {
+		reasons = append(reasons, fmt.Sprintf("%d sealed segment(s) were evicted before this server drained them", loss.EvictedUnreadSegments))
+	}
+	descriptor["truncated_by_store"] = len(reasons) > 0
+	if len(reasons) > 0 {
+		descriptor["truncation_reasons"] = reasons
+	}
 	return descriptor, nil
 }
 
@@ -1926,12 +2012,13 @@ func traceSessionLimitations() map[string]any {
 // traceEventView renders one event for an inline response sample.
 func traceEventView(event tracing.Event) map[string]any {
 	view := map[string]any{
-		"kind":          event.Kind,
-		"address":       event.Address,
-		"address_hex":   event.AddressHex,
-		"address_space": event.AddressSpace,
-		"cycle":         event.Cycle,
-		"segment_index": event.SegmentIndex,
+		"kind":           event.Kind,
+		"address":        event.Address,
+		"address_hex":    event.AddressHex,
+		"address_space":  event.AddressSpace,
+		"cycle":          event.Cycle,
+		"segment_index":  event.SegmentIndex,
+		"store_sequence": event.StoreSequence,
 	}
 	if event.EmulatedNanoseconds != 0 {
 		view["emulated_nanoseconds"] = event.EmulatedNanoseconds

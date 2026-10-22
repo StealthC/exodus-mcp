@@ -108,6 +108,49 @@ func runStateDiff(tc toolContext, args json.RawMessage) map[string]any {
 		fileDiff["note"] = fmt.Sprintf("Files are compared through the first %d bytes only; the full snapshot bytes stay available on disk.", stateDiffFileCapBytes)
 	}
 
+	// Verdict: a comparison that only read a prefix of either file cannot
+	// certify the snapshots are identical, because the bytes beyond the cap were
+	// never compared. identical therefore means "fully compared and equal", and
+	// the completeness facts are stored with the report so an artifact reader
+	// reaches the same verdict.
+	identicalInScope := false
+	if metadataIdentical, ok := metadataDiff["identical"].(bool); ok {
+		identicalInScope = metadataIdentical
+	}
+	if fileIdentical, ok := fileDiff["identical"].(bool); ok {
+		identicalInScope = identicalInScope && fileIdentical
+	}
+	comparisonComplete := !beforeTruncated && !afterTruncated
+	identical := identicalInScope && comparisonComplete
+	comparison := map[string]any{
+		"complete":              comparisonComplete,
+		"verdict_scope":         "full",
+		"cap_bytes":             stateDiffFileCapBytes,
+		"before_bytes_compared": len(beforeBytes),
+		"after_bytes_compared":  len(afterBytes),
+		"before_bytes_on_disk":  beforeSize,
+		"after_bytes_on_disk":   afterSize,
+		"identical_in_scope":    identicalInScope,
+		"identical":             identical,
+	}
+	if comparisonComplete {
+		comparison["truncated"] = false
+		fileDiff["complete"] = true
+	} else {
+		reasons := []string{}
+		if beforeTruncated {
+			reasons = append(reasons, fmt.Sprintf("the before snapshot is %d bytes and only the first %d were compared", beforeSize, len(beforeBytes)))
+		}
+		if afterTruncated {
+			reasons = append(reasons, fmt.Sprintf("the after snapshot is %d bytes and only the first %d were compared", afterSize, len(afterBytes)))
+		}
+		reasons = append(reasons, "identical is false because the compared prefix cannot certify the unread bytes")
+		comparison["verdict_scope"] = "prefix"
+		comparison["truncated"] = true
+		comparison["truncated_reasons"] = reasons
+		fileDiff["complete"] = false
+	}
+
 	// Semantic sections: requested but never performed by this read-only tool.
 	semantic := map[string]any{
 		"complete": false,
@@ -135,6 +178,7 @@ func runStateDiff(tc toolContext, args json.RawMessage) map[string]any {
 		"after_snapshot":  stateSnapshotView(after),
 		"metadata_diff":   metadataDiff,
 		"file_diff":       fileDiff,
+		"comparison":      comparison,
 		"semantic":        semantic,
 		"provenance": map[string]any{
 			"note": stateDiffProvenanceNote,
@@ -150,17 +194,10 @@ func runStateDiff(tc toolContext, args json.RawMessage) map[string]any {
 		return failureResult(&toolFailure{Code: "artifact_error", Message: err.Error()}, tc.modern)
 	}
 
-	identical := false
-	if metadataIdentical, ok := metadataDiff["identical"].(bool); ok {
-		identical = metadataIdentical
-	}
-	if fileIdentical, ok := fileDiff["identical"].(bool); ok {
-		identical = identical && fileIdentical
-	}
-
 	result := map[string]any{
 		"kind":             "state-diff",
 		"identical":        identical,
+		"comparison":       comparison,
 		"metadata_diff":    metadataDiff,
 		"file_diff":        fileDiff,
 		"semantic":         semantic,
