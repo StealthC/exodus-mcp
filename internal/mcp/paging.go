@@ -2,6 +2,7 @@ package mcp
 
 import (
 	"encoding/base64"
+	"encoding/json"
 	"fmt"
 	"strings"
 )
@@ -24,6 +25,13 @@ import (
 // the stable ordering key of its store (annotation created_at, audit
 // operation_id, trace store_sequence, snapshot byte offset for searches and
 // diffs; the last three are immutable once issued).
+//
+// A cursor also carries the query that produced it (pattern and window,
+// comparison semantics, annotation filters, audit filters, event filters), so
+// page 2 or later can be requested with the cursor alone: the decoded token IS
+// the request. An argument supplied next to a cursor is an assertion about that
+// query and is rejected when it contradicts it — never silently preferred in
+// either direction.
 
 // cursorSeparator joins the fields of one decoded cursor. It cannot appear in
 // an annotation id, a session id, or a hex number, so the split is unambiguous.
@@ -71,6 +79,47 @@ func invalidCursorFailure(message string) *toolFailure {
 		Message: "invalid cursor: " + message + "; omit cursor to start at the first page",
 		Data:    map[string]any{"field": "cursor"},
 	}
+}
+
+// cursorConflictFailure rejects an argument that contradicts the query a cursor
+// already carries. Re-sending the original arguments with a cursor is allowed
+// only when they match it, so a caller never has to guess which of the two
+// values the page actually used.
+func cursorConflictFailure(field string, cursorValue, providedValue any) *toolFailure {
+	return &toolFailure{
+		Code: "invalid_params",
+		Message: fmt.Sprintf("%s does not match the query this cursor pages (cursor: %v, call: %v); omit it to page the cursor's query, or omit the cursor to start a new enumeration",
+			field, cursorValue, providedValue),
+		Data: map[string]any{
+			"field":          field,
+			"cursor_value":   cursorValue,
+			"provided_value": providedValue,
+		},
+	}
+}
+
+// encodeCursorQuery renders one tool's query identity (the request fields a
+// cursor must reproduce) as a single opaque cursor field. JSON keeps the blob
+// self-describing, and base64 keeps it free of the field separator.
+func encodeCursorQuery(query any) (string, *toolFailure) {
+	encoded, err := json.Marshal(query)
+	if err != nil {
+		return "", &toolFailure{Code: "internal_error", Message: "encode cursor query: " + err.Error()}
+	}
+	return base64.RawURLEncoding.EncodeToString(encoded), nil
+}
+
+// decodeCursorQuery restores the query identity a cursor carries. A blob this
+// server did not write is rejected as an invalid cursor.
+func decodeCursorQuery(encoded string, target any, cursor string) *toolFailure {
+	decoded, err := base64.RawURLEncoding.DecodeString(encoded)
+	if err != nil {
+		return invalidCursorFailure(fmt.Sprintf("%q is not a cursor this server issued", cursor))
+	}
+	if err := json.Unmarshal(decoded, target); err != nil {
+		return invalidCursorFailure(fmt.Sprintf("%q is not a cursor this server issued", cursor))
+	}
+	return nil
 }
 
 // pagingPage is the paging envelope computed for one response page.
@@ -122,3 +171,7 @@ func (page pagingPage) apply(result map[string]any) map[string]any {
 // pagingNote documents the envelope once, in the tool descriptions that return
 // it, so a client learns the contract from the schema.
 const pagingNote = "Reports the one paging envelope {returned, total, truncated, has_more, next_cursor} (next_cursor is null on the last page); total is the whole filtered result set and has_more/truncated say whether this page is only part of it."
+
+// cursorSteppingNote documents how a caller pages: the cursor carries the query,
+// so later pages are cursor-only requests.
+const cursorSteppingNote = "Page 2 and later may be requested with the cursor alone: the cursor carries the query that produced it. Re-sending the original arguments is allowed only when they match the cursor; a differing value is rejected with invalid_params naming the field."

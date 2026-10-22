@@ -65,28 +65,28 @@ func phase5ToolSpecs() []toolSpec {
 		},
 		{
 			name:        "memory_search",
-			description: "Search a consistent snapshot for a raw byte pattern, with optional wildcard/mask. Without snapshot_id the tool dumps the range into a snapshot artifact first (never a live racy scan); with snapshot_id it searches that artifact without any new read and derives the address space, start address, byte length, and byte order from the snapshot's capture provenance. A requested start_address/length may NARROW the captured range (a subset is a smaller question about the same bytes) and the response echoes the requested range next to the searched_range it actually scanned; a window that leaves the captured range is provenance_conflict. Pattern is hex bytes with optional spaces; use \"??\" or \"?\" for a single wildcard byte (any value), e.g. \"4A ?? 42\" matches 4A xx 42. Wildcard mask is explicitly documented; exact-byte mode (no wildcards) is unchanged. Optional alignment restricts matches to addresses aligned to that power-of-two. Snapshots without capture metadata (legacy) are reported as provenance_unknown. Returns bounded inline matches plus a full-results artifact that serializes the parsed pattern and mask for reproducibility. Matches page by cursor (default page is the first max_matches matches); a cursor carries the snapshot, the searched window, the pattern, and the resume offset, so later pages never re-read the target or resend a snapshot. " + pagingNote,
+			description: "Search a consistent snapshot for a raw byte pattern, with optional wildcard/mask. Without snapshot_id the tool dumps the range into a snapshot artifact first (never a live racy scan); with snapshot_id it searches that artifact without any new read and derives the address space, start address, byte length, and byte order from the snapshot's capture provenance. A requested start_address/length may NARROW the captured range (a subset is a smaller question about the same bytes) and the response echoes the requested range next to the searched_range it actually scanned; a window that leaves the captured range is provenance_conflict. Pattern is hex bytes with optional spaces; use \"??\" or \"?\" for a single wildcard byte (any value), e.g. \"4A ?? 42\" matches 4A xx 42. Wildcard mask is explicitly documented; exact-byte mode (no wildcards) is unchanged. Optional alignment restricts matches to addresses aligned to that power-of-two. Snapshots without capture metadata (legacy) are reported as provenance_unknown. Returns bounded inline matches plus a full-results artifact that serializes the parsed pattern and mask for reproducibility. Matches page by cursor (default page is the first max_matches matches); the cursor carries the snapshot, the searched window, the pattern with its wildcard mask, and the resume offset, so later pages never re-read the target or resend a snapshot. " + cursorSteppingNote + " " + pagingNote,
 			schema: objectSchema(map[string]any{
 				"space":         stringProperty("Address space id from memory_spaces_list; required without snapshot_id or when the snapshot lacks provenance. With a proven snapshot it must match the snapshot's captured space."),
-				"pattern":       stringProperty("Byte pattern as hex with optional spaces and ??/? wildcards, e.g. \"4A 42 41\" or \"4A ?? 42\" (wildcard byte)."),
+				"pattern":       stringProperty("Byte pattern as hex with optional spaces and ??/? wildcards, e.g. \"4A 42 41\" or \"4A ?? 42\" (wildcard byte). Required unless cursor is given; with a cursor it must match the cursor's pattern."),
 				"start_address": addressProperty(),
 				"length":        integerProperty(fmt.Sprintf("Bytes to scan (default %d when no snapshot is given; with a proven snapshot it may narrow the captured range and must stay inside it).", dumpCapBytes), 1),
 				"max_matches":   integerProperty(fmt.Sprintf("Maximum inline matches per page (default %d, cap %d).", defaultSearchMaxMatches, maxSearchMaxMatches), 1),
 				"snapshot_id":   stringProperty("Optional id of a memory-dump or memory-snapshot artifact to search instead of reading again."),
 				"alignment":     integerProperty("Optional alignment: matches only at addresses where (address - start_address) % alignment == 0 (must be power of two, e.g. 2 for word-aligned).", 1),
-				"cursor":        stringProperty("next_cursor from a previous memory_search call; resumes after the last returned match using the same snapshot, window, and pattern. Omit to start at the first page."),
+				"cursor":        stringProperty("next_cursor from a previous memory_search call. The cursor carries the snapshot, the searched window, the pattern, and the alignment, so a later page needs only the cursor; any argument supplied alongside it must match the cursor. Omit to start at the first page."),
 				"context":       contextProperty(),
-			}, []string{"pattern"}),
+			}, nil),
 			run: runMemorySearch,
 		},
 		{
 			name:        "memory_diff",
-			description: "Compare two consistent memory snapshots cell-by-cell and report cells matching a comparison mode. Without snapshot_after_id the region is read fresh into a snapshot first (never a live racy scan). The before snapshot's capture provenance supplies the address space, range, and default byte order; comparing snapshots with incompatible provenance (different space, range, or ROM identity) fails with incompatible_provenance by default — pass allow_incompatible_provenance to force it, and the response warns with both source manifests instead of fabricating a common address origin. Snapshots without capture metadata (legacy) are reported provenance_unknown. Modes: changed, unchanged, increased, decreased, changed_by (signed delta), equal_to (after value), in_range (after value bounds). Width byte/word/long with explicit byte order (default big-endian) and aligned scanning by default. Returns bounded inline matches plus a full-results artifact. The response echoes the requested comparison next to the compared_range it actually scanned. Matches page by cursor: a cursor names both snapshot artifacts (so a later page compares the same bytes instead of reading the target again), the cell semantics, and the resume offset; a fresh after read becomes a stored snapshot on the first page, and every page reuses it. " + pagingNote,
+			description: "Compare two consistent memory snapshots cell-by-cell and report cells matching a comparison mode. Without snapshot_after_id the region is read fresh into a snapshot first (never a live racy scan). The before snapshot's capture provenance supplies the address space, range, and default byte order; comparing snapshots with incompatible provenance (different space, range, or ROM identity) fails with incompatible_provenance by default — pass allow_incompatible_provenance to force it, and the response warns with both source manifests instead of fabricating a common address origin. Snapshots without capture metadata (legacy) are reported provenance_unknown. Modes: changed, unchanged, increased, decreased, changed_by (signed delta), equal_to (after value), in_range (after value bounds). Width byte/word/long with explicit byte order (default big-endian) and aligned scanning by default. Returns bounded inline matches plus a full-results artifact. The response echoes the requested comparison next to the compared_range it actually scanned. Matches page by cursor: the cursor names both snapshot artifacts (so a later page compares the same bytes instead of reading the target again), the mode, width, byte order, comparison values, and the resume offset. " + cursorSteppingNote + " " + pagingNote,
 			schema: objectSchema(map[string]any{
-				"snapshot_before_id":            stringProperty("id of a memory-dump or memory-snapshot artifact representing the earlier state."),
+				"snapshot_before_id":            stringProperty("id of a memory-dump or memory-snapshot artifact representing the earlier state. Required unless cursor is given."),
 				"snapshot_after_id":             stringProperty("optional id of a memory-dump or memory-snapshot artifact representing the later state; when omitted, the before range is read fresh into a snapshot before comparing."),
 				"space":                         stringProperty("Address space id from memory_spaces_list; required when snapshot_after_id is omitted and the before snapshot lacks provenance. With a proven before snapshot it must match the captured space."),
-				"mode":                          enumProperty("Comparison mode.", []string{"changed", "unchanged", "increased", "decreased", "changed_by", "equal_to", "in_range"}),
+				"mode":                          enumProperty("Comparison mode. Required unless cursor is given.", []string{"changed", "unchanged", "increased", "decreased", "changed_by", "equal_to", "in_range"}),
 				"width":                         enumProperty("Cell width. Default byte; word/long cells honor byte_order.", []string{"byte", "word", "long"}),
 				"byte_order":                    enumProperty("Byte order for word/long cells. Defaults to the before snapshot's captured byte order when it has provenance; otherwise big-endian (M68K domain); use little-endian for Z80 RAM cells.", []string{"big-endian", "little-endian"}),
 				"value":                         integerProperty("Value for equal_to (unsigned, must fit the width) or the signed delta for changed_by.", 0),
@@ -96,9 +96,9 @@ func phase5ToolSpecs() []toolSpec {
 				"max_matches":                   integerProperty(fmt.Sprintf("Maximum inline matches (default %d, cap %d).", defaultSearchMaxMatches, maxSearchMaxMatches), 1),
 				"allow_misaligned":              booleanProperty("Scan every cell offset instead of aligning to the cell width in the address domain."),
 				"allow_incompatible_provenance": booleanProperty("Compare snapshots whose capture provenance differs (space, range, or ROM identity) and report a prominent warning instead of failing with incompatible_provenance. Never fabricates a common address origin."),
-				"cursor":                        stringProperty("next_cursor from a previous memory_diff call; resumes the same comparison (same before/after snapshots and cell semantics) after the last returned match. Omit to start at the first page."),
+				"cursor":                        stringProperty("next_cursor from a previous memory_diff call. The cursor carries both snapshots, the mode, width, byte order, comparison values, and the alignment policy, so a later page needs only the cursor; any argument supplied alongside it must match the cursor. Omit to start at the first page."),
 				"context":                       contextProperty(),
-			}, []string{"snapshot_before_id", "mode"}),
+			}, nil),
 			run: runMemoryDiff,
 		},
 		{
@@ -470,6 +470,7 @@ type searchCursor struct {
 	Start      uint64 // first address of the searched window
 	Length     uint64 // searched byte length
 	PatternHex string
+	MaskHex    string
 	Alignment  uint64
 	After      uint64 // byte offset inside the searched window to resume at
 }
@@ -481,18 +482,19 @@ func (cursor searchCursor) encode() string {
 		strconv.FormatUint(cursor.Start, 10),
 		strconv.FormatUint(cursor.Length, 10),
 		cursor.PatternHex,
+		cursor.MaskHex,
 		strconv.FormatUint(cursor.Alignment, 10),
 		strconv.FormatUint(cursor.After, 10),
 	)
 }
 
 func parseSearchCursor(raw string) (searchCursor, *toolFailure) {
-	parts, failure := decodeCursor(raw, searchCursorPrefix, 8)
+	parts, failure := decodeCursor(raw, searchCursorPrefix, 9)
 	if failure != nil {
 		return searchCursor{}, failure
 	}
 	numbers := make([]uint64, 5)
-	for index, position := range []int{2, 3, 4, 6, 7} {
+	for index, position := range []int{2, 3, 4, 7, 8} {
 		value, err := strconv.ParseUint(parts[position], 10, 64)
 		if err != nil {
 			return searchCursor{}, invalidCursorFailure(fmt.Sprintf("%q is not a cursor this server issued", raw))
@@ -502,39 +504,73 @@ func parseSearchCursor(raw string) (searchCursor, *toolFailure) {
 	if parts[0] == "" || numbers[2] == 0 {
 		return searchCursor{}, invalidCursorFailure(fmt.Sprintf("%q is not a cursor this server issued", raw))
 	}
-	return searchCursor{
+	if parts[5] == "" || len(parts[5]) != len(parts[6]) {
+		return searchCursor{}, invalidCursorFailure(fmt.Sprintf("%q is not a cursor this server issued", raw))
+	}
+	cursor := searchCursor{
 		SnapshotID: parts[0],
 		SpaceID:    parts[1],
 		Offset:     numbers[0],
 		Start:      numbers[1],
 		Length:     numbers[2],
 		PatternHex: parts[5],
+		MaskHex:    parts[6],
 		Alignment:  numbers[3],
 		After:      numbers[4],
-	}, nil
+	}
+	if cursor.Alignment != 0 && cursor.Alignment&(cursor.Alignment-1) != 0 {
+		return searchCursor{}, invalidCursorFailure(fmt.Sprintf("%q is not a cursor this server issued", raw))
+	}
+	if _, err := hex.DecodeString(cursor.PatternHex); err != nil {
+		return searchCursor{}, invalidCursorFailure(fmt.Sprintf("%q is not a cursor this server issued", raw))
+	}
+	if _, err := hex.DecodeString(cursor.MaskHex); err != nil {
+		return searchCursor{}, invalidCursorFailure(fmt.Sprintf("%q is not a cursor this server issued", raw))
+	}
+	return cursor, nil
 }
 
-// resolveSearchCursor reconciles a cursor with the arguments of the current
-// call. A cursor already fixes the snapshot, the window, and the query, so a
-// parameter that contradicts them is rejected instead of silently restarting
-// the enumeration against different bytes.
-func resolveSearchCursor(tc toolContext, contextID string, parsed memorySearchArgs, patternHex string, cursor searchCursor) (searchSource, *toolFailure) {
-	source := searchSource{}
-	if parsed.Pattern != "" && patternHex != cursor.PatternHex {
-		return source, invalidCursorFailure(fmt.Sprintf("this cursor pages a search for pattern %q, not %q", cursor.PatternHex, patternHex))
+// reconcileSearchCursorQuery applies the query a cursor carries when the caller
+// omitted it, and rejects an argument that contradicts it. The decoded cursor is
+// the request, so a cursor-only call is valid and a conflicting argument is an
+// error naming the field.
+func reconcileSearchCursorQuery(parsed *memorySearchArgs, cursor searchCursor) (patternHex, maskHex string, failure *toolFailure) {
+	patternHex, maskHex = cursor.PatternHex, cursor.MaskHex
+	if parsed.Pattern != "" {
+		pattern, mask, parseFailure := parseHexPatternWithMask(parsed.Pattern)
+		if parseFailure != nil {
+			return "", "", parseFailure
+		}
+		providedPattern := strings.ToUpper(hex.EncodeToString(pattern))
+		providedMask := strings.ToUpper(hex.EncodeToString(mask))
+		if providedPattern != cursor.PatternHex || providedMask != cursor.MaskHex {
+			return "", "", cursorConflictFailure("pattern",
+				fmt.Sprintf("%s with mask %s", cursor.PatternHex, cursor.MaskHex),
+				fmt.Sprintf("%s with mask %s", providedPattern, providedMask))
+		}
 	}
 	if parsed.Alignment != 0 && parsed.Alignment != cursor.Alignment {
-		return source, invalidCursorFailure(fmt.Sprintf("this cursor pages a search with alignment %d, not %d", cursor.Alignment, parsed.Alignment))
+		return "", "", cursorConflictFailure("alignment", cursor.Alignment, parsed.Alignment)
 	}
 	if parsed.SnapshotID != "" && parsed.SnapshotID != cursor.SnapshotID {
-		return source, invalidCursorFailure(fmt.Sprintf("this cursor pages snapshot %q, not %q", cursor.SnapshotID, parsed.SnapshotID))
+		return "", "", cursorConflictFailure("snapshot_id", cursor.SnapshotID, parsed.SnapshotID)
 	}
 	if parsed.Space != "" && parsed.Space != cursor.SpaceID {
-		return source, invalidCursorFailure(fmt.Sprintf("this cursor pages address space %q, not %q", cursor.SpaceID, parsed.Space))
+		return "", "", cursorConflictFailure("space", cursor.SpaceID, parsed.Space)
 	}
-	if parsed.StartAddress != nil || parsed.Length != 0 {
-		return source, invalidCursorFailure("pass either cursor or start_address/length, not both: the cursor already names the searched window")
+	if parsed.StartAddress != nil {
+		return "", "", cursorConflictFailure("start_address", canonicalHex(cursor.Start), fmt.Sprint(parsed.StartAddress))
 	}
+	if parsed.Length != 0 && parsed.Length != cursor.Length {
+		return "", "", cursorConflictFailure("length", cursor.Length, parsed.Length)
+	}
+	return patternHex, maskHex, nil
+}
+
+// resolveSearchCursor loads the snapshot a cursor names and slices the window it
+// recorded, so a later page reuses exactly the bytes the first page searched.
+func resolveSearchCursor(tc toolContext, contextID string, cursor searchCursor) (searchSource, *toolFailure) {
+	source := searchSource{}
 	raw, meta, failure := loadSearchSnapshot(tc, contextID, cursor.SnapshotID)
 	if failure != nil {
 		return source, failure
@@ -591,12 +627,39 @@ func runMemorySearch(tc toolContext, args json.RawMessage) map[string]any {
 	if failure != nil {
 		return failureResult(failure, tc.modern)
 	}
-	pattern, mask, failure := parseHexPatternWithMask(parsed.Pattern)
-	if failure != nil {
-		return failureResult(failure, tc.modern)
+	// The cursor is decoded before any required-argument check: the token IS the
+	// request, so a page 2 call needs nothing else, and a missing pattern is only
+	// an error when there is no cursor to supply it.
+	cursor := searchCursor{}
+	cursorPage := parsed.Cursor != ""
+	if cursorPage {
+		cursor, failure = parseSearchCursor(parsed.Cursor)
+		if failure != nil {
+			return failureResult(failure, tc.modern)
+		}
 	}
-	if parsed.Alignment != 0 && (parsed.Alignment&(parsed.Alignment-1) != 0) {
-		return failureResult(&toolFailure{Code: "invalid_params", Message: "alignment must be a power of two"}, tc.modern)
+	var pattern, mask []byte
+	if cursorPage {
+		patternHex, maskHex, conflict := reconcileSearchCursorQuery(parsed, cursor)
+		if conflict != nil {
+			return failureResult(conflict, tc.modern)
+		}
+		pattern, _ = hex.DecodeString(patternHex)
+		mask, _ = hex.DecodeString(maskHex)
+	} else {
+		pattern, mask, failure = parseHexPatternWithMask(parsed.Pattern)
+		if failure != nil {
+			return failureResult(failure, tc.modern)
+		}
+		if parsed.Alignment != 0 && (parsed.Alignment&(parsed.Alignment-1) != 0) {
+			return failureResult(&toolFailure{Code: "invalid_params", Message: "alignment must be a power of two"}, tc.modern)
+		}
+	}
+	alignment := parsed.Alignment
+	if cursorPage {
+		// The alignment is part of the query: paging with a different one would
+		// select a different set of matches.
+		alignment = cursor.Alignment
 	}
 
 	maxMatches := parsed.MaxMatches
@@ -611,7 +674,7 @@ func runMemorySearch(tc toolContext, args json.RawMessage) map[string]any {
 	}
 
 	startAddress := uint64(0)
-	if parsed.StartAddress != nil {
+	if parsed.StartAddress != nil && !cursorPage {
 		startAddress, failure = resolveAddress(parsed.StartAddress, addressSpaceFromArgs(args), parsed.Space)
 		if failure != nil {
 			return failureResult(failure, tc.modern)
@@ -619,15 +682,10 @@ func runMemorySearch(tc toolContext, args json.RawMessage) map[string]any {
 	}
 
 	var source searchSource
-	cursor := searchCursor{}
-	if parsed.Cursor != "" {
+	if cursorPage {
 		// A cursor fixes the snapshot, window, and query, so the page reuses
 		// exactly the bytes the first page searched.
-		cursor, failure = parseSearchCursor(parsed.Cursor)
-		if failure != nil {
-			return failureResult(failure, tc.modern)
-		}
-		source, failure = resolveSearchCursor(tc, context.ID, *parsed, strings.ToUpper(hex.EncodeToString(pattern)), cursor)
+		source, failure = resolveSearchCursor(tc, context.ID, cursor)
 	} else {
 		source, failure = resolveSearchSource(tc, context.ID, *parsed, startAddress, pattern)
 	}
@@ -642,7 +700,7 @@ func runMemorySearch(tc toolContext, args json.RawMessage) map[string]any {
 	if parsed.Cursor != "" && spaceID == "" {
 		spaceID = cursor.SpaceID
 	}
-	matches, total, remaining, artifactTruncated := findPatternMatches(source.bytes, pattern, mask, source.startAddress, maxMatches, parsed.Alignment, cursor.After)
+	matches, total, remaining, artifactTruncated := findPatternMatches(source.bytes, pattern, mask, source.startAddress, maxMatches, alignment, cursor.After)
 	inlineTruncated := uint64(len(matches.Inline)) < total
 	nextCursor := ""
 	if remaining > uint64(len(matches.Inline)) && len(matches.Inline) > 0 {
@@ -654,7 +712,8 @@ func runMemorySearch(tc toolContext, args json.RawMessage) map[string]any {
 			Start:      source.startAddress,
 			Length:     uint64(len(source.bytes)),
 			PatternHex: strings.ToUpper(hex.EncodeToString(pattern)),
-			Alignment:  parsed.Alignment,
+			MaskHex:    strings.ToUpper(hex.EncodeToString(mask)),
+			Alignment:  alignment,
 			After:      matches.LastOffset + 1,
 		}.encode()
 	}
@@ -677,7 +736,7 @@ func runMemorySearch(tc toolContext, args json.RawMessage) map[string]any {
 		"pattern_hex":          patternHex,
 		"pattern_mask_hex":     maskHex,
 		"pattern_length_bytes": len(pattern),
-		"alignment":            parsed.Alignment,
+		"alignment":            alignment,
 		"interpretation":       "matches are byte addresses in the address space; the pattern is raw bytes in address order with mask 00=wildcard and no endian interpretation is applied",
 		"source_snapshot":      source.descriptor,
 		"source_range":         source.sourceRange(),
@@ -689,7 +748,7 @@ func runMemorySearch(tc toolContext, args json.RawMessage) map[string]any {
 		"matches_total":  total,
 		"truncated":      artifactTruncated,
 		"addresses":      matches.Addresses,
-		"parsed_pattern": map[string]any{"bytes_hex": patternHex, "mask_hex": maskHex, "alignment": parsed.Alignment},
+		"parsed_pattern": map[string]any{"bytes_hex": patternHex, "mask_hex": maskHex, "alignment": alignment},
 	}
 	resultsBytes, err := json.Marshal(results)
 	if err != nil {
@@ -706,7 +765,7 @@ func runMemorySearch(tc toolContext, args json.RawMessage) map[string]any {
 		"pattern_hex":                patternHex,
 		"pattern_mask_hex":           maskHex,
 		"pattern_length_bytes":       len(pattern),
-		"alignment":                  parsed.Alignment,
+		"alignment":                  alignment,
 		"interpretation":             "matches are byte addresses; raw pattern bytes preserve address order with mask 00=wildcard and are never decoded",
 		"searched_start_address":     source.startAddress,
 		"searched_start_address_hex": canonicalHex(source.startAddress),
@@ -718,7 +777,7 @@ func runMemorySearch(tc toolContext, args json.RawMessage) map[string]any {
 		"snapshot_read_note":         source.readOrigin,
 		"snapshot":                   source.descriptor,
 		"source_range":               source.sourceRange(),
-		"parsed_pattern":             map[string]any{"bytes_hex": patternHex, "mask_hex": maskHex, "alignment": parsed.Alignment},
+		"parsed_pattern":             map[string]any{"bytes_hex": patternHex, "mask_hex": maskHex, "alignment": alignment},
 	}
 	if source.consistency != nil {
 		summary["capture_consistency"] = captureConsistencyToMap(source.consistency)
@@ -971,7 +1030,7 @@ func parseDiffCursor(raw string) (memoryDiffCursor, *toolFailure) {
 	if err != nil || parts[0] == "" || parts[1] == "" {
 		return memoryDiffCursor{}, invalidCursorFailure(fmt.Sprintf("%q is not a cursor this server issued", raw))
 	}
-	return memoryDiffCursor{
+	cursor := memoryDiffCursor{
 		BeforeID:  parts[0],
 		AfterID:   parts[1],
 		Mode:      parts[2],
@@ -982,27 +1041,49 @@ func parseDiffCursor(raw string) (memoryDiffCursor, *toolFailure) {
 		MaxValue:  parts[7],
 		Alignment: parts[8],
 		After:     after,
-	}, nil
+	}
+	// The cursor is the request, so its own vocabulary must hold: a token this
+	// server issued can only carry a documented comparison shape.
+	switch cursor.Mode {
+	case "changed", "unchanged", "increased", "decreased", "changed_by", "equal_to", "in_range":
+	default:
+		return memoryDiffCursor{}, invalidCursorFailure(fmt.Sprintf("%q carries no usable comparison mode", raw))
+	}
+	if _, supported := diffWidths[cursor.Width]; !supported {
+		return memoryDiffCursor{}, invalidCursorFailure(fmt.Sprintf("%q carries no usable cell width", raw))
+	}
+	if cursor.ByteOrder != "big-endian" && cursor.ByteOrder != "little-endian" {
+		return memoryDiffCursor{}, invalidCursorFailure(fmt.Sprintf("%q carries no usable byte order", raw))
+	}
+	if cursor.Alignment != "aligned-to-width" && cursor.Alignment != "misaligned-scan" {
+		return memoryDiffCursor{}, invalidCursorFailure(fmt.Sprintf("%q carries no usable alignment policy", raw))
+	}
+	return cursor, nil
 }
 
 // resumeMemoryDiff rewrites the request into the comparison the cursor names,
 // so a later page cannot silently compare different bytes or a different mode.
-// Caller parameters that contradict the cursor are rejected.
+// A cursor-only call is valid: every argument the comparison needs travels in
+// the token. Arguments supplied next to it must match, and a differing one is
+// rejected naming the field.
 func resumeMemoryDiff(parsed *memoryDiffArgs, cursor memoryDiffCursor) *toolFailure {
 	if parsed.SnapshotBeforeID != "" && parsed.SnapshotBeforeID != cursor.BeforeID {
-		return invalidCursorFailure(fmt.Sprintf("this cursor pages the comparison of before snapshot %q, not %q", cursor.BeforeID, parsed.SnapshotBeforeID))
+		return cursorConflictFailure("snapshot_before_id", cursor.BeforeID, parsed.SnapshotBeforeID)
 	}
 	if parsed.SnapshotAfterID != "" && parsed.SnapshotAfterID != cursor.AfterID {
-		return invalidCursorFailure(fmt.Sprintf("this cursor pages the comparison with after snapshot %q, not %q; a different after snapshot would be a different comparison", cursor.AfterID, parsed.SnapshotAfterID))
+		return cursorConflictFailure("snapshot_after_id", cursor.AfterID, parsed.SnapshotAfterID)
 	}
 	if parsed.Mode != "" && parsed.Mode != cursor.Mode {
-		return invalidCursorFailure(fmt.Sprintf("this cursor pages a %q comparison, not %q", cursor.Mode, parsed.Mode))
+		return cursorConflictFailure("mode", cursor.Mode, parsed.Mode)
 	}
 	if parsed.Width != "" && parsed.Width != cursor.Width {
-		return invalidCursorFailure(fmt.Sprintf("this cursor pages %q cells, not %q", cursor.Width, parsed.Width))
+		return cursorConflictFailure("width", cursor.Width, parsed.Width)
 	}
 	if parsed.ByteOrder != "" && parsed.ByteOrder != cursor.ByteOrder {
-		return invalidCursorFailure(fmt.Sprintf("this cursor pages %q cells, not %q", cursor.ByteOrder, parsed.ByteOrder))
+		return cursorConflictFailure("byte_order", cursor.ByteOrder, parsed.ByteOrder)
+	}
+	if parsed.AllowMisaligned != (cursor.Alignment == "misaligned-scan") && parsed.AllowMisaligned {
+		return cursorConflictFailure("allow_misaligned", cursor.Alignment == "misaligned-scan", parsed.AllowMisaligned)
 	}
 	if cursor.Value != "" {
 		value, err := strconv.ParseInt(cursor.Value, 10, 64)
@@ -1010,11 +1091,11 @@ func resumeMemoryDiff(parsed *memoryDiffArgs, cursor memoryDiffCursor) *toolFail
 			return invalidCursorFailure(fmt.Sprintf("%q holds an unreadable comparison value", cursor.Value))
 		}
 		if parsed.Value != nil && *parsed.Value != value {
-			return invalidCursorFailure(fmt.Sprintf("this cursor pages value %d, not %d", value, *parsed.Value))
+			return cursorConflictFailure("value", value, *parsed.Value)
 		}
 		parsed.Value = &value
 	} else if parsed.Value != nil {
-		return invalidCursorFailure("this cursor pages a comparison without value")
+		return cursorConflictFailure("value", nil, *parsed.Value)
 	}
 	if cursor.MinValue != "" {
 		minValue, err := strconv.ParseUint(cursor.MinValue, 10, 64)
@@ -1022,9 +1103,11 @@ func resumeMemoryDiff(parsed *memoryDiffArgs, cursor memoryDiffCursor) *toolFail
 			return invalidCursorFailure(fmt.Sprintf("%q holds an unreadable min_value", cursor.MinValue))
 		}
 		if parsed.MinValue != nil && *parsed.MinValue != minValue {
-			return invalidCursorFailure(fmt.Sprintf("this cursor pages min_value %d, not %d", minValue, *parsed.MinValue))
+			return cursorConflictFailure("min_value", minValue, *parsed.MinValue)
 		}
 		parsed.MinValue = &minValue
+	} else if parsed.MinValue != nil {
+		return cursorConflictFailure("min_value", nil, *parsed.MinValue)
 	}
 	if cursor.MaxValue != "" {
 		maxValue, err := strconv.ParseUint(cursor.MaxValue, 10, 64)
@@ -1032,9 +1115,11 @@ func resumeMemoryDiff(parsed *memoryDiffArgs, cursor memoryDiffCursor) *toolFail
 			return invalidCursorFailure(fmt.Sprintf("%q holds an unreadable max_value", cursor.MaxValue))
 		}
 		if parsed.MaxValue != nil && *parsed.MaxValue != maxValue {
-			return invalidCursorFailure(fmt.Sprintf("this cursor pages max_value %d, not %d", maxValue, *parsed.MaxValue))
+			return cursorConflictFailure("max_value", maxValue, *parsed.MaxValue)
 		}
 		parsed.MaxValue = &maxValue
+	} else if parsed.MaxValue != nil {
+		return cursorConflictFailure("max_value", nil, *parsed.MaxValue)
 	}
 	parsed.SnapshotBeforeID = cursor.BeforeID
 	parsed.SnapshotAfterID = cursor.AfterID

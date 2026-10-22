@@ -229,10 +229,13 @@ claim to the exact test function or smoke-script check that proves it.
   `system_paused_during_read` when the snapshot's live read paused the
   system, with a note explaining the flag source when a snapshot is reused.
   Matches page by cursor: the cursor carries the snapshot id, the searched
-  window, the pattern, and the resume byte offset, so every page after the
-  first reuses the same immutable snapshot (no second read, no resend) and the
-  envelope `{returned, total, truncated, has_more, next_cursor}` walks the
-  result set to exhaustion without repeats or gaps.
+  window, the pattern **with its wildcard mask**, the alignment, and the resume
+  byte offset, so every page after the first reuses the same immutable snapshot
+  (no second read, no resend) and the envelope `{returned, total, truncated,
+  has_more, next_cursor}` walks the result set to exhaustion without repeats or
+  gaps. Page 2 and later may be requested with the cursor alone; re-sending the
+  original arguments is allowed only when they match the cursor, and a
+  contradicting value is `invalid_params` naming the field.
 - `memory_diff`: cheat-finder comparison between two consistent snapshots.
   Cell widths byte/word/long with explicit byte order (default big-endian,
   derived from the before snapshot's captured byte order when it has
@@ -249,7 +252,9 @@ claim to the exact test function or smoke-script check that proves it.
   artifacts** plus the cell semantics and the resume byte offset, so a page
   after the first compares exactly the bytes the first page compared — a fresh
   after read is stored once and reused (`fresh_after_read` is false on cursor
-  pages) instead of taking another live reading. `requested_comparison` echoes
+  pages) instead of taking another live reading. Cursor-only pages are the
+  documented stepping form; re-sent arguments must match the cursor.
+  `requested_comparison` echoes
   the requested mode/width/byte order next to the `compared_range`.
 - `system_snapshot_capture`: bounded atomic cross-domain snapshot with a
   `system-snapshot/1` artifact manifest, shared capture provenance, explicit
@@ -630,7 +635,9 @@ claim to the exact test function or smoke-script check that proves it.
   cursor (the monotonic operation id of the last entry, so an entry recorded
   between pages never duplicates or skips a row) or by offset;
   `has_more`, `next_cursor`, and `next_offset` agree, and both are null on the
-  last page instead of pointing at an empty page. Reported through the shared
+  last page instead of pointing at an empty page. The cursor carries the
+  filters, so page 2+ may be requested with the cursor alone; a re-sent filter
+  must match it. Reported through the shared
   `{returned, total, truncated, has_more, next_cursor}` envelope. Externally
   observed run-state transitions are recorded here as `run_state_change`
   events with the observed generation (never advancing it).
@@ -722,7 +729,7 @@ claim to the exact test function or smoke-script check that proves it.
 ## Evidence annotations (P2)
 
 - `annotation_create`, `annotation_get`, `annotation_update`, `annotation_delete`: context-scoped evidence store for addresses and ranges. Each annotation carries title, text, tags, category, author/source, confidence, `kind` (`observation` vs `hypothesis`), creation/update timestamps, address space/range (flexible `$`/`0x`/`h` parsing), ROM identity (`rom_sha256`+path) and `target_generation` stamping at creation, and evidence links to artifacts, states, captures, trace events, symbols, and managed debug resources. Hypotheses never promote to symbols automatically.
-- `annotation_list`: bounded, paginated view (default 20, cap 100, `truncated`+`next_offset`) with filters for query substring, tags, category, kind, address space, and staleness (`stale`/`stale_reason` `rom_sha256_mismatch`/`target_generation_mismatch`, `stale_only`/`include_stale` with `stale_excluded` honesty). Preserves history across ROM loads. Pages by cursor (a keyset anchor on the immutable `created_at`+`id` pair of the last returned annotation, so a concurrent create, edit, or delete never repeats or skips a row) or by offset (mutually exclusive with `cursor`), and reports the shared `{returned, total, truncated, has_more, next_cursor}` envelope; `next_offset` is null on the last page.
+- `annotation_list`: bounded, paginated view (default 20, cap 100, `truncated`+`next_offset`) with filters for query substring, tags, category, kind, address space, and staleness (`stale`/`stale_reason` `rom_sha256_mismatch`/`target_generation_mismatch`, `stale_only`/`include_stale` with `stale_excluded` honesty). Preserves history across ROM loads. Pages by cursor (a keyset anchor on the immutable `created_at`+`id` pair of the last returned annotation, so a concurrent create, edit, or delete never repeats or skips a row) or by offset (mutually exclusive with `cursor`), and reports the shared `{returned, total, truncated, has_more, next_cursor}` envelope; `next_offset` is null on the last page. The cursor carries the filters, so page 2+ may be requested with the cursor alone; a re-sent filter must match it.
 - `annotation_export` / `annotation_import`: versioned `annotation-export/1` artifact (`application/json`, provenance via `genericProvenance`) and import with conflict detection (`overwrite` flag, per-id `conflicts` list, 500-per-context cap). Import honors the same staleness and provenance rules.
 
 ## Advanced debugging (Phase 7)
@@ -876,7 +883,9 @@ documented in [TRACE-SESSIONS.md](TRACE-SESSIONS.md).
   `store_sequence`, so pages advance to exhaustion instead of returning the
   same oldest window, and the shared `{returned, total, truncated, has_more,
   next_cursor}` envelope plus `paging.skipped_evicted` state what was skipped
-  when the bounded store evicted events between pages. Optional
+  when the bounded store evicted events between pages. The cursor carries the
+  session and the event filter, so page 2+ may be requested with the cursor
+  alone; a re-sent filter must match it. Optional
   `trace-session-event/1` / `trace-session-access/1` JSONL artifact with full
   `artifact-provenance/2` metadata, plus ROM-hash-bound symbol resolution of
   access PCs. The artifact descriptor's `truncated_by_store` covers evicted
