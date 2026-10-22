@@ -730,10 +730,11 @@ claim to the exact test function or smoke-script check that proves it.
   final registers (pc/a7/d0) for both runs — restores the initial state
   afterwards (caller-provided `initial_state_id`, or a fresh snapshot of the
   current machine), and reports `deterministic` true/false with named checks
-  plus a `replay-manifest/2` artifact recording both runs, the checks, and the
+  plus a `replay-manifest/3` artifact recording both runs, the checks, and the
   methodology. Recording (run 1) and replay verification (run 2) share one
-  code path, so a mismatch is a real emulator nondeterminism signal rather
-  than a harness artifact. The VDP render counter is not part of a saved state
+  code path, so a gating mismatch is a real emulator nondeterminism signal
+  rather than a harness artifact. The VDP render counter is not part of a saved
+  state
   and is never reset by `state_load`, so absolute tokens are not comparable
   across the restore: every step is compared as a delta from a
   `frame_token_baseline` captured at the start of its own run. A target that
@@ -753,11 +754,32 @@ claim to the exact test function or smoke-script check that proves it.
   state observed before the call (`run_state_restored`: `restored` when a
   running target was resumed, `already_paused`, or
   `resume_skipped_initial_run_state_unknown` when the server never observed
-  it). A difference is reported in `diverged_step` (`step`, `field`,
-  `run1`, `run2`) when it belongs to one step and in `divergences` otherwise,
-  and an axis that could not be read (a missing token, an unreadable register
-  set, a counter that wrapped) is listed in `unproven` and never counted as a
-  match.
+  it).
+- `deterministic_replay` splits frame-level from register-level evidence,
+  because `state_load` is not bit-exact on this emulator. Each run fingerprints
+  the state its restore produced before any input (`restore_fingerprints`: M68K
+  pc/a7/d0 plus the absolute render token). `restore_fidelity` is `exact` when
+  both fingerprints agree on the registers, `not_exact` when they differ (with
+  `restore_fidelity_fields` naming the fields), and `unverified` when a
+  fingerprint could not be read. **Frame evidence always gates**: the per-step
+  frame-token deltas and the frames advanced count against the verdict
+  regardless of fidelity. **Register evidence gates only when the restore was
+  proven exact**: on a `not_exact`/`unverified` restore `register_comparison` is
+  `advisory`, the observed register differences are listed in
+  `advisory_divergences` with both values and the step, and they do not accuse
+  the input sequence — a restore that lands an instruction boundary off would
+  otherwise be reported as sequence nondeterminism (the reported defect,
+  covered by `TestDeterministicReplayAdvisoryRegistersWhenRestoreIsNotExact`,
+  while `TestDeterministicReplayRegistersAttributeDivergenceToStep` proves the
+  register axis still fails an exact-restore divergence and
+  `TestDeterministicReplayFrameDriftGatesEvenWhenRestoreIsNotExact` proves the
+  frame axis always gates). The render token is recorded in every fingerprint
+  but excluded from the fidelity test because it is never restored: its
+  per-step deltas are what the replay compares. A gating difference is reported
+  in `diverged_step` (`step`, `field`, `run1`, `run2`) when it belongs to one
+  step and in `divergences` otherwise, and an axis that could not be read (a
+  missing token, an unreadable register set, a counter that wrapped) is listed
+  in `unproven` and never counted as a match.
 
 ## Continuous trace sessions (Phase 10)
 

@@ -38,9 +38,15 @@ type replayFakeConfig struct {
 	// injecting a per-step token divergence.
 	frameDriftStep   int
 	frameDriftFrames uint64
-	// registerDrift adds a pc offset in run 2, injecting a CPU-state
-	// divergence without changing the frame count.
+	// registerDrift adds a pc offset to the samples taken after the run's first
+	// frame advance, injecting a CPU-state divergence without changing the frame
+	// count or the post-restore fingerprint.
 	registerDrift bool
+	// restorePCBias adds that many bytes to every register sample of the second
+	// and later restores, modelling a state_load that is not bit-exact: the
+	// machine resumes one instruction earlier or later, so the post-restore
+	// fingerprint already differs and every later sample inherits the drift.
+	restorePCBias uint64
 	// omitFrameToken makes frame_advance report no token at all.
 	omitFrameToken bool
 	// unreadableRegisters makes regs_get return no register map.
@@ -136,7 +142,12 @@ func replayFake(config replayFakeConfig) *fakeBridgeClient {
 				return json.RawMessage(`{"cpu":"m68k","byte_order":"big-endian"}`), nil
 			}
 			pc := uint64(0x200) + executed*2
-			if config.registerDrift && loads == 2 {
+			if loads >= 2 {
+				// A state_load that is not bit-exact leaves the machine one
+				// instruction off, so the drift is already in the fingerprint.
+				pc += config.restorePCBias
+			}
+			if config.registerDrift && loads == 2 && advances > 0 {
 				pc += 0x100
 			}
 			return json.RawMessage(fmt.Sprintf(`{"cpu":"m68k","byte_order":"not-applicable","system_paused_during_read":false,"registers":{"pc":%d,"a7":16776672,"d0":%d},"flags":{},"width_bits":32}`, pc, executed)), nil
@@ -316,12 +327,19 @@ func TestDeterministicReplayReportsDivergedStep(t *testing.T) {
 }
 
 // TestDeterministicReplayRegistersAttributeDivergenceToStep injects a CPU-state
-// difference that leaves the frame count untouched.
+// difference that leaves the frame count untouched. The two restores are
+// identical, so the register axis gates and the difference is a real verdict.
 func TestDeterministicReplayRegistersAttributeDivergenceToStep(t *testing.T) {
 	content := replayContent(t, replayFake(replayFakeConfig{registerDrift: true}),
 		`{"steps":[{"inputs":{"1":["a"]},"frames":1}]}`)
 	if content["deterministic"] != false {
 		t.Fatalf("deterministic = %v, want false: %v", content["deterministic"], content)
+	}
+	if content["restore_fidelity"] != "exact" || content["register_comparison"] != "gating" {
+		t.Fatalf("restore_fidelity = %v register_comparison = %v, want exact/gating", content["restore_fidelity"], content["register_comparison"])
+	}
+	if advisories, _ := content["advisory_divergences"].([]any); len(advisories) != 0 {
+		t.Fatalf("advisory_divergences = %v, want none for an exact restore", advisories)
 	}
 	diverged, ok := content["diverged_step"].(map[string]any)
 	if !ok {
@@ -337,8 +355,101 @@ func TestDeterministicReplayRegistersAttributeDivergenceToStep(t *testing.T) {
 	if checks["frame_token_deltas_match"]["passed"] != true {
 		t.Fatalf("frame_token_deltas_match = %v, want true (the drift leaves the token deltas intact)", checks["frame_token_deltas_match"])
 	}
-	if checks["final_registers_match"]["passed"] != false {
-		t.Fatalf("final_registers_match = %v, want false", checks["final_registers_match"])
+	if checks["final_registers_match"]["passed"] != false || checks["final_registers_match"]["gating"] != true {
+		t.Fatalf("final_registers_match = %v, want a failed gating check", checks["final_registers_match"])
+	}
+}
+
+// TestDeterministicReplayAdvisoryRegistersWhenRestoreIsNotExact is the
+// regression test for the second reported defect: state_load is not bit-exact,
+// so one run can start one instruction away from the other. The runs are then
+// frame-identical and the register samples differ, which used to be reported as
+// sequence nondeterminism. The difference must stay visible as advisory
+// evidence instead of failing the verdict.
+func TestDeterministicReplayAdvisoryRegistersWhenRestoreIsNotExact(t *testing.T) {
+	content := replayContent(t, replayFake(replayFakeConfig{restorePCBias: 4}),
+		`{"steps":[{"inputs":{"1":["a"]},"frames":2}]}`)
+
+	if content["deterministic"] != true {
+		t.Fatalf("deterministic = %v, want true: %v", content["deterministic"], content)
+	}
+	if content["restore_fidelity"] != "not_exact" {
+		t.Fatalf("restore_fidelity = %v, want not_exact", content["restore_fidelity"])
+	}
+	if content["register_comparison"] != "advisory" {
+		t.Fatalf("register_comparison = %v, want advisory", content["register_comparison"])
+	}
+	fields, _ := content["restore_fidelity_fields"].([]any)
+	if len(fields) != 1 || fields[0] != "m68k_pc" {
+		t.Fatalf("restore_fidelity_fields = %v, want [m68k_pc]", fields)
+	}
+	if unproven, _ := content["unproven"].([]any); len(unproven) != 0 {
+		t.Fatalf("unproven = %v, want none (nothing was unreadable)", unproven)
+	}
+	// A register difference caused by the restore must not be a gating
+	// divergence, but it must stay visible with both values and the step.
+	if divergences, exists := content["divergences"]; exists {
+		t.Fatalf("divergences = %v, want none: register differences are advisory here", divergences)
+	}
+	if _, exists := content["diverged_step"]; exists {
+		t.Fatalf("diverged_step reported for an advisory register difference: %v", content["diverged_step"])
+	}
+	advisories, _ := content["advisory_divergences"].([]any)
+	if len(advisories) == 0 {
+		t.Fatalf("advisory_divergences missing: %v", content)
+	}
+	first, _ := advisories[0].(map[string]any)
+	if first["field"] != "step_registers.m68k_pc" || first["step"] != float64(0) {
+		t.Fatalf("advisory_discoveries[0] = %v, want step 0 / step_registers.m68k_pc", first)
+	}
+	run1, run2 := first["run1"].(float64), first["run2"].(float64)
+	if run2-run1 != 4 {
+		t.Fatalf("advisory pc values = %v / %v, want a 4-byte drift", run1, run2)
+	}
+	// The fingerprints that justify the advisory comparison travel with the
+	// response, both values included.
+	fingerprints, _ := content["restore_fingerprints"].(map[string]any)
+	firstFingerprint, _ := fingerprints["run_1"].(map[string]any)
+	secondFingerprint, _ := fingerprints["run_2"].(map[string]any)
+	if firstFingerprint["m68k_pc"] == secondFingerprint["m68k_pc"] {
+		t.Fatalf("restore_fingerprints = %v, want differing pc values", fingerprints)
+	}
+	checks := replayChecks(content)
+	if checks["frame_token_deltas_match"]["gating"] != true || checks["frame_token_deltas_match"]["passed"] != true {
+		t.Fatalf("frame_token_deltas_match = %v, want a passed gating check", checks["frame_token_deltas_match"])
+	}
+	for _, name := range []string{"step_registers_match", "final_registers_match"} {
+		if checks[name]["gating"] != false || checks[name]["passed"] != false {
+			t.Fatalf("%s = %v, want a failed advisory check", name, checks[name])
+		}
+		if detail, _ := checks[name]["detail"].(string); !strings.Contains(detail, "advisory") {
+			t.Fatalf("%s detail does not explain the advisory comparison: %q", name, detail)
+		}
+	}
+}
+
+// TestDeterministicReplayFrameDriftGatesEvenWhenRestoreIsNotExact proves the
+// frame axis always counts: an inexact restore never excuses a different
+// number of frames advanced.
+func TestDeterministicReplayFrameDriftGatesEvenWhenRestoreIsNotExact(t *testing.T) {
+	content := replayContent(t, replayFake(replayFakeConfig{restorePCBias: 4, frameDriftStep: 0, frameDriftFrames: 2}),
+		`{"steps":[{"inputs":{"1":["a"]},"frames":2}]}`)
+	if content["deterministic"] != false {
+		t.Fatalf("deterministic = %v, want false", content["deterministic"])
+	}
+	if content["restore_fidelity"] != "not_exact" || content["register_comparison"] != "advisory" {
+		t.Fatalf("restore_fidelity = %v register_comparison = %v, want not_exact/advisory", content["restore_fidelity"], content["register_comparison"])
+	}
+	diverged, ok := content["diverged_step"].(map[string]any)
+	if !ok || diverged["field"] != "frame_token_delta" {
+		t.Fatalf("diverged_step = %v, want a gating frame_token_delta divergence", content["diverged_step"])
+	}
+	checks := replayChecks(content)
+	if checks["frame_token_deltas_match"]["passed"] != false || checks["frame_token_deltas_match"]["gating"] != true {
+		t.Fatalf("frame_token_deltas_match = %v, want a failed gating check", checks["frame_token_deltas_match"])
+	}
+	if advisories, _ := content["advisory_divergences"].([]any); len(advisories) == 0 {
+		t.Fatalf("advisory_divergences missing for an inexact restore: %v", content)
 	}
 }
 
@@ -390,6 +501,14 @@ func TestDeterministicReplayUnreadableRegistersAreNotProven(t *testing.T) {
 	}
 	if checks["frame_token_deltas_match"]["passed"] != true {
 		t.Fatalf("frame_token_deltas_match = %v, want true (tokens stay readable)", checks["frame_token_deltas_match"])
+	}
+	// An unreadable fingerprint cannot prove the restore was exact, so the
+	// register axis is advisory and the verdict fails on the unproven data.
+	if content["restore_fidelity"] != "unverified" || content["register_comparison"] != "advisory" {
+		t.Fatalf("restore_fidelity = %v register_comparison = %v, want unverified/advisory", content["restore_fidelity"], content["register_comparison"])
+	}
+	if checks["step_registers_match"]["gating"] != false {
+		t.Fatalf("step_registers_match = %v, want a non-gating check", checks["step_registers_match"])
 	}
 }
 
@@ -615,8 +734,8 @@ func TestDeterministicReplayManifestRecordsBaselines(t *testing.T) {
 	if err := json.Unmarshal(raw, &manifest); err != nil {
 		t.Fatalf("decode manifest: %v", err)
 	}
-	if manifest["schema_version"] != "replay-manifest/2" {
-		t.Fatalf("schema_version = %v, want replay-manifest/2", manifest["schema_version"])
+	if manifest["schema_version"] != "replay-manifest/3" {
+		t.Fatalf("schema_version = %v, want replay-manifest/3", manifest["schema_version"])
 	}
 	if manifest["frame_token_comparison"] != "per_step_delta_from_run_baseline" {
 		t.Fatalf("frame_token_comparison = %v", manifest["frame_token_comparison"])
@@ -640,6 +759,21 @@ func TestDeterministicReplayManifestRecordsBaselines(t *testing.T) {
 	}
 	if manifest["run_state_restored"] != "already_paused" || manifest["resumed_after_restore"] != false {
 		t.Fatalf("manifest run_state_restored = %v resumed_after_restore = %v, want already_paused/false", manifest["run_state_restored"], manifest["resumed_after_restore"])
+	}
+	// The manifest must carry the restore-fidelity split, so a stored artifact
+	// explains why a register difference did or did not count.
+	if manifest["restore_fidelity"] != "exact" || manifest["register_comparison"] != "gating" {
+		t.Fatalf("manifest restore_fidelity = %v register_comparison = %v, want exact/gating", manifest["restore_fidelity"], manifest["register_comparison"])
+	}
+	if advisories, ok := manifest["advisory_divergences"].([]any); !ok || len(advisories) != 0 {
+		t.Fatalf("manifest advisory_discoveries = %v, want an empty array", manifest["advisory_divergences"])
+	}
+	fingerprints, _ := manifest["restore_fingerprints"].(map[string]any)
+	if first, _ := fingerprints["run_1"].(map[string]any); first["m68k_pc"] == nil {
+		t.Fatalf("manifest restore_fingerprints = %v, want both fingerprints", fingerprints)
+	}
+	if note, _ := manifest["restore_fidelity_note"].(string); !strings.Contains(note, "excluded") {
+		t.Fatalf("manifest restore_fidelity_note does not explain the token exclusion: %q", note)
 	}
 	// The artifact envelope must not claim a live sample of a paused window.
 	provenance := mustMap(t, mustMap(t, descriptor["provenance"], "artifact provenance")["capture_consistency"], "capture consistency")
