@@ -520,7 +520,13 @@ func (server *Server) modernResult(r *http.Request, req request) (map[string]any
 }
 
 func capabilities() map[string]any {
-	return map[string]any{"tools": map[string]any{"listChanged": false}}
+	return map[string]any{
+		"tools": map[string]any{"listChanged": false},
+		// The closed failure taxonomy, published once per session so a client
+		// can build one conditional over every tool error without scraping
+		// per-tool catalogs.
+		"x-error-codes": errorCodeDeclaration(),
+	}
 }
 
 func (server *Server) serverInfo() map[string]string {
@@ -571,7 +577,10 @@ func (server *Server) runCommand(ctx context.Context, operation string, params m
 	if err != nil {
 		var commandErr *bridge.CommandError
 		if errors.As(err, &commandErr) {
-			return nil, &toolFailure{Code: commandErr.Code, Message: commandErr.Message}, false
+			// Native failure codes are part of the declared taxonomy; an
+			// unknown one is preserved as native_code instead of publishing a
+			// code no client can know.
+			return nil, normalizeNativeFailure(commandErr.Code, commandErr.Message), false
 		}
 		// A transport-class failure means the cached status may describe a
 		// dead or restarted bridge; force the next command to re-probe.

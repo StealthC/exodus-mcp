@@ -233,7 +233,18 @@ func errorResult(code, message string, modern bool) map[string]any {
 }
 
 func failureResult(failure *toolFailure, modern bool) map[string]any {
-	structured := map[string]any{"code": failure.Code, "message": failure.Message}
+	code := failure.Code
+	structured := map[string]any{}
+	// Every error response carries a declared code and its class. A handler that
+	// invented a code cannot publish it: the declared fallback is reported and
+	// the original value is preserved so the defect stays diagnosable.
+	if !isDeclaredErrorCode(code) {
+		structured["undeclared_code"] = code
+		code = errorCodeInternalFallback
+	}
+	structured["code"] = code
+	structured["message"] = failure.Message
+	structured["error_class"] = errorClassOf(code)
 	for key, value := range failure.Data {
 		structured[key] = value
 	}

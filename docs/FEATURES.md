@@ -5,7 +5,7 @@ grouped by capability, and records how far each behavior is verified. Only
 open work is tracked in [ROADMAP.md](ROADMAP.md); the
 [CHANGELOG.md](../CHANGELOG.md) records the delivery history.
 
-The MCP server currently exposes **94 tools** spanning roadmap phases 0-10:
+The MCP server currently exposes **97 tools** spanning roadmap phases 0-10:
 bridge and context foundations, memory and artifact access, both processors,
 VDP graphics, deterministic controlled experimentation, advanced analysis,
 evidence annotations, advanced debugging, deterministic replay, workflow
@@ -142,6 +142,51 @@ claim to the exact test function or smoke-script check that proves it.
   only on successful MCP mutations.
 - **System-specific prefixes.** Tools use clear `m68k_`, `z80_`, and `vdp_`
   prefixes rather than pretending behavior is generic.
+
+### Error codes
+
+Every failed tool call returns `isError: true` with a `code`, a human
+`message`, and `error_class`. `code` is the stable machine-readable member of
+one declared taxonomy (`internal/mcp/error_codes.go`); `error_class` groups it
+by what the caller can do. Both are published once per session under
+`capabilities.x-error-codes` (code, class, origin) so a client builds one
+conditional instead of scraping per-tool catalogs.
+
+| Class | Meaning |
+| --- | --- |
+| `invalid_request` | the request itself is wrong: shape, value, bound, or two fields that contradict |
+| `not_found` | the request named a resource that does not exist |
+| `unsupported` | the capability is not offered here (plugin operation, tool, read-only space, script) |
+| `conflict` | well formed, but the current state contradicts it (lock held, stale generation, provenance mismatch) |
+| `target` | the emulator or the native action failed, was preempted, or cannot answer |
+| `artifact` | artifact storage, indexing, or retrieval failed |
+| `workspace` | analysis-context, snapshot, annotation, or trace-session bookkeeping failed |
+| `bridge` | the authenticated local bridge is unreachable or its answer is undecodable |
+| `experiment` | a scripted experiment failed |
+| `internal` | the server could not complete or classify its own work (a defect, not a caller mistake) |
+
+The registry has three origins: `server` (a code this package produces),
+`native` (a failure code of the pinned plugin, passed through unchanged because
+clients already branch on it — `unknown_space`, `out_of_range`,
+`state_load_failed`, and so on), and `experiment` (a script-protocol outcome).
+A native code the server does not know is reported as `native_error` with the
+original value in `native_code`; a handler that invents a code publishes
+`internal_error` with the original in `undeclared_code`. Neither case loses
+the diagnostic, and a client never sees an undeclared `code`.
+
+`TestErrorCodeRegistryIsWellFormed`, `TestEveryProducedCodeIsDeclared`,
+`TestEveryDeclaredCodeIsProduced`, `TestEveryDeclaredCodeCarriesItsClass`,
+`TestUndeclaredFailureCodeIsNormalized`,
+`TestUnknownNativeCodeBecomesNativeError`,
+`TestKnownNativeCodePassesThrough`, `TestEveryToolFailureCarriesADeclaredCode`,
+and `TestCapabilitiesPublishTheErrorTaxonomy` enforce both directions: a literal
+code in a handler, in the pinned plugin, or in the experiment protocol without a
+registry entry fails, an entry nobody emits fails, and every failure response
+carries its declared class.
+
+Two other fields named `code` are *not* error codes and are documented with
+their own vocabularies: `run_state_restore.code` (the outcome of one capture
+window) and the success-payload `artifact_describe_deprecated` warning.
 
 ### Response vocabularies
 
