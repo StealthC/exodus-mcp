@@ -2,8 +2,11 @@ package mcp
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
+	"fmt"
 	"sort"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -135,7 +138,7 @@ func TestConsolidatedCatalogHasNoDuplicateConcept(t *testing.T) {
 
 // consolidatedCanonicalTools is the merged catalog. Each consolidation group
 // appends its canonical concept here.
-var consolidatedCanonicalTools = []string{"target_status", "memory_map"}
+var consolidatedCanonicalTools = []string{"target_status", "memory_map", "memory_read"}
 
 // payloadView strips the fields the dispatcher injects into every response and
 // the alias' own deprecation marker, so two payloads can be compared field by
@@ -372,6 +375,84 @@ func TestMemoryMapValidatesTheContext(t *testing.T) {
 	result := postToolCall(t, newTestServer(t, client), "memory_map", `{"context":"ctx_missing"}`)
 	if structured(result)["code"] != "unknown_context" {
 		t.Fatalf("code = %v, want unknown_context", structured(result))
+	}
+}
+
+// ----------------------------------------------------------------------------------------------------------------------
+// memory_read alias parity (group 3)
+// ----------------------------------------------------------------------------------------------------------------------
+
+// busReadClient answers mem_read for the two processor bus spaces with the byte
+// order each bus declares.
+func busReadClient() *fakeBridgeClient {
+	client := &fakeBridgeClient{status: newFakeStatus()}
+	blob := []byte{0x12, 0x34, 0x56, 0x78, 0x9A, 0xBC, 0xDE, 0xF0}
+	client.executeFunc = func(_ context.Context, method string, params map[string]string) (json.RawMessage, error) {
+		if method != "mem_read" {
+			return json.RawMessage(`{}`), nil
+		}
+		order := "big-endian"
+		if params["space"] == "z80-bus" {
+			order = "little-endian"
+		}
+		address, _ := strconv.ParseUint(params["address"], 10, 64)
+		length, _ := strconv.ParseUint(params["length"], 10, 64)
+		data := blob[:length]
+		return json.RawMessage(fmt.Sprintf(`{"space_id":%q,"kind":"bus","address":%d,"effective_address":%d,"length":%d,"byte_order":%q,"encoding":"base64","data":%q}`,
+			params["space"], address, address, length, order, base64.StdEncoding.EncodeToString(data))), nil
+	}
+	return client
+}
+
+// TestMemoryReadAbsorbsTheBusReaders proves each legacy bus reader is
+// memory_read{cpu} for the same bus: every legacy field is reproduced, and the
+// merged tool adds the cpu echo and the request echo.
+func TestMemoryReadAbsorbsTheBusReaders(t *testing.T) {
+	client := busReadClient()
+	for _, tc := range []struct {
+		cpu        string
+		alias      string
+		byteOrder  string
+		addressArg string
+		address    float64
+	}{
+		{"m68k", "m68k_read_memory", "big-endian", "0xFF0000", 0xFF0000},
+		{"z80", "z80_read_memory", "little-endian", "0x2000", 0x2000},
+	} {
+		canonical := canonicalPayload(t, client, "memory_read", fmt.Sprintf(`{"cpu":%q,"address":%q,"length":4}`, tc.cpu, tc.addressArg))
+		legacy := canonicalPayload(t, client, tc.alias, fmt.Sprintf(`{"address":%q,"length":4}`, tc.addressArg))
+
+		for key, value := range legacy {
+			if !jsonEqual(t, canonical[key], value) {
+				t.Fatalf("%s: memory_read{cpu:%s}.%s = %v, alias says %v", tc.alias, tc.cpu, key, canonical[key], value)
+			}
+		}
+		if canonical["cpu"] != tc.cpu {
+			t.Fatalf("%s: memory_read.cpu = %v", tc.alias, canonical["cpu"])
+		}
+		if canonical["space_id"] != tc.cpu+"-bus" {
+			t.Fatalf("%s: memory_read.space_id = %v", tc.alias, canonical["space_id"])
+		}
+		if canonical["byte_order"] != tc.byteOrder {
+			t.Fatalf("%s: memory_read.byte_order = %v, want %s", tc.alias, canonical["byte_order"], tc.byteOrder)
+		}
+		if canonical["requested_address"] != tc.address {
+			t.Fatalf("%s: memory_read.requested_address = %v, want %v", tc.alias, canonical["requested_address"], tc.address)
+		}
+	}
+}
+
+// TestMemoryReadRejectsAmbiguousBusSelection keeps the selector unambiguous.
+func TestMemoryReadRejectsAmbiguousBusSelection(t *testing.T) {
+	client := busReadClient()
+	result := postToolCall(t, newTestServer(t, client), "memory_read", `{"cpu":"m68k","space":"mem-ram","address":0,"length":1}`)
+	if structured(result)["code"] != "invalid_params" {
+		t.Fatalf("code = %v, want invalid_params", structured(result))
+	}
+	// Omitting both is also rejected: the handler must not guess a space.
+	result = postToolCall(t, newTestServer(t, client), "memory_read", `{"address":0,"length":1}`)
+	if structured(result)["code"] != "invalid_params" {
+		t.Fatalf("code = %v, want invalid_params", structured(result))
 	}
 }
 

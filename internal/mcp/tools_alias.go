@@ -65,6 +65,16 @@ var toolAliasRecords = []toolAliasRecord{
 		Mapping:     "mega_drive_memory_map returns the legacy {regions, note, live_spaces} object; memory_map.reference carries the same fields.",
 	},
 	{
+		Alias:       "m68k_read_memory",
+		Replacement: "memory_read",
+		Mapping:     "m68k_read_memory returns the legacy inline read object; memory_read{cpu:\"m68k\", address, length, ...} returns the same bytes with the same byte order for space m68k-bus, plus cpu and the requested_*/effective_* echo.",
+	},
+	{
+		Alias:       "z80_read_memory",
+		Replacement: "memory_read",
+		Mapping:     "z80_read_memory returns the legacy inline read object; memory_read{cpu:\"z80\", address, length, ...} returns the same bytes with the same byte order for space z80-bus, plus cpu and the requested_*/effective_* echo.",
+	},
+	{
 		Alias:       "memory_spaces_list",
 		Replacement: "memory_map",
 		Mapping:     "memory_spaces_list returns the legacy {spaces, byte_order_policy, bus_address_formula} object; memory_map.live carries the same fields.",

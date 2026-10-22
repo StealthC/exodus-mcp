@@ -53,7 +53,7 @@ func cpuToolSpecs() []toolSpec {
 			name:        "m68k_read_memory",
 			description: "Read memory through the 68000 bus view. Declared byte order: big-endian. Inline reads are capped at 4096 bytes. Reports the standardized capture_consistency object; optional capture_mode \"paused\" makes the read temporally atomic.",
 			schema:      cpuReadMemorySchema(),
-			run:         makeRunCpuMemoryRead("m68k-bus"),
+			run:         aliasRun("m68k_read_memory", makeRunCpuMemoryRead("m68k-bus")),
 		},
 		{
 			name:        "m68k_registers",
@@ -116,7 +116,7 @@ func cpuToolSpecs() []toolSpec {
 			name:        "z80_read_memory",
 			description: "Read memory through the Z80 bus view. Declared byte order: little-endian. Inline reads are capped at 4096 bytes. Reports the standardized capture_consistency object; optional capture_mode \"paused\" makes the read temporally atomic.",
 			schema:      cpuReadMemorySchema(),
-			run:         makeRunCpuMemoryRead("z80-bus"),
+			run:         aliasRun("z80_read_memory", makeRunCpuMemoryRead("z80-bus")),
 		},
 		{
 			name:        "z80_registers",

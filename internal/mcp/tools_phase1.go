@@ -123,14 +123,15 @@ func phase1ToolSpecs() []toolSpec {
 			name:        "memory_read",
 			description: fmt.Sprintf("Read at most %d bytes inline with explicit byte-order metadata, effective-address echo, and the standardized capture_consistency object (live when the system runs unpaused, paused when it was already stopped, atomic when the read had to pause it). Optional capture_mode %q pauses once before the read and restores the prior run state, making the sample temporally atomic at the cost of perturbing real-time behavior; the default %q never pauses. Larger ranges must use memory_dump.", inlineReadCapBytes, captureModePaused, captureModeLive),
 			schema: objectSchema(map[string]any{
-				"space":          stringProperty("Address space id from memory_spaces_list."),
+				"cpu":            cpuVocab.property("Processor whose bus view to read (m68k or z80). Mutually exclusive with space: cpu selects that processor's documented bus space, which is what the deprecated m68k_read_memory and z80_read_memory aliases always read."),
+				"space":          stringProperty("Address space id from memory_spaces_list, or a processor bus id. Required unless cpu is supplied."),
 				"address":        addressProperty(),
 				"length":         integerProperty(fmt.Sprintf("Byte length between 1 and %d.", inlineReadCapBytes), 1),
 				"representation": memoryRepresentationVocab.property("Inline rendering."),
 				"decode":         decodeSchemaProperty(),
 				"capture_mode":   captureModeProperty(),
 				"context":        contextProperty(),
-			}, []string{"space", "address", "length"}),
+			}, []string{"address", "length"}),
 			run: runMemoryRead,
 		},
 		{
@@ -586,6 +587,7 @@ type cpuMemoryReadArgs struct {
 }
 
 type memoryReadArgs struct {
+	CPU            string         `json:"cpu"`
 	Space          string         `json:"space"`
 	Address        any            `json:"address"`
 	AddressSpace   string         `json:"address_space"`
@@ -725,6 +727,23 @@ func runMemoryRead(tc toolContext, args json.RawMessage) map[string]any {
 	if failure != nil {
 		return failureResult(failure, tc.modern)
 	}
+	space := strings.TrimSpace(parsed.Space)
+	cpu := strings.TrimSpace(parsed.CPU)
+	if cpu != "" {
+		// cpu is the bus-view selector the legacy m68k_read_memory and
+		// z80_read_memory tools published as their only address domain, so the
+		// merged tool accepts either the explicit space or the processor and
+		// resolves the processor to its documented bus space.
+		if failure := cpuVocab.validate(cpu); failure != nil {
+			return failureResult(failure, tc.modern)
+		}
+		if space != "" {
+			return failureResult(&toolFailure{Code: "invalid_params", Message: "pass either space or cpu, not both: cpu selects that processor's bus view (" + cpu + "-bus)"}, tc.modern)
+		}
+		space = cpu + "-bus"
+	} else if space == "" {
+		return failureResult(&toolFailure{Code: "invalid_params", Message: "space is required unless cpu is supplied"}, tc.modern)
+	}
 	if _, failure = resolveContext(tc.server, parsed.Context); failure != nil {
 		return failureResult(failure, tc.modern)
 	}
@@ -732,7 +751,7 @@ func runMemoryRead(tc toolContext, args json.RawMessage) map[string]any {
 	if failure = guard.resolve(); failure != nil {
 		return failureResult(failure, tc.modern)
 	}
-	address, failure := resolveAddress(parsed.Address, addressSpaceFromArgs(args), parsed.Space)
+	address, failure := resolveAddress(parsed.Address, addressSpaceFromArgs(args), space)
 	if failure != nil {
 		return failureResult(failure, tc.modern)
 	}
@@ -740,7 +759,11 @@ func runMemoryRead(tc toolContext, args json.RawMessage) map[string]any {
 	if requested, failure := parseAddress(parsed.Address); failure == nil {
 		echo.Address = requested
 	}
-	return readMemoryWithEcho(tc, parsed.Space, address, parsed.Length, parsed.Representation, parsed.Decode, guard, echo)
+	result := readMemoryWithEcho(tc, space, address, parsed.Length, parsed.Representation, parsed.Decode, guard, echo)
+	if cpu != "" {
+		result = patchPayloadField(result, "cpu", cpu)
+	}
+	return result
 }
 
 func decodeValues(raw []byte, spaceOrder string, decode *decodeRequest) (map[string]any, *toolFailure) {

@@ -61,3 +61,32 @@ func failureFromResult(result map[string]any) *toolFailure {
 	}
 	return failure
 }
+
+// patchPayloadField adds or replaces one success field in a completed result
+// envelope. Both encodings are patched so modern and legacy clients see the same
+// payload; a failure result (whose content text is "code: message") keeps its
+// text and gains nothing.
+func patchPayloadField(result map[string]any, key string, value any) map[string]any {
+	if result == nil {
+		return result
+	}
+	if failed, _ := result["isError"].(bool); failed {
+		return result
+	}
+	if structured, ok := result["structuredContent"].(map[string]any); ok {
+		structured[key] = value
+	}
+	content, ok := result["content"].([]map[string]string)
+	if !ok || len(content) == 0 {
+		return result
+	}
+	var payload map[string]any
+	if json.Unmarshal([]byte(content[0]["text"]), &payload) != nil {
+		return result
+	}
+	payload[key] = value
+	if encoded, err := json.Marshal(payload); err == nil {
+		content[0]["text"] = string(encoded)
+	}
+	return result
+}
