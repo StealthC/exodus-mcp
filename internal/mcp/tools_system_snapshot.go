@@ -44,7 +44,7 @@ func systemSnapshotToolSpec() toolSpec {
 		"memory_ranges":          map[string]any{"type": "array", "description": fmt.Sprintf("Named memory ranges (1-%d; total capped at %d bytes).", captureMaxRanges, dumpCapBytes), "items": map[string]any{"type": "object", "additionalProperties": false, "properties": map[string]any{"name": stringProperty("Range name."), "address": addressProperty(), "address_space": stringProperty("Address domain; omitted means space."), "length": integerProperty("Range length.", 1), "space": stringProperty("Memory space id; defaults to the address domain.")}, "required": []string{"name", "address", "length"}}, "minItems": 1, "maxItems": captureMaxRanges},
 		"include_m68k_registers": boolProp("Include M68K registers (default true)."), "include_z80_registers": boolProp("Include Z80 registers (default true)."), "include_vdp_status": boolProp("Include VDP status (default true)."), "include_frame": boolProp("Include rendered PNG frame (default true)."), "include_cram": boolProp("Include CRAM bytes (default true)."), "include_vsram": boolProp("Include VSRAM bytes (default true)."), "include_vram": boolProp("Include VRAM range (default false)."), "vram_address": addressProperty(), "vram_length": integerProperty("VRAM length, capped at 131072 bytes.", 1), "include_sprite_table": boolProp("Include sprite-table data when available (default true)."),
 		"context": contextProperty(), "expected_target_generation": integerProperty("Expected target generation.", 1), "control_id": stringProperty("Existing target control lock."),
-	}, []string{"memory_ranges"}), run: runSystemSnapshot}
+	}, []string{"memory_ranges"}), run: aliasRun("system_snapshot_capture", runSystemSnapshot)}
 }
 
 func systemBool(v *bool, def bool) bool {

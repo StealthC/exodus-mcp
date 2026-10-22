@@ -14,6 +14,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -487,7 +488,12 @@ func dispatchLegacy(server *Server, w http.ResponseWriter, r *http.Request, req 
 		w.WriteHeader(http.StatusAccepted)
 		return
 	case "tools/list":
-		result = map[string]any{"tools": toolSchemas()}
+		includeDeprecated, rpcErr := toolsListIncludeDeprecated(req.Params)
+		if rpcErr != nil {
+			writeError(w, http.StatusBadRequest, req.ID, rpcErr.Code, rpcErr.Message, rpcErr.Data)
+			return
+		}
+		result = map[string]any{"tools": toolCatalog(includeDeprecated)}
 	case "tools/call":
 		result = server.callTool(r.Context(), req.Params, false)
 	default:
@@ -510,8 +516,12 @@ func (server *Server) modernResult(r *http.Request, req request) (map[string]any
 			"cacheScope":        "public",
 		}
 	case "tools/list":
+		includeDeprecated, rpcErr := toolsListIncludeDeprecated(req.Params)
+		if rpcErr != nil {
+			return nil, rpcErr, http.StatusBadRequest
+		}
 		result = map[string]any{
-			"tools":      toolSchemas(),
+			"tools":      toolCatalog(includeDeprecated),
 			"ttlMs":      3600000,
 			"cacheScope": "public",
 		}
@@ -528,11 +538,72 @@ func (server *Server) modernResult(r *http.Request, req request) (map[string]any
 func capabilities() map[string]any {
 	return map[string]any{
 		"tools": map[string]any{"listChanged": false},
+		// The consolidated catalog hides deprecated aliases by default. The
+		// policy is published once per session so a client can discover the
+		// opt-in parameter instead of guessing why a name it used to list is
+		// gone (aliases stay callable either way).
+		"x-deprecated-tools": map[string]any{
+			"count":                        deprecatedAliasCount,
+			"canonical_count":              canonicalConceptCount,
+			"listed_by_default":            false,
+			"include_deprecated_parameter": toolsListIncludeDeprecatedParameter,
+		},
 		// The closed failure taxonomy, published once per session so a client
 		// can build one conditional over every tool error without scraping
 		// per-tool catalogs.
 		"x-error-codes": errorCodeDeclaration(),
 	}
+}
+
+// toolsListIncludeDeprecatedParameter is the tools/list opt-in that lists
+// deprecated aliases; it is published in the session capabilities.
+const toolsListIncludeDeprecatedParameter = "include_deprecated"
+
+// toolsListIncludeDeprecated parses the tools/list parameters. tools/list is a
+// dispatcher endpoint, not a tool, so it validates its own small parameter set:
+// include_deprecated selects the deprecated aliases and _meta is the dispatcher's
+// own envelope. Any other parameter is rejected with the same -32602
+// invalid-params error the dispatcher already returns for malformed request
+// params, never ignored.
+func toolsListIncludeDeprecated(params json.RawMessage) (bool, *rpcError) {
+	trimmed := bytes.TrimSpace(params)
+	if len(trimmed) == 0 || string(trimmed) == "null" {
+		return false, nil
+	}
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(trimmed, &fields); err != nil {
+		return false, &rpcError{Code: -32602, Message: "tools/list params must be an object", Data: map[string]any{"reason": err.Error()}}
+	}
+	include := false
+	keys := make([]string, 0, len(fields))
+	for key := range fields {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	for _, key := range keys {
+		switch key {
+		case toolsListIncludeDeprecatedParameter:
+			if err := json.Unmarshal(fields[key], &include); err != nil {
+				return false, &rpcError{
+					Code:    -32602,
+					Message: toolsListIncludeDeprecatedParameter + " must be a boolean",
+					Data:    map[string]any{"field": key, "value": string(fields[key])},
+				}
+			}
+		case "_meta":
+			// The dispatcher's own envelope (protocol version, capabilities).
+		default:
+			return false, &rpcError{
+				Code:    -32602,
+				Message: fmt.Sprintf("tools/list does not accept %q", key),
+				Data: map[string]any{
+					"field":           key,
+					"accepted_fields": []string{"_meta", toolsListIncludeDeprecatedParameter},
+				},
+			}
+		}
+	}
+	return include, nil
 }
 
 func (server *Server) serverInfo() map[string]string {

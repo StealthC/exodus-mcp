@@ -33,7 +33,7 @@ func vdpExportToolSpecs() []toolSpec {
 				"length":       integerProperty("Bytes to export (default: the full buffer; caps: vram 65536, cram 128, vsram 80).", 1),
 				"capture_mode": enumProperty("Capture mode: \"live\" (default) never pauses; \"paused\" pauses once, reads, and restores the prior run state.", []string{"live", "paused"}),
 			}, []string{"target", "address"}),
-			run: runVDPMemoryExport,
+			run: aliasRun("vdp_memory_export", runVDPMemoryExport),
 		},
 	}
 }

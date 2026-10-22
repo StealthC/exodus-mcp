@@ -9,6 +9,95 @@ and this project will use [Semantic Versioning](https://semver.org/spec/v2.0.0.h
 
 ### Added
 
+- Consolidated tool catalog (issue #17): one concept per tool, 72 canonical
+  concepts, and every pre-consolidation name still registered as a deprecated
+  alias. The 11 merged tools are `target_status`, `memory_map`,
+  `disassemble{cpu}`, `cpu_step{cpu, mode, timeout_ms}`,
+  `debug_instrument{action, kind}` (also absorbing the `run_until_*` windows via
+  `run_until: true`), `events_list{kinds}` (audit/mutation/debug/trace/
+  run_state), `vdp_render_export{mode, crop}`, `capture{components, mode}`,
+  `snapshot_diff{sections}`, `trace_session_query{include}`, and
+  `trace{analyze, until}`; `memory_read{cpu}`, `vdp_memory_read{output}` and
+  `sound_status{output}` kept their names and gained the merged selector.
+  Merged tools are facades over the existing handlers for this release, so
+  provenance, capture consistency, cursor paging, vocabularies, error codes and
+  artifact schema versions cannot drift between a merged tool and its alias.
+- `debug_instrument.update`: replace an instrument (the native API has no
+  in-place update, so update removes and recreates in one call and reports
+  `previous_instrument_id`, the new `instrument_id`, and a failed-replacement
+  `update_partial` outcome).
+- `vdp_render_export.crop`: export a rectangular window in source pixels before
+  scaling, reported as `summary.crop` with the cropped `png_width`/`png_height`.
+- `cpu_step.timeout_ms`: opt-in bound on the wait for the pause a step-over/
+  step-out produces, reported as `step_completion` (rejected for `instruction`
+  mode).
+- `sound_status{output: "artifact"}`: the full YM2612/PSG state as a versioned
+  JSON artifact plus a compact summary, so a large register dump never travels
+  inline. `sound_status{output: "wav"}` is the bounded PCM capture that
+  `audio_capture` used to own.
+- Catalog metadata: every alias response carries a `deprecated` block
+  (`tool_alias_deprecated`, replacement, removal policy, payload mapping), and
+  `tools/list` publishes an `x-deprecated-tool` annotation with a
+  `DEPRECATED: use ...` description prefix.
+- `tools/list` hides deprecated aliases by default: the catalog a client sees is
+  the 72 canonical concepts. `tools/list` with `{"include_deprecated": true}`
+  returns all 111 with the deprecation metadata, and dispatch is never filtered,
+  so an alias stays callable by name in both modes. The modern and legacy
+  dispatchers accept the flag; an unknown parameter or a non-boolean value is
+  rejected with the dispatcher's `-32602` invalid-params error instead of being
+  ignored. `server/discover` and `initialize` publish the policy as
+  `capabilities["x-deprecated-tools"] = {count: 39, canonical_count: 72,
+  listed_by_default: false, include_deprecated_parameter: "include_deprecated"}`.
+
+### Deprecated
+
+Every tool name below still works and still returns its previous payload shape,
+plus the `deprecated` block naming its replacement. They are hidden from the
+default `tools/list` (see "Catalog visibility" in
+[FEATURES.md](docs/FEATURES.md#catalog-visibility)) but remain callable by name;
+list them with:
+
+```json
+{"method": "tools/list", "params": {"include_deprecated": true}}
+```
+
+Replacements in parentheses:
+
+- Status: `bridge_status`, `emulator_status`, `target_info` (`target_status`).
+- Memory layout: `mega_drive_memory_map`, `memory_spaces_list` (`memory_map`).
+- Bus reads: `m68k_read_memory`, `z80_read_memory` (`memory_read{cpu}`).
+- Disassembly: `m68k_disassemble`, `z80_disassemble` (`disassemble{cpu}`).
+- Stepping: `m68k_step`, `z80_step`, `cpu_step_over`, `cpu_step_out`
+  (`cpu_step`).
+- Instruments: `cpu_breakpoint_set`, `cpu_breakpoint_list`,
+  `cpu_breakpoint_remove`, `cpu_watchpoint_set`, `cpu_watchpoint_list`,
+  `cpu_watchpoint_remove`, `run_until_breakpoint`, `run_until_watchpoint`
+  (`debug_instrument`).
+- Events: `target_audit_log`, `context_mutation_log`, `cpu_debug_events_list`
+  (`events_list`).
+- VDP memory: `vdp_memory_export` (`vdp_memory_read{output:"artifact"}`).
+- VDP renders: `vdp_tile_export`, `vdp_plane_export` (`vdp_render_export`).
+- Captures: `memory_snapshot_capture`, `system_snapshot_capture`, `vdp_capture`,
+  `frame_capture` (`capture`). `frame_capture` is a documented mapping: the
+  merged tool stores the same frame inside a tracked VDP capture, so the PNG
+  bytes match but the envelope carries `capture_id` and a manifest.
+- Diffs: `state_diff`, `memory_diff` (`snapshot_diff`).
+- Trace: `trace_session_status`, `trace_session_events`
+  (`trace_session_query`); `cpu_trace_capture`, `cpu_trace_capture_watchpoint`,
+  `cpu_coverage_capture` (`trace`).
+- Audio: `audio_capture` (`sound_status{output:"wav"}`; both report
+  `audio_unavailable` against the pinned bridge).
+
+Behavior notes for callers: the merged selectors reject an argument the selected
+action/mode/kind/section does not consume (`unsupported_parameter`) instead of
+ignoring it, and infer the selector from the supplied arguments when it is
+omitted. `m68k_read_memory`/`z80_read_memory` callers migrating to
+`memory_read{cpu}` get the same bytes plus `cpu` and the request echo;
+`context_mutation_log` callers migrating to `events_list{kinds:["mutation"]}` get
+the same rows; `cpu_debug_events_list` callers migrating to
+`events_list{kinds:["debug"]}` get an id-based `next_cursor` in addition to
+offset paging.
+
 - Per-occurrence memory access capture (fork change): the processor access path
   now records every observed read/write behind an atomic flag, with the engine's
   monotonic sequence, cycle counter, issuing PC, direction, width, transferred

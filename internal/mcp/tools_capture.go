@@ -70,7 +70,7 @@ func memorySnapshotCaptureSpec() toolSpec {
 			"expected_target_generation": integerProperty("Optional target generation the caller last observed; fails with target_generation_conflict on mismatch.", 1),
 			"control_id":                 stringProperty("Optional control id from target_control_acquire; required while the control lock is active."),
 		}, []string{"space", "ranges"}),
-		run: runMemorySnapshotCapture,
+		run: aliasRun("memory_snapshot_capture", runMemorySnapshotCapture),
 	}
 }
 

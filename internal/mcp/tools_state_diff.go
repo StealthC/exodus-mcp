@@ -45,7 +45,7 @@ func stateDiffToolSpecs() []toolSpec {
 				"include_vdp":        booleanProperty("Request the VDP comparison section (default true); reported as not performed in this read-only mode."),
 				"context":            contextProperty(),
 			}, []string{"snapshot_before_id", "snapshot_after_id"}),
-			run: runStateDiff,
+			run: aliasRun("state_diff", runStateDiff),
 		},
 	}
 }
