@@ -47,6 +47,19 @@ type toolAliasRecord struct {
 	Mapping string
 }
 
+// The catalog shape is pinned in one place: the alias declaration, the
+// consolidation registry test, and the tools/list catalog test all read these
+// numbers, so a merge that adds or removes an alias cannot make one of them
+// drift silently.
+const (
+	// deprecatedAliasCount is the number of deprecated tool names.
+	deprecatedAliasCount = 39
+	// canonicalConceptCount is the number of published concepts (one per tool).
+	canonicalConceptCount = 72
+	// registeredToolCount is every callable tool name, aliases included.
+	registeredToolCount = canonicalConceptCount + deprecatedAliasCount
+)
+
 // toolAliasRecords declares every deprecated alias in the catalog.
 var toolAliasRecords = []toolAliasRecord{
 	{

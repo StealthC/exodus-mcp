@@ -6,6 +6,7 @@ import (
 	"encoding/binary"
 	"encoding/json"
 	"fmt"
+	"net/http"
 	"os"
 	"path/filepath"
 	"sort"
@@ -140,17 +141,17 @@ func TestConsolidatedCatalogHasNoDuplicateConcept(t *testing.T) {
 	// The consolidation lands the catalog on 72 concepts: the 100 tools that
 	// existed before the merge, 39 of them now deprecated aliases, plus 11 merged
 	// tools.
-	if len(toolAliasRecords) != consolidatedAliasCount {
-		t.Fatalf("declared aliases = %d, want %d", len(toolAliasRecords), consolidatedAliasCount)
+	if len(toolAliasRecords) != deprecatedAliasCount {
+		t.Fatalf("declared aliases = %d, want %d", len(toolAliasRecords), deprecatedAliasCount)
 	}
-	if len(canonical) != consolidatedCanonicalCount {
-		t.Fatalf("canonical concepts = %d, want %d", len(canonical), consolidatedCanonicalCount)
+	if len(canonical) != canonicalConceptCount {
+		t.Fatalf("canonical concepts = %d, want %d", len(canonical), canonicalConceptCount)
 	}
-	if len(toolRegistry) != consolidatedAliasCount+consolidatedCanonicalCount {
-		t.Fatalf("registry = %d tools, want %d", len(toolRegistry), consolidatedAliasCount+consolidatedCanonicalCount)
+	if len(toolRegistry) != deprecatedAliasCount+canonicalConceptCount {
+		t.Fatalf("registry = %d tools, want %d", len(toolRegistry), deprecatedAliasCount+canonicalConceptCount)
 	}
-	if len(aliasToolNames()) != consolidatedAliasCount {
-		t.Fatalf("published aliases = %d, want %d", len(aliasToolNames()), consolidatedAliasCount)
+	if len(aliasToolNames()) != deprecatedAliasCount {
+		t.Fatalf("published aliases = %d, want %d", len(aliasToolNames()), deprecatedAliasCount)
 	}
 }
 
@@ -160,13 +161,6 @@ func TestConsolidatedCatalogHasNoDuplicateConcept(t *testing.T) {
 
 // consolidatedCanonicalTools is the merged catalog. Each consolidation group
 // appends its canonical concept here.
-// consolidatedAliasCount and consolidatedCanonicalCount pin the consolidated
-// catalog shape (issue #17).
-const (
-	consolidatedAliasCount     = 39
-	consolidatedCanonicalCount = 72
-)
-
 var consolidatedCanonicalTools = []string{"target_status", "memory_map", "memory_read", "disassemble", "cpu_step", "debug_instrument", "events_list", "vdp_memory_read", "vdp_render_export", "capture", "snapshot_diff", "trace_session_query", "trace", "sound_status"}
 
 // payloadView strips the fields the dispatcher injects into every response and
@@ -1466,4 +1460,241 @@ func TestSoundStatusArtifactOutput(t *testing.T) {
 	if rejected["code"] != "unsupported_parameter" || rejected["field"] != "duration_ms" {
 		t.Fatalf("expected unsupported_parameter for duration_ms: %v", rejected)
 	}
+}
+
+// ----------------------------------------------------------------------------------------------------------------------
+// tools/list catalog gating (issue #17)
+// ----------------------------------------------------------------------------------------------------------------------
+
+// modernToolsListResult sends one tools/list request and returns its result
+// object, failing on a transport or JSON-RPC error.
+func modernToolsListResult(t *testing.T, server *Server, params string) map[string]any {
+	t.Helper()
+	body := fmt.Sprintf(`{"jsonrpc":"2.0","id":1,"method":"tools/list","params":%s}`, params)
+	request, err := http.NewRequest(http.MethodPost, "http://127.0.0.1:8768/mcp", strings.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	request.Header.Set("MCP-Protocol-Version", ModernProtocolVersion)
+	request.Header.Set("Mcp-Method", "tools/list")
+	recorder := newRecorder()
+	server.Handler().ServeHTTP(recorder, request)
+	if recorder.status != http.StatusOK {
+		t.Fatalf("tools/list status = %d, body = %s", recorder.status, recorder.body.String())
+	}
+	var envelope struct {
+		Result map[string]any `json:"result"`
+	}
+	if err := json.Unmarshal(recorder.body.Bytes(), &envelope); err != nil {
+		t.Fatalf("decode tools/list response: %v", err)
+	}
+	return envelope.Result
+}
+
+// TestToolsListHidesDeprecatedAliasesByDefault pins the consumer-facing catalog:
+// one tool per concept, no deprecation metadata, unless the caller opts in.
+func TestToolsListHidesDeprecatedAliasesByDefault(t *testing.T) {
+	server := newTestServer(t, &fakeBridgeClient{status: newFakeStatus()})
+	result := modernToolsListResult(t, server, fmt.Sprintf(`{"_meta":{"io.modelcontextprotocol/protocolVersion":%q}}`, ModernProtocolVersion))
+	tools, _ := result["tools"].([]any)
+	if len(tools) != canonicalConceptCount {
+		t.Fatalf("default catalog = %d tools, want %d", len(tools), canonicalConceptCount)
+	}
+	for _, raw := range tools {
+		descriptor := raw.(map[string]any)
+		if _, present := descriptor["x-deprecated-tool"]; present {
+			t.Fatalf("default catalog lists deprecated tool %v", descriptor["name"])
+		}
+	}
+	if deprecatedCatalogCount(toolCatalog(false)) != 0 {
+		t.Fatal("the default catalog carries deprecation metadata")
+	}
+}
+
+// TestToolsListListsDeprecatedAliasesOnRequest pins the opt-in view and the count
+// invariant (111 = 72 canonical + 39 aliases).
+func TestToolsListListsDeprecatedAliasesOnRequest(t *testing.T) {
+	server := newTestServer(t, &fakeBridgeClient{status: newFakeStatus()})
+	result := modernToolsListResult(t, server, fmt.Sprintf(`{"include_deprecated":true,"_meta":{"io.modelcontextprotocol/protocolVersion":%q}}`, ModernProtocolVersion))
+	tools, _ := result["tools"].([]any)
+	if len(tools) != registeredToolCount {
+		t.Fatalf("include_deprecated catalog = %d tools, want %d", len(tools), registeredToolCount)
+	}
+	deprecated := 0
+	for _, raw := range tools {
+		descriptor := raw.(map[string]any)
+		annotation, present := descriptor["x-deprecated-tool"].(map[string]any)
+		if !present {
+			continue
+		}
+		deprecated++
+		if annotation["replacement"] == nil {
+			t.Fatalf("deprecated tool %v has no replacement", descriptor["name"])
+		}
+	}
+	if deprecated != deprecatedAliasCount {
+		t.Fatalf("deprecated tools = %d, want %d", deprecated, deprecatedAliasCount)
+	}
+	// The legacy era publishes the same policy.
+	legacyDefault := legacyToolsListCount(t, server, `{}`)
+	if legacyDefault != canonicalConceptCount {
+		t.Fatalf("legacy default catalog = %d tools, want %d", legacyDefault, canonicalConceptCount)
+	}
+	legacyAll := legacyToolsListCount(t, server, `{"include_deprecated":true}`)
+	if legacyAll != registeredToolCount {
+		t.Fatalf("legacy include_deprecated catalog = %d tools, want %d", legacyAll, registeredToolCount)
+	}
+}
+
+// legacyToolsListCount sends one legacy tools/list request and returns the tool
+// count.
+func legacyToolsListCount(t *testing.T, server *Server, params string) int {
+	t.Helper()
+	body := fmt.Sprintf(`{"jsonrpc":"2.0","id":1,"method":"tools/list","params":%s}`, params)
+	request, err := http.NewRequest(http.MethodPost, "http://127.0.0.1:8768/mcp", strings.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	recorder := newRecorder()
+	server.Handler().ServeHTTP(recorder, request)
+	if recorder.status != http.StatusOK {
+		t.Fatalf("legacy tools/list status = %d, body = %s", recorder.status, recorder.body.String())
+	}
+	var envelope struct {
+		Result struct {
+			Tools []any `json:"tools"`
+		} `json:"result"`
+	}
+	if err := json.Unmarshal(recorder.body.Bytes(), &envelope); err != nil {
+		t.Fatalf("decode legacy tools/list response: %v", err)
+	}
+	return len(envelope.Result.Tools)
+}
+
+// TestHiddenAliasStillExecutes proves hiding is a listing decision only: the
+// dispatcher still routes a deprecated name end-to-end.
+func TestHiddenAliasStillExecutes(t *testing.T) {
+	server := newTestServer(t, &fakeBridgeClient{status: newFakeStatus()})
+	catalog := modernToolsListResult(t, server, `{}`)
+	for _, raw := range catalog["tools"].([]any) {
+		if name := raw.(map[string]any)["name"]; name == "bridge_status" {
+			t.Fatal("bridge_status must be hidden from the default catalog")
+		}
+	}
+	result := postToolCall(t, server, "bridge_status", `{}`)
+	if result["isError"] == true {
+		t.Fatalf("hidden alias failed to execute: %v", result)
+	}
+	payload := structured(result)
+	if payload["connected"] != true {
+		t.Fatalf("hidden alias returned %v", payload)
+	}
+	if payload["deprecated"] == nil {
+		t.Fatalf("hidden alias lost its deprecation block: %v", payload)
+	}
+	// The disassembly alias exercises the canonical path through the dispatcher.
+	traceClient := disasmClient()
+	result = postToolCall(t, newTestServer(t, traceClient), "m68k_disassemble", `{"count":2}`)
+	if structured(result)["code"] != nil {
+		t.Fatalf("hidden m68k_disassemble failed: %v", structured(result))
+	}
+}
+
+// TestToolsListRejectsUnknownParameters keeps the dispatcher endpoint honest.
+func TestToolsListRejectsUnknownParameters(t *testing.T) {
+	server := newTestServer(t, &fakeBridgeClient{status: newFakeStatus()})
+	request, err := http.NewRequest(http.MethodPost, "http://127.0.0.1:8768/mcp",
+		strings.NewReader(fmt.Sprintf(`{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{"page":2,"_meta":{"io.modelcontextprotocol/protocolVersion":%q}}}`, ModernProtocolVersion)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	request.Header.Set("MCP-Protocol-Version", ModernProtocolVersion)
+	request.Header.Set("Mcp-Method", "tools/list")
+	recorder := newRecorder()
+	server.Handler().ServeHTTP(recorder, request)
+	if recorder.status != http.StatusBadRequest {
+		t.Fatalf("status = %d, want %d: %s", recorder.status, http.StatusBadRequest, recorder.body.String())
+	}
+	var envelope struct {
+		Error map[string]any `json:"error"`
+	}
+	if err := json.Unmarshal(recorder.body.Bytes(), &envelope); err != nil {
+		t.Fatalf("decode error response: %v", err)
+	}
+	if envelope.Error["code"] != float64(-32602) {
+		t.Fatalf("code = %v, want -32602", envelope.Error["code"])
+	}
+	data, _ := envelope.Error["data"].(map[string]any)
+	if data["field"] != "page" {
+		t.Fatalf("error data = %v", data)
+	}
+
+	// A non-boolean include_deprecated is rejected, never coerced.
+	request, err = http.NewRequest(http.MethodPost, "http://127.0.0.1:8768/mcp",
+		strings.NewReader(fmt.Sprintf(`{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{"include_deprecated":"yes","_meta":{"io.modelcontextprotocol/protocolVersion":%q}}}`, ModernProtocolVersion)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	request.Header.Set("MCP-Protocol-Version", ModernProtocolVersion)
+	request.Header.Set("Mcp-Method", "tools/list")
+	recorder = newRecorder()
+	server.Handler().ServeHTTP(recorder, request)
+	if recorder.status != http.StatusBadRequest {
+		t.Fatalf("non-boolean include_deprecated status = %d: %s", recorder.status, recorder.body.String())
+	}
+}
+
+// TestCapabilitiesAdvertiseTheDeprecatedCatalogPolicy publishes the opt-in next
+// to the catalog so a client can discover it without guessing.
+func TestCapabilitiesAdvertiseTheDeprecatedCatalogPolicy(t *testing.T) {
+	policy, ok := capabilities()["x-deprecated-tools"].(map[string]any)
+	if !ok {
+		t.Fatalf("capabilities publish no x-deprecated-tools policy: %v", capabilities())
+	}
+	if policy["count"] != deprecatedAliasCount {
+		t.Fatalf("count = %v, want %d", policy["count"], deprecatedAliasCount)
+	}
+	if policy["canonical_count"] != canonicalConceptCount {
+		t.Fatalf("canonical_count = %v, want %d", policy["canonical_count"], canonicalConceptCount)
+	}
+	if policy["listed_by_default"] != false {
+		t.Fatalf("listed_by_default = %v", policy["listed_by_default"])
+	}
+	if policy["include_deprecated_parameter"] != toolsListIncludeDeprecatedParameter {
+		t.Fatalf("parameter = %v", policy["include_deprecated_parameter"])
+	}
+	// The session views publish the same object.
+	server := newTestServer(t, &fakeBridgeClient{status: newFakeStatus()})
+	discover := modernDiscoverCapabilities(t, server)
+	xDeprecated, _ := discover["x-deprecated-tools"].(map[string]any)
+	if !jsonEqual(t, xDeprecated, policy) {
+		t.Fatalf("server/discover policy = %v, want %v", xDeprecated, policy)
+	}
+}
+
+// modernDiscoverCapabilities returns the capabilities object of one
+// server/discover response.
+func modernDiscoverCapabilities(t *testing.T, server *Server) map[string]any {
+	t.Helper()
+	body := fmt.Sprintf(`{"jsonrpc":"2.0","id":1,"method":"server/discover","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":%q}}}`, ModernProtocolVersion)
+	request, err := http.NewRequest(http.MethodPost, "http://127.0.0.1:8768/mcp", strings.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	request.Header.Set("MCP-Protocol-Version", ModernProtocolVersion)
+	request.Header.Set("Mcp-Method", "server/discover")
+	recorder := newRecorder()
+	server.Handler().ServeHTTP(recorder, request)
+	if recorder.status != http.StatusOK {
+		t.Fatalf("server/discover status = %d, body = %s", recorder.status, recorder.body.String())
+	}
+	var envelope struct {
+		Result struct {
+			Capabilities map[string]any `json:"capabilities"`
+		} `json:"result"`
+	}
+	if err := json.Unmarshal(recorder.body.Bytes(), &envelope); err != nil {
+		t.Fatalf("decode discover response: %v", err)
+	}
+	return envelope.Result.Capabilities
 }

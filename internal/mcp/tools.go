@@ -116,6 +116,38 @@ func lookupTool(name string) *toolSpec {
 	return nil
 }
 
+// toolCatalog renders the catalog a client sees. Deprecated aliases are hidden
+// by default: the consumer-facing catalog is one tool per concept, while an
+// alias stays callable by name (dispatch never filters). includeDeprecated lists
+// them with their `x-deprecated-tool` metadata, which is what a caller migrating
+// an old transcript needs.
+func toolCatalog(includeDeprecated bool) []map[string]any {
+	schemas := toolSchemas()
+	if includeDeprecated {
+		return schemas
+	}
+	filtered := make([]map[string]any, 0, len(schemas)-len(toolAliasRecords))
+	for _, schema := range schemas {
+		name, _ := schema["name"].(string)
+		if _, alias := toolAliasByName[name]; alias {
+			continue
+		}
+		filtered = append(filtered, schema)
+	}
+	return filtered
+}
+
+// deprecatedCatalogCount reports how many published tools are deprecated aliases.
+func deprecatedCatalogCount(schemas []map[string]any) int {
+	count := 0
+	for _, schema := range schemas {
+		if _, present := schema["x-deprecated-tool"]; present {
+			count++
+		}
+	}
+	return count
+}
+
 // toolSchemas renders deterministic tool descriptors shared by both eras. The
 // emitted vocabularies are published next to every inputSchema (as the
 // `x-response-vocabularies` extension) so a client can validate what the server

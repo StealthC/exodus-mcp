@@ -5,8 +5,11 @@ grouped by capability, and records how far each behavior is verified. Only
 open work is tracked in [ROADMAP.md](ROADMAP.md); the
 [CHANGELOG.md](../CHANGELOG.md) records the delivery history.
 
-The MCP server currently registers **111 tools**: **72 canonical concepts** and
-**39 deprecated aliases**, spanning roadmap phases 0-10: bridge and context
+The MCP server currently registers **111 callable tool names**: **72 canonical
+concepts** and **39 deprecated aliases**. `tools/list` publishes the 72 canonical
+tools by default and lists the aliases only when asked (`include_deprecated:
+true`); dispatch is never filtered, so any alias stays callable by name in both
+modes. The catalog spans roadmap phases 0-10: bridge and context
 foundations, memory and artifact access, both processors, VDP graphics,
 deterministic controlled experimentation, advanced analysis, evidence
 annotations, advanced debugging, deterministic replay, workflow ergonomics,
@@ -45,8 +48,34 @@ name stays registered for this release as a **deprecated alias**:
   Failure responses carry it too (`TestAliasDeprecationAlsoAnnotatesFailures`);
 - `tools/list` publishes the same mapping as an `x-deprecated-tool` annotation
   and prefixes the description with `DEPRECATED: use <replacement>.`
-  (`TestDeprecatedAliasesArePublishedAsDeprecated`). Aliases stay **listed** in
-  this release; hiding them behind a catalog flag is deferred (ROADMAP).
+  (`TestDeprecatedAliasesArePublishedAsDeprecated`).
+
+### Catalog visibility
+
+`tools/list` hides deprecated aliases by default. The consumer-facing catalog is
+one tool per concept:
+
+| Request | Result |
+| --- | --- |
+| `tools/list` (no params, or `{}`) | 72 canonical tools, no `x-deprecated-tool` entries (`TestToolsListHidesDeprecatedAliasesByDefault`) |
+| `tools/list` with `{"include_deprecated": true}` | all 111, the 39 aliases carrying `x-deprecated-tool` (`TestToolsListDeprecatedAliasesOnRequest`) |
+
+The flag is accepted by the modern and legacy dispatchers alike. It is a
+dispatcher parameter, not a tool argument: an unknown parameter (or a
+non-boolean `include_deprecated`) is rejected with the dispatcher's existing
+`-32602` invalid-params error and HTTP 400, naming the field and the accepted
+set, instead of being ignored (`TestToolsListRejectsUnknownParameters`). Hiding
+is a listing decision only: a deprecated alias still executes end-to-end by name
+(`TestHiddenAliasStillExecutes`).
+
+`server/discover` and `initialize` publish the policy once per session under
+`capabilities["x-deprecated-tools"]`:
+`{count: 39, canonical_count: 72, listed_by_default: false,
+include_deprecated_parameter: "include_deprecated"}`
+(`TestCapabilitiesAdvertiseTheDeprecatedCatalogPolicy`). The three counts live in
+one declaration (`deprecatedAliasCount`, `canonicalConceptCount`,
+`registeredToolCount`), which the consolidation registry test, the catalog test,
+and these capabilities all read, so they cannot drift.
 
 **Architecture for this release: a facade.** A merged tool dispatches to the
 handler of the concept it absorbed, in-process, with exactly the arguments the

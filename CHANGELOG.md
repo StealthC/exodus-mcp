@@ -39,12 +39,28 @@ and this project will use [Semantic Versioning](https://semver.org/spec/v2.0.0.h
   (`tool_alias_deprecated`, replacement, removal policy, payload mapping), and
   `tools/list` publishes an `x-deprecated-tool` annotation with a
   `DEPRECATED: use ...` description prefix.
+- `tools/list` hides deprecated aliases by default: the catalog a client sees is
+  the 72 canonical concepts. `tools/list` with `{"include_deprecated": true}`
+  returns all 111 with the deprecation metadata, and dispatch is never filtered,
+  so an alias stays callable by name in both modes. The modern and legacy
+  dispatchers accept the flag; an unknown parameter or a non-boolean value is
+  rejected with the dispatcher's `-32602` invalid-params error instead of being
+  ignored. `server/discover` and `initialize` publish the policy as
+  `capabilities["x-deprecated-tools"] = {count: 39, canonical_count: 72,
+  listed_by_default: false, include_deprecated_parameter: "include_deprecated"}`.
 
 ### Deprecated
 
 Every tool name below still works and still returns its previous payload shape,
-plus the `deprecated` block naming its replacement. Aliases stay listed in
-`tools/list` for this release; hiding them is a separate, pending change.
+plus the `deprecated` block naming its replacement. They are hidden from the
+default `tools/list` (see "Catalog visibility" in
+[FEATURES.md](docs/FEATURES.md#catalog-visibility)) but remain callable by name;
+list them with:
+
+```json
+{"method": "tools/list", "params": {"include_deprecated": true}}
+```
+
 Replacements in parentheses:
 
 - Status: `bridge_status`, `emulator_status`, `target_info` (`target_status`).

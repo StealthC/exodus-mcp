@@ -91,12 +91,14 @@ merged tools are facades over the absorbed handlers for this release.
   `capture`, `snapshot_diff`, `trace_session_query`, `trace`, and
   `sound_status` should own their logic once the aliases are removed, so a
   payload section no longer re-publishes another handler's map.
-- [ ] Deprecated-alias catalog gating: decide whether `tools/list` keeps listing
-  deprecated aliases, hides them behind an `include_deprecated` flag, or drops
-  them entirely after the deprecation window. Aliases are listed today; the
-  decision is deliberately deferred to a separate, small change.
-- [ ] Remove the 39 aliases after their deprecation window, with a changelog
-  entry and a migration note per replacement.
+- [ ] Remove the 39 deprecated aliases after their deprecation window, with a
+  changelog entry and a migration note per replacement. The catalog already hides
+  them by default (`tools/list` lists 72 concepts; `include_deprecated: true`
+  lists all 111) and advertises the policy in `x-deprecated-tools`; only removal
+  is open.
+- [ ] Once the aliases are gone, drop the `include_deprecated` parameter and the
+  `x-deprecated-tools` capability, or keep the capability's counts at zero for one
+  release so a client that reads them sees the removal explicitly.
 
 ## Delivery rules for remaining work
 
