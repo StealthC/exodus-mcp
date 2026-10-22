@@ -63,7 +63,8 @@ and this project will use [Semantic Versioning](https://semver.org/spec/v2.0.0.h
   CPU. Execution events are the engine's own per-instruction trace lines (PC,
   opcode text, cycle, emulated time); optional non-breaking watchpoints report
   aggregate read/write hit counters per configured range. The native side
-  segments its trace output, auto-stops at `max_duration_ms`, enforces
+  segments its trace output, stays active until explicitly stopped (or the
+  optional `stop_after_vdp_frames` threshold is observed; actual VDP frame count is reported), enforces
   `max_total_bytes`/`max_segments` retention, and reports evictions; the server
   bounds its event ring, address histogram, and watch samples, and every
   response carries an explicit `loss` object with `loss.complete`. JSONL

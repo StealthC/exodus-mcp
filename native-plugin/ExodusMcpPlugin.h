@@ -215,7 +215,8 @@ private:
 	unsigned long long _traceSessionWindowMs;
 	unsigned long long _traceSessionIntervalMs;
 	unsigned long long _traceSessionSegmentMs;
-	unsigned long long _traceSessionMaxDurationMs;
+	unsigned long long _traceSessionStopAfterVdpFrames;
+	unsigned int _traceSessionStartVdpFrameToken;
 	unsigned long long _traceSessionMaxTotalBytes;
 	unsigned int _traceSessionMaxSegments;
 	unsigned long long _traceSessionStartedTick;

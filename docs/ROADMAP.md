@@ -49,6 +49,11 @@ restart recovery, and ROM-hash-bound symbol resolution. See
 
 - [ ] Release automation for the changelog-cut → annotated tag → release-notes
   workflow.
+- [ ] Headless Exodus host with terminal logging: a windowless host executable
+  that boots `System.dll`, loads the MCP plugin unchanged, maps module
+  connectors deterministically, streams the emulator log to stdout, and shuts
+  down without a window. See [HEADLESS.md](HEADLESS.md) for the assessment,
+  phases, estimates, and open decisions.
 
 ## Delivery rules for remaining work
 

@@ -100,17 +100,17 @@ type Watch struct {
 
 // Config is the immutable configuration of one trace session.
 type Config struct {
-	CPU           string  `json:"cpu"`
-	Mode          string  `json:"mode"`
-	Disassemble   bool    `json:"disassemble"`
-	WindowMs      uint64  `json:"window_ms"`
-	IntervalMs    uint64  `json:"interval_ms"`
-	SegmentMs     uint64  `json:"segment_ms"`
-	MaxDurationMs uint64  `json:"max_duration_ms"`
-	MaxTotalBytes uint64  `json:"max_total_bytes"`
-	MaxSegments   uint64  `json:"max_segments"`
-	MaxEvents     uint64  `json:"max_events"`
-	Watches       []Watch `json:"watches,omitempty"`
+	CPU                string  `json:"cpu"`
+	Mode               string  `json:"mode"`
+	Disassemble        bool    `json:"disassemble"`
+	WindowMs           uint64  `json:"window_ms"`
+	IntervalMs         uint64  `json:"interval_ms"`
+	SegmentMs          uint64  `json:"segment_ms"`
+	StopAfterVdpFrames uint64  `json:"stop_after_vdp_frames"`
+	MaxTotalBytes      uint64  `json:"max_total_bytes"`
+	MaxSegments        uint64  `json:"max_segments"`
+	MaxEvents          uint64  `json:"max_events"`
+	Watches            []Watch `json:"watches,omitempty"`
 
 	// Per-occurrence read/write capture. AccessCapture is "off" (aggregate
 	// counters only), "ranges" (native-filtered per-access records inside the

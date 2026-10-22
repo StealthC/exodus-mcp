@@ -27,6 +27,8 @@ Guidance for contributors and coding agents working in this workspace.
   retrieval contract.
 - [Features](docs/FEATURES.md): delivered tool catalog, design rules, and validation status.
 - [Tool roadmap](docs/ROADMAP.md): remaining planned phases and deferred work.
+- [Headless host](docs/HEADLESS.md): assessed plan for running Exodus without a
+  window and streaming emulator logs to the terminal.
 - Write all new documentation, code comments, identifiers, commit messages,
   and user-facing errors in English unless explicitly requested otherwise.
 

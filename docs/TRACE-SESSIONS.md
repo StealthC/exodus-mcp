@@ -54,8 +54,8 @@ Consequences that shape the API:
   in between; the two streams share the same window boundaries. Measured on Kid
   Chameleon, a 100 ms M68K window with disassembly enabled writes about 1.3 MB
   (~13 MB/s of traced time), so the default 1 % duty cycle costs roughly
-  8 MB per minute; size `max_total_bytes` (default 128 MiB) and
-  `max_duration_ms` (default 10 min) from that ratio.
+   8 MB per minute; size `max_total_bytes` (default 128 MiB) from that ratio.
+   Sessions do not expire by wall-clock time.
 - `mode: "continuous"` — the writer stays armed and only the segment file
   rotates every `segment_ms` (default 250 ms). Every instruction is recorded, at
   the cost of the engine's per-opcode disassembly and a sustained write stream.
@@ -69,12 +69,12 @@ Segments are plain engine trace files (execution) and per-access log files
 ## Volume and bounds are surfaced before capture
 
 `trace_session_start` returns a `volume` object carrying every limit in force
-(`max_duration_ms`, `max_total_bytes`, `max_segments`, `max_events`,
-`access_max_bytes`), the estimated bytes for the configured duration and duty
-cycle, the measured bytes/second the estimate is derived from, and whether
-access capture is on. A ten-minute, 128 MiB audit is a deliberate choice, never a
-surprise at stop time. `trace_session_status` repeats the object with the live
-configuration.
+(`stop_after_vdp_frames`, `max_total_bytes`, `max_segments`, `max_events`,
+`access_max_bytes`), the measured bytes/second and whether access capture is on.
+Since a session is unbounded unless `stop_after_vdp_frames` is set, the response does not
+claim a finite total-volume estimate. Native and server retention caps still
+bound storage and report evictions. `trace_session_status` repeats the object
+with the live configuration.
 
 ## Native session lifecycle
 
@@ -94,9 +94,14 @@ machine:
   (default 128 MiB) for the execution stream, and `access_max_bytes` (default
   64 MiB) for access records, deleting the oldest sealed segment and counting
   the eviction;
-- auto-stops at `max_duration_ms` (default 10 minutes) or when the traced
-  processor disappears, so a session can never outlive the configured bounds,
-  even if the MCP server stops polling.
+- stops capture when the monitor observes the `stop_after_vdp_frames` threshold, if
+  configured, or when the traced processor disappears. The frame counter is the
+  VDP's completed rendered-frame token; it does not advance while the emulator
+  is paused. Monitor scheduling can overshoot the threshold; status reports the
+  actual `vdp_frames_elapsed`. Instruction events are counted independently.
+  Reaching the threshold stops trace capture, not
+  emulation. Otherwise, call `trace_session_stop` explicitly. Segment and byte
+  retention remain bounded independently of session lifetime.
 
 `trace_session_drain` returns the oldest not-yet-drained sealed segment of the
 selected `stream` (`trace` default, `access`) in chunks (default 1 MiB, max
@@ -194,7 +199,7 @@ as such. Access events always expose the raw `pc` as authoritative.
 
 | Tool | Kind | Purpose |
 | --- | --- | --- |
-| `trace_session_start` | mutation | Arm a session with `cpu`, `mode`, window/interval/segment/duration/disk caps, `max_events`, optional read/write counters, `access_capture` (`off`/`ranges`/`all`), `access_include_registers`, `access_max_bytes`, and `start_guard`; returns the volume contract. |
+| `trace_session_start` | mutation | Arm a session with `cpu`, `mode`, window/interval/segment settings, optional `stop_after_vdp_frames`, disk caps, `max_events`, optional read/write counters, `access_capture` (`off`/`ranges`/`all`), `access_include_registers`, `access_max_bytes`, and `start_guard`; returns the volume contract. |
 | `trace_session_status` | read | Drain both streams into the store (unless `collect: false`) and report configuration, limits, native counters, segment tables, access stream counters, watch deltas, totals, and loss. |
 | `trace_session_events` | read | Drain, then filter by kind, direction, address/PC/cycle/sequence range, and effective value; bounded inline events, per-address histogram, optional JSONL artifact, and ROM-bound symbol resolution. |
 | `trace_session_stop` | mutation | Final drain, disable both writers, restore trace flags, delete watchpoints and segment files, report final totals and loss; exports JSONL by default. |

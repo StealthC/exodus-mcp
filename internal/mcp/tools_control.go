@@ -26,7 +26,7 @@ func controlToolSpecs() []toolSpec {
 		},
 		{
 			name:        "cpu_breakpoint_set",
-			description: "Create an enabled exact-address execution breakpoint owned by this MCP process, recording context provenance. Optional `condition` filters by the processor's program counter (greater/less boundaries, inclusive-free range), and `break_on_counter` pauses only on every Nth hit; `breakpoint_list` reports the native hit counter. `one_shot: true` auto-removes the breakpoint through the audited mutation path once a hit proves it fired (checked at the next paused observation), so one-shot instrumentation never stays armed. Mutates the target: advances the target generation. Accepts optional expected_target_generation and control_id.",
+			description: "Create an enabled exact-address execution breakpoint owned by this MCP process, recording context provenance. For the Exodus M68K and Z80 cores, the address check runs before the opcode is fetched/executed; when it hits, the triggering instruction has not executed yet. Optional `condition` filters by the processor's program counter (greater/less boundaries, inclusive-free range), and `break_on_counter` pauses only on every Nth hit; `breakpoint_list` reports the native hit counter. `one_shot: true` auto-removes the breakpoint through the audited mutation path once a hit proves it fired (checked at the next paused observation), so one-shot instrumentation never stays armed. Mutates the target: advances the target generation. Accepts optional expected_target_generation and control_id.",
 			schema: objectSchema(map[string]any{
 				"cpu":                        enumProperty("Processor to break.", []string{"m68k", "z80"}),
 				"address":                    addressProperty(),
@@ -34,7 +34,7 @@ func controlToolSpecs() []toolSpec {
 				"range_end":                  addressProperty(),
 				"break_on_counter":           booleanProperty("Only pause on every Nth hit instead of every hit; N comes from break_counter."),
 				"break_counter":              integerProperty("Break every Nth hit when break_on_counter is true (default 1).", 1),
-				"one_shot":                   booleanProperty("Remove this breakpoint automatically once a hit proves it fired (default false)."),
+				"one_shot":                   booleanProperty("Remove this breakpoint automatically once a hit proves it fired (default false). A one-shot breakpoint will be absent from breakpoint_list after its hit; emulator_status reports one_shot_removals."),
 				"context":                    contextProperty(),
 				"expected_target_generation": integerProperty("Optional target generation the caller last observed; fails with target_generation_conflict on mismatch.", 1),
 				"control_id":                 stringProperty("Optional control id from target_control_acquire; required while the control lock is active."),
@@ -60,7 +60,7 @@ func controlToolSpecs() []toolSpec {
 				"address":                    addressProperty(),
 				"length":                     integerProperty("Watched range length in bytes (default 1).", 1),
 				"access":                     enumProperty("Access types that trigger the watchpoint.", []string{"read", "write", "any"}),
-				"one_shot":                   booleanProperty("Remove this watchpoint automatically once a hit proves it fired (default false)."),
+				"one_shot":                   booleanProperty("Remove this watchpoint automatically once a hit proves it fired (default false). A one-shot watchpoint will be absent from watchpoint_list after its hit; emulator_status reports one_shot_removals."),
 				"context":                    contextProperty(),
 				"expected_target_generation": integerProperty("Optional target generation the caller last observed; fails with target_generation_conflict on mismatch.", 1),
 				"control_id":                 stringProperty("Optional control id from target_control_acquire; required while the control lock is active."),

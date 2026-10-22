@@ -416,7 +416,8 @@ ExodusMcpPlugin::ExodusMcpPlugin(const std::wstring& implementationName, const s
 	_traceSessionWindowMs(0),
 	_traceSessionIntervalMs(0),
 	_traceSessionSegmentMs(0),
-	_traceSessionMaxDurationMs(0),
+	_traceSessionStopAfterVdpFrames(0),
+	_traceSessionStartVdpFrameToken(0),
 	_traceSessionMaxTotalBytes(0),
 	_traceSessionMaxSegments(0),
 	_traceSessionStartedTick(0),
@@ -3574,13 +3575,13 @@ bool ExodusMcpPlugin::BuildTraceSessionStartData(const BridgeRequest& request, s
 	unsigned long long windowMs = 100;
 	unsigned long long intervalMs = 10000;
 	unsigned long long segmentMs = 250;
-	unsigned long long maxDurationMs = 600000;
+	unsigned long long stopAfterVdpFrames = 0;
 	unsigned long long maxTotalBytes = 128 * 1024 * 1024;
 	unsigned long long maxSegments = 128;
 	ParseUnsigned(ParamValue(request.params, "window_ms"), windowMs);
 	ParseUnsigned(ParamValue(request.params, "interval_ms"), intervalMs);
 	ParseUnsigned(ParamValue(request.params, "segment_ms"), segmentMs);
-	ParseUnsigned(ParamValue(request.params, "max_duration_ms"), maxDurationMs);
+	ParseUnsigned(ParamValue(request.params, "stop_after_vdp_frames"), stopAfterVdpFrames);
 	ParseUnsigned(ParamValue(request.params, "max_total_bytes"), maxTotalBytes);
 	ParseUnsigned(ParamValue(request.params, "max_segments"), maxSegments);
 	if (windowMs < 10) { windowMs = 10; }
@@ -3589,8 +3590,19 @@ bool ExodusMcpPlugin::BuildTraceSessionStartData(const BridgeRequest& request, s
 	if (intervalMs > 60000) { intervalMs = 60000; }
 	if (segmentMs < 50) { segmentMs = 50; }
 	if (segmentMs > 60000) { segmentMs = 60000; }
-	if (maxDurationMs < 1000) { maxDurationMs = 1000; }
-	if (maxDurationMs > 3600000) { maxDurationMs = 3600000; }
+	if (stopAfterVdpFrames > 1000000000ULL)
+	{
+		errorCode = "invalid_params";
+		errorMessage = "stop_after_vdp_frames must be at most 1000000000";
+		return false;
+	}
+	IS315_5313* sessionVdp = FindVdp();
+	if (stopAfterVdpFrames != 0 && sessionVdp == 0)
+	{
+		errorCode = "vdp_not_found";
+		errorMessage = "stop_after_vdp_frames requires a VDP with a rendered-frame counter";
+		return false;
+	}
 	if (maxTotalBytes < 1024 * 1024) { maxTotalBytes = 1024 * 1024; }
 	if (maxTotalBytes > 1024ULL * 1024ULL * 1024ULL) { maxTotalBytes = 1024ULL * 1024ULL * 1024ULL; }
 	if (maxSegments < 2) { maxSegments = 2; }
@@ -3745,7 +3757,8 @@ bool ExodusMcpPlugin::BuildTraceSessionStartData(const BridgeRequest& request, s
 	_traceSessionWindowMs = windowMs;
 	_traceSessionIntervalMs = intervalMs;
 	_traceSessionSegmentMs = segmentMs;
-	_traceSessionMaxDurationMs = maxDurationMs;
+	_traceSessionStopAfterVdpFrames = stopAfterVdpFrames;
+	_traceSessionStartVdpFrameToken = sessionVdp != 0 ? sessionVdp->GetImageLastRenderedFrameToken() : 0;
 	_traceSessionMaxTotalBytes = maxTotalBytes;
 	_traceSessionMaxSegments = (unsigned int)maxSegments;
 	_traceSessionStartedTick = TickNow();
@@ -3977,10 +3990,19 @@ void ExodusMcpPlugin::TraceSessionThread()
 			break;
 		}
 		const unsigned long long now = TickNow();
-		const unsigned long long elapsed = TickElapsed(now, _traceSessionStartedTick);
-		if (_traceSessionMaxDurationMs != 0 && elapsed >= _traceSessionMaxDurationMs)
+		IS315_5313* currentVdp = FindVdp();
+		if (_traceSessionStopAfterVdpFrames != 0 && currentVdp == 0)
 		{
-			FinishTraceSessionLocked("duration_limit");
+			FinishTraceSessionLocked("vdp_unavailable");
+			NoteTraceSessionLocked("The VDP became unavailable before the configured frame limit was reached.");
+			LeaveCriticalSection(&_traceSessionLock);
+			break;
+		}
+		const unsigned int vdpFrameToken = currentVdp != 0 ? currentVdp->GetImageLastRenderedFrameToken() : _traceSessionStartVdpFrameToken;
+		const unsigned int vdpFramesElapsed = vdpFrameToken - _traceSessionStartVdpFrameToken;
+		if (_traceSessionStopAfterVdpFrames != 0 && vdpFramesElapsed >= _traceSessionStopAfterVdpFrames)
+		{
+			FinishTraceSessionLocked("frame_limit");
 			LeaveCriticalSection(&_traceSessionLock);
 			break;
 		}
@@ -4023,6 +4045,13 @@ void ExodusMcpPlugin::TraceSessionThread()
 					waitMs = 10;
 				}
 			}
+		}
+		// A frame cap is checked on the monitor thread rather than in the VDP's
+		// render callback. Poll tightly so the observed frame-limit overrun stays
+		// small; report the actual vdp_frames_elapsed value to make any overrun clear.
+		if (_traceSessionStopAfterVdpFrames != 0 && waitMs > 1)
+		{
+			waitMs = 1;
 		}
 		LeaveCriticalSection(&_traceSessionLock);
 
@@ -4108,7 +4137,7 @@ void ExodusMcpPlugin::FinishTraceSessionLocked(const std::string& stopReason)
 	_traceSessionActive = false;
 	_traceSessionCapturing = false;
 	_traceSessionStopReason = stopReason;
-	if (stopReason == "duration_limit")
+	if (stopReason == "frame_limit")
 	{
 		_traceSessionAutoStopped = true;
 	}
@@ -4614,6 +4643,9 @@ std::string ExodusMcpPlugin::BuildTraceSessionStatusJsonLocked(bool consumeWatch
 {
 	const unsigned long long now = TickNow();
 	const unsigned long long elapsed = (_traceSessionStartedTick == 0) ? 0 : TickElapsed(now, _traceSessionStartedTick);
+	IS315_5313* currentVdp = FindVdp();
+	const unsigned int currentVdpFrameToken = currentVdp != 0 ? currentVdp->GetImageLastRenderedFrameToken() : _traceSessionStartVdpFrameToken;
+	const unsigned int vdpFramesElapsed = currentVdpFrameToken - _traceSessionStartVdpFrameToken;
 	std::string data = "{\"active\":";
 	data += BoolText(_traceSessionActive);
 	data += ",\"capturing\":";
@@ -4632,8 +4664,10 @@ std::string ExodusMcpPlugin::BuildTraceSessionStatusJsonLocked(bool consumeWatch
 	AppendNumber(data, _traceSessionIntervalMs);
 	data += ",\"segment_ms\":";
 	AppendNumber(data, _traceSessionSegmentMs);
-	data += ",\"max_duration_ms\":";
-	AppendNumber(data, _traceSessionMaxDurationMs);
+	data += ",\"stop_after_vdp_frames\":";
+	AppendNumber(data, _traceSessionStopAfterVdpFrames);
+	data += ",\"vdp_frames_elapsed\":";
+	AppendNumber(data, vdpFramesElapsed);
 	data += ",\"max_total_bytes\":";
 	AppendNumber(data, _traceSessionMaxTotalBytes);
 	data += ",\"max_segments\":";

@@ -254,7 +254,9 @@ is available; unavailable native features are documented explicitly (see
   `greater`/`less`/`range` filters by the program counter (range bounds are
   exclusive), and `break_on_counter` pauses only on every Nth native hit
   (ignored hits never stop the system). `cpu_breakpoint_list` reports
-  `enabled`, the condition fields, and the native `hit_count`.
+  `enabled`, the condition fields, and the native `hit_count`. In both Exodus
+  CPU cores the breakpoint check occurs before opcode fetch/execution; at a hit,
+  the reported triggering PC is the instruction that has not run yet.
 - Watchpoints: `cpu_watchpoint_set`, `cpu_watchpoint_list`,
   `cpu_watchpoint_remove` — byte ranges with read/write/any access filtering,
   live hit counters, and deterministic hit-and-pause through the Exodus
@@ -580,13 +582,18 @@ documented in [TRACE-SESSIONS.md](TRACE-SESSIONS.md).
   — native filtering means out-of-range accesses are never written — with a
   monotonic engine sequence, cycle, PC, direction, width, transferred value, an
   optional pre-write value when captured, and a same-instant register snapshot
-  (`access_include_registers`, default true for ranges). `max_duration_ms`,
-  `max_total_bytes`, `max_segments`, and `access_max_bytes` bound the native
-  side (auto-stop and eviction are reported, never silent) while `max_events`
-  bounds the server-side store. Every start response carries a `volume` object
-  with the limits in force, the estimated bytes for the configured duration and
-  duty cycle, and the measured bytes/second the estimate derives from, so a
-  128 MiB / ten-minute audit is a deliberate choice. `start_guard: "quiet"`
+  (`access_include_registers`, default true for ranges). Sessions remain active
+  until explicitly stopped or the processor disappears; they do not expire by
+  wall-clock time, so pausing the emulator does not consume a session lifetime.
+  Optional `stop_after_vdp_frames` is a completed-rendered-VDP-frame stop
+  threshold, not an instruction count, and requires a VDP; monitor polling may
+  overshoot, and `vdp_frames_elapsed` reports the actual count. Reaching it
+  stops capture, not emulation. `max_total_bytes`,
+  `max_segments`, and `access_max_bytes`
+  bound native retention (oldest data is evicted and loss is reported, never
+  silent), while `max_events` bounds the server-side store. Every start response
+  carries a `volume` object with retention limits and measured trace throughput;
+  no total-volume estimate is claimed for an unbounded session. `start_guard: "quiet"`
   stops the system for the configuration calls only and restores it; the default
   `"none"` arms capture on the running CPU.
 - `trace_session_status`: drains both native streams into the bounded event

@@ -42,9 +42,7 @@ const (
 	traceSessionDefaultSegmentMs     = 250
 	traceSessionMinSegmentMs         = 50
 	traceSessionMaxSegmentMs         = 60000
-	traceSessionDefaultDurationMs    = 600000
-	traceSessionMinDurationMs        = 1000
-	traceSessionMaxDurationMs        = 3600000
+	traceSessionMaxVdpFrames         = 1000000000
 	traceSessionDefaultTotalBytes    = 128 << 20
 	traceSessionMinTotalBytes        = 1 << 20
 	traceSessionMaxTotalBytes        = 1 << 30
@@ -70,19 +68,19 @@ func traceSessionToolSpecs() []toolSpec {
 	return []toolSpec{
 		{
 			name:        "trace_session_start",
-			description: "Start a persistent, non-pausing trace session. The native plugin captures execution trace lines in sampled windows (default) or continuously, and can also record each read/write access. Set access_capture to \"ranges\" to record individual accesses overlapping the configured watches, or \"all\" to record every access; the default \"off\" keeps only aggregate watch counters. Per-access records include monotonic sequence, cycle, PC, direction, width, transferred value, and (by default for ranges) a same-instant register snapshot. Access ranges are filtered natively; execution-trace address filters are post-capture. The session auto-stops at max_duration_ms and enforces segment/event/byte caps with explicit loss reporting. Starting a new session retires the previous one. Accepts optional expected_target_generation and control_id.",
+			description: "Start a persistent, non-pausing trace session. It remains active until trace_session_stop, processor removal, or an explicitly configured stop_after_vdp_frames threshold; there is no wall-clock expiry, so time spent paused does not consume the frame threshold. The threshold counts completed rendered VDP frames, not instruction executions, and requires a VDP. The monitor may observe the threshold several frames late; vdp_frames_elapsed reports the actual count. Reaching the threshold stops capture, not emulation. The native plugin captures execution trace lines in sampled windows (default) or continuously, and can also record each read/write access. Set access_capture to \"ranges\" to record individual accesses overlapping the configured watches, or \"all\" to record every access; the default \"off\" keeps only aggregate watch counters. Per-access records include monotonic sequence, cycle, PC, direction, width, transferred value, and (by default for ranges) a same-instant register snapshot. Access ranges are filtered natively; execution-trace address filters are post-capture. Storage remains bounded by segment/event/byte caps with explicit loss reporting. Starting a new session retires the previous one. Accepts optional expected_target_generation and control_id.",
 			schema: objectSchema(map[string]any{
-				"cpu":             enumProperty("Processor to trace.", []string{"m68k", "z80"}),
-				"mode":            enumProperty("sampled (default) captures window_ms of every interval_ms and leaves the engine untouched in between; continuous keeps the trace writer enabled and rotates only by segment_ms.", []string{"sampled", "continuous"}),
-				"disassemble":     booleanProperty("Ask the engine to disassemble every traced instruction (default true). Disabling lowers overhead but records only PC, cycle, and time."),
-				"window_ms":       integerProperty(fmt.Sprintf("Capture window per interval in sampled mode (default %d, range %d-%d).", traceSessionDefaultWindowMs, traceSessionMinWindowMs, traceSessionMaxWindowMs), 1),
-				"interval_ms":     integerProperty(fmt.Sprintf("Interval between capture windows (default %d, range window_ms-%d).", traceSessionDefaultIntervalMs, traceSessionMaxIntervalMs), 1),
-				"segment_ms":      integerProperty(fmt.Sprintf("Maximum age of one segment file in continuous mode (default %d, range %d-%d). Sampled mode already seals one segment per window.", traceSessionDefaultSegmentMs, traceSessionMinSegmentMs, traceSessionMaxSegmentMs), 1),
-				"max_duration_ms": integerProperty(fmt.Sprintf("Hard session lifetime; the session auto-stops at this bound (default %d, range %d-%d).", traceSessionDefaultDurationMs, traceSessionMinDurationMs, traceSessionMaxDurationMs), 1),
-				"max_total_bytes": integerProperty(fmt.Sprintf("Retention cap for sealed segment files on disk (default %d, range %d-%d); exceeding it evicts the oldest segments and reports the loss.", traceSessionDefaultTotalBytes, traceSessionMinTotalBytes, traceSessionMaxTotalBytes), 1),
-				"max_segments":    integerProperty(fmt.Sprintf("Retention cap in segment files (default %d, range %d-%d).", traceSessionDefaultMaxSegments, traceSessionMinMaxSegments, traceSessionMaxMaxSegments), 1),
-				"max_events":      integerProperty(fmt.Sprintf("Server-side event store capacity (default %d, cap %d); evicted events are counted in loss.dropped_events.", traceSessionDefaultMaxEvents, traceSessionMaxMaxEvents), 1),
-				"start_guard":     enumProperty("Configuration guard. \"none\" (default) arms tracing while the system keeps running; \"quiet\" stops the system for the configuration calls and restores the prior run state (a sub-millisecond pause, reported as a pause in the response).", []string{"none", "quiet"}),
+				"cpu":                   enumProperty("Processor to trace.", []string{"m68k", "z80"}),
+				"mode":                  enumProperty("sampled (default) captures window_ms of every interval_ms and leaves the engine untouched in between; continuous keeps the trace writer enabled and rotates only by segment_ms.", []string{"sampled", "continuous"}),
+				"disassemble":           booleanProperty("Ask the engine to disassemble every traced instruction (default true). Disabling lowers overhead but records only PC, cycle, and time."),
+				"window_ms":             integerProperty(fmt.Sprintf("Capture window per interval in sampled mode (default %d, range %d-%d).", traceSessionDefaultWindowMs, traceSessionMinWindowMs, traceSessionMaxWindowMs), 1),
+				"interval_ms":           integerProperty(fmt.Sprintf("Interval between capture windows (default %d, range window_ms-%d).", traceSessionDefaultIntervalMs, traceSessionMaxIntervalMs), 1),
+				"segment_ms":            integerProperty(fmt.Sprintf("Maximum age of one segment file in continuous mode (default %d, range %d-%d). Sampled mode already seals one segment per window.", traceSessionDefaultSegmentMs, traceSessionMinSegmentMs, traceSessionMaxSegmentMs), 1),
+				"stop_after_vdp_frames": integerProperty(fmt.Sprintf("Optional completed rendered VDP frame stop threshold; 0/omitted means no automatic frame stop. This counts frames, not instructions, and requires an active VDP (maximum %d). Monitor polling can overshoot; status.vdp_frames_elapsed reports actual frames. Reaching it stops capture, not emulation. Paused emulation does not advance it.", traceSessionMaxVdpFrames), 0),
+				"max_total_bytes":       integerProperty(fmt.Sprintf("Retention cap for sealed segment files on disk (default %d, range %d-%d); exceeding it evicts the oldest segments and reports the loss.", traceSessionDefaultTotalBytes, traceSessionMinTotalBytes, traceSessionMaxTotalBytes), 1),
+				"max_segments":          integerProperty(fmt.Sprintf("Retention cap in segment files (default %d, range %d-%d).", traceSessionDefaultMaxSegments, traceSessionMinMaxSegments, traceSessionMaxMaxSegments), 1),
+				"max_events":            integerProperty(fmt.Sprintf("Server-side event store capacity (default %d, cap %d); evicted events are counted in loss.dropped_events.", traceSessionDefaultMaxEvents, traceSessionMaxMaxEvents), 1),
+				"start_guard":           enumProperty("Configuration guard. \"none\" (default) arms tracing while the system keeps running; \"quiet\" stops the system for the configuration calls and restores the prior run state (a sub-millisecond pause, reported as a pause in the response).", []string{"none", "quiet"}),
 				"watches": map[string]any{
 					"type":        "array",
 					"description": fmt.Sprintf("Read/write address ranges (max %d). Non-breaking watchpoint counters are always sampled. With access_capture=\"ranges\", every access whose byte width overlaps a watched byte is recorded individually; execution is never paused.", traceSessionMaxWatches),
@@ -110,7 +108,7 @@ func traceSessionToolSpecs() []toolSpec {
 		},
 		{
 			name:        "trace_session_status",
-			description: "Report the live trace session and, by default, drain every sealed native segment into the server-side event store first. The response carries the session configuration, native capture counters, per-segment table, watched read/write counter deltas, the bounded store's totals, and a machine-readable loss object (dropped events, malformed/truncated trace lines, evicted undrained segments). Never mutates the target and never pauses the system.",
+			description: "Report the live trace session and, by default, drain every sealed native segment into the server-side event store first. The response carries the session configuration, native capture counters, per-segment table, watched read/write counter deltas, the bounded store's totals, and a machine-readable loss object (dropped events, malformed/truncated trace lines, evicted undrained segments). Native elapsed_ms is wall-clock telemetry only; sessions have no wall-clock auto-expiry. stop_after_vdp_frames/vdp_frames_elapsed count completed VDP rendered frames, independently of instruction-event counts, and do not advance while paused. Never mutates the target and never pauses the system.",
 			schema: objectSchema(map[string]any{
 				"session_id":           stringProperty("Optional session id; when present it must match the live session."),
 				"collect":              booleanProperty("Drain sealed native segments before reporting (default true)."),
@@ -194,7 +192,7 @@ type traceSessionStartArgs struct {
 	WindowMs               uint64                  `json:"window_ms"`
 	IntervalMs             uint64                  `json:"interval_ms"`
 	SegmentMs              uint64                  `json:"segment_ms"`
-	MaxDurationMs          uint64                  `json:"max_duration_ms"`
+	StopAfterVdpFrames     uint64                  `json:"stop_after_vdp_frames"`
 	MaxTotalBytes          uint64                  `json:"max_total_bytes"`
 	MaxSegments            uint64                  `json:"max_segments"`
 	MaxEvents              uint64                  `json:"max_events"`
@@ -297,9 +295,8 @@ func runTraceSessionStart(tc toolContext, args json.RawMessage) map[string]any {
 	if failure != nil {
 		return failureResult(failure, tc.modern)
 	}
-	maxDurationMs, failure := traceSessionBounded(parsed.MaxDurationMs, traceSessionDefaultDurationMs, traceSessionMinDurationMs, traceSessionMaxDurationMs, "max_duration_ms")
-	if failure != nil {
-		return failureResult(failure, tc.modern)
+	if parsed.StopAfterVdpFrames > traceSessionMaxVdpFrames {
+		return failureResult(&toolFailure{Code: "invalid_params", Message: fmt.Sprintf("stop_after_vdp_frames must be at most %d", traceSessionMaxVdpFrames)}, tc.modern)
 	}
 	maxTotalBytes, failure := traceSessionBounded(parsed.MaxTotalBytes, traceSessionDefaultTotalBytes, traceSessionMinTotalBytes, traceSessionMaxTotalBytes, "max_total_bytes")
 	if failure != nil {
@@ -372,17 +369,17 @@ func runTraceSessionStart(tc toolContext, args json.RawMessage) map[string]any {
 
 	sessionID := newTraceSessionID()
 	params := map[string]string{
-		"cpu":             parsed.CPU,
-		"mode":            mode,
-		"disassemble":     strconv.FormatBool(disassemble),
-		"window_ms":       strconv.FormatUint(windowMs, 10),
-		"interval_ms":     strconv.FormatUint(intervalMs, 10),
-		"segment_ms":      strconv.FormatUint(segmentMs, 10),
-		"max_duration_ms": strconv.FormatUint(maxDurationMs, 10),
-		"max_total_bytes": strconv.FormatUint(maxTotalBytes, 10),
-		"max_segments":    strconv.FormatUint(maxSegments, 10),
-		"start_guard":     startGuard,
-		"session_id":      sessionID,
+		"cpu":                   parsed.CPU,
+		"mode":                  mode,
+		"disassemble":           strconv.FormatBool(disassemble),
+		"window_ms":             strconv.FormatUint(windowMs, 10),
+		"interval_ms":           strconv.FormatUint(intervalMs, 10),
+		"segment_ms":            strconv.FormatUint(segmentMs, 10),
+		"stop_after_vdp_frames": strconv.FormatUint(parsed.StopAfterVdpFrames, 10),
+		"max_total_bytes":       strconv.FormatUint(maxTotalBytes, 10),
+		"max_segments":          strconv.FormatUint(maxSegments, 10),
+		"start_guard":           startGuard,
+		"session_id":            sessionID,
 
 		"access_capture":           accessCapture,
 		"access_include_registers": strconv.FormatBool(accessIncludeRegisters),
@@ -393,17 +390,17 @@ func runTraceSessionStart(tc toolContext, args json.RawMessage) map[string]any {
 	}
 
 	config := tracing.Config{
-		CPU:           parsed.CPU,
-		Mode:          mode,
-		Disassemble:   disassemble,
-		WindowMs:      windowMs,
-		IntervalMs:    intervalMs,
-		SegmentMs:     segmentMs,
-		MaxDurationMs: maxDurationMs,
-		MaxTotalBytes: maxTotalBytes,
-		MaxSegments:   maxSegments,
-		MaxEvents:     maxEvents,
-		Watches:       watches,
+		CPU:                parsed.CPU,
+		Mode:               mode,
+		Disassemble:        disassemble,
+		WindowMs:           windowMs,
+		IntervalMs:         intervalMs,
+		SegmentMs:          segmentMs,
+		StopAfterVdpFrames: parsed.StopAfterVdpFrames,
+		MaxTotalBytes:      maxTotalBytes,
+		MaxSegments:        maxSegments,
+		MaxEvents:          maxEvents,
+		Watches:            watches,
 
 		AccessCapture:          accessCapture,
 		AccessIncludeRegisters: accessIncludeRegisters,
@@ -418,21 +415,21 @@ func runTraceSessionStart(tc toolContext, args json.RawMessage) map[string]any {
 		guard:     parsed.guard(),
 		contextID: context.ID,
 		detail: map[string]any{
-			"cpu":              parsed.CPU,
-			"mode":             mode,
-			"disassemble":      disassemble,
-			"window_ms":        windowMs,
-			"interval_ms":      intervalMs,
-			"segment_ms":       segmentMs,
-			"max_duration_ms":  maxDurationMs,
-			"max_total_bytes":  maxTotalBytes,
-			"max_segments":     maxSegments,
-			"max_events":       maxEvents,
-			"start_guard":      startGuard,
-			"watches":          watches,
-			"session_id":       sessionID,
-			"access_capture":   accessCapture,
-			"access_max_bytes": accessMaxBytes,
+			"cpu":                   parsed.CPU,
+			"mode":                  mode,
+			"disassemble":           disassemble,
+			"window_ms":             windowMs,
+			"interval_ms":           intervalMs,
+			"segment_ms":            segmentMs,
+			"stop_after_vdp_frames": parsed.StopAfterVdpFrames,
+			"max_total_bytes":       maxTotalBytes,
+			"max_segments":          maxSegments,
+			"max_events":            maxEvents,
+			"start_guard":           startGuard,
+			"watches":               watches,
+			"session_id":            sessionID,
+			"access_capture":        accessCapture,
+			"access_max_bytes":      accessMaxBytes,
 		},
 		commit: func() {
 			// executeMutation advances the target revision before running
@@ -447,9 +444,8 @@ func runTraceSessionStart(tc toolContext, args json.RawMessage) map[string]any {
 		return failureResult(failure, tc.modern)
 	}
 
-	// Surface the bounds and the measured/estimated volume before the caller
-	// leaves the session running: an audit that costs 128 MiB and ten minutes
-	// must be a deliberate choice, not a surprise at stop time.
+	// Surface retention bounds before capture; session lifetime is manual unless
+	// the caller opts into a frame limit.
 	result := map[string]any{
 		"session":     traceSessionSummary(tc, created, payload),
 		"native":      payload,
@@ -1472,8 +1468,8 @@ func traceSessionSymbolView(tc toolContext, session *tracing.Session, context *a
 	return view
 }
 
-// traceSessionVolume states, before and during a session, exactly how large
-// the capture can become. The estimate is derived from the measured native
+// traceSessionVolume reports retention bounds and measured throughput. The
+// estimate is derived from the measured native
 // behavior of the engine: a disassembled M68K instruction trace writes roughly
 // 1.3 MB per 100 ms of traced time (~13 MB/s), and one access record is a
 // single short line (about 120 bytes with the register snapshot).
@@ -1485,25 +1481,23 @@ func traceSessionVolume(session *tracing.Session) map[string]any {
 	}
 	traceBytesPerSecond := 13.0 * 1024 * 1024 * duty
 	limits := map[string]any{
-		"max_duration_ms":    config.MaxDurationMs,
-		"max_total_bytes":    config.MaxTotalBytes,
-		"max_segments":       config.MaxSegments,
-		"max_events":         config.MaxEvents,
-		"access_max_bytes":   config.AccessMaxBytes,
-		"access_capture":     config.AccessCapture,
-		"store_is_bounded":   true,
-		"retention_is_lossy": true,
+		"stop_after_vdp_frames": config.StopAfterVdpFrames,
+		"max_total_bytes":       config.MaxTotalBytes,
+		"max_segments":          config.MaxSegments,
+		"max_events":            config.MaxEvents,
+		"access_max_bytes":      config.AccessMaxBytes,
+		"access_capture":        config.AccessCapture,
+		"store_is_bounded":      true,
+		"retention_is_lossy":    true,
 	}
-	estimatedTraceBytes := traceBytesPerSecond * (float64(config.MaxDurationMs) / 1000.0)
 	view := map[string]any{
 		"limits": limits,
 		"estimate": map[string]any{
 			"trace_bytes_per_second":   uint64(traceBytesPerSecond),
-			"estimated_trace_bytes":    uint64(estimatedTraceBytes),
 			"duty_cycle":               duty,
 			"access_record_bytes":      120,
 			"untraced_time_in_sampled": config.Mode == "sampled",
-			"basis":                    "Measured on Kid Chameleon: a 100 ms disassembled M68K trace window writes ~1.3 MB (~13 MB/s of traced time); access records are one short line each (~120 bytes with registers).",
+			"basis":                    "Trace session lifetime is unbounded unless stop_after_vdp_frames is set; disk and event retention caps bound storage and evict oldest data. The throughput estimate is provided, but a total-byte estimate is not meaningful without a lifetime limit.",
 		},
 		"note": "Retention caps evict the oldest sealed segments and the bounded store evicts the oldest events; every eviction is counted in loss, so a cap is never silent. Serialize large results into artifacts instead of inline responses.",
 	}

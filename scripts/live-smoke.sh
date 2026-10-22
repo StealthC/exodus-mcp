@@ -749,6 +749,8 @@ print(s)
 			run_result=$(tool_call "run_until_breakpoint" "{\"cpu\": \"m68k\", \"address\": $run_pc, \"timeout_ms\": 20000}")
 			run_reason=$(json_get "$run_result" "parsed.get('stop_reason', '')" 2>/dev/null)
 			check "run_until_breakpoint fires at the target PC" "[ \"\$run_reason\" = 'breakpoint_hit' ]"
+			run_trigger_pc=$(json_get "$run_result" "int(parsed.get('triggering_pc', -1))" 2>/dev/null)
+			check "execution breakpoint stops before the instruction" "[ \"\$run_trigger_pc\" = \"\$run_pc\" ]"
 			run_removed=$(json_get "$run_result" "str(parsed.get('instrument_removed', False)).lower()" 2>/dev/null)
 			check "run_until_breakpoint removes its instrument" "[ \"\$run_removed\" = 'true' ]"
 			run_hit=$(json_get "$run_result" "parsed.get('hit_count', 0) >= 1" 2>/dev/null)
@@ -824,7 +826,7 @@ print(s)
 	# trace flags on stop. The caps here are deliberately small: the probe must
 	# leave no large segment files behind.
 	tool_call "cpu_run" >/dev/null
-	session_start=$(tool_call "trace_session_start" '{"cpu": "m68k", "window_ms": 100, "interval_ms": 300, "max_duration_ms": 20000, "max_total_bytes": 8388608, "max_segments": 16, "access_capture": "ranges", "watches": [{"address": "0xFF0000", "length": 8, "access": "any"}]}')
+	session_start=$(tool_call "trace_session_start" '{"cpu": "m68k", "window_ms": 100, "interval_ms": 300, "max_total_bytes": 8388608, "max_segments": 16, "access_capture": "ranges", "watches": [{"address": "0xFF0000", "length": 8, "access": "any"}]}')
 	session_id=$(json_get "$session_start" "parsed.get('session', {}).get('id', '')" 2>/dev/null)
 	check "trace session starts" "[ -n \"\$session_id\" ]"
 	session_watches=$(json_get "$session_start" "parsed.get('native', {}).get('armed_watches', 0)" 2>/dev/null)

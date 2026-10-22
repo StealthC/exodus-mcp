@@ -163,7 +163,7 @@ func TestTraceSessionLifecycle(t *testing.T) {
 	server := newTestServer(t, fake.client())
 
 	start := structured(postToolCall(t, server, "trace_session_start",
-		`{"cpu":"m68k","watches":[{"address":"0xFF0000","length":4,"access":"write"}]}`))
+		`{"cpu":"m68k","stop_after_vdp_frames":3,"watches":[{"address":"0xFF0000","length":4,"access":"write"}]}`))
 	if start["code"] != nil {
 		t.Fatalf("start failed: %v", start)
 	}
@@ -177,6 +177,9 @@ func TestTraceSessionLifecycle(t *testing.T) {
 	if fake.started0["watch_count"] != "1" || fake.started0["watch0_address"] != strconv.Itoa(0xFF0000) ||
 		fake.started0["watch0_length"] != "4" || fake.started0["watch0_access"] != "write" {
 		t.Fatalf("watch encoding wrong: %v", fake.started0)
+	}
+	if fake.started0["stop_after_vdp_frames"] != "3" {
+		t.Fatalf("VDP frame stop threshold not forwarded: %v", fake.started0)
 	}
 	if _, ok := start["limitations"].(map[string]any); !ok {
 		t.Fatalf("limitations missing: %v", start)
@@ -222,6 +225,33 @@ func TestTraceSessionLifecycle(t *testing.T) {
 		}
 	} else {
 		t.Fatalf("stop must export by default: %v", stop)
+	}
+}
+
+func TestTraceSessionStartHasNoDefaultFrameExpiry(t *testing.T) {
+	fake := newTraceSessionFake()
+	server := newTestServer(t, fake.client())
+	result := structured(postToolCall(t, server, "trace_session_start", `{"cpu":"m68k"}`))
+	if result["code"] != nil {
+		t.Fatalf("start failed: %v", result)
+	}
+	if got := fake.started0["stop_after_vdp_frames"]; got != "0" {
+		t.Fatalf("omitted stop_after_vdp_frames forwarded as %q, want 0 (unbounded)", got)
+	}
+	if _, exists := fake.started0["max_duration_ms"]; exists {
+		t.Fatalf("wall-clock expiry must not be configured by default: %v", fake.started0)
+	}
+}
+
+func TestTraceSessionStartRejectsExcessiveFrameLimit(t *testing.T) {
+	fake := newTraceSessionFake()
+	server := newTestServer(t, fake.client())
+	result := structured(postToolCall(t, server, "trace_session_start", `{"cpu":"m68k","stop_after_vdp_frames":1000000001}`))
+	if result["code"] != "invalid_params" {
+		t.Fatalf("expected invalid_params, got %v", result)
+	}
+	if fake.started {
+		t.Fatal("invalid frame limit reached native bridge")
 	}
 }
 
