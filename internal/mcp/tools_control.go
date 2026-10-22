@@ -99,7 +99,7 @@ func controlToolSpecs() []toolSpec {
 				"event_id_max":  integerProperty("Only events with an id at or below this value.", 1),
 				"context":       stringProperty("Analysis context handle; omitted means the caller's default context, and \"all\" queries the retained history across every context."),
 			}, nil),
-			run: runDebugEventsList,
+			run: aliasRun("cpu_debug_events_list", runDebugEventsList),
 		},
 	}
 }

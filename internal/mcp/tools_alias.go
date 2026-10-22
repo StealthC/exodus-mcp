@@ -65,6 +65,21 @@ var toolAliasRecords = []toolAliasRecord{
 		Mapping:     "mega_drive_memory_map returns the legacy {regions, note, live_spaces} object; memory_map.reference carries the same fields.",
 	},
 	{
+		Alias:       "target_audit_log",
+		Replacement: "events_list",
+		Mapping:     "target_audit_log returns the global audit page; events_list{kinds:[\"audit\"], ...} returns the same page under sections.audit with the same cursor family.",
+	},
+	{
+		Alias:       "context_mutation_log",
+		Replacement: "events_list",
+		Mapping:     "context_mutation_log returns one context's mutation trail without control-lock lifecycle events; events_list{kinds:[\"mutation\"], context:...} returns the same page under sections.mutation.",
+	},
+	{
+		Alias:       "cpu_debug_events_list",
+		Replacement: "events_list",
+		Mapping:     "cpu_debug_events_list returns the debug stop-event page; events_list{kinds:[\"debug\"], ...} accepts the same filters and offset and returns the same page under sections.debug plus an id-based next_cursor.",
+	},
+	{
 		Alias:       "cpu_breakpoint_set",
 		Replacement: "debug_instrument",
 		Mapping:     "cpu_breakpoint_set returns its legacy {breakpoint_id, ...} payload; debug_instrument{action:\"set\", kind:\"breakpoint\", ...} performs the same create and returns it under result.",

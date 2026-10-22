@@ -31,7 +31,7 @@ func targetToolSpecs() []toolSpec {
 				"limit":          integerProperty("Maximum entries returned (default 50, cap 200).", 0),
 				"cursor":         stringProperty("next_cursor from a previous target_audit_log call. The cursor carries the filters and the position, so a later page needs only the cursor; any filter supplied alongside it must match the cursor. Omit to start at the newest page; mutually exclusive with offset."),
 			}, nil),
-			run: runTargetAuditLog,
+			run: aliasRun("target_audit_log", runTargetAuditLog),
 		},
 		{
 			name:        "target_control_acquire",
@@ -78,7 +78,7 @@ func targetToolSpecs() []toolSpec {
 				"offset":  integerProperty("Skip this many matching entries (default 0). Mutually exclusive with cursor.", 0),
 				"cursor":  stringProperty("next_cursor from a previous context_mutation_log call. The cursor carries the context scope and the position, so a later page needs only the cursor."),
 			}, nil),
-			run: runMutationLog,
+			run: aliasRun("context_mutation_log", runMutationLog),
 		},
 	}
 }

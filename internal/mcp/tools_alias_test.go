@@ -10,6 +10,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/StealthC/exodus-mcp/internal/analysis"
 	"github.com/StealthC/exodus-mcp/internal/bridge"
 )
 
@@ -141,7 +142,7 @@ func TestConsolidatedCatalogHasNoDuplicateConcept(t *testing.T) {
 
 // consolidatedCanonicalTools is the merged catalog. Each consolidation group
 // appends its canonical concept here.
-var consolidatedCanonicalTools = []string{"target_status", "memory_map", "memory_read", "disassemble", "cpu_step", "debug_instrument"}
+var consolidatedCanonicalTools = []string{"target_status", "memory_map", "memory_read", "disassemble", "cpu_step", "debug_instrument", "events_list"}
 
 // payloadView strips the fields the dispatcher injects into every response and
 // the alias' own deprecation marker, so two payloads can be compared field by
@@ -720,6 +721,194 @@ func TestDebugInstrumentRejectsArgumentsOutsideTheAction(t *testing.T) {
 		if structured(result)["code"] != "unsupported_parameter" {
 			t.Fatalf("%s: code = %v, want unsupported_parameter", arguments, structured(result))
 		}
+	}
+}
+
+// ----------------------------------------------------------------------------------------------------------------------
+// events_list alias parity (group 7)
+// ----------------------------------------------------------------------------------------------------------------------
+
+// seededAuditServer returns a server whose audit stream holds five
+// memory_write rows and one control-lock lifecycle row.
+func seededAuditServer(t *testing.T) *Server {
+	t.Helper()
+	server := newTestServer(t, &fakeBridgeClient{status: newFakeStatus()})
+	contextID := defaultContextID(t, server)
+	for index := 0; index < 5; index++ {
+		server.audit.Record(analysis.AuditEntry{Tool: "memory_write", Outcome: analysis.OutcomeOK, ContextID: contextID, Detail: map[string]any{"index": index}})
+	}
+	server.audit.Record(analysis.AuditEntry{Tool: "run_state_change", Outcome: analysis.OutcomeOK, ContextID: contextID})
+	server.audit.Record(analysis.AuditEntry{Tool: "target_control_acquire", Outcome: analysis.OutcomeLockEvent, ContextID: contextID})
+	return server
+}
+
+// TestEventsListAbsorbsTheAuditTools proves both audit tools are kinds of one
+// query with the same payload.
+func TestEventsListAbsorbsTheAuditTools(t *testing.T) {
+	cases := []struct {
+		canonical string
+		alias     string
+		aliasArgs string
+		section   string
+	}{
+		{`{"kinds":["audit"],"limit":2}`, "target_audit_log", `{"limit":2}`, "audit"},
+		{`{"kinds":["audit"],"tool":"memory_write","limit":1}`, "target_audit_log", `{"tool":"memory_write","limit":1}`, "audit"},
+		{`{"kinds":["mutation"],"limit":2}`, "context_mutation_log", `{"limit":2}`, "mutation"},
+		{`{"kinds":["run_state"]}`, "target_audit_log", `{"tool":"run_state_change"}`, "run_state"},
+	}
+	for _, tc := range cases {
+		canonical := canonicalPayloadWithServer(t, seededAuditServer(t), "events_list", tc.canonical)
+		legacy := canonicalPayloadWithServer(t, seededAuditServer(t), tc.alias, tc.aliasArgs)
+		sections, _ := canonical["sections"].(map[string]any)
+		section, _ := sections[tc.section].(map[string]any)
+		if section == nil {
+			t.Fatalf("%s: events_list has no %s section: %v", tc.alias, tc.section, canonical)
+		}
+		if !jsonEqual(t, normalizeVolatile(section), normalizeVolatile(legacy)) {
+			t.Fatalf("%s parity failed:\nsection = %v\nlegacy  = %v", tc.alias, section, legacy)
+		}
+		if canonicalCursor, _ := section["next_cursor"].(string); canonicalCursor != "" {
+			legacyCursor, _ := legacy["next_cursor"].(string)
+			if cursorPrefix(canonicalCursor) != cursorPrefix(legacyCursor) {
+				t.Fatalf("%s cursor family = %q, want %q", tc.alias, cursorPrefix(canonicalCursor), cursorPrefix(legacyCursor))
+			}
+		}
+	}
+}
+
+// canonicalPayloadWithServer renders one modern payload from an existing server.
+func canonicalPayloadWithServer(t *testing.T, server *Server, tool, arguments string) map[string]any {
+	t.Helper()
+	return payloadView(t, postToolCall(t, server, tool, arguments))
+}
+
+// TestEventsListAbsorbsTheDebugEvents proves the debug stream is the same query
+// with one extra id-based cursor.
+func TestEventsListAbsorbsTheDebugEvents(t *testing.T) {
+	canonicalFake := newRunUntilFake(t)
+	canonicalFake.fireOnStatusCall = 2
+	server := canonicalFake.server(t)
+	if result := structured(postToolCall(t, server, "run_until_breakpoint", `{"cpu":"m68k","address":4096}`)); result["stop_reason"] != stopReasonBreakpointHit {
+		t.Fatalf("fixture did not record a stop: %v", result)
+	}
+	canonical := payloadView(t, postToolCall(t, server, "events_list", `{"kinds":["debug"]}`))
+	legacy := payloadView(t, postToolCall(t, server, "cpu_debug_events_list", `{}`))
+
+	sections, _ := canonical["sections"].(map[string]any)
+	section, _ := sections["debug"].(map[string]any)
+	if section == nil {
+		t.Fatalf("events_list has no debug section: %v", canonical)
+	}
+	if section["next_cursor"] != nil {
+		t.Fatalf("a complete debug page must report a null next_cursor: %v", section["next_cursor"])
+	}
+	delete(section, "next_cursor")
+	if !jsonEqual(t, section, legacy) {
+		t.Fatalf("debug parity failed:\nsection = %v\nlegacy  = %v", section, legacy)
+	}
+}
+
+// TestEventsListPagesAuditByCursorOnly proves #11 cursor paging survives the
+// merge: a cursor carries the stream and its query.
+func TestEventsListPagesAuditByCursorOnly(t *testing.T) {
+	server := seededAuditServer(t)
+	first := structured(postToolCall(t, server, "events_list", `{"kinds":["audit"],"tool":"memory_write","limit":2}`))
+	cursor, _ := first["next_cursor"].(string)
+	if cursor == "" {
+		t.Fatalf("first page must be partial: %v", first)
+	}
+	seen := map[float64]bool{}
+	collect := func(page map[string]any) {
+		sections, _ := page["sections"].(map[string]any)
+		section, _ := sections["audit"].(map[string]any)
+		for _, raw := range section["entries"].([]any) {
+			entry := raw.(map[string]any)
+			if entry["tool"] != "memory_write" {
+				t.Fatalf("cursor page lost the tool filter: %v", entry)
+			}
+			id := entry["operation_id"].(float64)
+			if seen[id] {
+				t.Fatalf("entry %v repeated across pages", id)
+			}
+			seen[id] = true
+		}
+	}
+	collect(first)
+	for cursor != "" {
+		page := structured(postToolCall(t, server, "events_list", fmt.Sprintf(`{"kinds":["audit"],"cursor":%q}`, cursor)))
+		collect(page)
+		cursor, _ = page["next_cursor"].(string)
+	}
+	if len(seen) != 5 {
+		t.Fatalf("paged %d audit rows, want 5", len(seen))
+	}
+
+	// A cursor is only meaningful for one stream.
+	result := postToolCall(t, server, "events_list", `{"kinds":["audit","debug"],"cursor":"aud1.x"}`)
+	if structured(result)["code"] != "invalid_params" {
+		t.Fatalf("code = %v, want invalid_params", structured(result))
+	}
+}
+
+// TestEventsListRejectsFiltersNoKindConsumes keeps the merged filter surface
+// honest for an explicit selection.
+func TestEventsListRejectsFiltersNoKindConsumes(t *testing.T) {
+	result := postToolCall(t, newTestServer(t, &fakeBridgeClient{status: newFakeStatus()}), "events_list", `{"kinds":["audit"],"cpu":"m68k"}`)
+	payload := structured(result)
+	if payload["code"] != "unsupported_parameter" || payload["field"] != "cpu" {
+		t.Fatalf("payload = %v", payload)
+	}
+}
+
+// volatileAuditFields are per-server values (context handles are generated per
+// server, timestamps are wall clock) that two independently seeded servers can
+// never share; the parity comparison normalizes them instead of ignoring the
+// surrounding structure.
+var volatileAuditFields = map[string]bool{
+	"context_id":       true,
+	"timestamp":        true,
+	"oldest_timestamp": true,
+	"newest_timestamp": true,
+	"created_at":       true,
+	"first_seen_at":    true,
+	"last_seen_at":     true,
+	// A cursor embeds the same per-server context handle, so its payload is
+	// volatile; the parity assertion below still compares the cursor family.
+	"next_cursor": true,
+	"cursor":      true,
+}
+
+// cursorPrefix returns the family prefix of one cursor, the part that names the
+// stream and therefore must match between the merged tool and its alias.
+func cursorPrefix(cursor string) string {
+	if index := strings.Index(cursor, "."); index >= 0 {
+		return cursor[:index+1]
+	}
+	return cursor
+}
+
+// normalizeVolatile replaces per-server values with a placeholder so a parity
+// comparison still checks that both payloads carry them.
+func normalizeVolatile(value any) any {
+	switch typed := value.(type) {
+	case map[string]any:
+		normalized := make(map[string]any, len(typed))
+		for key, entry := range typed {
+			if volatileAuditFields[key] {
+				normalized[key] = "<volatile>"
+				continue
+			}
+			normalized[key] = normalizeVolatile(entry)
+		}
+		return normalized
+	case []any:
+		normalized := make([]any, 0, len(typed))
+		for _, entry := range typed {
+			normalized = append(normalized, normalizeVolatile(entry))
+		}
+		return normalized
+	default:
+		return value
 	}
 }
 
