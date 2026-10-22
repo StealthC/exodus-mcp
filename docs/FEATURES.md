@@ -1,20 +1,31 @@
 # Features
 
-This catalog lists every feature delivered in the `exodus-mcp` analysis
-server, grouped by capability. Only open work is tracked in
-[ROADMAP.md](ROADMAP.md); the [CHANGELOG.md](../CHANGELOG.md) records the
-delivery history.
+This catalog lists the tools the `exodus-mcp` analysis server exposes,
+grouped by capability, and records how far each behavior is verified. Only
+open work is tracked in [ROADMAP.md](ROADMAP.md); the
+[CHANGELOG.md](../CHANGELOG.md) records the delivery history.
 
-The MCP server currently exposes **94 analysis tools** spanning the delivered
-roadmap phases 0-10: bridge and context foundations, memory and artifact
-access, both processors, VDP graphics, deterministic controlled
-experimentation, advanced analysis, evidence annotations, advanced debugging,
-deterministic replay, workflow ergonomics, per-occurrence trace sessions with
-restart recovery, and continuous trace sessions.
-Delivered entries are covered
-by unit and integration tests and exercised live where the native capability
-is available; unavailable native features are documented explicitly (see
-[Validation](#validation)).
+The MCP server currently exposes **94 tools** spanning roadmap phases 0-10:
+bridge and context foundations, memory and artifact access, both processors,
+VDP graphics, deterministic controlled experimentation, advanced analysis,
+evidence annotations, advanced debugging, deterministic replay, workflow
+ergonomics, per-occurrence trace sessions with restart recovery, and trace
+sessions.
+
+A tool exists in the catalog whether or not anyone has verified it, so every
+entry that claims a verified behavior carries one of these markers:
+
+| Marker | Meaning |
+| --- | --- |
+| **proven** | an automated test in this repository covers it; the test is named here and in [Validation](#validation) |
+| **live check** | a check in `scripts/live-smoke.sh` covers it against a running pair; the repository stores no recorded run, so it is only proven for a run of that script at this revision |
+| **unvalidated** | implemented, but no test and no smoke check exercises it — treat the behavior as unverified |
+| **planned** | not implemented; tracked in ROADMAP.md |
+
+Unavailable native capabilities are stated as unavailable instead of being
+described as working. When an entry says something is validated without a
+marker, the marker is defined in [Validation](#validation), which maps each
+claim to the exact test function or smoke-script check that proves it.
 
 ## Cross-cutting behavior
 
@@ -200,7 +211,9 @@ is available; unavailable native features are documented explicitly (see
   captures. Bounded inline matches plus a `memory-diff-results` artifact.
 - `system_snapshot_capture`: bounded atomic cross-domain snapshot with a
   `system-snapshot/1` artifact manifest, shared capture provenance, explicit
-  omitted/unavailable components, and one pause/resume window.
+  omitted/unavailable components, and one pause/resume window. **unvalidated**:
+  the tool appears only in the catalog test; its pause window, manifest, and
+  component selection have no behavioral test.
 - `memory_snapshot_capture`: bounded paused composite capture — one or more
   named ranges of one address space are read inside a single pause window
   (the system is paused exactly once when running and restored afterwards;
@@ -227,20 +240,24 @@ is available; unavailable native features are documented explicitly (see
   token, run state, consistency, capture time — or the honest
   `provenance_unknown` state) for every produced artifact.
 
-## Audio observability (Phase 6 initial slice)
+## Audio observability (Phase 6, partial)
 
 - `sound_status` reads typed YM2612 and SN76489/PSG state without reconstructing
   registers from bus writes. It reports raw register snapshots, FM channel and
   operator envelope/pan/DAC fields, PSG tone/volume/mute fields, device
   availability, and explicit null/unobservable notes. The result is
   `sound-status/1` and is a live, non-atomic sample relative to CPU/VDP.
-- `audio_capture` validates duration (maximum 10 seconds), sample rate,
-  channels, and an 8 MiB WAV cap before asking the native bridge for PCM. The
-  response is artifact-first with `audio-capture/1` metadata and
-  `artifact-provenance/2` identifying the mixer and little-endian PCM. The
-  pinned SDK currently has no safe bounded PCM buffer exposed to the extension,
-  so unavailable/incomplete capture returns a diagnostic and never fabricates
-  a silent WAV.
+  **unvalidated**: no Go test and no `scripts/live-smoke.sh` check calls this
+  tool; the typed reads are only exercised by running it against a live pair.
+- `audio_capture` — **planned, not delivered.** The server-side argument
+  contract exists (duration 1-10000 ms, sample rate 22050/44100/48000,
+  channels 1-2, 8 MiB WAV cap, malformed-WAV rejection) and is returned before
+  the bridge is called, but the pinned plugin answers every `audio_capture`
+  request with `audio_unavailable`
+  (`native-plugin/ExodusMcpPlugin.cpp`, `audio_capture` branch), so the shipped
+  pair can never produce an `audio-capture` artifact. No test covers the
+  server's success branch. Completion is tracked in [ROADMAP.md](ROADMAP.md)
+  Phase 6, which requires a safe bounded PCM buffer from the native SDK.
 
 ## Processors, symbols, and execution (Phase 2 and Phase 4 control)
 
@@ -328,7 +345,11 @@ is available; unavailable native features are documented explicitly (see
   `region_start`/`region_end`/`max_entries`), legacy `ranges` for
   compatibility, and per-section `truncation` facts (`source_events`,
   `decoded_events`, `unique_addresses`, `blocks`, `edges`) — a trace
-  ring/timeout limit is never reported as complete coverage.
+  ring/timeout limit is never reported as complete coverage. The counts,
+  filters, and artifact shape are **proven** by
+  `internal/mcp/tools_phase5_test.go` (`TestCpuCoverageCaptureBuildsCoverage`,
+  `TestCpuCoverageCaptureRegionFilter`); the instruction-aware `blocks` and
+  `edges` structure is **unvalidated** — no test asserts either section.
 - Symbols: `symbols_set`, `symbols_list`, `symbols_clear`, scoped to an
   analysis context. Every symbol keeps both coordinates — the supplied
   `space_id` plus address, and the resolved processor-bus `bus_space_id` plus
@@ -345,21 +366,28 @@ is available; unavailable native features are documented explicitly (see
   extended VRAM, name-table, pattern, and h-scroll-base fields, with
   completed-plane geometry.
 - `frame_capture`: the live rendered frame as a PNG artifact with frame/timing
-  metadata — liveness (frame token advances while running) and paused
-  determinism (identical hashes) validated. The frame buffer is read without
-  pausing, so `system_paused_during_read` is always false and
+  metadata. Paused determinism (identical digests for consecutive captures) is
+  a **live check** (`scripts/live-smoke.sh`, "paused frame captures are
+  deterministic" plus the consecutive-capture stress check); frame liveness
+  (the frame token advancing while the system runs) is **unvalidated** and is
+  visible only in the timestamped token of a manual run. The frame buffer is
+  read without pausing, so `system_paused_during_read` is always false and
   `capture_consistency.state` is `live` (the frame token identifies the
-  rendered frame). Optional `capture_mode: "paused"` makes the frame match a
-  temporally atomic instant. The artifact's capture provenance records the
-  frame token, target generation, and ROM identity.
-- `vdp_memory_read`: VRAM, CRAM, and VSRAM through the proven timed-buffer
-  path. Raw views (`hexdump`, `array_u8`, `raw_base64`), big-endian
+  rendered frame; **proven** by `internal/mcp/tools_frame_capture_test.go`
+  `TestFrameCaptureReportsNoPause`). Optional `capture_mode: "paused"` makes the
+  frame match a temporally atomic instant. The artifact's capture provenance
+  records the frame token, target generation, and ROM identity.
+- `vdp_memory_read`: VRAM, CRAM, and VSRAM through the timed-buffer path.
+  Raw views (`hexdump`, `array_u8`, `raw_base64`), big-endian
   `array_u16` words, and a decoded CRAM view expanding 9-bit RGB entries into
   8-bit RGB (`-RRR-GGG-BBB-` channel layout). Reports
   `system_paused_during_read` when execution had to be stopped and the
   standardized `capture_consistency` object (atomic for a paused timed-buffer
   read); optional `capture_mode: "paused"` makes the sample temporally
-  atomic.
+  atomic. Views and metadata are **proven** by
+  `internal/mcp/tools_test.go` (`TestVDPMemoryReadCramRGB333View`,
+  `TestVDPMemoryReadDefaultsAndMetadata`, `TestVDPMemoryReadRejectsBadRequests`);
+  byte equality with `memory_read` is a **live check**.
 - `vdp_memory_export`: artifact-first binary export of arbitrary
   VRAM/CRAM/VSRAM ranges — the raw bytes land in an immutable
   `vdp-memory-export` artifact (application/octet-stream) with SHA-256,
@@ -400,24 +428,32 @@ is available; unavailable native features are documented explicitly (see
   reported as pending until a frame has rendered with it active. Read under
   the VDP's own lock, never pausing the system (`system_paused_during_read`
   is always false).
-- `vdp_capture`: one bounded atomic VDP capture. It acquires the capture
-  guard once, reads status/registers, the frame buffer, CRAM, VSRAM, selected
-  VRAM ranges, the sprite table, and scroll data, then restores the prior run
-  state; a `vdp-capture-manifest` links all raw and derived artifacts to one
-  `capture_id` and `frame_token`. Callers select expensive components
-  (`include_frame`/`include_cram`/`include_vsram`/`include_vram` with a
-  131072-byte `vram_length` cap/`include_sprite_table`) and the manifest
-  reports each omitted component with its reason. A `vdp-render-manifest`
-  artifact describes one completed frame: display geometry, plane/window
-  configuration, scroll bases and decoded offsets, palette state, sprite
-  link-chain/display order, visible sprite cell bounds, tile/name-table
-  references, priority data, and renderer assumptions. VDP-specific semantics
-  are preserved in every decoded field (big-endian VRAM words, CRAM 9-bit
-  packing, high-nibble-left tile pixel order, name-entry bits, interlace
-  state). `vdp_tile_export`, `vdp_plane_export`, `vdp_sprite_table`, and
-  `vdp_pixel_info` optionally consume a compatible capture via
-  `vdp_capture_id`, making repeated inspection deterministic (byte-identical
-  reuse, `vdp_capture_reused`) and avoiding repeated pauses.
+- `vdp_capture`: one bounded VDP capture guarded by `capture_mode`. The default
+  `"live"` guard performs no pause; `"paused"` pauses once and restores the
+  prior run state through the shared capture guard. It reads status/registers,
+  the frame buffer, CRAM, VSRAM, and optionally one VRAM range (131072-byte
+  `vram_length` cap), then writes a `vdp-capture-manifest` linking the produced
+  artifacts to one `capture_id`; omitted components carry a reason. Two
+  components are placeholders today and the manifest states it: the
+  sprite-table component is recorded as included with a note pointing at
+  `vdp_sprite_table` without reading the table, and the `vdp-render-manifest`
+  artifact is a structural stub whose `display_geometry`, `palette_state`,
+  `sprite_state`, and `scroll_state` entries are notes referring to other
+  artifacts, not decoded plane/window configuration, scroll offsets, sprite
+  display order, or priority data. **unvalidated**: no test and no
+  `scripts/live-smoke.sh` check calls `vdp_capture`.
+- `vdp_capture_id` reuse is **not implemented**. `vdp_tile_export`,
+  `vdp_plane_export`, `vdp_sprite_table`, and `vdp_pixel_info` accept
+  `vdp_capture_id`, validate the `cap_` prefix, and echo
+  `vdp_capture_reused`/`vdp_capture_id`, but each still performs a fresh read;
+  no bytes or artifact of the named capture are consumed, so repeated
+  inspection is not byte-identical and does not avoid pausing. Do not build a
+  workflow on capture reuse until it is implemented.
+- VDP-specific semantics are preserved in the fields that are actually decoded:
+  big-endian VRAM words (`vdp_memory_read` word view), CRAM 9-bit packing
+  (`vdp_memory_read` `cram_rgb333`, `vdp_palette_export`), high-nibble-left
+  tile pixel order (`vdp_tile_export`), and name-entry bits
+  (`vdp_sprite_table`, `vdp_pixel_info`).
 
 ## Controlled experimentation (Phase 4)
 
@@ -430,13 +466,15 @@ is available; unavailable native features are documented explicitly (see
   through the Exodus UI, read its path from `emulator_status.rom.path`
   (`path_source: "loaded_module"`) and pass it back here.
 - `target_reset`: the discoverable reset tool — `kind: "hard"` performs the
-  documented same-path cartridge reload described under `rom_load`. A
-  `kind: "soft"` request is intentionally rejected with
-  `unsupported_plugin`: the fork/plugin now contain the versioned native
-  reset-interface scaffold, but it is not advertised until the M68000
-  architectural reset-vector fetch observer and RAM/VDP preservation checks
-  are implemented. The server never emulates reset with register or memory
-  writes.
+  documented same-path cartridge reload described under `rom_load`. `kind:
+  "soft"` calls the versioned native `soft_reset` bridge operation and is
+  rejected with `unsupported_plugin` when the connected plugin does not
+  advertise it (no register or memory-write fallback, ever). The plugin
+  advertises `soft_reset` only when the loaded fork exposes a compatible
+  `ISystemResetInterface`; that fork-side capability cannot be checked from
+  this repository (the `vendor/exodus` submodule is not initialized in every
+  checkout). The soft path itself is described in
+  [Phase 9](#phase-9-workflow-ergonomics-delivered-atomic-snapshots-reset-input-exports-instrumentation-and-state-override).
 - Target revision: a process-local `target_generation` starts at 1, advances
   exactly once per successful mutation, and is attached to every response,
   resource, snapshot, and audit record. Ambiguous native failures move the
@@ -588,7 +626,10 @@ documented in [TRACE-SESSIONS.md](TRACE-SESSIONS.md).
   `mode: "sampled"` traces `window_ms` (default 100) of every `interval_ms`
   (default 10 000) and leaves the CPU untouched in between; `mode:
   "continuous"` traces every instruction and only rotates the segment file
-  every `segment_ms`. Optional `watches` arm non-breaking read/write
+  every `segment_ms`. **unvalidated**: every test and the live check use the
+  default `sampled` window mode, so continuous capture and
+  `stop_after_vdp_frames` have never been exercised by an automated check.
+  Optional `watches` arm non-breaking read/write
   watchpoints whose hit counters are sampled. `access_capture: "ranges"`
   additionally records **per-occurrence read/write events** inside those ranges
   — native filtering means out-of-range accesses are never written — with a
@@ -652,7 +693,11 @@ suppressed when a different ROM is loaded.
   `external_reset_pulse`, `vector_fetch`, preservation details, generation
   before/after, and initial/final run states. Older plugins fail closed with
   `unsupported_plugin`; native proof failures are exposed as
-  `soft_reset_partial` and never converted to success.
+  `soft_reset_partial` and never converted to success. The older-plugin
+  fallback is **proven** by `internal/mcp/tools_reset_test.go`
+  `TestTargetResetSoftNotDelivered`; the success path is a **live check**
+  (`scripts/live-smoke.sh` requires the soft reset to succeed on the built
+  pair).
 - `one_shot: true` on `cpu_breakpoint_set` / `cpu_watchpoint_set`: the server
   marks the instrument as one-shot in its resource provenance. Whenever the
   emulator is observed paused, a housekeeping sweep reads the native
@@ -722,91 +767,135 @@ suppressed when a different ROM is loaded.
 
 ## Validation
 
-All delivered phases are validated live against Kid Chameleon on the
-reference harness, in addition to unit and integration tests:
+The claims above are backed by two kinds of evidence — automated tests and
+live smoke checks — and this section names the exact one for every claim. The
+repository stores no recorded live run, so a **live check** is only proven for
+the run of `scripts/live-smoke.sh --full` that produced it.
 
-- Pause/run, M68K/Z80 single-instruction steps, and the breakpoint lifecycle,
-  including the conditional-breakpoint surface validated live against the
-  rebuilt plugin: location-condition echo and list agreement, break-on-Nth-hit
-  counters, validation errors, and the plain-breakpoint `break_counter`
-  default (covered by `live-smoke.sh --full`).
-- Symbol-aware disassembly is covered by dedicated unit tests for both CPUs:
-  exact and bus-masked matches, `$`/`0x`/`h`-suffixed operand literal
-  extraction, displacement-placeholder rejection, and cross-space isolation.
-- Watchpoint lifecycle: hit pauses the system at the offending instruction
-  with rollback confirmed, all address formats and access modes, exact error
-  codes, removal, and purge-on-ROM-swap.
-- Memory write with read-back, unaligned word-boundary writes, Z80 RAM, and
-  error codes; `memory_diff` refine-a-candidate workflow.
-- Frame-capture liveness and paused determinism; `vdp_memory_read` byte
-  equality against `memory_read` on VRAM/CRAM/VSRAM; palette decode against
-  the live frame; tile and plane exports reproducing title-screen art;
-  sprite-table chain `[0, 4, 15]` in attract mode; `vdp_pixel_info`
-  attribution of border, layer B sky, layer A text/building, and a bottom-row
-  sprite; `vdp_command_dma_status` live native register/DMA observation with
-  explicit unavailable command-latch fields.
-- Continuous trace sessions: unit and tool tests cover the native trace format,
-  the per-access record contract (direction, width, boundary addresses,
-  previous-value availability, register order), bounded store with loss
-  accounting, access sequence gaps, effective-value filters, manifest round trip
-  and recovery, aggregate watch samples, and artifact export. A native unit test
-  (`native-plugin/tests/memory_access_log_test.cpp`, run by
-  `scripts/native-test.sh` and `scripts/test.sh`) compiles the engine's own
-  record formatter with the host compiler and validates the encoding rules. The
-  live loop exercises a session on the running emulator
-  (`live-smoke.sh --full`), confirming capture without a pause, native access
-  capture with no sequence gaps, segment draining, and trace-flag restoration on
-  stop. The CPU-core integration of the access hook is validated by building the
-  fork and by that live loop; it is not covered by the native unit test, which
-  links only the format header.
-- Save/list/load round trip with generation/ROM provenance and stale flags;
-  `target_reset(kind: "soft")` is live-verified to fail safely with
-  `unsupported_plugin` on the current fork/plugin scaffold, without a native
-  action or register/memory-write fallback;
-  frame advance and input with a 3-button controller; coverage capture;
-  watchpoint-triggered trace capture; ROM header parsing and checksum
-  validation.
-- Artifact provenance: a RAM dump captured at `0xFF0000` searches and diffs at
-  `0xFF0000` with no caller restatement; comparing M68K RAM to Z80 RAM fails
-  with `incompatible_provenance` by default and warns when forced; legacy
-  artifacts without capture metadata report `provenance_unknown`; the
-  `rom_identity` object (file SHA-256, header title/serial, file-based Sega
-  checksum) is computed from a real cartridge file with honest completeness
-  facts; `data_hex` and base64 writes normalize to the same bytes with the
-  same audit hash; `verify_readback` reports exact matches and mask/transform
-  differences.
-- Capture consistency: `memory_snapshot_capture` on a running ROM reports
-  exactly one pause/resume cycle with all range artifacts and the manifest
-  sharing one capture id and the atomic object; a capture with the system
-  already paused performs no pause/resume mutations; a guarded
-  (`capture_mode: "paused"`) read pauses once, reads, and restores (also on
-  read failure); a composite VDP export whose chunked reads found the system
-  running reports `composite_non_atomic` and never claims coherence; mixing
-  artifacts from different composite captures fails with
-  `incompatible_provenance` unless explicitly allowed; `state_load` reports
-  `state_restored`.
-- Atomic VDP capture: `vdp_capture` from a running ROM reports exactly one
-  pause/resume cycle with all artifacts sharing one capture id and frame
-  token; capture reuse (`vdp_capture_id`) makes two derived exports
-  byte-identical without pausing; the render manifest identifies the sprite
-  chain and name-table entries validated against `vdp_pixel_info`; VRAM and
-  CRAM from different frames are never claimed coherent.
-- Structured evidence: a synthetic variable-length 68K sequence forms one
-  instruction-aware coverage block; a conditional branch produces two distinct
-  observed edges across captures; Z80 and M68K trace/coverage artifacts retain
-  their own address spaces; a known RAM write yields its debug event with PC,
-  access direction, effective address, target generation, and linked trace,
-  while a watchpoint timeout produces no synthetic event.
-- Optimistic concurrency: two clients sharing one observed generation produce
-  exactly one mutation and one `target_generation_conflict`; an unconditional
-  single-agent mutation needs no lease or lock; a held control lock rejects
-  foreign mutations while reads stay available; TTL expiry releases only the
-  lock; ambiguous transport failures move the target to the documented
-  resynchronization state; the audit stream reproduces ROM swaps,
-  breakpoint/watchpoint/freeze setup and purge, and generation transitions.
-- `experiment_run` fixture path: manifest artifact contents over HTTP plus
-  the frame-capture artifact, and the internal control lock released with an
-  audited `experiment_completed` reason.
+### Proven by automated tests
+
+The catalog contains 94 unique tool names (`grep -h 'name: *"' internal/mcp/tools*.go`
+excluding tests, deduplicated); determinism of `tools/list` and presence of a
+named subset are asserted by `internal/mcp/server_test.go`
+`TestToolsListDeterministicAndComplete`.
+
+| Area | Test |
+| --- | --- |
+| Memory read caps, decoding, hexdump, dump artifact, artifact get/preview, contexts, register passthrough, disassembly cap, trace artifact, ROM load path, control passthrough, VDP reads, tile/plane/palette exports, sprite table, address parsing, symbols | `internal/mcp/tools_test.go` |
+| Strict decoding, `oneOf` address schemas, canonical address/artifact shapes, space capabilities | `internal/mcp/tools_p1_schema_test.go` |
+| Address-space bus mapping and out-of-range diagnostics | `internal/mcp/tools_spacemap_test.go` |
+| Paused-read flag propagation for `memory_read`, `memory_dump`, `memory_search` | `internal/mcp/tools_paused_read_test.go` |
+| Artifact store: roundtrip, context scoping, preview caps, HTTP full/range/ETag, TTL and startup sweep, `provenance_unknown` vs stamped envelope | `internal/artifact/artifact_test.go` |
+| Capture consistency states, paused guard pause/restore (also on read failure), `memory_snapshot_capture` window and validation, cross-capture diff rejection, `state_load` `state_restored`, composite VDP export consistency | `internal/mcp/tools_consistency_test.go` |
+| Provenance-driven search/diff addressing, typed provenance envelope, ROM identity, checksum completeness, write read-back | `internal/mcp/tools_provenance_test.go` |
+| Breakpoint conditions and the `break_counter` default | `internal/mcp/tools_breakpoint_conditions_test.go` |
+| Freeze lifecycle, limits, surfaced write errors, purge on ROM load | `internal/mcp/tools_freeze_test.go` |
+| Memory-write echo and audit record, `data_hex`/base64 normalization, read-back verification (the memory-write contract itself is described in its own section above) | `internal/mcp/tools_phase4_test.go` `TestMemoryWriteEchoesAndRecordsAudit`, `internal/mcp/tools_provenance_test.go` `TestMemoryWriteHexInputAndEcho`, `TestMemoryWriteReadbackVerification` |
+| Debug-event history folding, gaps, pagination | `internal/mcp/tools_debug_events_test.go` |
+| Run-until wrappers and one-shot sweep | `internal/mcp/tools_run_until_test.go` |
+| Target generation/control lock store, conflict and resynchronization | `internal/analysis/target_test.go` |
+| Control lock, generation conflicts, audit stream, state save/load/list, frame advance, input set, context close | `internal/mcp/tools_phase4_test.go` |
+| Search/diff modes, ROM header parse and checksum, `target_info` ROM summary, coverage counts and region filter, watchpoint trace arguments | `internal/mcp/tools_phase5_test.go` |
+| State run-state contract and `state_load` `run_state` override | `internal/mcp/tools_state_contract_test.go` |
+| State diff metadata, file bytes, identical detection | `internal/mcp/tools_state_diff_test.go` |
+| Deterministic replay true/false/validation | `internal/mcp/tools_replay_test.go` |
+| Annotation lifecycle, filters, staleness, export/import round trip | `internal/mcp/tools_annotations_test.go`, `internal/analysis/annotations_test.go` |
+| Backtrace heuristics, symbol resolution, frame cap | `internal/mcp/tools_backtrace_test.go` |
+| Register-condition parser and evaluator | `internal/mcp/tools_register_condition_test.go` |
+| Sprite-table chain divergence, cycle detection, paused flag, paging | `internal/mcp/tools_sprite_table_test.go`, `internal/mcp/tools_test.go` |
+| VDP memory export artifact, defaults, validation, paused mode | `internal/mcp/tools_vdp_export_test.go` |
+| VDP DMA status native observation and unsupported-plugin path; soft-reset interface gating | `internal/mcp/tools_vdp_command_dma_test.go` |
+| Reset tools: hard reload path, older-plugin soft fallback, preconditions | `internal/mcp/tools_reset_test.go` |
+| Input sequence ordering, lock reuse, validation, release on failure | `internal/mcp/tools_input_sequence_test.go` |
+| Experiment fixtures, allowlist, control reuse, script limits | `internal/mcp/tools_experiment_test.go`, `internal/experiment/runner_test.go`, `internal/experiment/script_test.go` |
+| Trace session store, segment parsing, filters, loss accounting, recovery | `internal/tracing/session_test.go`, `internal/tracing/access_test.go` |
+| Trace session tools and ROM-load retirement | `internal/mcp/tools_trace_session_test.go` |
+| Run-state attribution and externally observed transitions | `internal/mcp/runstate_test.go` |
+| Audit log bounds, filters, window metadata | `internal/analysis/audit_test.go` |
+| Context isolation and lifecycle | `internal/analysis/context_test.go` |
+| Saved-state store provenance | `internal/analysis/states_test.go` |
+| Metrics endpoint | `internal/mcp/metrics_test.go` |
+| Symbol-aware disassembly for both CPUs, operand literal extraction, cross-space isolation | `internal/mcp/tools_disasm_symbols_test.go` |
+| Bridge wire protocol, launch configuration, Windows named-pipe round trip | `internal/bridge/protocol_test.go`, `internal/bridge/launch_test.go`, `internal/bridge/client_windows_test.go` (Windows build tag; run by `scripts/test.sh --windows-live`) |
+| Child shutdown when the HTTP server fails (the listener-before-child ordering itself is code reading, `cmd/exodus-mcp/main.go`) | `cmd/exodus-mcp/main_test.go` `TestRunUntilExodusExitsShutsDownServer`, `TestRunUntilExodusExitsStopsChildWhenServerFails` |
+| Native trace/access record encoding | `native-plugin/tests/memory_access_log_test.cpp`, run by `scripts/native-test.sh` (invoked from `scripts/test.sh`) |
+
+### Proven only by live checks
+
+Each label below is a `check` string in `scripts/live-smoke.sh`; run
+`bash ./scripts/live-smoke.sh --full` against a running pair to reproduce it.
+
+- Pause/run, M68K step, breakpoint lifecycle and conditional breakpoint echo:
+  "cpu_pause succeeds", "m68k_step succeeds while paused", "plain breakpoint
+  defaults break_counter to 1", "conditional breakpoint echoes condition",
+  "conditional breakpoint listed with condition", "watchpoint set returns an
+  id".
+- Paused frame determinism: "paused frame captures are deterministic",
+  "consecutive paused captures stay responsive".
+- VDP reads and exports: "vdp_memory_read matches generic memory bytes", "cram
+  decode yields 64 palette entries", "sprite table decodes paged entries",
+  "sprite link chain walks", "palette export yields four lines", "tile export
+  attaches png and json artifacts", "plane export attaches png and json
+  artifacts", "pixel info attributes a source layer".
+- ROM header parsing and checksum: "rom_info identifies the cartridge",
+  "rom_info validates the header checksum", "rom_info checksum matches an
+  independent computation" (skipped when the ROM path is not readable from
+  WSL).
+- Memory search/diff over a snapshot: "memory_search finds the header magic",
+  "memory_diff scans the snapshot range", "memory_diff equal_to finds the
+  header byte".
+- Coverage and watchpoint trace: "coverage records executed entries",
+  "watchpoint trace captures entries", "watchpoint trace stops on the hit".
+- Concurrency, lock, freeze, audit and experiment plumbing: "stale generation
+  yields target_generation_conflict", "lock expires by its TTL", "reads stay
+  available under the lock", "memory_freeze sweeper re-applied the cell",
+  "target audit stream is queryable", "experiment releases its internal lock".
+- Hard and soft reset: "target_reset reports reset_source hard", "target_reset
+  soft succeeds while paused", "soft reset advances generation once",
+  "target_reset soft preserves running state".
+- `run_until_*`, one-shot removal and pause attribution: "run_until_breakpoint
+  fires at the target PC", "run_until_watchpoint fires on a RAM write",
+  "emulator_status attributes the managed stop", "one-shot breakpoint
+  auto-removes on hit".
+- Sampled trace session: "trace session starts", "native access stream is
+  reported", "per-access write records are captured", "per-access sequence has
+  no gaps in a short run", "trace session never pauses the CPU", "trace session
+  restores trace flags", "trace session deletes its segments".
+
+### Unvalidated
+
+Implemented but covered by neither a test nor a live-smoke check, so the
+behavior is unverified as of this revision:
+
+- `sound_status`: no test, no smoke check.
+- `audio_capture`: unreachable success path — the pinned plugin answers
+  `audio_unavailable` for every call.
+- `vdp_capture` and its `vdp-capture-manifest` / `vdp-render-manifest`
+  artifacts: no test, no smoke check, and the sprite-table and render-manifest
+  components are placeholders (see the VDP section).
+- `vdp_capture_id` reuse in `vdp_tile_export`, `vdp_plane_export`,
+  `vdp_sprite_table`, and `vdp_pixel_info`: the parameter is validated and
+  echoed; no captured bytes are reused.
+- `system_snapshot_capture`: appears only in the catalog test; its pause
+  window, manifest, and component selection are untested.
+- Trace session `mode: "continuous"` and `stop_after_vdp_frames`: both tests
+  and the live check use the default `sampled` window mode.
+- `cpu_coverage_capture` `blocks`/`edges`: the tests assert entry, distinct and
+  range counts and the artifact kind, not the instruction-aware block/edge
+  structure.
+- Frame liveness (frame token advancing while running): no automated
+  assertion; only paused determinism is checked.
+- Decoding claims that were verified by looking at a title screen: tile and
+  plane exports reproducing title-screen art, palette decode against the live
+  frame, the attract-mode sprite chain `[0, 4, 15]`, and the per-layer
+  `vdp_pixel_info` attribution list. The smoke check only asserts that a source
+  layer is reported.
+- Watchpoint "pauses at the offending instruction with rollback confirmed":
+  the lifecycle is live-checked, the rollback assertion is not automated.
+- Soft-reset preservation proofs in the fork: the server and plugin contract is
+  testable (older-plugin fallback) and live-checked on a compatible pair, but
+  the fork-side `ISystemResetInterface` implementation is outside this
+  repository and cannot be verified here.
 
 ## Adopted external input
 

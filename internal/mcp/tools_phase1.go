@@ -119,7 +119,7 @@ func phase1ToolSpecs() []toolSpec {
 		},
 		{
 			name:        "target_info",
-			description: "Report emulator identity, loaded modules, device summary, and the platform baseline. ROM header parsing arrives in a later phase.",
+			description: "Report emulator identity (plugin version and lifecycle), loaded modules, device summary, the platform baseline, and a light cartridge summary read from the 256-byte header at 0x100 (identified flag, system type, title, serial, region, or an explicit reason when no cartridge is identified). The full parsed header, checksum validation, and memory mapping are available through rom_info.",
 			schema:      objectSchema(map[string]any{}, nil),
 			run:         runTargetInfo,
 		},
