@@ -6,8 +6,10 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"mime"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -182,13 +184,26 @@ type Artifact struct {
 	ContextID  string      `json:"context_id"`
 	CreatedAt  time.Time   `json:"created_at"`
 	Provenance *Provenance `json:"provenance,omitempty"`
+
+	// SchemaVersion is the schema_version the payload declares inside itself
+	// (JSON artifacts only), recorded at write time so listing can report it
+	// without re-reading the bytes.
+	SchemaVersion string `json:"schema_version,omitempty"`
 }
 
-// Store persists immutable artifacts on disk with an in-memory index.
+// Store persists immutable artifacts on disk with an in-memory index mirrored to
+// a JSON document in the same directory, so a restarted server reopens what it
+// wrote instead of discarding it.
 type Store struct {
 	dir       string
 	mu        sync.RWMutex
 	artifacts map[string]Artifact
+	captures  map[string]Capture
+
+	// retention is the TTL the store enforces (0 = unlimited). It is learned
+	// from ExpireOlderThan or SetRetention and persisted with the index, so
+	// listing can report an artifact's expiry before a download fails.
+	retention time.Duration
 
 	// OnPut, when non-nil, is invoked after a successful write with the
 	// stored artifact's kind. It lets the owner observe artifact creation
@@ -197,24 +212,42 @@ type Store struct {
 	OnPut func(kind string)
 }
 
-// NewStore creates or reopens a store directory. Stale files from earlier
-// sessions are removed because the index is intentionally session-scoped.
+// NewStore creates or reopens a store directory. The persisted index is loaded
+// first, so artifacts written by an earlier session stay retrievable; files no
+// index entry claims are removed, so a partial write or a hand-placed file never
+// becomes an artifact.
 func NewStore(dir string) (*Store, error) {
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return nil, fmt.Errorf("create artifact directory: %w", err)
+	}
+	store := &Store{
+		dir:       dir,
+		artifacts: make(map[string]Artifact),
+		captures:  make(map[string]Capture),
+	}
+	if err := store.loadIndex(); err != nil {
+		return nil, err
 	}
 	entries, err := os.ReadDir(dir)
 	if err != nil {
 		return nil, fmt.Errorf("scan artifact directory: %w", err)
 	}
 	for _, entry := range entries {
-		if !entry.IsDir() {
-			if err := os.RemoveAll(filepath.Join(dir, entry.Name())); err != nil {
-				return nil, fmt.Errorf("clean stale artifact: %w", err)
-			}
+		if entry.IsDir() {
+			continue
+		}
+		name := entry.Name()
+		if name == indexFileName {
+			continue
+		}
+		if _, known := store.artifacts[name]; known {
+			continue
+		}
+		if err := os.RemoveAll(filepath.Join(dir, name)); err != nil {
+			return nil, fmt.Errorf("clean stale artifact: %w", err)
 		}
 	}
-	return &Store{dir: dir, artifacts: make(map[string]Artifact)}, nil
+	return store, nil
 }
 
 // Dir reports the backing directory.
@@ -222,9 +255,12 @@ func (store *Store) Dir() string { return store.dir }
 
 // ExpireOlderThan removes artifacts created before the given age, deleting
 // their backing files, and returns how many were removed. A non-positive TTL
-// disables expiry and never removes anything. Unknown-file removal errors are
-// surfaced so an operator can notice a broken store, but the sweep continues
-// reporting the count of artifacts removed so far this pass.
+// disables expiry and never removes anything. The TTL is recorded as the store's
+// retention so listing can report each artifact's expiry; captures whose
+// manifest or components were removed are dropped from the capture index.
+// Unknown-file removal errors are surfaced so an operator can notice a broken
+// store, but the sweep continues reporting the count of artifacts removed so far
+// this pass.
 func (store *Store) ExpireOlderThan(ttl time.Duration) (int, error) {
 	if ttl <= 0 {
 		return 0, nil
@@ -232,6 +268,7 @@ func (store *Store) ExpireOlderThan(ttl time.Duration) (int, error) {
 	cutoff := time.Now().UTC().Add(-ttl)
 	store.mu.Lock()
 	defer store.mu.Unlock()
+	store.retention = ttl
 	removed := 0
 	for id, artifact := range store.artifacts {
 		if artifact.CreatedAt.After(cutoff) {
@@ -242,6 +279,19 @@ func (store *Store) ExpireOlderThan(ttl time.Duration) (int, error) {
 		}
 		delete(store.artifacts, id)
 		removed++
+	}
+	droppedCaptures := 0
+	for id, capture := range store.captures {
+		if capture.CreatedAt.After(cutoff) {
+			continue
+		}
+		delete(store.captures, id)
+		droppedCaptures++
+	}
+	if removed > 0 || droppedCaptures > 0 {
+		if err := store.persistIndexLocked(); err != nil {
+			return removed, err
+		}
 	}
 	return removed, nil
 }
@@ -296,13 +346,35 @@ func (store *Store) PutWithProvenance(contextID, kind, mimeType string, data []b
 	if err := os.WriteFile(store.path(id), data, 0o600); err != nil {
 		return Artifact{}, fmt.Errorf("write artifact bytes: %w", err)
 	}
+	artifact.SchemaVersion = extractSchemaVersion(mimeType, data)
 	store.mu.Lock()
 	store.artifacts[id] = artifact
+	persistErr := store.persistIndexLocked()
 	store.mu.Unlock()
+	if persistErr != nil {
+		return Artifact{}, persistErr
+	}
 	if store.OnPut != nil {
 		store.OnPut(kind)
 	}
 	return artifact, nil
+}
+
+// extractSchemaVersion reads the schema_version a JSON payload declares about
+// itself, so listing can report it without re-reading the bytes. Raw and image
+// artifacts declare none, and a payload without the field stays unversioned.
+func extractSchemaVersion(mimeType string, data []byte) string {
+	mediaType, _, _ := mime.ParseMediaType(mimeType)
+	if mediaType != "application/json" && !strings.HasSuffix(mediaType, "+json") {
+		return ""
+	}
+	var probe struct {
+		SchemaVersion string `json:"schema_version"`
+	}
+	if err := json.Unmarshal(data, &probe); err != nil {
+		return ""
+	}
+	return probe.SchemaVersion
 }
 
 // FinalizeCaptureConsistency completes the capture-consistency object of the
@@ -322,6 +394,7 @@ func (store *Store) FinalizeCaptureConsistency(ids []string, consistency *Captur
 	}
 	store.mu.Lock()
 	defer store.mu.Unlock()
+	changed := false
 	for _, id := range ids {
 		stored, present := store.artifacts[id]
 		if !present || stored.Provenance == nil {
@@ -331,6 +404,12 @@ func (store *Store) FinalizeCaptureConsistency(ids []string, consistency *Captur
 		stored.Provenance.CaptureConsistency = &completed
 		stored.Provenance.Consistency = consistency.State
 		store.artifacts[id] = stored
+		changed = true
+	}
+	if changed {
+		// The completion is durable metadata: persist it so a restarted server
+		// never advertises the provisional window state.
+		_ = store.persistIndexLocked()
 	}
 }
 

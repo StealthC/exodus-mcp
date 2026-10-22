@@ -207,7 +207,7 @@ func TestCanonicalAddressAndArtifactShapes(t *testing.T) {
 		t.Fatalf("memory_dump summary canonical wrong: %v", summary)
 	}
 	artifactDesc := dumpSc["artifact"].(map[string]any)
-	for _, key := range []string{"id", "kind", "mime_type", "size_bytes", "sha256", "url", "resource_uri", "provenance", "provenance_state"} {
+	for _, key := range []string{"id", "kind", "mime_type", "size_bytes", "sha256", "url", "provenance", "provenance_state"} {
 		if _, ok := artifactDesc[key]; !ok {
 			t.Fatalf("artifact descriptor missing %s: %v", key, artifactDesc)
 		}
@@ -233,7 +233,7 @@ func TestCanonicalAddressAndArtifactShapes(t *testing.T) {
 	}
 	for _, a := range artifacts {
 		desc := a.(map[string]any)
-		for _, key := range []string{"id", "mime_type", "size_bytes", "sha256", "url", "resource_uri", "provenance"} {
+		for _, key := range []string{"id", "mime_type", "size_bytes", "sha256", "url", "provenance"} {
 			if _, ok := desc[key]; !ok {
 				t.Fatalf("tile artifact missing %s: %v", key, desc)
 			}

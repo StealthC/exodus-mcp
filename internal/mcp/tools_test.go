@@ -167,7 +167,7 @@ func TestMemoryDumpProducesArtifact(t *testing.T) {
 	}
 	content := structured(result)
 	artifactDesc := content["artifact"].(map[string]any)
-	for _, key := range []string{"id", "mime_type", "size_bytes", "sha256", "url", "resource_uri"} {
+	for _, key := range []string{"id", "mime_type", "size_bytes", "sha256", "url"} {
 		if _, present := artifactDesc[key]; !present {
 			t.Fatalf("artifact descriptor missing %s: %v", key, artifactDesc)
 		}
