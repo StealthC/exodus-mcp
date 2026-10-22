@@ -699,7 +699,7 @@ func TestCpuTraceCaptureWatchpointPassesParams(t *testing.T) {
 	}
 	content := structured(callTool(t, client, "cpu_trace_capture_watchpoint", `{"watchpoint_id":3,"max_entries":2,"timeout_ms":900}`))
 	summary := content["summary"].(map[string]any)
-	if summary["stopped_on_watchpoint"] != true || summary["stop_reason"] != "watchpoint_hit" {
+	if summary["stopped_on_watchpoint"] != true || summary["native_stop_reason"] != "watchpoint_hit" {
 		t.Fatalf("stop fields wrong: %v", summary)
 	}
 	hits := summary["watchpoint_ids_hit"].([]any)

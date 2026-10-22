@@ -36,12 +36,7 @@ func runVDPCommandDMAStatus(tc toolContext, args json.RawMessage) map[string]any
 	payload["target_generation"] = tc.server.target.Generation()
 	payload["rom_identity"] = tc.server.romIdentityView(0)
 	payload["captured_at"] = capturedAt.Format(time.RFC3339Nano)
-	payload["capture_consistency"] = map[string]any{
-		"state":             "composite_non_atomic",
-		"paused_by_tool":    false,
-		"initial_run_state": tc.server.runStateString(),
-		"final_run_state":   tc.server.runStateString(),
-		"note":              "VDP registers and internal status are observed by the native plugin; atomicity with CPU state is not claimed.",
-	}
+	payload["capture_consistency"] = tc.server.captureConsistencyView(newCaptureConsistency(tc.server, consistencyCompositeNonAtomic,
+		"VDP registers and internal status are observed by the native plugin; atomicity with CPU state is not claimed."))
 	return okResult(payload, tc.modern)
 }

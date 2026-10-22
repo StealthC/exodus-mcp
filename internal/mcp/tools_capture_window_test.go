@@ -251,8 +251,10 @@ func TestPausedCaptureArtifactProvenanceMatchesResponse(t *testing.T) {
 			if provenance["consistency"] != tc.wantState {
 				t.Fatalf("legacy consistency label = %v, want %v (derived from the object)", provenance["consistency"], tc.wantState)
 			}
-			if summary["consistency"] != tc.wantState {
-				t.Fatalf("response consistency label = %v, want %v (derived from the object)", summary["consistency"], tc.wantState)
+			// Issue #12: the response carries only the object, never a second
+			// bare label that could disagree with it.
+			if value, present := summary["consistency"]; present {
+				t.Fatalf("response must not carry the deprecated consistency label, got %v", value)
 			}
 			// The stored metadata survives the response, so a later
 			// artifact_describe sees the finalized window too.
@@ -287,8 +289,8 @@ func TestLiveCaptureProvenanceMatchesResponse(t *testing.T) {
 		t.Fatalf("live capture of a paused target reports: %v", response)
 	}
 	summary := mustMap(t, content["summary"], "summary")
-	if summary["consistency"] != "paused" {
-		t.Fatalf("response consistency label = %v, want paused", summary["consistency"])
+	if value, present := summary["consistency"]; present {
+		t.Fatalf("response must not carry the deprecated consistency label, got %v", value)
 	}
 	artifact := mustMap(t, content["artifact"], "artifact")
 	provenance := mustMap(t, artifact["provenance"], "artifact provenance")

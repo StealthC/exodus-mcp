@@ -677,13 +677,25 @@ const (
 
 // Provenance vocabulary for why a stop event happened. Every recorded event is
 // a managed instrument stop: the server only records a stop it proved with a
-// managed breakpoint/watchpoint hit counter.
+// managed breakpoint/watchpoint hit counter. The same four-plus-one values are
+// published for emulator_status and run_until_*, so one conditional answers
+// "why did execution stop" on every surface (see stopSourceVocab).
 const (
 	stopSourceInstrument = "instrument"
 	stopSourceExternal   = "external"
 	stopSourceMCP        = "mcp"
 	stopSourceNone       = "none"
 	stopSourceUnknown    = "unknown"
+)
+
+// Provenance vocabulary for who produced the current run state (pause_source).
+// It is a different question from stop_source: pause_source names the actor
+// that left the machine in its state, stop_source names why execution stopped.
+const (
+	pauseSourceBreakpointOrWatchpoint = "breakpoint_or_watchpoint"
+	pauseSourceMCP                    = "mcp"
+	pauseSourceUIOrExternal           = "ui_or_external"
+	pauseSourceUnknown                = "unknown"
 )
 
 // eventStopSource names why an event exists from its resource kind. An event is

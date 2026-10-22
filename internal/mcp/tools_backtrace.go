@@ -355,7 +355,7 @@ func runBacktrace(tc toolContext, args json.RawMessage) map[string]any {
 		"truncated":           truncated,
 		"frames":              frames,
 		"registers":           registerSummary,
-		"capture_consistency": captureConsistencyToMap(buildCaptureConsistency(tc.server, map[string]any{}, true, allReadsPaused, nil, nil)),
+		"capture_consistency": tc.server.captureConsistencyView(buildCaptureConsistency(tc.server, map[string]any{}, true, allReadsPaused, nil, nil)),
 	}
 	if scanNote != "" {
 		result["scan_note"] = scanNote

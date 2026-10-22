@@ -90,17 +90,36 @@ func lookupTool(name string) *toolSpec {
 	return nil
 }
 
-// toolSchemas renders deterministic tool descriptors shared by both eras.
+// toolSchemas renders deterministic tool descriptors shared by both eras. The
+// emitted vocabularies are published next to every inputSchema (as the
+// `x-response-vocabularies` extension) so a client can validate what the server
+// may return instead of learning it per tool from prose.
 func toolSchemas() []map[string]any {
 	schemas := make([]map[string]any, 0, len(toolRegistry))
 	for _, spec := range toolRegistry {
 		schemas = append(schemas, map[string]any{
 			"name":        spec.name,
 			"description": spec.description,
-			"inputSchema": spec.schema,
+			"inputSchema": publishedSchema(spec.schema),
 		})
 	}
 	return schemas
+}
+
+// publishedSchema decorates one input schema with the response contract
+// annotations. The handler's own schema is never mutated: dispatch-time enum
+// validation reads it directly.
+func publishedSchema(schema map[string]any) map[string]any {
+	if schema == nil {
+		return nil
+	}
+	published := make(map[string]any, len(schema)+2)
+	for key, value := range schema {
+		published[key] = value
+	}
+	published[responseVocabularySchemaKey] = responseVocabularyDeclaration()
+	published[responseDeprecationSchemaKey] = responseDeprecationDeclaration()
+	return published
 }
 
 func (server *Server) callTool(ctx context.Context, params json.RawMessage, modern bool) map[string]any {
@@ -663,7 +682,7 @@ func artifactDescriptor(server *Server, stored artifact.Artifact, contextID stri
 		"url":        fmt.Sprintf("%s/artifacts/%s?context=%s", server.baseURL, stored.ID, contextID),
 	}
 	if stored.Provenance != nil {
-		descriptor["provenance"] = provenanceEnvelopeView(*stored.Provenance)
+		descriptor["provenance"] = server.provenanceEnvelopeView(*stored.Provenance)
 		descriptor["provenance_state"] = stored.Provenance.State
 	} else {
 		descriptor["provenance"] = provenanceUnknownView()

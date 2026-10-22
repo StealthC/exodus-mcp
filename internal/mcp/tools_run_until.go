@@ -483,6 +483,27 @@ func runUntil(tc toolContext, ac *analysis.Context, plan runUntilPlan) map[strin
 	}
 }
 
+// run_until stop_reason labels: which instrument ended the window. This is not
+// stop_source (why execution stopped) and not triggering_pc_source (where the
+// PC came from).
+const (
+	stopReasonBreakpointHit = "breakpoint_hit"
+	stopReasonWatchpointHit = "watchpoint_hit"
+)
+
+// stopReasonForKind renders the stop_reason of one run_until window from its
+// instrument kind, in the declared vocabulary.
+func stopReasonForKind(kind string) string {
+	switch kind {
+	case "breakpoint":
+		return stopReasonBreakpointHit
+	case "watchpoint":
+		return stopReasonWatchpointHit
+	default:
+		return consistencyUnknown
+	}
+}
+
 // instrumentRemoval is the verified outcome of one native removal call.
 // Removed is true only when the native side proved no instrument is armed:
 // either it deleted the resource (removed) or it no longer owned it
@@ -564,7 +585,7 @@ func runUntilSuccess(tc toolContext, plan runUntilPlan, status *emulatorStatusDa
 	registers := fetchCPURegisters(tc, plan.cpu)
 	pc, pcSource := stopTriggeringPC(event, registers)
 	result := map[string]any{
-		"stop_reason":   plan.kind + "_hit",
+		"stop_reason":   stopReasonForKind(plan.kind),
 		"stop_source":   stopSource,
 		"resource_kind": plan.kind,
 		"resource_id":   id,

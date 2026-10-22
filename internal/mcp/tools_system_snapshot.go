@@ -167,6 +167,9 @@ func runSystemSnapshot(tc toolContext, args json.RawMessage) map[string]any {
 			window.PauseVerified = state == runStatePaused
 		}
 	}
+	// The components are read after the guard's own pause: the window reports
+	// the generation the sample belongs to.
+	window.TargetGeneration = tc.server.target.Generation()
 	captureID := newCaptureID()
 	at := time.Now().UTC()
 	consistency := &artifact.CaptureConsistency{State: consistencyAtomic, ExecutionPausedByTool: wasRunning, InitialRunState: initial, InitialFrameToken: initialToken}
@@ -354,7 +357,10 @@ func runSystemSnapshot(tc toolContext, args json.RawMessage) map[string]any {
 	// The manifest embeds the component descriptors, which were built while the
 	// window was open: re-stamp them before writing the durable manifest so it
 	// cannot carry a provisional window state.
-	view := captureConsistencyToMap(consistency)
+	view := tc.server.captureConsistencyViewFor(consistency, window.generation())
+	// The durable manifest carries the same complete object shape as the
+	// response, not the frozen struct's subset.
+	manifest["capture_consistency"] = view
 	restampCaptureProvenance(manifest, view, consistency.State)
 	b, err := json.MarshalIndent(manifest, "", "  ")
 	if err != nil {

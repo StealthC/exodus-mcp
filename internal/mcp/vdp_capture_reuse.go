@@ -177,14 +177,14 @@ func (data *vdpCaptureData) omittedFailure(name, reason string) *toolFailure {
 
 // captureConsistencyView is the capture's own capture_consistency object, or nil
 // when the manifest provenance carries none.
-func (data *vdpCaptureData) captureConsistencyView() map[string]any {
-	return captureConsistencyToMap(data.consistency)
+func (data *vdpCaptureData) captureConsistencyView(tc toolContext) map[string]any {
+	return tc.server.captureConsistencyViewFor(data.consistency, data.capture.TargetGeneration)
 }
 
 // captureConsistencyState is the capture's consistency label, or "unknown".
 func (data *vdpCaptureData) captureConsistencyState() string {
 	if data.consistency == nil || data.consistency.State == "" {
-		return "unknown"
+		return consistencyUnknown
 	}
 	return data.consistency.State
 }
@@ -231,8 +231,7 @@ func (source captureReuseSource) annotate(tc toolContext, value map[string]any, 
 	if source.data.frameToken != nil {
 		value["vdp_capture_frame_token"] = *source.data.frameToken
 	}
-	value["capture_consistency"] = source.data.captureConsistencyView()
-	value["consistency"] = source.data.captureConsistencyState()
+	value["capture_consistency"] = source.data.captureConsistencyView(tc)
 	if note != "" {
 		value["note"] = note
 	}

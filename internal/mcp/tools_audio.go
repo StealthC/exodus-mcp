@@ -7,8 +7,6 @@ import (
 	"fmt"
 	"strings"
 	"time"
-
-	"github.com/StealthC/exodus-mcp/internal/artifact"
 )
 
 const (
@@ -78,7 +76,8 @@ func runSoundStatus(tc toolContext, raw json.RawMessage) map[string]any {
 	if payload == nil {
 		payload = map[string]any{}
 	}
-	payload["capture_consistency"] = map[string]any{"state": "live", "execution_paused_by_tool": false, "execution_resumed_after": false, "initial_run_state": tc.server.runStateString(), "final_run_state": tc.server.runStateString(), "note": "YM2612/PSG state is sampled through the native device interfaces; it is not temporally atomic with CPU or VDP."}
+	payload["capture_consistency"] = tc.server.captureConsistencyView(newCaptureConsistency(tc.server, consistencyLive,
+		"YM2612/PSG state is sampled through the native device interfaces; it is not temporally atomic with CPU or VDP."))
 	payload["target_generation"] = tc.server.target.Generation()
 	payload["captured_at"] = time.Now().UTC().Format(time.RFC3339Nano)
 	payload["rom_path"] = tc.server.currentROMPath()
@@ -148,7 +147,8 @@ func runAudioCapture(tc toolContext, raw json.RawMessage) map[string]any {
 	}
 	now := time.Now().UTC()
 	generation := tc.server.target.Generation()
-	consistency := &artifact.CaptureConsistency{State: "composite_non_atomic", InitialRunState: tc.server.runStateString(), FinalRunState: tc.server.runStateString(), Note: "Audio is captured under the native audio clock and is not atomic with CPU or VDP state."}
+	consistency := newCaptureConsistency(tc.server, consistencyCompositeNonAtomic,
+		"Audio is captured under the native audio clock and is not atomic with CPU or VDP state.")
 	captureID := fmt.Sprintf("audio-%d", now.UnixNano())
 	provenance := genericProvenance(tc.server, "audio-capture", now)
 	provenance.CaptureID = captureID
@@ -162,5 +162,5 @@ func runAudioCapture(tc toolContext, raw json.RawMessage) map[string]any {
 	if err != nil {
 		return failureResult(&toolFailure{Code: "artifact_error", Message: err.Error()}, tc.modern)
 	}
-	return okResult(map[string]any{"schema_version": "audio-capture/1", "capture_id": captureID, "duration_requested_ms": args.DurationMS, "sample_rate": rate, "channels": channels, "frames": frames, "state": "complete", "capture_consistency": consistency, "artifact": artifactDescriptor(tc.server, stored, context.ID)}, tc.modern)
+	return okResult(map[string]any{"schema_version": "audio-capture/1", "capture_id": captureID, "duration_requested_ms": args.DurationMS, "sample_rate": rate, "channels": channels, "frames": frames, "state": "complete", "capture_consistency": tc.server.captureConsistencyView(consistency), "artifact": artifactDescriptor(tc.server, stored, context.ID)}, tc.modern)
 }

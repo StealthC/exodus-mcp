@@ -140,16 +140,21 @@ func (tracker *runStateTracker) observe(server *Server, running bool, frameToken
 	if !external || server == nil {
 		return
 	}
-	attribution := "external (no MCP run-state action explains the transition)"
+	// The audit stream uses the same pause_source vocabulary as every other
+	// surface; the prose that used to be the whole value is the note beside it.
+	pauseSource := pauseSourceUIOrExternal
+	pauseNote := "External (no MCP run-state action explains the transition)."
 	if !running && stop != nil {
-		attribution = "breakpoint_or_watchpoint (MCP-managed " + stop.Kind + " " + strconv.FormatUint(stop.ResourceID, 10) + " fired with hit count " + strconv.FormatUint(stop.HitCount, 10) + ")"
+		pauseSource = pauseSourceBreakpointOrWatchpoint
+		pauseNote = "MCP-managed " + stop.Kind + " " + strconv.FormatUint(stop.ResourceID, 10) + " fired with hit count " + strconv.FormatUint(stop.HitCount, 10) + "."
 	}
 	detail := map[string]any{
 		"event":                      "run_state_change",
 		"system_running":             running,
 		"previous_system_running":    !running,
 		"observed_target_generation": server.target.Generation(),
-		"attribution":                attribution,
+		"pause_source":               pauseSource,
+		"pause_source_note":          pauseNote,
 	}
 	if frameToken != nil {
 		detail["frame_token"] = *frameToken
@@ -168,15 +173,15 @@ func (tracker *runStateTracker) view(running bool) (source, note string) {
 	tracker.mu.Lock()
 	defer tracker.mu.Unlock()
 	if tracker.stopAttribution != nil && !running {
-		return "breakpoint_or_watchpoint", "A native debugger stop was attributed to MCP-managed " + tracker.stopAttribution.Kind + " " + strconv.FormatUint(tracker.stopAttribution.ResourceID, 10) + " (hit count " + strconv.FormatUint(tracker.stopAttribution.HitCount, 10) + ")."
+		return pauseSourceBreakpointOrWatchpoint, "A native debugger stop was attributed to MCP-managed " + tracker.stopAttribution.Kind + " " + strconv.FormatUint(tracker.stopAttribution.ResourceID, 10) + " (hit count " + strconv.FormatUint(tracker.stopAttribution.HitCount, 10) + ")."
 	}
 	if tracker.mcpSet != nil && *tracker.mcpSet == running {
-		return "mcp", "The observed run state matches the last run-state-affecting MCP action; the change is attributed to MCP."
+		return pauseSourceMCP, "The observed run state matches the last run-state-affecting MCP action; the change is attributed to MCP."
 	}
 	if tracker.observed != nil {
-		return "ui_or_external", "No MCP run-state action explains the current state; it was changed by the emulator UI, another bridge client, or a native debugger stop (breakpoint_or_watchpoint is reported when the plugin exposes a stop reason)."
+		return pauseSourceUIOrExternal, "No MCP run-state action explains the current state; it was changed by the emulator UI, another bridge client, or a native debugger stop (breakpoint_or_watchpoint is reported when the plugin exposes a stop reason)."
 	}
-	return "unknown", "No run state has been observed or set yet in this server process."
+	return pauseSourceUnknown, "No run state has been observed or set yet in this server process."
 }
 
 // lastKnownChange returns the last known run-state transition time and

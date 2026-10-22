@@ -186,7 +186,7 @@ func runVDPMemoryExport(tc toolContext, args json.RawMessage) map[string]any {
 			"byte_order":                byteOrder,
 			"raw_byte_ordering":         "address-order",
 			"system_paused_during_read": pausedDuringRead,
-			"capture_consistency":       captureConsistencyToMap(consistencyObject),
+			"capture_consistency":       tc.server.captureConsistencyViewWindow(window, consistencyObject),
 			"artifact":                  artifactDescriptor(tc.server, stored, context.ID),
 			"sha256":                    stored.SHA256,
 			// Request echo: the address and defaulted length the caller asked

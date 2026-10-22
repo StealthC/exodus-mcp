@@ -260,6 +260,9 @@ func runMemorySnapshotCapture(tc toolContext, args json.RawMessage) map[string]a
 		}
 	}
 
+	// Every artifact of the window is written after the guard's own pause, so
+	// the window reports the generation the sample belongs to.
+	window.TargetGeneration = tc.server.target.Generation()
 	// Read every range while paused; all artifacts share one capture id and
 	// the window's single capture-consistency object.
 	captureID := newCaptureID()
@@ -344,7 +347,10 @@ func runMemorySnapshotCapture(tc toolContext, args json.RawMessage) map[string]a
 	// The manifest embeds the range descriptors, which were built while the
 	// window was open: re-stamp them before writing the durable manifest so it
 	// cannot carry a provisional window state.
-	view := captureConsistencyToMap(atomicConsistency)
+	view := tc.server.captureConsistencyViewFor(atomicConsistency, window.generation())
+	// The durable manifest carries the same complete object shape as the
+	// response, not the frozen struct's subset.
+	manifest["capture_consistency"] = view
 	restampCaptureProvenance(manifest, view, atomicConsistency.State)
 	manifestBytes, err := json.MarshalIndent(manifest, "", "  ")
 	if err != nil {

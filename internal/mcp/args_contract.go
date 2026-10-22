@@ -85,6 +85,18 @@ func (vocab enumVocab) resolve(value, fallback string) (string, *toolFailure) {
 	return value, nil
 }
 
+// coerce keeps a value that belongs to the vocabulary and substitutes the
+// fallback otherwise, reporting whether it had to substitute. It is the output
+// counterpart of validate: a response field cannot publish a value the schema
+// does not declare, and the caller reports the substitution instead of hiding
+// it.
+func (vocab enumVocab) coerce(value, fallback string) (string, bool) {
+	if value != "" && vocab.accepts(value) {
+		return value, false
+	}
+	return fallback, true
+}
+
 // intEnumVocab is the integer counterpart of enumVocab; zero is reserved for
 // "omitted" so a caller can rely on the documented default.
 type intEnumVocab struct {
@@ -157,6 +169,100 @@ var (
 	vdpRepresentationVocab      = newEnumVocab("representation", "hexdump", "array_u8", "raw_base64", "array_u16", "cram_rgb333")
 	memoryRepresentationVocab   = newEnumVocab("representation", "raw_base64", "hexdump", "array_u8")
 )
+
+// ----------------------------------------------------------------------------------------------------------------------
+// Response vocabularies
+//
+// These are the closed vocabularies of the fields the server *emits*, not
+// consumes. They are declared once here so a producer cannot introduce a
+// second spelling of the same concept: the capture-consistency renderer, the
+// published catalog, and the conformance tests all read the same declaration.
+// ----------------------------------------------------------------------------------------------------------------------
+
+var (
+	// captureStateVocab is capture_consistency.state. The first four states
+	// describe one capture; the two extended states keep the distinctions the
+	// existing contract already promised (a restored snapshot is not a live
+	// capture, and a composite that spanned moments is not a coherent instant).
+	captureStateVocab = newEnumVocab("state",
+		consistencyLive,
+		consistencyAtomic,
+		consistencyPaused,
+		consistencyCompositeNonAtomic,
+		consistencyStateRestored,
+		consistencyUnknown,
+	)
+	// runStateVocab is the observed run state: capture_consistency's
+	// initial_run_state and final_run_state, provenance cpu_run_state, the
+	// emulator_status run_state, and a debug event's run_state.
+	runStateVocab = newEnumVocab("run_state", runStateRunning, runStatePaused, runStateUnknown)
+	// pauseSourceVocab is who caused the current run state (pause_source).
+	pauseSourceVocab = newEnumVocab("pause_source",
+		pauseSourceBreakpointOrWatchpoint,
+		pauseSourceMCP,
+		pauseSourceUIOrExternal,
+		pauseSourceUnknown,
+	)
+	// stopSourceVocab is why execution stopped (stop_source): the run_until_*
+	// family, structured debug events, and emulator_status.
+	stopSourceVocab = newEnumVocab("stop_source",
+		stopSourceInstrument,
+		stopSourceExternal,
+		stopSourceMCP,
+		stopSourceNone,
+		stopSourceUnknown,
+	)
+	// runUntilStopReasonVocab is the stop_reason of a run_until_* call, a label
+	// for which instrument ended the window. It is not stop_source: the two
+	// answer different questions and must not be compared.
+	runUntilStopReasonVocab = newEnumVocab("stop_reason", stopReasonBreakpointHit, stopReasonWatchpointHit, consistencyUnknown)
+)
+
+// responseVocabularyDeclaration renders every emitted vocabulary as one
+// machine-readable object, published next to each tool's inputSchema so a
+// client can build one conditional without parsing prose or per-tool special
+// cases.
+func responseVocabularyDeclaration() map[string]any {
+	return map[string]any{
+		"capture_consistency.state":             captureStateVocab.valuesEcho(),
+		"capture_consistency.initial_run_state": runStateVocab.valuesEcho(),
+		"capture_consistency.final_run_state":   runStateVocab.valuesEcho(),
+		"cpu_run_state":                         runStateVocab.valuesEcho(),
+		"run_state":                             runStateVocab.valuesEcho(),
+		"pause_source":                          pauseSourceVocab.valuesEcho(),
+		"stop_source":                           stopSourceVocab.valuesEcho(),
+		"stop_reason":                           runUntilStopReasonVocab.valuesEcho(),
+		"capture_mode":                          captureModeVocab.valuesEcho(),
+	}
+}
+
+// responseDeprecationDeclaration names every response field kept only for
+// backwards compatibility, its replacement, and whether it is derived from that
+// replacement (a derived alias can never become a second source of truth).
+func responseDeprecationDeclaration() map[string]any {
+	return map[string]any{
+		"consistency": map[string]any{
+			"replacement": "capture_consistency.state",
+			"derived":     true,
+			"note":        consistencyDeprecatedFieldNote,
+		},
+		"capture_consistency.paused_by_tool": map[string]any{
+			"replacement": "capture_consistency.execution_paused_by_tool",
+			"derived":     true,
+			"note":        "paused_by_tool mirrors execution_paused_by_tool for consumers of the older capture objects; the two are always equal.",
+		},
+	}
+}
+
+// responseVocabularySchemaKey is the JSON-Schema annotation that publishes the
+// emitted vocabularies. It is an extension key, so a client that does not know
+// it ignores it, and a client that checks its output can validate every value
+// the server is allowed to emit.
+const responseVocabularySchemaKey = "x-response-vocabularies"
+
+// responseDeprecationSchemaKey is the companion annotation for deprecated
+// response fields.
+const responseDeprecationSchemaKey = "x-deprecated-response-fields"
 
 // invalidEnumFailure is the stable rejection for a value outside a declared
 // vocabulary: code invalid_params plus the field, the offending value, and the

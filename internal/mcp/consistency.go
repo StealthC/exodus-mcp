@@ -3,7 +3,6 @@ package mcp
 import (
 	"crypto/rand"
 	"encoding/base64"
-	"encoding/json"
 	"fmt"
 	"reflect"
 	"time"
@@ -20,14 +19,28 @@ import (
 // (non-invasive, possibly internally inconsistent) from this metadata instead
 // of inferring it from a tool name.
 
-// Capture consistency states (see artifact.CaptureConsistency).
+// Capture consistency states (see artifact.CaptureConsistency). The vocabulary
+// is declared once in captureStateVocab; these constants are the values the
+// producers use.
 const (
 	consistencyLive               = "live"
 	consistencyPaused             = "paused"
 	consistencyAtomic             = "atomic"
 	consistencyStateRestored      = "state_restored"
 	consistencyCompositeNonAtomic = "composite_non_atomic"
+	consistencyUnknown            = "unknown"
 )
+
+// consistencyDeprecatedFieldNote is the published note of the deprecated bare
+// `consistency` label. The label survives only inside the artifact provenance
+// envelope (a frozen artifact schema) and is always derived from
+// capture_consistency.state there.
+const consistencyDeprecatedFieldNote = "Deprecated: read capture_consistency.state. This label is derived from that object at render time and can never disagree with it."
+
+// consistencyNoteMissing is the note of an object whose producer stated no
+// note. The object always carries the key, so a consumer never branches on its
+// presence.
+const consistencyNoteMissing = "The producing path stated no further note; the reported facts are the whole claim."
 
 // captureModeLive is the explicit default of the optional capture guard:
 // never pause a running system.
@@ -142,14 +155,14 @@ func buildCaptureConsistency(server *Server, payload map[string]any, composite, 
 	if composite {
 		if allChunksPaused {
 			consistency.State = consistencyPaused
-			consistency.FinalRunState = "paused"
+			consistency.FinalRunState = runStatePaused
 			consistency.Note = "Every component read found the system already paused; the composite spans one stable paused instant."
-			if initial != "paused" {
+			if initial != runStatePaused {
 				consistency.Note += " The run-state tracker's last observation said " + initial + "; the system was paused throughout the reads."
 			}
 		} else {
 			consistency.State = consistencyCompositeNonAtomic
-			consistency.FinalRunState = "running"
+			consistency.FinalRunState = runStateRunning
 			consistency.Note = "Component reads spanned multiple emulated moments (at least one found the system running); the pieces must not be combined into a coherent instant. Per-component frame tokens are not captured."
 		}
 		return consistency
@@ -158,11 +171,11 @@ func buildCaptureConsistency(server *Server, payload map[string]any, composite, 
 		// The handler stopped a running system and restored it: the sample is
 		// temporally atomic and the end state equals the start state.
 		consistency.State = consistencyAtomic
-		if initial == "unknown" {
+		if initial == runStateUnknown {
 			// The tracker never saw the state, but the pause flag proves the
 			// system was running and was resumed; state it explicitly.
-			consistency.InitialRunState = "running"
-			consistency.FinalRunState = "running"
+			consistency.InitialRunState = runStateRunning
+			consistency.FinalRunState = runStateRunning
 			consistency.Note = "The plugin paused a running system for the read and restored it; the pre-operation run state was not otherwise observed."
 			return consistency
 		}
@@ -170,15 +183,15 @@ func buildCaptureConsistency(server *Server, payload map[string]any, composite, 
 		consistency.Note = "The capture paused a running system once and restored it; the sample is temporally atomic."
 		return consistency
 	}
-	if initial == "paused" {
+	if initial == runStatePaused {
 		consistency.State = consistencyPaused
-		consistency.FinalRunState = "paused"
+		consistency.FinalRunState = runStatePaused
 		consistency.Note = "The system was already paused; no run-state change was caused by the capture."
 		return consistency
 	}
 	consistency.State = consistencyLive
 	consistency.FinalRunState = initial
-	if initial == "unknown" {
+	if initial == runStateUnknown {
 		consistency.Note = "The read never paused the system; the pre-read run state was not observed (query emulator_status first for a full verdict)."
 	} else {
 		consistency.Note = "Sampled while the system was running without pausing; values are live and can be internally inconsistent across reads."
@@ -259,6 +272,13 @@ func (server *Server) resumeSystemOnce(tc toolContext) (map[string]any, *toolFai
 type captureWindow struct {
 	Mode string
 
+	// TargetGeneration is the generation the capture was taken under: it is
+	// recorded once the guard's own pause has run, because that pause advances
+	// the generation. Every artifact of the window is written after it, so the
+	// consistency object the response and the stored artifacts report names the
+	// generation the sample really belongs to.
+	TargetGeneration uint64
+
 	InitialRunState string
 	InitialKnown    bool
 	InitialToken    *uint64
@@ -286,6 +306,16 @@ type captureWindow struct {
 	publish func() (map[string]any, *toolFailure)
 
 	artifacts []artifact.Artifact
+}
+
+// generation returns the capture's target generation, or nil when the window
+// recorded none.
+func (window *captureWindow) generation() *uint64 {
+	if window == nil || window.TargetGeneration == 0 {
+		return nil
+	}
+	generation := window.TargetGeneration
+	return &generation
 }
 
 // track registers one artifact written inside the window so its stored
@@ -326,19 +356,12 @@ func (window *captureWindow) consistencyFor(server *Server, payload map[string]a
 	return window.Consistency
 }
 
-// legacyConsistency returns the legacy consistency label a producer must
-// report next to the object. It is derived from the object, never copied from
-// the plugin payload, so the two fields describing one capture cannot
-// contradict each other.
-func (window *captureWindow) legacyConsistency(server *Server, payload map[string]any) string {
-	return window.consistencyFor(server, payload).State
-}
-
 // beginCaptureWindow starts a window: it observes the initial run state and
 // pauses the system once when the caller asked for a paused capture.
 func beginCaptureWindow(tc toolContext, guard captureGuard) (*captureWindow, *toolFailure) {
 	window := &captureWindow{Mode: guard.Mode, InitialRunState: runStateUnknown}
 	if guard.Mode == captureModeLive {
+		window.TargetGeneration = tc.server.target.Generation()
 		return window, nil
 	}
 	window.InitialRunState, window.InitialKnown = observedRunState(tc)
@@ -353,6 +376,10 @@ func beginCaptureWindow(tc toolContext, guard captureGuard) (*captureWindow, *to
 			window.PauseVerified = state == runStatePaused
 		}
 	}
+	// Every artifact of the window is written inside it, after the guard's own
+	// pause, so the window reports the generation the sample belongs to rather
+	// than the one the call arrived with.
+	window.TargetGeneration = tc.server.target.Generation()
 	// The window only claims atomicity when it really paused the target; a
 	// target that was already paused is the documented "paused" state, exactly
 	// as an unguarded read of the same machine reports.
@@ -508,7 +535,7 @@ func withCaptureGuard(tc toolContext, guard captureGuard, read func(window *capt
 		// A live window never changes the run state, but it still reports the
 		// one consistency object its artifacts were written with.
 		if window.Consistency != nil {
-			view := captureConsistencyToMap(window.Consistency)
+			view := tc.server.captureConsistencyViewFor(window.Consistency, window.generation())
 			result["capture_consistency"] = view
 			if summary, ok := result["summary"].(map[string]any); ok {
 				summary["capture_consistency"] = view
@@ -537,7 +564,7 @@ func withCaptureGuard(tc toolContext, guard captureGuard, read func(window *capt
 		}
 		return failureResult(readFailure, tc.modern)
 	}
-	view := captureConsistencyToMap(window.Consistency)
+	view := tc.server.captureConsistencyViewFor(window.Consistency, window.generation())
 	result["capture_consistency"] = view
 	result["run_state_restore"] = restore
 	result["initial_run_state"] = window.InitialRunState
@@ -620,18 +647,131 @@ func currentFrameToken(tc toolContext) *uint64 {
 	return &value
 }
 
-// captureConsistencyToMap renders the object as a plain map for responses.
-func captureConsistencyToMap(consistency *artifact.CaptureConsistency) map[string]any {
+// captureConsistencyResponseKeys is the complete key set every emitted
+// capture_consistency object carries, in contract order. No producer publishes
+// a subset: a consumer reads one shape on every state-observing tool.
+var captureConsistencyResponseKeys = []string{
+	"state",
+	"note",
+	"execution_paused_by_tool",
+	"execution_resumed_after",
+	"paused_by_tool",
+	"initial_run_state",
+	"final_run_state",
+	"initial_frame_token",
+	"final_frame_token",
+	"target_generation",
+}
+
+// captureConsistencyView renders the object as the one response shape every
+// state-observing tool reports:
+//
+//   - every key of captureConsistencyResponseKeys is present, with a null frame
+//     token or target generation when the value is unknown;
+//   - state and the observed run states are members of their declared
+//     vocabularies, and an undeclared value is substituted with the honest
+//     fallback ("unknown") and named in undeclared_values instead of being
+//     published as-is;
+//   - paused_by_tool is derived from execution_paused_by_tool, so the older
+//     name cannot become a second source of truth.
+func (server *Server) captureConsistencyView(consistency *artifact.CaptureConsistency) map[string]any {
+	return captureConsistencyResponse(consistency, server.targetGenerationValue())
+}
+
+// captureConsistencyViewFor renders the object with the target generation the
+// caller observed for it. A capture envelope reports the generation the capture
+// was taken under, which is not necessarily the generation of a later read of
+// the same artifact.
+func (server *Server) captureConsistencyViewFor(consistency *artifact.CaptureConsistency, generation *uint64) map[string]any {
+	return captureConsistencyResponse(consistency, optionalUint64(generation))
+}
+
+// captureConsistencyViewWindow renders the object with the generation the
+// capture window recorded (the sample's generation, which its own pause/resume
+// mutations may already have advanced), falling back to the current generation
+// when no window is in scope.
+func (server *Server) captureConsistencyViewWindow(window *captureWindow, consistency *artifact.CaptureConsistency) map[string]any {
+	if generation := window.generation(); generation != nil {
+		return server.captureConsistencyViewFor(consistency, generation)
+	}
+	return server.captureConsistencyView(consistency)
+}
+
+// captureConsistencyResponse renders one capture-consistency object.
+func captureConsistencyResponse(consistency *artifact.CaptureConsistency, generation any) map[string]any {
 	if consistency == nil {
 		return nil
 	}
-	encoded, err := json.Marshal(consistency)
-	if err != nil {
-		return map[string]any{"state": consistency.State}
+	view := make(map[string]any, len(captureConsistencyResponseKeys)+1)
+	var undeclared []string
+	state, substituted := captureStateVocab.coerce(consistency.State, consistencyUnknown)
+	if substituted {
+		undeclared = append(undeclared, "state="+consistency.State)
 	}
-	var view map[string]any
-	if err := json.Unmarshal(encoded, &view); err != nil {
-		return map[string]any{"state": consistency.State}
+	initialState, substituted := runStateVocab.coerce(consistency.InitialRunState, runStateUnknown)
+	if substituted {
+		undeclared = append(undeclared, "initial_run_state="+consistency.InitialRunState)
+	}
+	finalState, substituted := runStateVocab.coerce(consistency.FinalRunState, runStateUnknown)
+	if substituted {
+		undeclared = append(undeclared, "final_run_state="+consistency.FinalRunState)
+	}
+	note := consistency.Note
+	if note == "" {
+		note = consistencyNoteMissing
+	}
+	if len(undeclared) > 0 {
+		note += " WARNING: this object reported values outside the declared vocabulary; they are published as \"unknown\" and named in undeclared_values."
+	}
+	view["state"] = state
+	view["note"] = note
+	view["execution_paused_by_tool"] = consistency.ExecutionPausedByTool
+	view["execution_resumed_after"] = consistency.ExecutionResumedAfter
+	// Deprecated alias of execution_paused_by_tool (see
+	// responseDeprecationDeclaration): always the same value, never a separate
+	// fact.
+	view["paused_by_tool"] = consistency.ExecutionPausedByTool
+	view["initial_run_state"] = initialState
+	view["final_run_state"] = finalState
+	view["initial_frame_token"] = optionalUint64(consistency.InitialFrameToken)
+	view["final_frame_token"] = optionalUint64(consistency.FinalFrameToken)
+	view["target_generation"] = generation
+	if len(undeclared) > 0 {
+		view["undeclared_values"] = undeclared
 	}
 	return view
+}
+
+// targetGenerationValue returns the target generation observed at render time,
+// or nil when the server has no target.
+func (server *Server) targetGenerationValue() any {
+	if server == nil {
+		return nil
+	}
+	return server.target.Generation()
+}
+
+// optionalUint64 renders an optional number as a number or an explicit null.
+func optionalUint64(value *uint64) any {
+	if value == nil {
+		return nil
+	}
+	return *value
+}
+
+// newCaptureConsistency builds a complete object for a capture whose relation
+// to the emulated instant the producer states explicitly (a frame sampled under
+// the VDP's own lock, an audio window, a restored snapshot, a live session).
+// The observed run state is reported for both ends, and no pause or resume is
+// claimed: a producer that paused the target owns a capture window instead.
+func newCaptureConsistency(server *Server, state, note string) *artifact.CaptureConsistency {
+	observed := initialRunStateLabel(server)
+	return &artifact.CaptureConsistency{
+		State:                 state,
+		ExecutionPausedByTool: false,
+		ExecutionResumedAfter: false,
+		InitialRunState:       observed,
+		FinalRunState:         observed,
+		Note:                  note,
+	}
 }
