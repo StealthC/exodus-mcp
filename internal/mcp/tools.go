@@ -74,6 +74,7 @@ func buildToolRegistry() []toolSpec {
 	specs = append(specs, cpuStepSpec())
 	specs = append(specs, debugInstrumentSpec())
 	specs = append(specs, eventsListSpec())
+	specs = append(specs, vdpRenderExportSpec())
 	specs = append(specs, controlToolSpecs()...)
 	specs = append(specs, vdpToolSpecs()...)
 	specs = append(specs, vdpCommandDMAToolSpecs()...)

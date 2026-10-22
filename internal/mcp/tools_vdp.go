@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"image"
 	"image/color"
+	"image/draw"
 	"image/png"
 	"strconv"
 	"time"
@@ -58,6 +59,7 @@ func vdpToolSpecs() []toolSpec {
 			name:        "vdp_tile_export",
 			description: "Export one or more consecutive 8x8 4bpp VRAM patterns (tiles) as a scaled PNG artifact plus a JSON pixel-decode artifact, colored through a chosen CRAM palette line. Reports whether any read paused a running system (system_paused_during_read) and coherent_snapshot. vdp_capture_id resolves a stored vdp_capture and renders from its captured VRAM and CRAM components instead of reading the device, so repeated inspection is byte-identical and performs no read: the response then reports data_source \"capture\", vdp_capture_reused true, the capture's frame token, and source_capture_id. A capture without a covering VRAM or CRAM component fails with capture_component_omitted; an unknown or foreign id fails with capture_not_found.",
 			schema: objectSchema(map[string]any{
+				"crop":             renderCropSchemaProperty(),
 				"tile":             integerProperty("First tile index counted from VRAM offset 0 (default 0). Each tile occupies 32 bytes.", 0),
 				"count":            integerProperty(fmt.Sprintf("Consecutive tile count between 1 and %d (default 1).", maxVDPTileStripCount), 1),
 				"palette":          integerProperty("CRAM palette line 0-3 used to color pixel indices 1-15 (default 0).", 0),
@@ -66,19 +68,20 @@ func vdpToolSpecs() []toolSpec {
 				"vdp_capture_id":   stringProperty("Optional capture_id from vdp_capture; when set, the tiles come from the capture's stored VRAM and CRAM components and no device read is performed."),
 				"context":          contextProperty(),
 			}, nil),
-			run: runVDPTileExport,
+			run: aliasRun("vdp_tile_export", runVDPTileExport),
 		},
 		{
 			name:        "vdp_plane_export",
 			description: "Render a full scroll plane (A, B, or window) from VRAM as an unscrolled texture view: scaled PNG artifact plus JSON structural summary with distinct tiles, priority counts, and capture consistency (system_paused_during_read / coherent_snapshot). vdp_capture_id resolves a stored vdp_capture and renders from its captured VRAM, CRAM, and status components instead of reading the device: the response then reports data_source \"capture\" and vdp_capture_reused true. A capture whose VRAM component does not cover the whole buffer fails with capture_component_omitted; an unknown or foreign id fails with capture_not_found.",
 			schema: objectSchema(map[string]any{
+				"crop":             renderCropSchemaProperty(),
 				"plane":            vdpPlaneVocab.property("Which name table to render."),
 				"scale":            integerProperty("Nearest-neighbor upscale factor 1-4 (default 1).", 1),
 				"transparent_zero": booleanProperty("Render pixel index 0 as transparent instead of its palette color (default true)."),
 				"vdp_capture_id":   stringProperty("Optional capture_id from vdp_capture; when set, the plane comes from the capture's stored VRAM, CRAM, and status components and no device read is performed."),
 				"context":          contextProperty(),
 			}, nil),
-			run: runVDPPlaneExport,
+			run: aliasRun("vdp_plane_export", runVDPPlaneExport),
 		},
 		{
 			name:        "vdp_pixel_info",
@@ -1121,21 +1124,23 @@ const (
 )
 
 type vdpTileExportArgs struct {
-	Tile            uint64 `json:"tile"`
-	Count           uint64 `json:"count"`
-	Palette         uint64 `json:"palette"`
-	Scale           uint64 `json:"scale"`
-	TransparentZero *bool  `json:"transparent_zero"`
-	VDPCaptureID    string `json:"vdp_capture_id"`
-	Context         string `json:"context"`
+	Crop            *renderCropArgs `json:"crop"`
+	Tile            uint64          `json:"tile"`
+	Count           uint64          `json:"count"`
+	Palette         uint64          `json:"palette"`
+	Scale           uint64          `json:"scale"`
+	TransparentZero *bool           `json:"transparent_zero"`
+	VDPCaptureID    string          `json:"vdp_capture_id"`
+	Context         string          `json:"context"`
 }
 
 type vdpPlaneExportArgs struct {
-	Plane           string `json:"plane"`
-	Scale           uint64 `json:"scale"`
-	TransparentZero *bool  `json:"transparent_zero"`
-	VDPCaptureID    string `json:"vdp_capture_id"`
-	Context         string `json:"context"`
+	Crop            *renderCropArgs `json:"crop"`
+	Plane           string          `json:"plane"`
+	Scale           uint64          `json:"scale"`
+	TransparentZero *bool           `json:"transparent_zero"`
+	VDPCaptureID    string          `json:"vdp_capture_id"`
+	Context         string          `json:"context"`
 }
 
 // fetchVDPBytesChunked reads length bytes through repeated timed-buffer reads,
@@ -1356,6 +1361,53 @@ type exportedTile struct {
 	Rows    [mdTileEdgePixels][mdTileEdgePixels]int `json:"pixel_indices"`
 }
 
+// renderCropArgs is the optional rectangular window of a rendered export. The
+// coordinates are source pixels before scaling (a tile is 8x8 source pixels), so
+// a crop is independent of the requested upscale.
+type renderCropArgs struct {
+	X      uint64 `json:"x"`
+	Y      uint64 `json:"y"`
+	Width  uint64 `json:"width"`
+	Height uint64 `json:"height"`
+}
+
+// cropRenderedImage applies one crop window to a rendered export image and
+// returns the cropped image plus the structured crop view. A nil crop returns the
+// image unchanged and no view, so a caller that never asks for a crop sees
+// exactly the pre-merge payload.
+func cropRenderedImage(img *image.NRGBA, crop *renderCropArgs, scale int) (*image.NRGBA, map[string]any, *toolFailure) {
+	if crop == nil {
+		return img, nil, nil
+	}
+	sourceWidth := img.Bounds().Dx() / scale
+	sourceHeight := img.Bounds().Dy() / scale
+	if crop.Width == 0 || crop.Height == 0 {
+		return nil, nil, &toolFailure{Code: "invalid_params", Message: "crop.width and crop.height must be at least 1 source pixel"}
+	}
+	if crop.X+crop.Width > uint64(sourceWidth) || crop.Y+crop.Height > uint64(sourceHeight) {
+		return nil, nil, &toolFailure{
+			Code: "out_of_range",
+			Message: fmt.Sprintf("crop x=%d,y=%d %dx%d exceeds the rendered %dx%d source pixels",
+				crop.X, crop.Y, crop.Width, crop.Height, sourceWidth, sourceHeight),
+			Data: map[string]any{"source_width": sourceWidth, "source_height": sourceHeight},
+		}
+	}
+	rect := image.Rect(int(crop.X)*scale, int(crop.Y)*scale, int(crop.X+crop.Width)*scale, int(crop.Y+crop.Height)*scale)
+	cropped := image.NewNRGBA(image.Rect(0, 0, rect.Dx(), rect.Dy()))
+	draw.Draw(cropped, cropped.Bounds(), img, rect.Min, draw.Src)
+	view := map[string]any{
+		"x":             crop.X,
+		"y":             crop.Y,
+		"width":         crop.Width,
+		"height":        crop.Height,
+		"unit":          "source pixels before scaling",
+		"scale":         scale,
+		"source_width":  sourceWidth,
+		"source_height": sourceHeight,
+	}
+	return cropped, view, nil
+}
+
 func runVDPTileExport(tc toolContext, args json.RawMessage) map[string]any {
 	parsed, failure := decodeArgs[vdpTileExportArgs](args)
 	if failure != nil {
@@ -1444,6 +1496,15 @@ func runVDPTileExport(tc toolContext, args json.RawMessage) map[string]any {
 		coherent = source.data.coherentCapture()
 		consistency = source.data.consistency
 	}
+	if uint64(len(vram)) < totalBytes {
+		// A bridge answer shorter than the requested strip cannot be rendered;
+		// report the shortfall instead of slicing past the buffer.
+		return failureResult(&toolFailure{
+			Code:    "out_of_range",
+			Message: fmt.Sprintf("VRAM read returned %d of %d bytes for tiles %d-%d", len(vram), totalBytes, parsed.Tile, parsed.Tile+count-1),
+			Data:    map[string]any{"requested_bytes": totalBytes, "returned_bytes": len(vram)},
+		}, tc.modern)
+	}
 	colors := cramPaletteColors(cramRGB333Entries(cramRaw))
 	// A derived export of a stored capture stays in that capture's lineage, so
 	// artifact_list(capture_id) finds it next to the captured components.
@@ -1475,6 +1536,12 @@ func runVDPTileExport(tc toolContext, args json.RawMessage) map[string]any {
 			Rows:    tile,
 		})
 	}
+
+	croppedImg, cropView, failure := cropRenderedImage(img, parsed.Crop, scale)
+	if failure != nil {
+		return failureResult(failure, tc.modern)
+	}
+	img = croppedImg
 
 	var pngBuffer bytes.Buffer
 	if err := png.Encode(&pngBuffer, img); err != nil {
@@ -1519,6 +1586,11 @@ func runVDPTileExport(tc toolContext, args json.RawMessage) map[string]any {
 		"png_sha256":                pngStored.SHA256,
 		"json_size_bytes":           len(jsonDocument),
 		"json_sha256":               jsonStored.SHA256,
+	}
+	if cropView != nil {
+		summary["crop"] = cropView
+		summary["png_width"] = img.Bounds().Dx()
+		summary["png_height"] = img.Bounds().Dy()
 	}
 	if !source.unused {
 		summary["system_paused_during_read"] = false
@@ -1621,6 +1693,13 @@ func runVDPPlaneExport(tc toolContext, args json.RawMessage) map[string]any {
 		captureID = source.id
 	}
 
+	if nameTableBase > uint64(len(vramAll)) {
+		return failureResult(&toolFailure{
+			Code:    "out_of_range",
+			Message: fmt.Sprintf("the %s name table starts at %s, past the %d bytes of VRAM the bridge returned", parsed.Plane, canonicalHex(nameTableBase), len(vramAll)),
+			Data:    map[string]any{"name_table_base": nameTableBase, "vram_bytes": len(vramAll)},
+		}, tc.modern)
+	}
 	nameTableBytes := widthCells * heightCells * 2
 	truncated := false
 	if nameTableBase+uint64(nameTableBytes) > uint64(len(vramAll)) {
@@ -1658,6 +1737,16 @@ func runVDPPlaneExport(tc toolContext, args json.RawMessage) map[string]any {
 			drawMDTile(img, &tile, colors, paletteLine, transparentZero,
 				cellColumn*mdTileEdgePixels*scale, cellRow*mdTileEdgePixels*scale, scale, hflip, vflip)
 		}
+	}
+
+	croppedImg, cropView, failure := cropRenderedImage(img, parsed.Crop, scale)
+	if failure != nil {
+		return failureResult(failure, tc.modern)
+	}
+	img = croppedImg
+	if cropView != nil {
+		width = img.Bounds().Dx()
+		height = img.Bounds().Dy()
 	}
 
 	var pngBuffer bytes.Buffer
@@ -1718,6 +1807,9 @@ func runVDPPlaneExport(tc toolContext, args json.RawMessage) map[string]any {
 		"capture_consistency":       tc.server.captureConsistencyView(consistency),
 		"byte_order":                "big-endian",
 		"notes":                     notes,
+	}
+	if cropView != nil {
+		summary["crop"] = cropView
 	}
 	if !source.unused {
 		summary["system_paused_during_read"] = false

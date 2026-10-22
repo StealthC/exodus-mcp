@@ -65,6 +65,16 @@ var toolAliasRecords = []toolAliasRecord{
 		Mapping:     "mega_drive_memory_map returns the legacy {regions, note, live_spaces} object; memory_map.reference carries the same fields.",
 	},
 	{
+		Alias:       "vdp_tile_export",
+		Replacement: "vdp_render_export",
+		Mapping:     "vdp_tile_export returns the legacy {summary, artifacts} payload; vdp_render_export{mode:\"tiles\", ...} runs the same render and returns the same payload with mode and, when requested, crop.",
+	},
+	{
+		Alias:       "vdp_plane_export",
+		Replacement: "vdp_render_export",
+		Mapping:     "vdp_plane_export returns the legacy {summary, artifacts} payload; vdp_render_export{mode:\"plane\", plane, ...} runs the same render and returns the same payload with mode and, when requested, crop.",
+	},
+	{
 		Alias:       "vdp_memory_export",
 		Replacement: "vdp_memory_read",
 		Mapping:     "vdp_memory_export returns the legacy artifact payload; vdp_memory_read{output:\"artifact\", ...} returns the same artifact descriptor and provenance with an output echo.",

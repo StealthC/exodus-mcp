@@ -142,7 +142,7 @@ func TestConsolidatedCatalogHasNoDuplicateConcept(t *testing.T) {
 
 // consolidatedCanonicalTools is the merged catalog. Each consolidation group
 // appends its canonical concept here.
-var consolidatedCanonicalTools = []string{"target_status", "memory_map", "memory_read", "disassemble", "cpu_step", "debug_instrument", "events_list", "vdp_memory_read"}
+var consolidatedCanonicalTools = []string{"target_status", "memory_map", "memory_read", "disassemble", "cpu_step", "debug_instrument", "events_list", "vdp_memory_read", "vdp_render_export"}
 
 // payloadView strips the fields the dispatcher injects into every response and
 // the alias' own deprecation marker, so two payloads can be compared field by
@@ -164,7 +164,7 @@ func payloadView(t *testing.T, result map[string]any) map[string]any {
 // canonicalPayload calls one tool on a throwaway server so per-server
 // observations (run-state timestamps, generation) never leak between the two
 // sides of a parity comparison.
-func canonicalPayload(t *testing.T, client *fakeBridgeClient, tool, arguments string) map[string]any {
+func canonicalPayload(t *testing.T, client bridge.Client, tool, arguments string) map[string]any {
 	t.Helper()
 	return payloadView(t, postToolCall(t, newTestServer(t, client), tool, arguments))
 }
@@ -881,6 +881,8 @@ var volatileAuditFields = map[string]bool{
 	"id":          true,
 	"url":         true,
 	"captured_at": true,
+	// A capture id is generated per export, so two runs never share one.
+	"capture_id": true,
 }
 
 // cursorPrefix returns the family prefix of one cursor, the part that names the
@@ -979,6 +981,92 @@ func TestVDPMemoryReadRejectsAnInlineRepresentationOnArtifact(t *testing.T) {
 	result := postToolCall(t, newTestServer(t, vdpReadClient()), "vdp_memory_read", `{"output":"artifact","target":"vram","address":0,"representation":"hexdump"}`)
 	if structured(result)["code"] != "invalid_params" {
 		t.Fatalf("code = %v, want invalid_params", structured(result))
+	}
+}
+
+// ----------------------------------------------------------------------------------------------------------------------
+// vdp_render_export alias parity (group 9)
+// ----------------------------------------------------------------------------------------------------------------------
+
+// renderClient builds a VDP fixture with a populated tile and plane table.
+func renderClient() *fakeVDPMemoryClient {
+	vram := make([]byte, 65536)
+	copy(vram[5*32:], []byte{0x01, 0x23, 0x45, 0x67, 0x89, 0xAB, 0xCD, 0xEF})
+	// Name table B at 8192: cell 0 maps to tile 5 with palette line 1.
+	vram[8192] = 0x00
+	vram[8193] = 0x25
+	cram := make([]byte, 128)
+	for entry := 1; entry < 16; entry++ {
+		cram[entry*2] = 0x0E
+		cram[entry*2+1] = 0xEE
+	}
+	return newFakeVDPMemoryClient(vram, cram)
+}
+
+// TestVDPRenderExportAbsorbsTheRenderTools proves each legacy render tool is the
+// same call with a mode, including the artifact descriptors and summaries.
+func TestVDPRenderExportAbsorbsTheRenderTools(t *testing.T) {
+	cases := []struct {
+		canonical string
+		alias     string
+		aliasArgs string
+	}{
+		{`{"mode":"tiles","tile":5,"scale":2}`, "vdp_tile_export", `{"tile":5,"scale":2}`},
+		{`{"mode":"plane","plane":"b"}`, "vdp_plane_export", `{"plane":"b"}`},
+	}
+	for _, tc := range cases {
+		canonical := canonicalPayload(t, renderClient(), "vdp_render_export", tc.canonical)
+		legacy := canonicalPayload(t, renderClient(), tc.alias, tc.aliasArgs)
+		if canonical["mode"] == nil {
+			t.Fatalf("%s: vdp_render_export lost its mode echo", tc.alias)
+		}
+		delete(canonical, "mode")
+		if !jsonEqual(t, normalizeVolatile(canonical), normalizeVolatile(legacy)) {
+			t.Fatalf("%s parity failed:\ncanonical = %v\nlegacy     = %v", tc.alias, canonical, legacy)
+		}
+	}
+}
+
+// TestVDPRenderExportCropsTheRenderedImage covers the merged tool's one new
+// argument: a source-pixel window applied before scaling.
+func TestVDPRenderExportCropsTheRenderedImage(t *testing.T) {
+	full := canonicalPayload(t, renderClient(), "vdp_render_export", `{"mode":"tiles","tile":5,"scale":2}`)
+	cropped := canonicalPayload(t, renderClient(), "vdp_render_export", `{"mode":"tiles","tile":5,"scale":2,"crop":{"x":2,"y":0,"width":4,"height":8}}`)
+
+	fullSummary, _ := full["summary"].(map[string]any)
+	croppedSummary, _ := cropped["summary"].(map[string]any)
+	if croppedSummary["png_width"] != float64(8) || croppedSummary["png_height"] != float64(16) {
+		t.Fatalf("cropped png is %vx%v, want 8x16 (4x8 source pixels at scale 2)", croppedSummary["png_width"], croppedSummary["png_height"])
+	}
+	if fullSummary["png_width"] != nil {
+		t.Fatalf("an uncropped export must not invent crop dimensions: %v", fullSummary)
+	}
+	crop, _ := croppedSummary["crop"].(map[string]any)
+	if crop["width"] != float64(4) || crop["source_width"] != float64(8) || crop["scale"] != float64(2) {
+		t.Fatalf("crop view = %v", crop)
+	}
+	// The tile JSON still describes the whole exported strip: crop is an image
+	// window, not a decode change.
+	if fullSummary["tile_count"] != croppedSummary["tile_count"] {
+		t.Fatalf("crop changed the decoded tile count: %v vs %v", fullSummary["tile_count"], croppedSummary["tile_count"])
+	}
+}
+
+// TestVDPRenderExportRejectsAnArgumentOutsideTheMode keeps the merged contract
+// honest, and rejects a crop larger than the image instead of clipping silently.
+func TestVDPRenderExportRejectsAnArgumentOutsideTheMode(t *testing.T) {
+	for _, arguments := range []string{
+		`{"mode":"tiles","plane":"b"}`,
+		`{"mode":"plane","plane":"b","tile":1}`,
+	} {
+		result := postToolCall(t, newTestServer(t, renderClient()), "vdp_render_export", arguments)
+		if structured(result)["code"] != "unsupported_parameter" {
+			t.Fatalf("%s: code = %v, want unsupported_parameter", arguments, structured(result))
+		}
+	}
+	result := postToolCall(t, newTestServer(t, renderClient()), "vdp_render_export", `{"mode":"tiles","tile":5,"crop":{"x":4,"y":0,"width":8,"height":8}}`)
+	if structured(result)["code"] != "out_of_range" {
+		t.Fatalf("code = %v, want out_of_range", structured(result))
 	}
 }
 
