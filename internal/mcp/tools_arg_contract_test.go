@@ -153,6 +153,14 @@ func TestEverySchemaPropertyIsConsumedOrRejected(t *testing.T) {
 				continue
 			}
 			if field, _ := payload["field"].(string); field == name {
+				// An opaque token (a paging cursor) is consumed by validation
+				// itself: the handler must reject a fabricated token, so a
+				// field-named rejection here proves the property is read. Any
+				// other property must accept the probe — a rejection means the
+				// handler ignores the schema it publishes.
+				if isOpaqueTokenProperty(name, property) {
+					continue
+				}
 				t.Fatalf("tool %q rejects its own published property %q: %s (arguments %s)",
 					spec.name, name, payload["message"], arguments)
 			}
@@ -603,4 +611,17 @@ func TestDeclaredGuardFieldsAreHonored(t *testing.T) {
 	if result := postToolCall(t, server, "cpu_pause", `{"expected_target_generation":99}`); result["isError"] != true || structured(result)["code"] != "target_generation_conflict" {
 		t.Fatalf("cpu_pause must apply the generation precondition: %v", structured(result))
 	}
+}
+
+// isOpaqueTokenProperty reports whether a published property carries an opaque
+// token rather than a plain value. A fabricated token is expected to be
+// rejected (a cursor is only meaningful for the tool and query that issued it),
+// so a field-named rejection is evidence that the handler consumed the
+// property, not evidence of a schema/handler mismatch.
+func isOpaqueTokenProperty(name string, property map[string]any) bool {
+	if name == "cursor" {
+		return true
+	}
+	description, _ := property["description"].(string)
+	return strings.Contains(description, "next_cursor")
 }
