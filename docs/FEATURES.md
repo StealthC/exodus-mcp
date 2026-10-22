@@ -287,9 +287,23 @@ claim to the exact test function or smoke-script check that proves it.
 - Watchpoints: `cpu_watchpoint_set`, `cpu_watchpoint_list`,
   `cpu_watchpoint_remove` — byte ranges with read/write/any access filtering,
   live hit counters, and deterministic hit-and-pause through the Exodus
-  debugger path. Breakpoints and watchpoints are purged safely on
-  `rom_load` with one audited invalidation batch; list views carry creation
-  provenance (context, target generation, ROM) without exposing control ids.
+  debugger path. **Range semantics are start-address based**, exactly like the
+  Exodus debugger: the processor evaluates one location per access — the access
+  **start** address — and its watchpoint API never reports the transfer width,
+  so a watchpoint on `[address, address+length-1]` fires when the access starts
+  inside that range and never when a wider access merely overlaps it (a
+  `MOVE.L` starting at `0xFF0000` does not trip a watchpoint at `0xFF0002`).
+  The set and list responses echo the contract as `range_semantics`
+  (`exact_address` for `length: 1`, `access_start_in_range` otherwise) next to
+  `range_end`, so the parameter never silently means something else. The
+  watched range must stay inside the processor address bus (`address: 0` with
+  `length > 1` is valid and now actually fires; a range that would end past the
+  bus mask is `invalid_params`). For overlap semantics the access path offers
+  no width, so a caller who needs them must use a trace session with
+  `access_capture: "ranges"` instead. Breakpoints and watchpoints are purged
+  safely on `rom_load` with one audited invalidation batch; set and list views
+  echo `one_shot` and carry creation provenance (context, target generation,
+  ROM) without exposing control ids.
 - `cpu_trace_capture`: artifact-first processor trace window. The trace log
   is routed through a temporary on-disk file, tracing is configured with the
   system stopped, and the prior run state is restored (the reproducible
@@ -318,21 +332,39 @@ claim to the exact test function or smoke-script check that proves it.
 - `cpu_debug_events_list`: bounded forensic event history (100 retained
   records) with `offset`/`limit` pagination over the filtered set, filters
   (`resource_kind`, `resource_id`, `cpu`, `direction`, `event_id_min/max`, and
-  the caller's context), and an explicit `history` object — capacity, retained,
-  recorded, dropped, retained id span, and `complete` — so a gap is never
-  inferred from a short list. Whenever a managed breakpoint or watchpoint stops
-  execution, a structured `debug-event` artifact records the managed resource
-  id, owner context, CPU, triggering PC, address space, watched effective
-  address, access direction, requested range, hit count, target generation,
-  frame token, timestamps, and provenance. Stop/resume semantics are explicit: a
-  breaking hit pauses the CPU and increments the native counter once; while the
-  CPU stays paused a repeated observation of the same resource, counter value,
-  direction, and PC is folded into the same event (`repeat_count`,
-  `last_seen_at`), and a resumed CPU produces a new counter value and therefore
-  a new event. Access width, value before/after, and transferred value for
-  *paused watchpoint stops* remain `null` with a "not exposed by native API"
-  note rather than presenting zero as data — per-occurrence values come from a
-  trace session with `access_capture`, not from the pause path.
+  the context scope), and an explicit `history` object — capacity, retained,
+  recorded, dropped, retained id span, `complete`, the query `scope`, how many
+  retained events the scope holds (`scope_retained`), and how many the filters
+  match (`matching`, identical to `total`) — so a gap is never inferred from a
+  short list and the counters never describe a broader set than `events` can
+  return. `resource_kind`, `cpu`, and `direction` are validated server-side
+  (`invalid_params` for an unknown value instead of an authoritative empty
+  list). The query is scoped to the caller's context by default and
+  `context: "all"` queries every context. Whenever a managed breakpoint or
+  watchpoint stops execution — a steady hit reached through `cpu_run` as well
+  as a one-shot hit — a structured `debug-event` (`debug-event/1`, additive
+  fields only) records the managed resource id, owner context, CPU, triggering
+  PC, address space, watched effective address, requested range, hit count,
+  target generation, frame token, timestamps, and provenance. The access
+  evidence separates `configured_access` (what the instrument was set with)
+  from `observed_direction` (`read`/`write`/`execute` when the stop proves the
+  direction, `null` when the core cannot tell — an `any` watchpoint stop), and
+  `access_direction` remains as the historical alias of `configured_access`.
+  The `direction` filter matches the **observed** value: `any` matches every
+  event including unknown directions, and `read`/`write`/`execute` never match
+  an event whose direction is unknown. `triggering_pc` is `null` together with
+  `triggering_pc_source: "unknown"` when the value could not be read, so a stop
+  is never attributed to the plausible address 0. Stop/resume semantics are
+  explicit: a breaking hit pauses the CPU and increments the native counter
+  once; the native counter is the identity of a stop, so while the CPU stays
+  paused a repeated observation of the same resource, counter value, and
+  direction is folded into the same event (`repeat_count`, `last_seen_at`) even
+  if a later pause reads a different PC, and a resumed CPU produces a new
+  counter value and therefore a new event. Access width, value before/after, and
+  transferred value for *paused watchpoint stops* remain `null` with a "not
+  exposed by native API" note rather than presenting zero as data —
+  per-occurrence values come from a trace session with `access_capture`, not
+  from the pause path.
 - `cpu_coverage_capture`: execution coverage artifact (`cpu-coverage/2`)
   from a bounded trace window — the executed address set with execution
   counts, instruction-aware basic `blocks` (start/end address, instruction
@@ -698,31 +730,44 @@ suppressed when a different ROM is loaded.
   `TestTargetResetSoftNotDelivered`; the success path is a **live check**
   (`scripts/live-smoke.sh` requires the soft reset to succeed on the built
   pair).
-- `one_shot: true` on `cpu_breakpoint_set` / `cpu_watchpoint_set`: the server
-  marks the instrument as one-shot in its resource provenance. Whenever the
-  emulator is observed paused, a housekeeping sweep reads the native
-  breakpoint/watchpoint lists and proves a fired break by the native hit
-  counter (a positive multiple of the break counter N — the core increments
-  on every passing location hit and breaks on multiples of N). A fired
-  one-shot instrument is removed through the audited mutation path
-  (`one_shot_sweep` audit entries with `one_shot_hit` detail), a structured
-  debug event records the stop evidence (resource, CPU, triggering PC from
-  `regs_get`, watched address/access for watchpoints, hit count, generation,
-  frame token), and `emulator_status` reports the removals
-  (`one_shot_removals`) plus the attribution. A one-shot instrument that
-  never fires stays armed until it does or until a ROM reload purges managed
-  resources; non-one-shot fired instruments get the attribution but are never
-  removed.
+- `one_shot: true` on `cpu_breakpoint_set` / `cpu_watchpoint_set` (echoed by
+  the set and list responses): the server marks the instrument as one-shot in
+  its resource provenance. Whenever the emulator is observed paused, a
+  housekeeping sweep reads the native breakpoint/watchpoint lists and proves a
+  fired break by the native hit counter (a positive multiple of the break
+  counter N — the core increments on every passing location hit and breaks on
+  multiples of N). Every proven stop is attributed and recorded as one
+  structured debug event — steady and one-shot instruments alike — so a plain
+  `cpu_run` hit is as queryable as a one-shot hit and a repeated paused
+  observation folds instead of duplicating. A fired one-shot instrument is
+  removed through the audited mutation path (`one_shot_sweep` audit entries
+  with `one_shot_hit` detail), and `emulator_status` reports the removals
+  (`one_shot_removals`) plus the attribution. A one-shot instrument that never
+  fires stays armed until it does or until a ROM reload purges managed
+  resources; non-one-shot fired instruments get the attribution and the event
+  but are never removed.
 - `run_until_breakpoint` / `run_until_watchpoint`: one-shot run-to-instrument
   wrappers. One call arms the instrument (same conditions/access semantics as
   the set tools), runs the system under exclusive control for the whole
   window (caller `control_id` reused, otherwise an internal lock), polls
   `emulator_status` every 100 ms (cache bypassed) until the instrument proves
-  fired, and reports the stop evidence: `stop_reason`, resource id, `hit_count`,
-  `triggering_pc` (+ hex), registers, `pause_source:
-  breakpoint_or_watchpoint`, watched address/access for watchpoints, the
-  debug `event_id`, and the generation span. The instrument is removed on
-  every exit path — success, foreign-pause preemption
+  fired, and reports the stop evidence: `stop_reason`, `stop_source`,
+  resource id, `hit_count`, `one_shot`, `triggering_pc` (+ hex), `pc_source`,
+  registers, `pause_source`, `configured_access`/`observed_direction` and the
+  watched range for watchpoints, the debug `event_id`, and the generation
+  span. The stop evidence never fabricates facts: `triggering_pc` is `null`
+  with `pc_source: "unknown"` when no read proved it, and it is paired with a
+  source (`instrument` when the value recorded at the stop is reused,
+  `register_read` for a live read). `stop_source` distinguishes an instrument
+  stop (`instrument`), an MCP pause (`mcp`), an external pause (`external`),
+  and a window that ended without a stop (`none`). The **tool itself** removes
+  the instrument inside the call, ahead of the paused-state sweep, and reports
+  the verified outcome: `instrument_removed` plus `instrument_removal`
+  (`removed` | `already_absent` | `failed`). A removal failure is surfaced as
+  `run_until_cleanup_failed` carrying the complete stop evidence, with
+  `instrument_removed: false` and `instrument_removal_failure`, and the
+  instrument is handed back to the sweep for a retry. The instrument is
+  removed on every exit path — success, foreign-pause preemption
   (`run_until_preempted` with the observed pause source), timeout
   (`run_until_timeout`, window default 30000 ms, min 100, cap 120000), or
   caller cancellation — so no armed instrumentation or polling is left
@@ -791,8 +836,8 @@ named subset are asserted by `internal/mcp/server_test.go`
 | Breakpoint conditions and the `break_counter` default | `internal/mcp/tools_breakpoint_conditions_test.go` |
 | Freeze lifecycle, limits, surfaced write errors, purge on ROM load | `internal/mcp/tools_freeze_test.go` |
 | Memory-write echo and audit record, `data_hex`/base64 normalization, read-back verification (the memory-write contract itself is described in its own section above) | `internal/mcp/tools_phase4_test.go` `TestMemoryWriteEchoesAndRecordsAudit`, `internal/mcp/tools_provenance_test.go` `TestMemoryWriteHexInputAndEcho`, `TestMemoryWriteReadbackVerification` |
-| Debug-event history folding, gaps, pagination | `internal/mcp/tools_debug_events_test.go` |
-| Run-until wrappers and one-shot sweep | `internal/mcp/tools_run_until_test.go` |
+| Debug-event history folding (counter identity, changed-PC re-observation), gaps, pagination, observed-vs-configured direction filters, filter-enum validation, cross-context scope and scope-consistent history counters | `internal/mcp/tools_debug_events_test.go` |
+| Run-until wrappers and one-shot sweep: verified instrument removal (including the native-failure path), `pc_source`/null `triggering_pc`, `stop_source`, steady-stop event recording, watchpoint range semantics and `one_shot` echoes | `internal/mcp/tools_run_until_test.go` |
 | Target generation/control lock store, conflict and resynchronization | `internal/analysis/target_test.go` |
 | Control lock, generation conflicts, audit stream, state save/load/list, frame advance, input set, context close | `internal/mcp/tools_phase4_test.go` |
 | Search/diff modes, ROM header parse and checksum, `target_info` ROM summary, coverage counts and region filter, watchpoint trace arguments | `internal/mcp/tools_phase5_test.go` |
@@ -856,7 +901,13 @@ Each label below is a `check` string in `scripts/live-smoke.sh`; run
 - `run_until_*`, one-shot removal and pause attribution: "run_until_breakpoint
   fires at the target PC", "run_until_watchpoint fires on a RAM write",
   "emulator_status attributes the managed stop", "one-shot breakpoint
-  auto-removes on hit".
+  auto-removes on hit". **Pending live check** (the native watchpoint
+  condition is not covered by a Go test): set a watchpoint at address 0 with
+  `length: 2`, let the running system access addresses 0-1 (for example the
+  vector table fetch), and confirm the stop; also set an `any` watchpoint,
+  confirm its event reports `observed_direction: null`, and confirm
+  `cpu_debug_events_list` with `direction: "write"` excludes it while
+  `direction: "any"` includes it.
 - Sampled trace session: "trace session starts", "native access stream is
   reported", "per-access write records are captured", "per-access sequence has
   no gaps in a short run", "trace session never pauses the CPU", "trace session

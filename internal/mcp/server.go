@@ -487,7 +487,10 @@ func (server *Server) setROMPath(path string) {
 // the audited mutation path once its native hit counter proves a break fired
 // (roadmap Phase 9). BreakCounter is the N of break_on_counter (1 when the
 // instrument always breaks on every hit); a break fired exactly when
-// hit_count is a positive multiple of it.
+// hit_count is a positive multiple of it. DeferRemoval keeps the paused-state
+// sweep from removing the instrument: a run_until window owns the removal so
+// the tool can report the real outcome instead of trusting the background
+// sweep.
 type debugResourceMeta struct {
 	ContextID        string
 	ControlID        string
@@ -495,7 +498,36 @@ type debugResourceMeta struct {
 	CreatedAt        time.Time
 	ROMPath          string
 	OneShot          bool
+	DeferRemoval     bool
 	BreakCounter     uint64
+}
+
+// Provenance vocabulary for a stop event's triggering PC. A recorded value is
+// either read from the processor registers while the CPU was paused at the
+// stop (register_read) or unknown; run_until additionally reports instrument
+// when it reuses the value the stop event recorded.
+const (
+	pcSourceInstrument   = "instrument"
+	pcSourceRegisterRead = "register_read"
+	pcSourceUnknown      = "unknown"
+)
+
+// observedDirection derives the direction a stop proves from the access the
+// instrument was configured with. A single-direction watchpoint can only fire
+// on that direction, and an execution breakpoint always stops execution. An
+// "any" watchpoint is ambiguous: the Exodus processor watchpoint API evaluates
+// only the access start address and never reports the transfer direction, so
+// the observed value stays unknown (nil) instead of repeating the
+// configuration.
+func observedDirection(configuredAccess string) *string {
+	direction := ""
+	switch configuredAccess {
+	case "read", "write", "execute":
+		direction = configuredAccess
+	default:
+		return nil
+	}
+	return &direction
 }
 
 // debugEvent is one structured breakpoint/watchpoint stop event.
@@ -503,26 +535,35 @@ type debugResourceMeta struct {
 // Stop/resume and duplicate-hit semantics: a breaking watchpoint increments its
 // native hit counter once per confirmed access and then pauses the CPU. While
 // the CPU stays paused no further access can occur, so repeated observations of
-// the same resource, hit count, direction, and triggering PC are the same event,
-// not new hits: they are folded into RepeatCount with LastSeenAt updated. A
-// resumed CPU (cpu_run) produces a new counter value on the next confirmed hit
-// and therefore a new event. Events whose counter value cannot be proven are
-// never synthesized.
+// the same resource, hit count, and direction are the same event, not new hits:
+// they are folded into RepeatCount with LastSeenAt updated. A resumed CPU
+// (cpu_run) produces a new counter value on the next confirmed hit and
+// therefore a new event. Events whose counter value cannot be proven are never
+// synthesized.
 type debugEvent struct {
-	ID               uint64
-	ResourceKind     string
-	ResourceID       uint64
-	ContextID        string
-	CPU              string
-	TriggeringPC     uint64
-	AddressSpace     string
-	WatchedAddress   uint64
-	AccessDirection  string
-	RequestedLength  uint64
-	HitCount         uint64
-	TargetGeneration uint64
-	FrameToken       *uint64
-	Timestamp        time.Time
+	ID             uint64
+	ResourceKind   string
+	ResourceID     uint64
+	ContextID      string
+	CPU            string
+	TriggeringPC   uint64
+	AddressSpace   string
+	WatchedAddress uint64
+	// AccessDirection is the access the instrument was CONFIGURED with
+	// ("read"/"write"/"any"/"execute"), never an observation. ObservedDirection
+	// is the direction the stop proves, or nil when the core cannot tell (an
+	// "any" watchpoint hit). Filters use the observed value.
+	AccessDirection   string
+	ObservedDirection *string
+	RequestedLength   uint64
+	HitCount          uint64
+	TargetGeneration  uint64
+	FrameToken        *uint64
+	// TriggeringPCSource explains TriggeringPC: register_read when the PC was
+	// read while paused at the stop, unknown when no read succeeded (the
+	// numeric field is then meaningless and rendered as null).
+	TriggeringPCSource string
+	Timestamp          time.Time
 	// FirstSeenAt and LastSeenAt bracket a folded duplicate observation.
 	FirstSeenAt time.Time
 	LastSeenAt  time.Time
@@ -572,6 +613,25 @@ func (server *Server) forgetDebugResource(kind string, id uint64) {
 	}
 }
 
+// setDebugResourceDeferRemoval marks whether the paused-state housekeeping
+// sweep may remove this instrument. A run_until window owns its instrument's
+// removal (so it can report the real outcome); when that removal fails, the
+// tool clears the flag so the sweep retries instead of leaking the instrument.
+func (server *Server) setDebugResourceDeferRemoval(kind string, id uint64, deferRemoval bool) {
+	server.debugMu.Lock()
+	defer server.debugMu.Unlock()
+	targets := server.breakpoints
+	if kind == "watchpoint" {
+		targets = server.watchpoints
+	}
+	meta, present := targets[id]
+	if !present {
+		return
+	}
+	meta.DeferRemoval = deferRemoval
+	targets[id] = meta
+}
+
 // debugResourceIDs returns the ids of every tracked resource of both kinds,
 // for the audited invalidation batch on rom_load.
 func (server *Server) debugResourceIDs() []uint64 {
@@ -599,19 +659,32 @@ func (server *Server) purgeDebugResources() {
 const maxDebugEvents = 100
 
 // pushDebugEvent records one stop observation, folding a repeat of the same
-// paused hit (same resource, hit count, direction, and PC) into the existing
-// event instead of creating a duplicate record.
+// paused hit (same resource, hit count, and direction) into the existing event
+// instead of creating a duplicate record. The native hit counter is the
+// identity of a stop: it increments once per confirmed access and strictly
+// increases across a resume, so an observation that repeats the counter value
+// is the same paused stop even if the reported PC moved after it (for example
+// when a later MCP pause reads a different PC). The observed direction and the
+// triggering-PC source are always explicit: a producer that cannot prove them
+// leaves them unknown rather than copying the configuration.
 func (server *Server) pushDebugEvent(event debugEvent) uint64 {
 	server.debugEventsMu.Lock()
 	defer server.debugEventsMu.Unlock()
+	if event.ObservedDirection == nil {
+		event.ObservedDirection = observedDirection(event.AccessDirection)
+	}
+	if event.TriggeringPCSource == "" {
+		event.TriggeringPCSource = pcSourceUnknown
+	}
 	now := time.Now().UTC()
 	for index := len(server.debugEvents) - 1; index >= 0; index-- {
 		existing := &server.debugEvents[index]
 		if existing.ResourceKind != event.ResourceKind || existing.ResourceID != event.ResourceID {
 			continue
 		}
-		if existing.HitCount == event.HitCount && existing.TriggeringPC == event.TriggeringPC &&
-			existing.AccessDirection == event.AccessDirection && existing.WatchedAddress == event.WatchedAddress {
+		if existing.HitCount == event.HitCount &&
+			existing.AccessDirection == event.AccessDirection && existing.WatchedAddress == event.WatchedAddress &&
+			sameOptionalString(existing.ObservedDirection, event.ObservedDirection) {
 			existing.RepeatCount++
 			existing.LastSeenAt = now
 			return existing.ID
@@ -640,6 +713,13 @@ func (server *Server) pushDebugEvent(event debugEvent) uint64 {
 	return event.ID
 }
 
+func sameOptionalString(left, right *string) bool {
+	if left == nil || right == nil {
+		return left == nil && right == nil
+	}
+	return *left == *right
+}
+
 // debugEventFilter selects retained stop events. Every field is optional; an
 // empty filter matches everything.
 type debugEventFilter struct {
@@ -647,9 +727,14 @@ type debugEventFilter struct {
 	ResourceID   uint64
 	ContextID    string
 	CPU          string
-	Direction    string
-	EventIDMin   uint64
-	EventIDMax   uint64
+	// Direction filters on the observed access direction, never on the
+	// instrument's configuration. "any" matches every event (including events
+	// whose observed direction is unknown) and an empty value does not filter.
+	// A concrete value never matches an event whose direction could not be
+	// observed.
+	Direction  string
+	EventIDMin uint64
+	EventIDMax uint64
 }
 
 func (filter debugEventFilter) matches(event debugEvent) bool {
@@ -665,8 +750,10 @@ func (filter debugEventFilter) matches(event debugEvent) bool {
 	if filter.CPU != "" && event.CPU != filter.CPU {
 		return false
 	}
-	if filter.Direction != "" && event.AccessDirection != filter.Direction {
-		return false
+	if filter.Direction != "" && filter.Direction != "any" {
+		if event.ObservedDirection == nil || *event.ObservedDirection != filter.Direction {
+			return false
+		}
 	}
 	if filter.EventIDMin != 0 && event.ID < filter.EventIDMin {
 		return false
@@ -678,26 +765,47 @@ func (filter debugEventFilter) matches(event debugEvent) bool {
 }
 
 // debugEventHistory is the explicit completeness statement of the retained
-// history: capacity, records recorded, records dropped, and the id span.
+// history: capacity, records recorded, records dropped, and the id span. The
+// scope fields keep the counters consistent with what a query can return:
+// retained is the whole ring, scope_retained is the ring restricted to the
+// query's context scope, and matching is exactly the number of events the same
+// query can page through.
 type debugEventHistory struct {
-	Capacity   int    `json:"capacity"`
-	Retained   int    `json:"retained"`
-	Recorded   uint64 `json:"recorded"`
-	Dropped    uint64 `json:"dropped"`
-	FirstEvent uint64 `json:"first_event_id,omitempty"`
-	LastEvent  uint64 `json:"last_event_id,omitempty"`
-	Complete   bool   `json:"complete"`
+	Capacity      int    `json:"capacity"`
+	Scope         string `json:"scope"`
+	Retained      int    `json:"retained"`
+	ScopeRetained int    `json:"scope_retained"`
+	Matching      int    `json:"matching"`
+	Recorded      uint64 `json:"recorded"`
+	Dropped       uint64 `json:"dropped"`
+	FirstEvent    uint64 `json:"first_event_id,omitempty"`
+	LastEvent     uint64 `json:"last_event_id,omitempty"`
+	Complete      bool   `json:"complete"`
 }
 
-func (server *Server) debugEventHistory() debugEventHistory {
+// debugEventHistoryFor describes the retained history from the perspective of
+// one query. scope names the context scope the query used.
+func (server *Server) debugEventHistoryFor(filter debugEventFilter, scope string) debugEventHistory {
 	server.debugEventsMu.Lock()
 	defer server.debugEventsMu.Unlock()
 	history := debugEventHistory{
 		Capacity: maxDebugEvents,
+		Scope:    scope,
 		Retained: len(server.debugEvents),
 		Recorded: server.debugEventsTotal,
 		Dropped:  server.debugEventsDropped,
 		Complete: server.debugEventsDropped == 0,
+	}
+	// The context scope alone explains how many retained events are even
+	// eligible; matching then applies every filter of the query.
+	scopeFilter := debugEventFilter{ContextID: filter.ContextID}
+	for _, event := range server.debugEvents {
+		if scopeFilter.matches(event) {
+			history.ScopeRetained++
+		}
+		if filter.matches(event) {
+			history.Matching++
+		}
 	}
 	if len(server.debugEvents) > 0 {
 		history.FirstEvent = server.debugEvents[0].ID

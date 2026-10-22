@@ -2,7 +2,9 @@ package mcp
 
 import (
 	"encoding/json"
+	"fmt"
 	"strconv"
+	"strings"
 	"time"
 )
 
@@ -41,7 +43,12 @@ func controlToolSpecs() []toolSpec {
 			}, []string{"cpu", "address"}),
 			run: runBreakpointSet,
 		},
-		{name: "cpu_breakpoint_list", description: "List execution breakpoints created through this MCP process, including enabled state, condition, break-on-counter settings, native hit counters, and creation provenance (context, target generation).", schema: objectSchema(map[string]any{}, nil), run: runBreakpointList},
+		{
+			name:        "cpu_breakpoint_list",
+			description: "List execution breakpoints created through this MCP process, including enabled state, condition, break-on-counter settings, native hit counters, the one_shot flag, and creation provenance (context, target generation).",
+			schema:      objectSchema(map[string]any{}, nil),
+			run:         runBreakpointList,
+		},
 		{
 			name:        "cpu_breakpoint_remove",
 			description: "Remove one execution breakpoint created through this MCP process. Mutates the target: advances the target generation. Accepts optional expected_target_generation and control_id.",
@@ -54,12 +61,12 @@ func controlToolSpecs() []toolSpec {
 		},
 		{
 			name:        "cpu_watchpoint_set",
-			description: "Create an enabled read and/or write watchpoint owned by this MCP process, recording context provenance. The system pauses when the watched range is accessed. `one_shot: true` auto-removes the watchpoint through the audited mutation path once a hit proves it fired (checked at the next paused observation), so one-shot instrumentation never stays armed. Mutates the target: advances the target generation. Accepts optional expected_target_generation and control_id.",
+			description: "Create an enabled read and/or write watchpoint owned by this MCP process, recording context provenance. The system pauses when the watched range is accessed. Range semantics are start-address based, exactly like the Exodus debugger: the watchpoint fires when the **start address** of an access falls inside [address, address+length-1], never when an access merely overlaps the range (the processor watchpoint API receives only the access start address, not the transfer width). `range_semantics` echoes the contract (`exact_address` for length 1, `access_start_in_range` otherwise). `access` defaults to any; for a single-direction watchpoint the stop event can prove the observed direction, while an `any` watchpoint stop reports `observed_direction: null` (the core does not expose the transfer direction). `one_shot: true` auto-removes the watchpoint through the audited mutation path once a hit proves it fired (checked at the next paused observation), so one-shot instrumentation never stays armed. Mutates the target: advances the target generation. Accepts optional expected_target_generation and control_id.",
 			schema: objectSchema(map[string]any{
 				"cpu":                        enumProperty("Processor to watch.", []string{"m68k", "z80"}),
 				"address":                    addressProperty(),
-				"length":                     integerProperty("Watched range length in bytes (default 1).", 1),
-				"access":                     enumProperty("Access types that trigger the watchpoint.", []string{"read", "write", "any"}),
+				"length":                     integerProperty("Watched range length in bytes (default 1). The range matches access start addresses only; it must stay inside the processor address bus.", 1),
+				"access":                     enumProperty("Access types that trigger the watchpoint (default any).", []string{"read", "write", "any"}),
 				"one_shot":                   booleanProperty("Remove this watchpoint automatically once a hit proves it fired (default false). A one-shot watchpoint will be absent from watchpoint_list after its hit; emulator_status reports one_shot_removals."),
 				"context":                    contextProperty(),
 				"expected_target_generation": integerProperty("Optional target generation the caller last observed; fails with target_generation_conflict on mismatch.", 1),
@@ -67,7 +74,7 @@ func controlToolSpecs() []toolSpec {
 			}, []string{"cpu", "address"}),
 			run: runWatchpointSet,
 		},
-		{name: "cpu_watchpoint_list", description: "List read/write watchpoints created through this MCP process, including hit counters and creation provenance (context, target generation).", schema: objectSchema(map[string]any{}, nil), run: runWatchpointList},
+		{name: "cpu_watchpoint_list", description: "List read/write watchpoints created through this MCP process, including hit counters, the configured access, the range semantics, the one_shot flag, and creation provenance (context, target generation).", schema: objectSchema(map[string]any{}, nil), run: runWatchpointList},
 		{
 			name:        "cpu_watchpoint_remove",
 			description: "Remove one watchpoint created through this MCP process. Mutates the target: advances the target generation. Accepts optional expected_target_generation and control_id.",
@@ -80,17 +87,17 @@ func controlToolSpecs() []toolSpec {
 		},
 		{
 			name:        "cpu_debug_events_list",
-			description: "List structured breakpoint/watchpoint stop events with pagination and filters. Each event includes the managed resource id, owner context, CPU, triggering PC, address_space, watched address, access direction, hit count, target_generation, frame_token, timestamps, repeat count, and provenance. History is bounded (100 retained events): the response's history object states the capacity, how many records were recorded, how many the cap dropped, the retained id span, and whether the retained history is complete, so a gap is never inferred from a short list. A repeated observation of the same paused hit (same resource, counter value, direction, and PC) is folded into the existing event and counted in repeat_count instead of creating a duplicate; a resumed CPU increments the native counter on the next hit and records a new event.",
+			description: "List structured breakpoint/watchpoint stop events with pagination and filters. Every managed stop is recorded once - a steady breakpoint or watchpoint hit reached through cpu_run as well as a one-shot hit - at the next paused observation. Each event separates `configured_access` (what the instrument was set with) from `observed_direction` (`read`/`write`/`execute` when the stop proves the direction, null when the core cannot tell: an `any` watchpoint stop). `direction` filters the OBSERVED value: `any` matches every event including unknown directions, and a concrete direction never matches an event whose direction is unknown. `resource_kind`, `cpu`, and `direction` are validated server-side (invalid_params for unknown values). History is bounded (100 retained events): the response's history object states the capacity, how many records were recorded, how many the cap dropped, the retained id span, whether the retained history is complete, the context scope, how many retained events the scope holds (`scope_retained`), and how many the filters match (`matching`, identical to `total`). Scope the query with `context` (handle, omitted for the caller's default context) or `context: \"all\"` for every context. A repeated observation of the same paused hit (same resource, counter value, and direction) is folded into the existing event and counted in repeat_count instead of creating a duplicate - the native counter is the identity of a stop - and a resumed CPU increments the counter on the next hit and records a new event.",
 			schema: objectSchema(map[string]any{
 				"offset":        integerProperty("Pagination offset within the filtered set (default 0).", 0),
 				"limit":         integerProperty("Pagination limit (default 20, cap 100).", 1),
 				"resource_kind": enumProperty("Filter by resource kind.", []string{"breakpoint", "watchpoint", "any"}),
 				"resource_id":   integerProperty("Filter by managed resource id.", 1),
 				"cpu":           enumProperty("Filter by processor.", []string{"m68k", "z80"}),
-				"direction":     enumProperty("Filter by access direction.", []string{"read", "write", "execute", "any"}),
+				"direction":     enumProperty("Filter by the OBSERVED access direction. \"any\" matches every event, including events whose direction could not be observed; read/write/execute match only events that proved that direction.", []string{"read", "write", "execute", "any"}),
 				"event_id_min":  integerProperty("Only events with an id at or above this value.", 1),
 				"event_id_max":  integerProperty("Only events with an id at or below this value.", 1),
-				"context":       contextProperty(),
+				"context":       stringProperty("Analysis context handle; omitted means the caller's default context, and \"all\" queries the retained history across every context."),
 			}, nil),
 			run: runDebugEventsList,
 		},
@@ -284,6 +291,7 @@ func runBreakpointSet(tc toolContext, args json.RawMessage) map[string]any {
 		payload["address_width_bits"] = width
 		payload["address_mask_hex"] = canonicalHex(mask)
 	}
+	payload["one_shot"] = parsed.OneShot
 	if id, ok := payload["breakpoint_id"].(float64); ok {
 		tc.server.trackDebugResource("breakpoint", uint64(id), debugResourceMeta{
 			ContextID:        context.ID,
@@ -368,16 +376,49 @@ func runWatchpointSet(tc toolContext, args json.RawMessage) map[string]any {
 	default:
 		return failureResult(&toolFailure{Code: "invalid_params", Message: "access must be read, write, or any"}, tc.modern)
 	}
-	if parsed.Length != nil && *parsed.Length == 0 {
+	access := parsed.Access
+	if access == "" {
+		access = "any"
+	}
+	length := uint64(1)
+	if parsed.Length != nil {
+		length = *parsed.Length
+	}
+	if length == 0 {
 		return failureResult(&toolFailure{Code: "invalid_params", Message: "length must be at least 1"}, tc.modern)
+	}
+	// The whole watched range must exist on the processor address bus: the
+	// range matches access start addresses, so its last byte is the highest
+	// start address that can fire.
+	if _, mask := addressBusWidthMask(parsed.CPU + "-bus"); mask != 0 {
+		if length-1 > mask || address > mask || address+length-1 > mask {
+			maxLength := uint64(0)
+			if address <= mask {
+				maxLength = mask + 1 - address
+			}
+			return failureResult(&toolFailure{
+				Code: "invalid_params",
+				Message: fmt.Sprintf("watched range %s..%s is outside the %s bus (mask %s); shorten length or move address",
+					canonicalHex(address), canonicalHex(address+length-1), parsed.CPU+"-bus", canonicalHex(mask)),
+				Data: map[string]any{
+					"address":          address,
+					"length":           length,
+					"range_end":        address + length - 1,
+					"address_space":    parsed.CPU + "-bus",
+					"address_mask_hex": canonicalHex(mask),
+					"range_semantics":  watchpointRangeSemantics(length),
+					"max_length":       maxLength,
+				},
+			}, tc.modern)
+		}
 	}
 	params := map[string]string{
 		"cpu":     parsed.CPU,
 		"address": strconv.FormatUint(address, 10),
-		"access":  parsed.Access,
+		"access":  access,
 	}
 	if parsed.Length != nil {
-		params["length"] = strconv.FormatUint(*parsed.Length, 10)
+		params["length"] = strconv.FormatUint(length, 10)
 	}
 	payload, before, after, failure := tc.server.executeMutation(tc.ctx, mutationCall{
 		tool:      "cpu_watchpoint_set",
@@ -388,7 +429,8 @@ func runWatchpointSet(tc toolContext, args json.RawMessage) map[string]any {
 		detail: map[string]any{
 			"cpu":     parsed.CPU,
 			"address": address,
-			"access":  parsed.Access,
+			"access":  access,
+			"length":  length,
 		},
 	})
 	if failure != nil {
@@ -397,7 +439,16 @@ func runWatchpointSet(tc toolContext, args json.RawMessage) map[string]any {
 	payload["address"] = address
 	payload["address_hex"] = canonicalHex(address)
 	payload["address_space"] = parsed.CPU + "-bus"
+	payload["access"] = access
+	payload["length"] = length
+	payload["one_shot"] = parsed.OneShot
+	payload["range_semantics"] = watchpointRangeSemantics(length)
 	annotateAddressPair(payload, parsed.CPU+"-bus", address)
+	if length > 1 {
+		payload["range_end"] = address + length - 1
+		payload["range_end_hex"] = canonicalHex(address + length - 1)
+		annotateAddressRangePair(payload, "range_end", parsed.CPU+"-bus", address+length-1)
+	}
 	if width, mask := addressBusWidthMask(parsed.CPU + "-bus"); width != 0 {
 		payload["address_width_bits"] = width
 		payload["address_mask_hex"] = canonicalHex(mask)
@@ -469,14 +520,45 @@ type debugEventsListArgs struct {
 	Context      string `json:"context"`
 }
 
+// debugEventQueryAllScopes is the explicit context value that queries the
+// retained history across every analysis context. Context handles are
+// generated as ctx_<base64url>, so the token cannot collide with a handle.
+const debugEventQueryAllScopes = "all"
+
+// debugEventDirectionValues and debugEventResourceKindValues are the accepted
+// filter enums. They are validated server-side so an unknown value fails with
+// invalid_params instead of silently returning an empty list.
+var (
+	debugEventDirectionValues    = []string{"read", "write", "execute", "any"}
+	debugEventResourceKindValues = []string{"breakpoint", "watchpoint", "any"}
+)
+
 func runDebugEventsList(tc toolContext, args json.RawMessage) map[string]any {
 	parsed, failure := decodeArgs[debugEventsListArgs](args)
 	if failure != nil {
 		return failureResult(failure, tc.modern)
 	}
-	context, failure := resolveContext(tc.server, parsed.Context)
-	if failure != nil {
+	if failure := validateEnumArg("resource_kind", parsed.ResourceKind, debugEventResourceKindValues); failure != nil {
 		return failureResult(failure, tc.modern)
+	}
+	if failure := validateEnumArg("cpu", parsed.CPU, []string{"m68k", "z80"}); failure != nil {
+		return failureResult(failure, tc.modern)
+	}
+	if failure := validateEnumArg("direction", parsed.Direction, debugEventDirectionValues); failure != nil {
+		return failureResult(failure, tc.modern)
+	}
+	// The context scope is a query decision, not an implicit default: the
+	// default context keeps unrelated instrumentation out of an analysis
+	// record, and "all" is the explicit cross-context query.
+	scope := "context"
+	if strings.EqualFold(strings.TrimSpace(parsed.Context), debugEventQueryAllScopes) {
+		scope = debugEventQueryAllScopes
+	} else {
+		context, failure := resolveContext(tc.server, parsed.Context)
+		if failure != nil {
+			return failureResult(failure, tc.modern)
+		}
+		scope = "context:" + context.ID
 	}
 	offset := int(parsed.Offset)
 	limit := int(parsed.Limit)
@@ -493,33 +575,48 @@ func runDebugEventsList(tc toolContext, args json.RawMessage) map[string]any {
 		Direction:    parsed.Direction,
 		EventIDMin:   parsed.EventIDMin,
 		EventIDMax:   parsed.EventIDMax,
-		// A managed stop belongs to the context that created its instrument;
-		// filtering by the caller's context keeps unrelated instrumentation out
-		// of an analysis record.
-		ContextID: context.ID,
+	}
+	if scope != debugEventQueryAllScopes {
+		filter.ContextID = strings.TrimPrefix(scope, "context:")
 	}
 	events, total, truncated := tc.server.listDebugEvents(filter, offset, limit)
-	history := tc.server.debugEventHistory()
+	history := tc.server.debugEventHistoryFor(filter, scope)
 	views := make([]map[string]any, 0, len(events))
 	for _, ev := range events {
 		view := map[string]any{
-			"event_id":            ev.ID,
-			"resource_kind":       ev.ResourceKind,
-			"resource_id":         ev.ResourceID,
-			"context_id":          ev.ContextID,
-			"cpu":                 ev.CPU,
-			"triggering_pc":       ev.TriggeringPC,
-			"triggering_pc_hex":   canonicalHex(ev.TriggeringPC),
-			"address_space":       ev.AddressSpace,
-			"watched_address":     ev.WatchedAddress,
-			"watched_address_hex": canonicalHex(ev.WatchedAddress),
-			"access_direction":    ev.AccessDirection,
-			"requested_length":    ev.RequestedLength,
-			"hit_count":           ev.HitCount,
-			"target_generation":   ev.TargetGeneration,
-			"timestamp":           ev.Timestamp,
+			"event_id":          ev.ID,
+			"resource_kind":     ev.ResourceKind,
+			"resource_id":       ev.ResourceID,
+			"context_id":        ev.ContextID,
+			"cpu":               ev.CPU,
+			"address_space":     ev.AddressSpace,
+			"watched_address":   ev.WatchedAddress,
+			"configured_access": ev.AccessDirection,
+			// access_direction is the historical name of configured_access and
+			// keeps its old value for compatibility; observed_direction is what
+			// the stop proves and what the direction filter matches.
+			"access_direction":   ev.AccessDirection,
+			"observed_direction": ev.ObservedDirection,
+			"requested_length":   ev.RequestedLength,
+			"hit_count":          ev.HitCount,
+			"target_generation":  ev.TargetGeneration,
+			"timestamp":          ev.Timestamp,
 		}
-		annotateAddressRangePair(view, "triggering_pc", ev.AddressSpace, ev.TriggeringPC)
+		if ev.ObservedDirection != nil && ev.ResourceKind == "watchpoint" {
+			view["range_semantics"] = watchpointRangeSemantics(ev.RequestedLength)
+		}
+		if ev.TriggeringPCSource == pcSourceUnknown {
+			// A PC that could not be read is null with its source, never a
+			// fabricated zero.
+			view["triggering_pc"] = nil
+			view["triggering_pc_hex"] = nil
+		} else {
+			view["triggering_pc"] = ev.TriggeringPC
+			view["triggering_pc_hex"] = canonicalHex(ev.TriggeringPC)
+			annotateAddressRangePair(view, "triggering_pc", ev.AddressSpace, ev.TriggeringPC)
+		}
+		view["triggering_pc_source"] = ev.TriggeringPCSource
+		view["watched_address_hex"] = canonicalHex(ev.WatchedAddress)
 		annotateAddressRangePair(view, "watched", ev.AddressSpace, ev.WatchedAddress)
 		if ev.FrameToken != nil {
 			view["frame_token"] = *ev.FrameToken
@@ -547,15 +644,41 @@ func runDebugEventsList(tc toolContext, args json.RawMessage) map[string]any {
 			"event_id_min":  filter.EventIDMin,
 			"event_id_max":  filter.EventIDMax,
 			"context_id":    filter.ContextID,
+			"scope":         history.Scope,
 		},
 		"semantics": map[string]any{
-			"stop":      "A hit that fired pauses the CPU; the event's hit_count is the native watchpoint counter at that observation.",
-			"resume":    "After cpu_run the CPU can reach the watched range again; the next confirmed hit increments the counter and records a new event.",
-			"duplicate": "Re-observing the same paused hit (same resource, counter value, direction, and PC) increases repeat_count; it is not a second access.",
-			"gap":       "history.dropped counts records the 100-event cap evicted; history.complete is false whenever records are gone.",
+			"stop":          "A hit that fired pauses the CPU; the event's hit_count is the native counter at that observation. Every managed stop is recorded once, one-shot or steady, at the next paused observation.",
+			"resume":        "After cpu_run the CPU can reach the watched range again; the next confirmed hit increments the counter and records a new event.",
+			"duplicate":     "Re-observing the same paused hit (same resource, counter value, and direction) increases repeat_count; the native counter is the identity of a stop, so a re-observation is never a second access.",
+			"direction":     "configured_access is what the instrument was set with; observed_direction is what the stop proves (null when the core cannot tell, for an \"any\" watchpoint hit). The direction filter matches observed_direction only: \"any\" matches every event, and a concrete direction never matches an event whose direction is unknown.",
+			"triggering_pc": "triggering_pc is null when the value could not be read; triggering_pc_source states register_read or unknown, so a stop is never attributed to a fabricated address 0.",
+			"scope":         "scope \"all\" queries every context; \"context:<id>\" restricts to one. history.matching equals total, and history.scope_retained is the ring size inside the scope.",
+			"gap":           "history.dropped counts records the 100-event cap evicted; history.complete is false whenever records are gone.",
 		},
-		"note": "History is bounded to 100 retained events. Use history.dropped/history.complete to decide whether the retained list is a complete record, and page with offset/limit over the filtered set.",
+		"note": "History is bounded to 100 retained events. Use history.matching/history.scope_retained/history.dropped to decide whether the retained list is a complete record of what the query can return, and page with offset/limit over the filtered set.",
 	}, tc.modern)
+}
+
+// validateEnumArg rejects an unsupported enum value with invalid_params and
+// names the accepted vocabulary. An empty value means "not filtered".
+func validateEnumArg(field, value string, allowed []string) *toolFailure {
+	if value == "" {
+		return nil
+	}
+	for _, candidate := range allowed {
+		if value == candidate {
+			return nil
+		}
+	}
+	return &toolFailure{
+		Code:    "invalid_params",
+		Message: fmt.Sprintf("%s must be one of %s", field, strings.Join(allowed, ", ")),
+		Data: map[string]any{
+			"field":   field,
+			"value":   value,
+			"allowed": allowed,
+		},
+	}
 }
 
 // annotateDebugList merges server-side provenance into a breakpoint_list or
@@ -588,6 +711,26 @@ func annotateDebugList(payload map[string]any, kind, key, idKey string, server *
 				annotateAddressRangePair(record, "range_end", space, rangeEnd)
 			}
 		}
+		if kind == "watchpoint" {
+			// The watchpoint range contract is start-address based: state it on
+			// every list entry so the parameter never silently means something
+			// else than the documentation.
+			length, _ := numberAsUint64(record["length"])
+			if length == 0 {
+				length = 1
+			}
+			record["length"] = length
+			record["range_semantics"] = watchpointRangeSemantics(length)
+			if length > 1 {
+				if addr, ok := numberAsUint64(record["address"]); ok {
+					record["range_end"] = addr + length - 1
+					record["range_end_hex"] = canonicalHex(addr + length - 1)
+					if space, ok := record["address_space"].(string); ok {
+						annotateAddressRangePair(record, "range_end", space, addr+length-1)
+					}
+				}
+			}
+		}
 		id, ok := record[idKey].(float64)
 		if !ok {
 			continue
@@ -600,5 +743,26 @@ func annotateDebugList(payload map[string]any, kind, key, idKey string, server *
 		record["target_generation"] = meta.TargetGeneration
 		record["created_at"] = meta.CreatedAt
 		record["rom_path"] = meta.ROMPath
+		record["one_shot"] = meta.OneShot
 	}
+}
+
+// Watchpoint range semantics. The Exodus processor evaluates one location per
+// access — the access START address — and its watchpoint API never reports the
+// transfer width, so a range watchpoint cannot implement overlap matching. The
+// documented contract is therefore hardware-consistent start-address matching:
+// the watchpoint fires exactly when the access start address falls inside
+// [address, address+length-1].
+const (
+	watchpointRangeExact       = "exact_address"
+	watchpointRangeAccessStart = "access_start_in_range"
+)
+
+// watchpointRangeSemantics names the documented range contract for a watch
+// length; the set and list responses echo it next to the range.
+func watchpointRangeSemantics(length uint64) string {
+	if length <= 1 {
+		return watchpointRangeExact
+	}
+	return watchpointRangeAccessStart
 }

@@ -2661,16 +2661,29 @@ bool ExodusMcpPlugin::BuildWatchpointSetData(const BridgeRequest& request, std::
 	watchpoint->SetOnRead(access == "read" || access == "any");
 	watchpoint->SetOnWrite(access == "write" || access == "any");
 	watchpoint->SetLocationMask(processor->GetAddressBusMask());
+	// Range semantics are start-address based, exactly like the processor: the
+	// core evaluates one location per access (the access start address) and
+	// never reports the transfer width, so a range watchpoint matches when the
+	// access starts inside [address, address+length-1]. The Go side documents
+	// and echoes this contract as range_semantics.
 	if (length == 1)
 	{
 		watchpoint->SetLocationCondition(IWatchpoint::Condition::Equal);
 		watchpoint->SetLocationConditionData1((unsigned int)address);
 	}
+	else if (address == 0)
+	{
+		// A range starting at 0 cannot express an inclusive lower bound with the
+		// strict ">" condition (data1 would underflow to the bus mask and the
+		// watchpoint could never fire). No masked location is below zero, so the
+		// inclusive [0, length-1] range is exactly location < length.
+		watchpoint->SetLocationCondition(IWatchpoint::Condition::Less);
+		watchpoint->SetLocationConditionData1((unsigned int)(address + length));
+	}
 	else
 	{
 		// Exodus range conditions are strict (location > data1 && location < data2),
 		// so an inclusive [address, address+length-1] range needs the neighbors.
-		// A range starting at 0 cannot be expressed because data1 would wrap.
 		watchpoint->SetLocationCondition(IWatchpoint::Condition::GreaterAndLess);
 		watchpoint->SetLocationConditionData1((unsigned int)(address - 1));
 		watchpoint->SetLocationConditionData2((unsigned int)(address + length));
