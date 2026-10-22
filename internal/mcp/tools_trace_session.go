@@ -6,6 +6,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"math"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -68,7 +69,7 @@ func traceSessionToolSpecs() []toolSpec {
 	return []toolSpec{
 		{
 			name:        "trace_session_start",
-			description: "Start a persistent, non-pausing trace session. It remains active until trace_session_stop, processor removal, or an explicitly configured stop_after_vdp_frames threshold; there is no wall-clock expiry, so time spent paused does not consume the frame threshold. The threshold counts completed rendered VDP frames, not instruction executions, and requires a VDP. The monitor may observe the threshold several frames late; vdp_frames_elapsed reports the actual count. Reaching the threshold stops capture, not emulation. The native plugin captures execution trace lines in sampled windows (default) or continuously, and can also record each read/write access. Set access_capture to \"ranges\" to record individual accesses overlapping the configured watches, or \"all\" to record every access; the default \"off\" keeps only aggregate watch counters. Per-access records include monotonic sequence, cycle, PC, direction, width, transferred value, and (by default for ranges) a same-instant register snapshot. Access ranges are filtered natively; execution-trace address filters are post-capture. Storage remains bounded by segment/event/byte caps with explicit loss reporting; the response's loss object states the completeness contract, where loss.complete is true only for a continuous session with zero loss whereas a sampled session always reports loss.complete false plus loss.capture_is_sampled and loss.capture (window_ms, interval_ms, duty_cycle). Starting a new session retires the previous one. Accepts optional expected_target_generation and control_id.",
+			description: "Start a persistent, non-pausing trace session. It remains active until trace_session_stop, processor removal, or an explicitly configured stop_after_vdp_frames threshold; there is no wall-clock expiry, so time spent paused does not consume the frame threshold. The threshold counts completed rendered VDP frames, not instruction executions, and requires a VDP. The monitor may observe the threshold several frames late; vdp_frames_elapsed reports the actual count. Reaching the threshold stops capture, not emulation. The native plugin captures execution trace lines in sampled windows (default) or continuously, and can also record each read/write access. Set access_capture to \"ranges\" to record individual accesses overlapping the configured watches, or \"all\" to record every access; the default \"off\" keeps only aggregate watch counters. Per-access records include monotonic sequence, cycle, PC, direction, width, transferred value, and (by default for ranges) a same-instant register snapshot. Access ranges are filtered natively; execution-trace address filters are post-capture. Storage remains bounded by segment/event/byte caps with explicit loss reporting; the response's loss object states the completeness contract without overpromising at start: loss.complete is true only for a session that has ended (loss.final) in continuous mode with zero loss, so a just-started session reports loss.complete false with the reason session_running, loss.estimated_eviction_risk when the estimated trace write rate exhausts a finite retention cap before the session ends (loss.estimated_eviction carries the horizons, the assumed frame rate, and the rule), and, for sampled mode, loss.capture_is_sampled plus loss.capture (window_ms, interval_ms, duty_cycle). Starting a new session retires the previous one. Accepts optional expected_target_generation and control_id.",
 			schema: objectSchema(map[string]any{
 				"cpu":                   enumProperty("Processor to trace.", []string{"m68k", "z80"}),
 				"mode":                  enumProperty("sampled (default) captures window_ms of every interval_ms and leaves the engine untouched in between; continuous keeps the trace writer enabled and rotates only by segment_ms.", []string{"sampled", "continuous"}),
@@ -108,7 +109,7 @@ func traceSessionToolSpecs() []toolSpec {
 		},
 		{
 			name:        "trace_session_status",
-			description: "Report the live trace session and, by default, drain every sealed native segment into the server-side event store first. Draining only reads sealed segments and never ends capture: a continuous session keeps tracing across the segment boundary because the plugin re-arms its trace gate after every seal/rotate. The response carries the session configuration, native capture counters, per-segment table, watched read/write counter deltas, the bounded store's totals, and a machine-readable loss object (dropped events, malformed/truncated trace lines, evicted undrained segments). loss.complete is true only when the capture covered the requested window with no gaps: a sampled session is never complete, and loss.capture_is_sampled plus loss.capture (mode, window_ms, interval_ms, duty_cycle, untraced_ms_per_interval) and loss.incomplete_reasons state what was actually captured and why it is or is not complete. Native elapsed_ms is wall-clock telemetry only; sessions have no wall-clock auto-expiry. stop_after_vdp_frames/vdp_frames_elapsed count completed VDP rendered frames, independently of instruction-event counts, and do not advance while paused. Never mutates the target and never pauses the system.",
+			description: "Report the live trace session and, by default, drain every sealed native segment into the server-side event store first. Draining only reads sealed segments and never ends capture: a continuous session keeps tracing across the segment boundary because the plugin re-arms its trace gate after every seal/rotate. The response carries the session configuration, native capture counters, per-segment table, watched read/write counter deltas, the bounded store's totals, and a machine-readable loss object (dropped events, malformed/truncated trace lines, evicted undrained segments). loss.complete is true only when the session has ended (loss.final) and the capture covered the requested window with no gaps: while the session runs it is always false with the reason session_running, and loss.estimated_eviction_risk states whether the estimated write rate will exhaust a finite retention cap before the session ends (loss.estimated_eviction carries the horizons and the rule). A sampled session is never complete, and loss.capture_is_sampled plus loss.capture (mode, window_ms, interval_ms, duty_cycle, untraced_ms_per_interval) and loss.incomplete_reasons state what was actually captured and why it is or is not complete. Native elapsed_ms is wall-clock telemetry only; sessions have no wall-clock auto-expiry. stop_after_vdp_frames/vdp_frames_elapsed count completed VDP rendered frames, independently of instruction-event counts, and do not advance while paused. Never mutates the target and never pauses the system.",
 			schema: objectSchema(map[string]any{
 				"session_id":           stringProperty("Optional session id; when present it must match the live session."),
 				"collect":              booleanProperty("Drain sealed native segments before reporting (default true). Draining never disarms capture: a continuous session keeps tracing across the sealed segment boundary."),
@@ -120,7 +121,7 @@ func traceSessionToolSpecs() []toolSpec {
 		},
 		{
 			name:        "trace_session_events",
-			description: "Query accumulated trace-session data: bounded execution events and histogram, aggregate watch-counter samples, and—when access_capture was set to \"ranges\" or \"all\"—individual read/write access events with PC, cycle, width, value, and optional registers. Filters and optional JSONL export operate on retained events; access ranges are filtered natively, while execution-address filters are post-capture. Drains native segments first unless collect=false; the drain never ends a continuous session. loss.complete means the capture covered the requested window with no gaps, so a sampled session reports loss.complete false with capture_is_sampled and its capture duty cycle; drained.complete is only about this call's drain cursor, not capture coverage. Never pauses the system.",
+			description: "Query accumulated trace-session data: bounded execution events and histogram, aggregate watch-counter samples, and—when access_capture was set to \"ranges\" or \"all\"—individual read/write access events with PC, cycle, width, value, and optional registers. Filters and optional JSONL export operate on retained events; access ranges are filtered natively, while execution-address filters are post-capture. Drains native segments first unless collect=false; the drain never ends a continuous session. loss.complete means the capture covered the requested window with no gaps, which is only decidable once the session has ended (loss.final): a running session reports loss.complete false with the reason session_running, a sampled session reports loss.complete false with capture_is_sampled and its capture duty cycle, and loss.estimated_eviction_risk states whether a finite retention cap will run out first. drained.complete is only about this call's drain cursor, not capture coverage. Never pauses the system.",
 			schema: objectSchema(map[string]any{
 				"kind":                   enumProperty("Event kind to select.", []string{"execute", "read", "write", "any"}),
 				"address_range_start":    addressProperty(),
@@ -1481,7 +1482,7 @@ func traceSessionVolume(session *tracing.Session) map[string]any {
 	if config.Mode == "sampled" && config.IntervalMs > 0 {
 		duty = float64(config.WindowMs) / float64(config.IntervalMs)
 	}
-	traceBytesPerSecond := 13.0 * 1024 * 1024 * duty
+	traceBytesPerSecond := traceSessionTraceBytesPerSecond(config)
 	limits := map[string]any{
 		"stop_after_vdp_frames": config.StopAfterVdpFrames,
 		"max_total_bytes":       config.MaxTotalBytes,
@@ -1501,7 +1502,7 @@ func traceSessionVolume(session *tracing.Session) map[string]any {
 			"untraced_time_in_sampled": config.Mode == "sampled",
 			"basis":                    "Trace session lifetime is unbounded unless stop_after_vdp_frames is set; disk and event retention caps bound storage and evict oldest data. The throughput estimate is provided, but a total-byte estimate is not meaningful without a lifetime limit.",
 		},
-		"note": "Retention caps evict the oldest sealed segments and the bounded store evicts the oldest events; every eviction is counted in loss, so a cap is never silent. Serialize large results into artifacts instead of inline responses.",
+		"note": "Retention caps evict the oldest sealed segments and the bounded store evicts the oldest events; every eviction is counted in loss, so a cap is never silent. Serialize large results into artifacts instead of inline responses. Whether this estimated write rate exhausts a finite cap before the session ends is stated in loss.estimated_eviction_risk.",
 	}
 	if config.AccessCapture == "" || config.AccessCapture == "off" {
 		view["access_estimate"] = map[string]any{
@@ -1518,6 +1519,18 @@ func traceSessionVolume(session *tracing.Session) map[string]any {
 		}
 	}
 	return view
+}
+
+// traceSessionTraceBytesPerSecond is the one write-rate estimate shared by the
+// volume report and the retention-risk projection: the engine writes roughly
+// 1.3 MB per 100 ms of traced time (~13 MiB/s) in continuous mode, scaled by the
+// fraction of wall-clock time sampled mode actually traces.
+func traceSessionTraceBytesPerSecond(config tracing.Config) float64 {
+	duty := 1.0
+	if config.Mode == "sampled" && config.IntervalMs > 0 {
+		duty = float64(config.WindowMs) / float64(config.IntervalMs)
+	}
+	return 13.0 * 1024 * 1024 * duty
 }
 
 // traceSessionManifestPersist writes the durable manifest for a live session so
@@ -1653,23 +1666,42 @@ func traceSessionConsistency(tc toolContext, session *tracing.Session, native ma
 // the retained data is complete.
 //
 // `complete` has exactly one meaning here: the capture covered the requested
-// window with no gaps. A sampled session leaves the processor untraced between
-// its capture windows by construction, so it can never be complete; its
-// coverage is stated in `capture` and `capture_is_sampled` so a consumer can
-// decide what to do with a sample instead of mistaking it for a record.
+// window with no gaps and the session has ended. Two independent reasons keep
+// it false while a session runs:
+//
+//   - A running session has not finished its loss accounting: retention can
+//     still evict and dropped counters can still move, so a start or status
+//     response cannot promise a completeness verdict the remaining lifetime may
+//     contradict. Such a session reports the `session_running` reason and
+//     `final: false`.
+//   - A sampled session leaves the processor untraced between its capture
+//     windows by construction, so it can never be complete; its coverage is
+//     stated in `capture` and `capture_is_sampled` so a consumer can decide
+//     what to do with a sample instead of mistaking it for a record.
+//
+// A continuous session that has ended with every loss counter at zero is the
+// only combination that reports `complete: true` with `final: true`.
 func traceSessionLossView(session *tracing.Session) map[string]any {
 	if session == nil {
 		return map[string]any{
-			"complete":           false,
-			"capture_is_sampled": false,
-			"incomplete_reasons": []string{"no_session"},
-			"note":               "no session",
+			"complete":                false,
+			"final":                   true,
+			"capture_is_sampled":      false,
+			"incomplete_reasons":      []string{"no_session"},
+			"estimated_eviction_risk": false,
+			"note":                    "no session exists, so there is no capture to describe and no completeness to claim.",
 		}
 	}
 	loss := session.LossView()
 	capture := traceSessionCaptureFacts(session)
 	sampled, _ := capture["sampled"].(bool)
-	reasons := make([]string, 0, 4)
+	final := session.Stopped
+	reasons := make([]string, 0, 6)
+	if !final {
+		// The session's own end is the primary reason: no verdict about a
+		// capture is final before the capture stops.
+		reasons = append(reasons, "session_running")
+	}
 	if sampled {
 		reasons = append(reasons, "sampled_mode")
 	}
@@ -1697,13 +1729,17 @@ func traceSessionLossView(session *tracing.Session) map[string]any {
 	if loss.AccessSequenceGaps != 0 {
 		reasons = append(reasons, "access_sequence_gaps")
 	}
-	complete := len(reasons) == 0
+	complete := final && len(reasons) == 0
+	risk, riskBasis := traceSessionEvictionEstimate(session, final)
 	view := map[string]any{
 		"complete":                       complete,
-		"complete_definition":            "complete is true only when the capture covered the requested window with no gaps: the session ran in continuous mode and every loss counter is zero. Sampled mode leaves the processor untraced between windows, so a sampled session is never complete and reports its coverage in capture.",
+		"final":                          final,
+		"complete_definition":            "complete is true only when the session has ended (final is true) and the capture covered the requested window with no gaps: continuous mode, every loss counter zero, and therefore no incomplete_reasons. A running session always reports complete false with the reason session_running, because retention and loss accounting are not final yet. Sampled mode leaves the processor untraced between windows, so a sampled session is never complete and reports its coverage in capture.",
 		"incomplete_reasons":             reasons,
 		"capture":                        capture,
 		"capture_is_sampled":             sampled,
+		"estimated_eviction_risk":        risk,
+		"estimated_eviction":             riskBasis,
 		"dropped_events":                 loss.DroppedEvents,
 		"dropped_address_counts":         loss.DroppedAddressCounts,
 		"dropped_watch_samples":          loss.DroppedWatchSamples,
@@ -1724,15 +1760,115 @@ func traceSessionLossView(session *tracing.Session) map[string]any {
 	}
 	if !complete {
 		switch {
+		case !final && len(reasons) == 1:
+			view["note"] = "The session is still running, so completeness is not final: retention can still evict and every loss counter can still move. Query again after trace_session_stop for a final verdict, and read estimated_eviction_risk for whether the estimated write rate exhausts a finite retention cap before the session ends."
+		case !final:
+			view["note"] = "The session is still running (session_running) and has already reported gaps or loss; see incomplete_reasons. Neither the sample nor the loss total is final until the session stops."
 		case sampled && len(reasons) == 1:
 			view["note"] = "Sampled mode leaves the processor untraced between capture windows, so the retained events are a sample of execution, not a complete record; capture.duty_cycle states the fraction of the session that was traced."
 		case sampled:
 			view["note"] = "The session is sampled and lost data in at least one further dimension; the retained events are neither a sample of known coverage nor a complete record. See incomplete_reasons."
 		default:
-			view["note"] = "The session lost data in at least one dimension; do not present the retained events as a complete record of execution. See incomplete_reasons."
+			view["note"] = "The session ended with loss in at least one dimension; do not present the retained events as a complete record of execution. See incomplete_reasons."
 		}
 	}
 	return view
+}
+
+// traceSessionBaselineFrameRateHz projects a stop_after_vdp_frames budget onto
+// wall-clock seconds. The plugin reports frames elapsed, never a frame rate, so
+// the projection states the Mega Drive NTSC baseline it assumes instead of
+// implying a measurement.
+const traceSessionBaselineFrameRateHz = 60.0
+
+// traceSessionEvictionEstimate projects whether the configured retention caps
+// will be exhausted before the session ends, and states the numbers behind the
+// verdict.
+//
+// The rule: retention is finite when max_total_bytes or max_segments can evict
+// (the defaults always can). The write rate is the same 13 MiB per traced
+// second used by traceSessionVolume, scaled by the sampled duty cycle; the byte
+// cap's horizon is max_total_bytes/rate and the segment cap's horizon is
+// max_segments * segment_ms. The session window is bounded only by
+// stop_after_vdp_frames, projected at the baseline frame rate. Risk is true when
+// a finite retention horizon is reached inside the session window; with no
+// frame limit the window is unbounded, so any finite cap is eventually reached
+// and the risk is reported as true rather than as unknown.
+//
+// A session that has already ended reports false: its outcome is stated by the
+// loss counters, not by a projection.
+func traceSessionEvictionEstimate(session *tracing.Session, final bool) (bool, map[string]any) {
+	config := session.Config
+	rate := traceSessionTraceBytesPerSecond(config)
+	retentionBounded := false
+	byteCapSeconds := 0.0
+	if rate > 0 && config.MaxTotalBytes > 0 {
+		byteCapSeconds = float64(config.MaxTotalBytes) / rate
+		retentionBounded = true
+	}
+	segmentCapSeconds := 0.0
+	if config.MaxSegments > 0 && config.SegmentMs > 0 {
+		segmentCapSeconds = float64(config.MaxSegments) * float64(config.SegmentMs) / 1000.0
+		retentionBounded = true
+	}
+	retentionSeconds := 0.0
+	switch {
+	case byteCapSeconds > 0 && segmentCapSeconds > 0:
+		retentionSeconds = math.Min(byteCapSeconds, segmentCapSeconds)
+	case byteCapSeconds > 0:
+		retentionSeconds = byteCapSeconds
+	default:
+		retentionSeconds = segmentCapSeconds
+	}
+
+	windowBounded := config.StopAfterVdpFrames > 0
+	windowSeconds := 0.0
+	if windowBounded {
+		windowSeconds = float64(config.StopAfterVdpFrames) / traceSessionBaselineFrameRateHz
+	}
+
+	appliesTo := "running_session"
+	verdict := "no_write_rate"
+	risk := false
+	switch {
+	case final:
+		appliesTo = "ended_session"
+		verdict = "session_ended"
+	case !retentionBounded || rate <= 0:
+		verdict = "no_write_rate"
+	case !windowBounded:
+		risk = true
+		verdict = "retention_exhausted_within_unbounded_session"
+	case retentionSeconds < windowSeconds:
+		risk = true
+		verdict = "retention_exhausted_before_session_window_end"
+	default:
+		verdict = "retention_survives_session_window"
+	}
+
+	basis := map[string]any{
+		"applies_to":             appliesTo,
+		"retention_bounded":      retentionBounded,
+		"trace_bytes_per_second": uint64(rate),
+		"byte_cap_seconds":       traceSessionSeconds(byteCapSeconds),
+		"segment_cap_seconds":    traceSessionSeconds(segmentCapSeconds),
+		"retention_cap_seconds":  traceSessionSeconds(retentionSeconds),
+		"session_window_bounded": windowBounded,
+		"session_window_seconds": traceSessionSeconds(windowSeconds),
+		"verdict":                verdict,
+		"rule":                   "estimated_eviction_risk is true when retention is finite and the estimated trace write rate (13 MiB per traced second, scaled by the sampled duty cycle) exhausts max_total_bytes or max_segments * segment_ms before the session window ends. The window is the stop_after_vdp_frames budget projected at 60 fps; a session with no frame limit has an unbounded window, so any finite cap is eventually reached. The numbers are estimates, not measurements, and an ended session reports false because its loss counters state what actually happened.",
+	}
+	if windowBounded {
+		basis["assumed_frame_rate_hz"] = traceSessionBaselineFrameRateHz
+	}
+	return risk, basis
+}
+
+// traceSessionSeconds rounds a projection to milliseconds of a second so the
+// rendered estimate stays readable; 0 means "unbounded" together with the
+// companion boolean flag, never a zero-length horizon.
+func traceSessionSeconds(value float64) float64 {
+	return math.Round(value*1000) / 1000
 }
 
 // traceSessionCaptureFacts renders what slice of the emulated timeline the
