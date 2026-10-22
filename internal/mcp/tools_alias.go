@@ -65,6 +65,16 @@ var toolAliasRecords = []toolAliasRecord{
 		Mapping:     "mega_drive_memory_map returns the legacy {regions, note, live_spaces} object; memory_map.reference carries the same fields.",
 	},
 	{
+		Alias:       "m68k_disassemble",
+		Replacement: "disassemble",
+		Mapping:     "m68k_disassemble returns the legacy M68K sweep payload; disassemble{cpu:\"m68k\", ...} accepts the same address/addresses/count/context arguments and returns the same payload.",
+	},
+	{
+		Alias:       "z80_disassemble",
+		Replacement: "disassemble",
+		Mapping:     "z80_disassemble returns the legacy Z80 sweep payload; disassemble{cpu:\"z80\", ...} accepts the same address/addresses/count/context arguments and returns the same payload.",
+	},
+	{
 		Alias:       "m68k_read_memory",
 		Replacement: "memory_read",
 		Mapping:     "m68k_read_memory returns the legacy inline read object; memory_read{cpu:\"m68k\", address, length, ...} returns the same bytes with the same byte order for space m68k-bus, plus cpu and the requested_*/effective_* echo.",

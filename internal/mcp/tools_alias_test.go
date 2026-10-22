@@ -79,7 +79,10 @@ func TestEveryAliasSpecIsWrapped(t *testing.T) {
 		}
 		server := contractServer(t)
 		result := callSpecForTest(t, server, spec, record.Alias, `{}`)
-		block := deprecatedBlock(t, result)
+		block, present := result["structuredContent"].(map[string]any)["deprecated"].(map[string]any)
+		if !present {
+			t.Fatalf("%s carries no deprecated block: %v", record.Alias, result["structuredContent"])
+		}
 		if block["code"] != aliasDeprecatedCode {
 			t.Fatalf("%s deprecated.code = %v", record.Alias, block["code"])
 		}
@@ -138,7 +141,7 @@ func TestConsolidatedCatalogHasNoDuplicateConcept(t *testing.T) {
 
 // consolidatedCanonicalTools is the merged catalog. Each consolidation group
 // appends its canonical concept here.
-var consolidatedCanonicalTools = []string{"target_status", "memory_map", "memory_read"}
+var consolidatedCanonicalTools = []string{"target_status", "memory_map", "memory_read", "disassemble"}
 
 // payloadView strips the fields the dispatcher injects into every response and
 // the alias' own deprecation marker, so two payloads can be compared field by
@@ -453,6 +456,69 @@ func TestMemoryReadRejectsAmbiguousBusSelection(t *testing.T) {
 	result = postToolCall(t, newTestServer(t, client), "memory_read", `{"address":0,"length":1}`)
 	if structured(result)["code"] != "invalid_params" {
 		t.Fatalf("code = %v, want invalid_params", structured(result))
+	}
+}
+
+// ----------------------------------------------------------------------------------------------------------------------
+// disassemble alias parity (group 4)
+// ----------------------------------------------------------------------------------------------------------------------
+
+// disasmClient answers the native disasm operation for both processors.
+func disasmClient() *fakeBridgeClient {
+	client := &fakeBridgeClient{status: newFakeStatus()}
+	client.executeFunc = func(_ context.Context, method string, params map[string]string) (json.RawMessage, error) {
+		if method != "disasm" {
+			return json.RawMessage(`{}`), nil
+		}
+		cpu := params["cpu"]
+		start := uint64(0x2064)
+		if value, err := strconv.ParseUint(params["address"], 10, 64); err == nil {
+			start = value
+		}
+		if cpu == "z80" {
+			return json.RawMessage(fmt.Sprintf(`{"cpu":"z80","start_address":%d,"requested_count":2,"disassembly_method":"linear sweep from the start address; not execution-verified","lines":[{"address":%d,"length":1,"bytes":"00","mnemonic":"nop","operands":""},{"address":%d,"length":3,"bytes":"C3 00 00","mnemonic":"jp","operands":"$0000"}]}`, start, start, start+1)), nil
+		}
+		return json.RawMessage(fmt.Sprintf(`{"cpu":"m68k","start_address":%d,"requested_count":2,"disassembly_method":"linear sweep from the start address; not execution-verified","lines":[{"address":%d,"length":2,"bytes":"60 FE","mnemonic":"bra.s","operands":"$%X"},{"address":%d,"length":2,"bytes":"4E71","mnemonic":"nop","operands":""}]}`, start, start, start, start+2)), nil
+	}
+	return client
+}
+
+// TestDisassembleAbsorbsThePerCPUDisassemblers proves each legacy disassembler
+// is disassemble{cpu}: identical payload, with the processor as an argument.
+func TestDisassembleAbsorbsThePerCPUDisassemblers(t *testing.T) {
+	client := disasmClient()
+	for _, tc := range []struct {
+		cpu   string
+		alias string
+		args  string
+	}{
+		{"m68k", "m68k_disassemble", `{"count":2}`},
+		{"z80", "z80_disassemble", `{"count":2}`},
+		{"m68k", "m68k_disassemble", `{"addresses":["0x2064","0x3000"]}`},
+	} {
+		canonicalArgs := `{"cpu":"` + tc.cpu + `",` + strings.TrimPrefix(tc.args, "{")
+		canonical := canonicalPayload(t, client, "disassemble", canonicalArgs)
+		legacy := canonicalPayload(t, client, tc.alias, tc.args)
+		if !jsonEqual(t, canonical, legacy) {
+			t.Fatalf("%s parity failed:\ncanonical = %v\nlegacy     = %v", tc.alias, canonical, legacy)
+		}
+		if canonical["cpu"] != tc.cpu {
+			t.Fatalf("%s: cpu = %v", tc.alias, canonical["cpu"])
+		}
+	}
+}
+
+// TestDisassembleRequiresAKnownProcessor keeps the selector closed: the merged
+// tool cannot guess a processor.
+func TestDisassembleRequiresAKnownProcessor(t *testing.T) {
+	client := disasmClient()
+	result := postToolCall(t, newTestServer(t, client), "disassemble", `{"cpu":"m68000"}`)
+	if structured(result)["code"] != "invalid_params" {
+		t.Fatalf("code = %v, want invalid_params", structured(result))
+	}
+	result = postToolCall(t, newTestServer(t, client), "disassemble", `{}`)
+	if structured(result)["code"] != "invalid_params" {
+		t.Fatalf("code = %v, want invalid_params for a missing cpu", structured(result))
 	}
 }
 

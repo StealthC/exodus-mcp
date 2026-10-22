@@ -47,7 +47,7 @@ func cpuToolSpecs() []toolSpec {
 				"count":     integerProperty(fmt.Sprintf("Instruction count between 1 and %d (default %d).", maxDisassemblyCount, defaultDisassemblyCount), 1),
 				"context":   contextProperty(),
 			}, nil),
-			run: makeRunDisassembly("m68k"),
+			run: aliasRun("m68k_disassemble", makeRunDisassembly("m68k")),
 		},
 		{
 			name:        "m68k_read_memory",
@@ -110,7 +110,7 @@ func cpuToolSpecs() []toolSpec {
 				"count":     integerProperty(fmt.Sprintf("Instruction count between 1 and %d (default %d).", maxDisassemblyCount, defaultDisassemblyCount), 1),
 				"context":   contextProperty(),
 			}, nil),
-			run: makeRunDisassembly("z80"),
+			run: aliasRun("z80_disassemble", makeRunDisassembly("z80")),
 		},
 		{
 			name:        "z80_read_memory",
