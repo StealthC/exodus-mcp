@@ -30,9 +30,9 @@ func controlToolSpecs() []toolSpec {
 			name:        "cpu_breakpoint_set",
 			description: "Create an enabled exact-address execution breakpoint owned by this MCP process, recording context provenance. For the Exodus M68K and Z80 cores, the address check runs before the opcode is fetched/executed; when it hits, the triggering instruction has not executed yet. Optional `condition` filters by the processor's program counter (greater/less boundaries, inclusive-free range), and `break_on_counter` pauses only on every Nth hit; `breakpoint_list` reports the native hit counter. `one_shot: true` auto-removes the breakpoint through the audited mutation path once a hit proves it fired (checked at the next paused observation), so one-shot instrumentation never stays armed. Mutates the target: advances the target generation. Accepts optional expected_target_generation and control_id.",
 			schema: objectSchema(map[string]any{
-				"cpu":                        enumProperty("Processor to break.", []string{"m68k", "z80"}),
+				"cpu":                        cpuVocab.property("Processor to break."),
 				"address":                    addressProperty(),
-				"condition":                  enumProperty("Location condition. equal breaks at exactly `address`; greater/less break above/below it; range breaks inside `address` (exclusive lower bound) and `range_end` (exclusive upper bound).", []string{"equal", "greater", "less", "range"}),
+				"condition":                  breakpointConditionVocab.property("Location condition. equal breaks at exactly `address`; greater/less break above/below it; range breaks inside `address` (exclusive lower bound) and `range_end` (exclusive upper bound)."),
 				"range_end":                  addressProperty(),
 				"break_on_counter":           booleanProperty("Only pause on every Nth hit instead of every hit; N comes from break_counter."),
 				"break_counter":              integerProperty("Break every Nth hit when break_on_counter is true (default 1).", 1),
@@ -45,8 +45,8 @@ func controlToolSpecs() []toolSpec {
 		},
 		{
 			name:        "cpu_breakpoint_list",
-			description: "List execution breakpoints created through this MCP process, including enabled state, condition, break-on-counter settings, native hit counters, the one_shot flag, and creation provenance (context, target generation).",
-			schema:      objectSchema(map[string]any{}, nil),
+			description: "List execution breakpoints created through this MCP process, including enabled state, condition, break-on-counter settings, native hit counters, the one_shot flag, and creation provenance (context, target generation). An optional context handle restricts the listing to the breakpoints that context created; omitted or \"all\" lists every entry.",
+			schema:      objectSchema(map[string]any{"context": listScopeProperty()}, nil),
 			run:         runBreakpointList,
 		},
 		{
@@ -63,10 +63,10 @@ func controlToolSpecs() []toolSpec {
 			name:        "cpu_watchpoint_set",
 			description: "Create an enabled read and/or write watchpoint owned by this MCP process, recording context provenance. The system pauses when the watched range is accessed. Range semantics are start-address based, exactly like the Exodus debugger: the watchpoint fires when the **start address** of an access falls inside [address, address+length-1], never when an access merely overlaps the range (the processor watchpoint API receives only the access start address, not the transfer width). `range_semantics` echoes the contract (`exact_address` for length 1, `access_start_in_range` otherwise). `access` defaults to any; for a single-direction watchpoint the stop event can prove the observed direction, while an `any` watchpoint stop reports `observed_direction: null` (the core does not expose the transfer direction). `one_shot: true` auto-removes the watchpoint through the audited mutation path once a hit proves it fired (checked at the next paused observation), so one-shot instrumentation never stays armed. Mutates the target: advances the target generation. Accepts optional expected_target_generation and control_id.",
 			schema: objectSchema(map[string]any{
-				"cpu":                        enumProperty("Processor to watch.", []string{"m68k", "z80"}),
+				"cpu":                        cpuVocab.property("Processor to watch."),
 				"address":                    addressProperty(),
 				"length":                     integerProperty("Watched range length in bytes (default 1). The range matches access start addresses only; it must stay inside the processor address bus.", 1),
-				"access":                     enumProperty("Access types that trigger the watchpoint (default any).", []string{"read", "write", "any"}),
+				"access":                     watchAccessVocab.property("Access types that trigger the watchpoint (default any)."),
 				"one_shot":                   booleanProperty("Remove this watchpoint automatically once a hit proves it fired (default false). A one-shot watchpoint will be absent from watchpoint_list after its hit; emulator_status reports one_shot_removals."),
 				"context":                    contextProperty(),
 				"expected_target_generation": integerProperty("Optional target generation the caller last observed; fails with target_generation_conflict on mismatch.", 1),
@@ -74,7 +74,7 @@ func controlToolSpecs() []toolSpec {
 			}, []string{"cpu", "address"}),
 			run: runWatchpointSet,
 		},
-		{name: "cpu_watchpoint_list", description: "List read/write watchpoints created through this MCP process, including hit counters, the configured access, the range semantics, the one_shot flag, and creation provenance (context, target generation).", schema: objectSchema(map[string]any{}, nil), run: runWatchpointList},
+		{name: "cpu_watchpoint_list", description: "List read/write watchpoints created through this MCP process, including hit counters, the configured access, the range semantics, the one_shot flag, and creation provenance (context, target generation). An optional context handle restricts the listing to the watchpoints that context created; omitted or \"all\" lists every entry.", schema: objectSchema(map[string]any{"context": listScopeProperty()}, nil), run: runWatchpointList},
 		{
 			name:        "cpu_watchpoint_remove",
 			description: "Remove one watchpoint created through this MCP process. Mutates the target: advances the target generation. Accepts optional expected_target_generation and control_id.",
@@ -91,10 +91,10 @@ func controlToolSpecs() []toolSpec {
 			schema: objectSchema(map[string]any{
 				"offset":        integerProperty("Pagination offset within the filtered set (default 0).", 0),
 				"limit":         integerProperty("Pagination limit (default 20, cap 100).", 1),
-				"resource_kind": enumProperty("Filter by resource kind.", []string{"breakpoint", "watchpoint", "any"}),
+				"resource_kind": debugEventResourceKindVocab.property("Filter by resource kind."),
 				"resource_id":   integerProperty("Filter by managed resource id.", 1),
-				"cpu":           enumProperty("Filter by processor.", []string{"m68k", "z80"}),
-				"direction":     enumProperty("Filter by the OBSERVED access direction. \"any\" matches every event, including events whose direction could not be observed; read/write/execute match only events that proved that direction.", []string{"read", "write", "execute", "any"}),
+				"cpu":           cpuVocab.property("Filter by processor."),
+				"direction":     debugEventDirectionVocab.property("Filter by the OBSERVED access direction. \"any\" matches every event, including events whose direction could not be observed; read/write/execute match only events that proved that direction."),
 				"event_id_min":  integerProperty("Only events with an id at or above this value.", 1),
 				"event_id_max":  integerProperty("Only events with an id at or below this value.", 1),
 				"context":       stringProperty("Analysis context handle; omitted means the caller's default context, and \"all\" queries the retained history across every context."),
@@ -115,7 +115,7 @@ func controlGuardSchema() map[string]any {
 
 func stepGuardSchema() map[string]any {
 	return objectSchema(map[string]any{
-		"cpu":                        enumProperty("Processor to control.", []string{"m68k", "z80"}),
+		"cpu":                        cpuVocab.property("Processor to control."),
 		"expected_target_generation": integerProperty("Optional target generation the caller last observed; fails with target_generation_conflict on mismatch.", 1),
 		"control_id":                 stringProperty("Optional control id from target_control_acquire; required while the control lock is active."),
 	}, []string{"cpu"})
@@ -211,6 +211,12 @@ func runBreakpointSet(tc toolContext, args json.RawMessage) map[string]any {
 	if failure != nil {
 		return failureResult(failure, tc.modern)
 	}
+	if failure := cpuVocab.validate(parsed.CPU); failure != nil {
+		return failureResult(failure, tc.modern)
+	}
+	if failure := cpuVocab.validate(parsed.CPU); failure != nil {
+		return failureResult(failure, tc.modern)
+	}
 	context, failure := resolveContext(tc.server, parsed.Context)
 	if failure != nil {
 		return failureResult(failure, tc.modern)
@@ -220,10 +226,8 @@ func runBreakpointSet(tc toolContext, args json.RawMessage) map[string]any {
 		return failureResult(failure, tc.modern)
 	}
 	condition := parsed.Condition
-	switch condition {
-	case "", "equal", "greater", "less", "range":
-	default:
-		return failureResult(&toolFailure{Code: "invalid_params", Message: "condition must be equal, greater, less, or range"}, tc.modern)
+	if failure := breakpointConditionVocab.validate(condition); failure != nil {
+		return failureResult(failure, tc.modern)
 	}
 	var rangeEnd uint64
 	if parsed.RangeEnd != nil {
@@ -306,13 +310,21 @@ func runBreakpointSet(tc toolContext, args json.RawMessage) map[string]any {
 	return okResult(stampGenerations(payload, before, after), tc.modern)
 }
 
-func runBreakpointList(tc toolContext, _ json.RawMessage) map[string]any {
+func runBreakpointList(tc toolContext, args json.RawMessage) map[string]any {
+	parsed, failure := decodeArgs[listScopeArgs](args)
+	if failure != nil {
+		return failureResult(failure, tc.modern)
+	}
+	scope, contextID, failure := resolveListScope(tc, parsed.Context)
+	if failure != nil {
+		return failureResult(failure, tc.modern)
+	}
 	payload, failure := tc.server.executeCommand(tc.ctx, "breakpoint_list", nil)
 	if failure != nil {
 		return failureResult(failure, tc.modern)
 	}
 	annotateDebugList(payload, "breakpoint", "breakpoints", "breakpoint_id", tc.server)
-	return okResult(payload, tc.modern)
+	return okResult(applyListScope(payload, "breakpoints", "breakpoint_id", "breakpoint", scope, contextID, tc.server), tc.modern)
 }
 
 type breakpointRemoveArgs struct {
@@ -363,6 +375,12 @@ func runWatchpointSet(tc toolContext, args json.RawMessage) map[string]any {
 	if failure != nil {
 		return failureResult(failure, tc.modern)
 	}
+	if failure := cpuVocab.validate(parsed.CPU); failure != nil {
+		return failureResult(failure, tc.modern)
+	}
+	if failure := cpuVocab.validate(parsed.CPU); failure != nil {
+		return failureResult(failure, tc.modern)
+	}
 	context, failure := resolveContext(tc.server, parsed.Context)
 	if failure != nil {
 		return failureResult(failure, tc.modern)
@@ -371,14 +389,9 @@ func runWatchpointSet(tc toolContext, args json.RawMessage) map[string]any {
 	if failure != nil {
 		return failureResult(failure, tc.modern)
 	}
-	switch parsed.Access {
-	case "", "read", "write", "any":
-	default:
-		return failureResult(&toolFailure{Code: "invalid_params", Message: "access must be read, write, or any"}, tc.modern)
-	}
-	access := parsed.Access
-	if access == "" {
-		access = "any"
+	access, failure := watchAccessVocab.resolve(parsed.Access, "any")
+	if failure != nil {
+		return failureResult(failure, tc.modern)
 	}
 	length := uint64(1)
 	if parsed.Length != nil {
@@ -467,13 +480,21 @@ func runWatchpointSet(tc toolContext, args json.RawMessage) map[string]any {
 	return okResult(stampGenerations(payload, before, after), tc.modern)
 }
 
-func runWatchpointList(tc toolContext, _ json.RawMessage) map[string]any {
+func runWatchpointList(tc toolContext, args json.RawMessage) map[string]any {
+	parsed, failure := decodeArgs[listScopeArgs](args)
+	if failure != nil {
+		return failureResult(failure, tc.modern)
+	}
+	scope, contextID, failure := resolveListScope(tc, parsed.Context)
+	if failure != nil {
+		return failureResult(failure, tc.modern)
+	}
 	payload, failure := tc.server.executeCommand(tc.ctx, "watchpoint_list", nil)
 	if failure != nil {
 		return failureResult(failure, tc.modern)
 	}
 	annotateDebugList(payload, "watchpoint", "watchpoints", "watchpoint_id", tc.server)
-	return okResult(payload, tc.modern)
+	return okResult(applyListScope(payload, "watchpoints", "watchpoint_id", "watchpoint", scope, contextID, tc.server), tc.modern)
 }
 
 type watchpointRemoveArgs struct {
@@ -525,26 +546,18 @@ type debugEventsListArgs struct {
 // generated as ctx_<base64url>, so the token cannot collide with a handle.
 const debugEventQueryAllScopes = "all"
 
-// debugEventDirectionValues and debugEventResourceKindValues are the accepted
-// filter enums. They are validated server-side so an unknown value fails with
-// invalid_params instead of silently returning an empty list.
-var (
-	debugEventDirectionValues    = []string{"read", "write", "execute", "any"}
-	debugEventResourceKindValues = []string{"breakpoint", "watchpoint", "any"}
-)
-
 func runDebugEventsList(tc toolContext, args json.RawMessage) map[string]any {
 	parsed, failure := decodeArgs[debugEventsListArgs](args)
 	if failure != nil {
 		return failureResult(failure, tc.modern)
 	}
-	if failure := validateEnumArg("resource_kind", parsed.ResourceKind, debugEventResourceKindValues); failure != nil {
+	if failure := debugEventResourceKindVocab.validate(parsed.ResourceKind); failure != nil {
 		return failureResult(failure, tc.modern)
 	}
-	if failure := validateEnumArg("cpu", parsed.CPU, []string{"m68k", "z80"}); failure != nil {
+	if failure := cpuVocab.validate(parsed.CPU); failure != nil {
 		return failureResult(failure, tc.modern)
 	}
-	if failure := validateEnumArg("direction", parsed.Direction, debugEventDirectionValues); failure != nil {
+	if failure := debugEventDirectionVocab.validate(parsed.Direction); failure != nil {
 		return failureResult(failure, tc.modern)
 	}
 	// The context scope is a query decision, not an implicit default: the
@@ -664,26 +677,79 @@ func runDebugEventsList(tc toolContext, args json.RawMessage) map[string]any {
 	}, tc.modern)
 }
 
-// validateEnumArg rejects an unsupported enum value with invalid_params and
-// names the accepted vocabulary. An empty value means "not filtered".
-func validateEnumArg(field, value string, allowed []string) *toolFailure {
-	if value == "" {
-		return nil
+// listScopeArgs is the optional context scope accepted by the resource
+// listings (breakpoints, watchpoints, freezes). The scope is a query decision,
+// never an implicit default: omitted or "all" lists every entry, and a handle
+// restricts the listing to the resources that context created.
+type listScopeArgs struct {
+	Context string `json:"context"`
+}
+
+// listScopeAll is the explicit cross-context scope token. Context handles are
+// generated as ctx_<base64url>, so the token cannot collide with a handle.
+const listScopeAll = "all"
+
+// listScopeProperty documents the shared listing scope argument.
+func listScopeProperty() map[string]any {
+	return stringProperty("Optional analysis context scope. A context handle restricts the listing to resources created under that context; omitted or \"all\" lists every entry, including resources created outside MCP.")
+}
+
+// resolveListScope turns the optional context argument into a filter id.
+func resolveListScope(tc toolContext, handle string) (scope, contextID string, failure *toolFailure) {
+	trimmed := strings.TrimSpace(handle)
+	if trimmed == "" || strings.EqualFold(trimmed, listScopeAll) {
+		return listScopeAll, "", nil
 	}
-	for _, candidate := range allowed {
-		if value == candidate {
-			return nil
+	resolved, failure := resolveContext(tc.server, trimmed)
+	if failure != nil {
+		return "", "", failure
+	}
+	return resolved.ID, resolved.ID, nil
+}
+
+// filterDebugListByContext drops the listed debug resources that do not belong
+// to contextID and returns how many were hidden. A resource created outside
+// MCP has no provenance, so a scoped listing reports it as out of scope instead
+// of attributing it to the caller's context.
+func filterDebugListByContext(payload map[string]any, key, idKey, kind, contextID string, server *Server) int {
+	if contextID == "" {
+		return 0
+	}
+	entries, ok := payload[key].([]any)
+	if !ok {
+		return 0
+	}
+	kept := make([]any, 0, len(entries))
+	hidden := 0
+	for _, entry := range entries {
+		record, ok := entry.(map[string]any)
+		if !ok {
+			kept = append(kept, entry)
+			continue
 		}
+		id, ok := record[idKey].(float64)
+		var meta *debugResourceMeta
+		if ok {
+			meta = server.debugResourceMeta(kind, uint64(id))
+		}
+		if meta == nil || meta.ContextID != contextID {
+			hidden++
+			continue
+		}
+		kept = append(kept, entry)
 	}
-	return &toolFailure{
-		Code:    "invalid_params",
-		Message: fmt.Sprintf("%s must be one of %s", field, strings.Join(allowed, ", ")),
-		Data: map[string]any{
-			"field":   field,
-			"value":   value,
-			"allowed": allowed,
-		},
+	payload[key] = kept
+	return hidden
+}
+
+// applyListScope echoes the effective scope and hides the resources another
+// context created, so a scoped listing is never silently incomplete.
+func applyListScope(payload map[string]any, key, idKey, kind, scope, contextID string, server *Server) map[string]any {
+	payload["context_scope"] = scope
+	if hidden := filterDebugListByContext(payload, key, idKey, kind, contextID, server); hidden > 0 {
+		payload["hidden_out_of_scope"] = hidden
 	}
+	return payload
 }
 
 // annotateDebugList merges server-side provenance into a breakpoint_list or

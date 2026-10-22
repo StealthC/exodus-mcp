@@ -1116,5 +1116,13 @@ The delivered catalog honors these rules, and any future tool must keep them:
   guarded-mutate pattern) and optional `control_id` (required while the
   exclusive control lock is active), and return enough metadata to reproduce
   the action in the global audit stream.
+- Mediation arguments are declared per tool, never globally: a tool that does
+  not consume `context`, `control_id`, or `expected_target_generation` rejects
+  it with `unsupported_parameter` (naming the field and the accepted fields)
+  instead of accepting an argument it would ignore, and every published enum is
+  revalidated before the handler runs, so an unsupported value fails with
+  `invalid_params` naming the field, value, and allowed values instead of
+  falling back to a default. Resource listings (`cpu_breakpoint_list`,
+  `cpu_watchpoint_list`, `memory_freeze_list`) take an optional `context` scope.
 - System-specific tools use clear prefixes (`m68k_`, `z80_`, `vdp_`) rather
   than pretending that behavior is generic.

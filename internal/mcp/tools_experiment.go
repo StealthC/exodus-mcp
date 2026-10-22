@@ -275,11 +275,13 @@ func (executor *experimentExecutor) Call(ctx context.Context, tool string, argum
 	if arguments == nil {
 		arguments = map[string]any{}
 	}
-	arguments["context"] = executor.contextID
-	arguments["control_id"] = executor.controlID
+	scopeExperimentArguments(spec, arguments, executor.contextID, executor.controlID)
 	raw, err := json.Marshal(arguments)
 	if err != nil {
 		return nil, &experiment.ToolError{Code: "tool_args_invalid", Message: "encode tool arguments: " + err.Error()}
+	}
+	if failure := validateToolArguments(spec, raw); failure != nil {
+		return nil, &experiment.ToolError{Code: failure.Code, Message: failure.Message}
 	}
 	result := injectTargetGeneration(executor.server, injectResultType(spec.run(toolContext{server: executor.server, ctx: ctx, modern: true}, raw), tool))
 	if failed, _ := result["isError"].(bool); failed {

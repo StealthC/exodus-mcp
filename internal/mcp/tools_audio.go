@@ -19,7 +19,6 @@ const (
 type soundStatusArgs struct {
 	Component   string `json:"component"`
 	CaptureMode string `json:"capture_mode"`
-	guardArgs
 }
 type audioCaptureArgs struct {
 	DurationMS int    `json:"duration_ms"`
@@ -35,8 +34,8 @@ func soundStatusSpec() toolSpec {
 		name:        "sound_status",
 		description: "Read-only YM2612 and/or PSG state. Values come from typed Exodus device interfaces; unavailable or write-only fields are reported explicitly and never reconstructed from bus writes.",
 		schema: objectSchema(map[string]any{
-			"component":    enumProperty("Chip state to read; defaults to both.", []string{"ym2612", "psg", "both"}),
-			"capture_mode": enumProperty("live reads the current device state; paused is not currently supported by the native sound reader.", []string{"live"}),
+			"component":    soundComponentVocab.property("Chip state to read; defaults to both."),
+			"capture_mode": soundCaptureModeVocab.property("live reads the current device state; paused is not currently supported by the native sound reader."),
 		}, nil),
 		run: runSoundStatus,
 	}
@@ -48,8 +47,8 @@ func audioCaptureSpec() toolSpec {
 		description: fmt.Sprintf("Capture a bounded mixed-audio WAV artifact (maximum %d ms and %d bytes). The native bridge must provide a bounded PCM capture; failures are reported as unavailable rather than as valid silence.", audioMaxDurationMS, audioMaxBytes),
 		schema: objectSchema(map[string]any{
 			"duration_ms": integerProperty(fmt.Sprintf("Capture duration in milliseconds (1-%d).", audioMaxDurationMS), 1),
-			"sample_rate": map[string]any{"type": "integer", "enum": []int{22050, 44100, 48000}, "description": "Supported output sample rate."},
-			"channels":    map[string]any{"type": "integer", "enum": []int{1, 2}, "description": "Output channels."},
+			"sample_rate": audioSampleRateVocab.property("Supported output sample rate (default 44100)."),
+			"channels":    audioChannelsVocab.property("Output channels (default 2)."),
 			"context":     contextProperty(),
 		}, []string{"duration_ms"}),
 		run: runAudioCapture,
@@ -61,12 +60,16 @@ func runSoundStatus(tc toolContext, raw json.RawMessage) map[string]any {
 	if failure != nil {
 		return failureResult(failure, tc.modern)
 	}
-	component := strings.TrimSpace(args.Component)
-	if component == "" {
-		component = "both"
+	component, failure := soundComponentVocab.resolve(strings.TrimSpace(args.Component), "both")
+	if failure != nil {
+		return failureResult(failure, tc.modern)
 	}
-	if args.CaptureMode != "" && args.CaptureMode != "live" {
-		return failureResult(&toolFailure{Code: "invalid_params", Message: "capture_mode must be live; sound state is not exposed as an atomic capture"}, tc.modern)
+	if failure := soundCaptureModeVocab.validate(strings.TrimSpace(args.CaptureMode)); failure != nil {
+		return failureResult(&toolFailure{
+			Code:    failure.Code,
+			Message: "sound state is not exposed as an atomic capture; " + failure.Message,
+			Data:    failure.Data,
+		}, tc.modern)
 	}
 	payload, failure := tc.server.executeCommand(tc.ctx, "sound_status", map[string]string{"component": component})
 	if failure != nil {
@@ -105,19 +108,13 @@ func runAudioCapture(tc toolContext, raw json.RawMessage) map[string]any {
 	if args.DurationMS < 1 || args.DurationMS > audioMaxDurationMS {
 		return failureResult(&toolFailure{Code: "invalid_params", Message: fmt.Sprintf("duration_ms must be between 1 and %d", audioMaxDurationMS)}, tc.modern)
 	}
-	rate := args.SampleRate
-	if rate == 0 {
-		rate = 44100
+	rate, failure := audioSampleRateVocab.resolve(args.SampleRate, 44100)
+	if failure != nil {
+		return failureResult(failure, tc.modern)
 	}
-	if rate != 22050 && rate != 44100 && rate != 48000 {
-		return failureResult(&toolFailure{Code: "invalid_params", Message: "sample_rate must be 22050, 44100, or 48000"}, tc.modern)
-	}
-	channels := args.Channels
-	if channels == 0 {
-		channels = 2
-	}
-	if channels != 1 && channels != 2 {
-		return failureResult(&toolFailure{Code: "invalid_params", Message: "channels must be 1 or 2"}, tc.modern)
+	channels, failure := audioChannelsVocab.resolve(args.Channels, 2)
+	if failure != nil {
+		return failureResult(failure, tc.modern)
 	}
 	estimated := int64(args.DurationMS)*int64(rate)*int64(channels)*2/1000 + 44
 	if estimated > audioMaxBytes {
