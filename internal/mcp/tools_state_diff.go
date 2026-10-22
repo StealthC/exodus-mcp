@@ -184,12 +184,7 @@ func runStateDiff(tc toolContext, args json.RawMessage) map[string]any {
 			"note": stateDiffProvenanceNote,
 		},
 	}
-	documentBytes, err := json.Marshal(document)
-	if err != nil {
-		return failureResult(&toolFailure{Code: "artifact_error", Message: err.Error()}, tc.modern)
-	}
-	provenance := genericProvenance(tc.server, stateDiffKind, time.Now().UTC())
-	stored, err := tc.server.store.PutWithProvenance(context.ID, stateDiffKind, "application/json", documentBytes, provenance)
+	stored, err := putJSONArtifact(tc.server, context.ID, stateDiffKind, document, genericProvenance(tc.server, stateDiffKind, time.Now().UTC()))
 	if err != nil {
 		return failureResult(&toolFailure{Code: "artifact_error", Message: err.Error()}, tc.modern)
 	}

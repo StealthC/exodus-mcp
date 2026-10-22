@@ -749,11 +749,7 @@ func runMemorySearch(tc toolContext, args json.RawMessage) map[string]any {
 		"addresses":      matches.Addresses,
 		"parsed_pattern": map[string]any{"bytes_hex": patternHex, "mask_hex": maskHex, "alignment": alignment},
 	}
-	resultsBytes, err := json.Marshal(results)
-	if err != nil {
-		return failureResult(&toolFailure{Code: "artifact_error", Message: err.Error()}, tc.modern)
-	}
-	storedResults, err := tc.server.store.PutWithProvenance(context.ID, "memory-search-results", "application/json", resultsBytes, genericProvenance(tc.server, "memory-search-results", time.Now().UTC()))
+	storedResults, err := putJSONArtifact(tc.server, context.ID, "memory-search-results", results, genericProvenance(tc.server, "memory-search-results", time.Now().UTC()))
 	if err != nil {
 		return failureResult(&toolFailure{Code: "artifact_error", Message: err.Error()}, tc.modern)
 	}
@@ -1608,11 +1604,7 @@ func runMemoryDiff(tc toolContext, args json.RawMessage) map[string]any {
 		document["min_value"] = *parsed.MinValue
 		document["max_value"] = *parsed.MaxValue
 	}
-	documentBytes, err := json.Marshal(document)
-	if err != nil {
-		return failureResult(&toolFailure{Code: "artifact_error", Message: err.Error()}, tc.modern)
-	}
-	storedResults, err := tc.server.store.PutWithProvenance(context.ID, "memory-diff-results", "application/json", documentBytes, genericProvenance(tc.server, "memory-diff-results", time.Now().UTC()))
+	storedResults, err := putJSONArtifact(tc.server, context.ID, "memory-diff-results", document, genericProvenance(tc.server, "memory-diff-results", time.Now().UTC()))
 	if err != nil {
 		return failureResult(&toolFailure{Code: "artifact_error", Message: err.Error()}, tc.modern)
 	}
@@ -2498,7 +2490,7 @@ func debugEventDescriptor(server *Server, event debugEvent, contextID, captureID
 	eventData["note"] = "Access width/value fields are not exposed by the native API and are marked unknown."
 	// Store as artifact
 	// Use a temporary context for storage; the event's context is used for provenance but storage is per requesting context
-	stored, _ := server.store.PutWithProvenance(contextID, "debug-event", "application/json", mustMarshal(eventData), provenance)
+	stored, _ := putJSONArtifact(server, contextID, "debug-event", eventData, provenance)
 	return artifactDescriptor(server, stored, contextID)
 }
 
@@ -2649,12 +2641,11 @@ func runCpuCoverageCapture(tc toolContext, args json.RawMessage) map[string]any 
 	coverage := buildCoverageV2(tc, parsed.CPU, filtered, addressesForBlocks, regionStart, regionEnd)
 	// Build versioned document
 	coverageDocument := map[string]any{
-		"schema_version": "cpu-coverage/2",
-		"kind":           "cpu-coverage",
-		"cpu":            parsed.CPU,
-		"address_space":  coverage.AddressSpace,
-		"byte_order":     coverage.ByteOrder,
-		"region":         map[string]any{"start_address": regionStart, "start_address_hex": canonicalHex(regionStart), "end_address": regionEnd, "end_address_hex": canonicalHex(regionEnd)},
+		"kind":          "cpu-coverage",
+		"cpu":           parsed.CPU,
+		"address_space": coverage.AddressSpace,
+		"byte_order":    coverage.ByteOrder,
+		"region":        map[string]any{"start_address": regionStart, "start_address_hex": canonicalHex(regionStart), "end_address": regionEnd, "end_address_hex": canonicalHex(regionEnd)},
 		"capture": map[string]any{
 			"duration_ms":     duration,
 			"max_entries":     maxEntries,
@@ -2701,10 +2692,6 @@ func runCpuCoverageCapture(tc toolContext, args json.RawMessage) map[string]any 
 		coverageDocument["addresses"] = coverage.Addresses[:maxCoverageAddresses]
 	}
 	annotateAddressMap(coverageDocument, coverage.AddressSpace)
-	documentBytes, err := json.Marshal(coverageDocument)
-	if err != nil {
-		return failureResult(&toolFailure{Code: "artifact_error", Message: err.Error()}, tc.modern)
-	}
 	provenance := coverageProvenance(tc, parsed.CPU, regionStart, regionEnd)
 	// Record filters in provenance
 	if !includeROM || !includeRAM || !retainRepeated {
@@ -2713,7 +2700,7 @@ func runCpuCoverageCapture(tc toolContext, args json.RawMessage) map[string]any 
 			Note:  fmt.Sprintf("Filters: include_rom=%v include_ram=%v retain_repeated=%v", includeROM, includeRAM, retainRepeated),
 		}
 	}
-	stored, err := tc.server.store.PutWithProvenance(context.ID, "cpu-coverage", "application/json", documentBytes, provenance)
+	stored, err := putJSONArtifact(tc.server, context.ID, "cpu-coverage", coverageDocument, provenance)
 	if err != nil {
 		return failureResult(&toolFailure{Code: "artifact_error", Message: err.Error()}, tc.modern)
 	}

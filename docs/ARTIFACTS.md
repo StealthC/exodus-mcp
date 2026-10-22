@@ -185,7 +185,9 @@ of a process that was started with a TTL and no persisted value.
 
 Every kind below is produced by the listed tool. `schema_version` refers to a
 version field *inside the artifact payload*, not to the tool response schema;
-`none` marks a gap recorded in [Schema version gaps](#schema-version-gaps).
+`none` marks a kind with no document-level header of our own (raw bytes, PNG,
+text, WAV); every JSON document kind declares its version — see
+[Schema versions](#schema-versions).
 
 ### Raw byte artifacts (`application/octet-stream`)
 
@@ -223,24 +225,24 @@ version field *inside the artifact payload*, not to the tool response schema;
 
 | Kind | Producer | Payload | `schema_version` |
 | --- | --- | --- | --- |
-| `memory-search-results` | `memory_search` | `kind`, `address_space`, `pattern_hex`, `pattern_mask_hex`, `pattern_length_bytes`, `alignment`, `interpretation`, `source_snapshot`, `source_range`, `range{start_address,byte_length}`, `matches_total`, `truncated`, `addresses`, `parsed_pattern` | none — has `kind` only |
-| `memory-diff-results` | `memory_diff` | `kind`, `mode`, `width`, `width_bytes`, `byte_order`, `alignment`, `interpretation`, `range`, `before_snapshot`, `after_snapshot`, `fresh_after_read`, `matches_total`, `truncated`, `matches`, optional `provenance_warning`, `before_capture_id`, `after_capture_id`, `capture_consistency`, mode value fields | none — has `kind` only |
+| `memory-search-results` | `memory_search` | `kind`, `address_space`, `pattern_hex`, `pattern_mask_hex`, `pattern_length_bytes`, `alignment`, `interpretation`, `source_snapshot`, `source_range`, `searched_range`, `range{start_address,byte_length}`, `matches_total`, `truncated`, `addresses`, `parsed_pattern` | `memory-search-results/1` |
+| `memory-diff-results` | `memory_diff` | `kind`, `mode`, `width`, `width_bytes`, `byte_order`, `alignment`, `interpretation`, `range`, `before_snapshot`, `after_snapshot`, `fresh_after_read`, `matches_total`, `truncated`, `matches`, optional `provenance_warning`, `before_capture_id`, `after_capture_id`, `capture_consistency`, mode value fields | `memory-diff-results/1` |
 | `cpu-coverage` | `cpu_coverage_capture` | Executed addresses with counts, instruction-aware `blocks`, observed `edges`, legacy `ranges`, filters, truncation facts | `cpu-coverage/2` |
 | `debug-event` | any managed breakpoint/watchpoint stop | `kind` is `"watchpoint-event"` (the artifact kind is `debug-event`), plus `event_id`, `resource_kind`, `resource_id`, `context_id`, `cpu`, `triggering_pc`(+hex), `address_space`, `watched_address`(+hex), `access_direction`, `requested_length`, `hit_count`, `target_generation`, `timestamp`, optional `frame_token`, explicit `null` access width/values with a note | `debug-event/1` |
-| `experiment-manifest` | `experiment_run` | `experiment_id`, `script{name,kind,sha256}`, `context_id`, `started_at`, `duration_ms`, `status`, `exit_code`, `arguments`, `initial_state_id`, `final_state_id`, `summary`, `steps`, `artifacts`, `error` | none |
+| `experiment-manifest` | `experiment_run` | `schema_version`, `experiment_id`, `script{name,kind,sha256}`, `context_id`, `started_at`, `duration_ms`, `status`, `exit_code`, `arguments`, `initial_state_id`, `final_state_id`, `summary`, `steps`, `artifacts`, `error` | `experiment-manifest/1` |
 | `annotation-export` | `annotation_export` | Export time, target ROM identity, target generation, annotations with their creation stamps and evidence links | `annotation-export/1` |
 | `replay-manifest` | `deterministic_replay` | `strict`/`warmup` modes, `determinism_scope`, `register_evidence`(+note), `runs_compared`, two runs (`run_1`/`run_2`; `run_3` plus `warmup*` fields only with `warmup:true`), restore fingerprints and `restore_fidelity*`, per-step frame tokens, per-step and final registers, gating checks, `divergences` (gating), `advisory_divergences`, `unproven`/`advisory_unproven`, methodology | `replay-manifest/5` |
-| `state-diff-results` | `state_diff` | Snapshot metadata and byte-level diff report | none — has `kind` only |
-| `capture-manifest` | `memory_snapshot_capture` | `kind`, `capture_id`, `capture_consistency`, `pause_resume_cycle`, generations, `rom_identity`, `space`, `ranges`, `internal_lock_acquired` | none — has `kind` only |
+| `state-diff-results` | `state_diff` | `kind`, `before_snapshot`, `after_snapshot`, `metadata_diff`, `file_diff`, `comparison` (completeness/verdict scope), `semantic` (requested but not performed), `provenance{note}` | `state-diff-results/1` |
+| `capture-manifest` | `memory_snapshot_capture` | `kind`, `capture_id`, `capture_consistency`, `pause_resume_cycle`, generations, `rom_identity`, `space`, `ranges`, `internal_lock_acquired`, `run_state_restore` | `capture-manifest/1` |
 | `system-snapshot-manifest` | `system_snapshot_capture` | `schema_version`, `kind`, `capture_id`, `captured_at`, `capture_consistency`, generations, `rom_identity`, `byte_order`, `components`, `artifacts` | `system-snapshot/1` |
 | `system-render-manifest` | `system_snapshot_capture` | `schema_version`, `capture_id`, and references to the frame, status, palette, scroll, and sprite components | `render-manifest/1` |
-| `system-m68k-registers`, `system-z80-registers`, `system-vdp-status` | `system_snapshot_capture` | The raw native command payload, pretty-printed | none |
-| `vdp-status` | `vdp_capture` | The raw native `vdp_status` payload (24 registers plus decoded fields) | none |
-| `vdp-capture-manifest` | `vdp_capture` | `kind`, `capture_id`, `captured_at`, `capture_consistency`, `components`, `artifacts`, `artifact_count`, `vdp_status` | none — has `kind` only |
-| `vdp-render-manifest` | `vdp_capture` | `kind`, `capture_id`, and four note-only sections (`display_geometry`, `palette_state`, `sprite_state`, `scroll_state`) | none — has `kind` only |
-| `vdp-palette-json` | `vdp_palette_export` | `kind`, `color_format`, `byte_order`, `lines` (four lines of 16 `{index,word,rgb333_r_g_b,rgb888_hex}`) | none — has `kind` only |
-| `vdp-tiles-json` | `vdp_tile_export` | `kind`, `pixel_order` (`high-nibble-left`), `byte_order`, `palette_line`, `tiles[]` (`index`, VRAM `address`, 8x8 row-major pixel indices) | none — has `kind` only |
-| `vdp-plane-json` | `vdp_plane_export` | `kind`, `plane`, `byte_order`, `name_entry_format`, `name_table_base`, `size_cells`, `distinct_tiles`, `priority_entries`, `invalid_entries`, `truncated` | none — has `kind` only |
+| `system-m68k-registers`, `system-z80-registers`, `system-vdp-status` | `system_snapshot_capture` | The native command payload plus the declared `schema_version` | `system-m68k-registers/1`, `system-z80-registers/1`, `system-vdp-status/1` |
+| `vdp-status` | `vdp_capture` | The native `vdp_status` payload (24 registers plus decoded fields) plus the declared `schema_version` | `vdp-status/1` |
+| `vdp-capture-manifest` | `vdp_capture` | `kind`, `capture_id`, `captured_at`, `capture_consistency`, `components`, `artifacts`, `artifact_count`, `vdp_status` | `vdp-capture-manifest/1` |
+| `vdp-render-manifest` | `vdp_capture` | `kind`, `capture_id`, and four note-only sections (`display_geometry`, `palette_state`, `sprite_state`, `scroll_state`) | `vdp-render-manifest/1` |
+| `vdp-palette-json` | `vdp_palette_export` | `kind`, `color_format`, `byte_order`, `lines` (four lines of 16 `{index,word,rgb333_r_g_b,rgb888_hex}`) | `vdp-palette-json/1` |
+| `vdp-tiles-json` | `vdp_tile_export` | `kind`, `pixel_order` (`high-nibble-left`), `byte_order`, `palette_line`, `tiles[]` (`index`, VRAM `address`, 8x8 row-major pixel indices) | `vdp-tiles-json/1` |
+| `vdp-plane-json` | `vdp_plane_export` | `kind`, `plane`, `byte_order`, `name_entry_format`, `name_table_base`, `size_cells`, `distinct_tiles`, `priority_entries`, `invalid_entries`, `truncated` | `vdp-plane-json/1` |
 | script-defined (for example `experiment-observations`) | `experiment_run` script `artifact` message | Bounded derived bytes declared by the script (kind must match `^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$`, MIME type parsed and validated) | script-declared |
 
 ## Provenance envelope
@@ -272,23 +274,61 @@ invented. The envelope fields are:
   always derived from `capture_consistency.state` at render time and can never
   disagree with it. Read `capture_consistency.state`.
 
-## Schema version gaps
+## Schema versions
 
-These kinds carry no `schema_version`, so a consumer cannot detect a shape
-change. This document records them; adding the field is separate work:
+Every JSON artifact kind embeds a `schema_version` in its own payload, and the
+value is declared once in `internal/mcp/artifact_schema.go`
+(`artifactSchemaVersions`). `putJSONArtifact` is the single write path: it
+stamps the declared version and refuses a kind that is not registered, so a
+producer cannot publish a document whose payload claims a version the server
+does not declare. A derived export (`vdp-tiles-json`, `vdp-plane-json`,
+`vdp-palette-json`) goes through `storeJSONArtifactAndDescriptor`, which uses the
+same wrapper.
 
-- `memory-search-results`, `memory-diff-results`, `experiment-manifest`,
-  `state-diff-results`, `capture-manifest`, `vdp-capture-manifest`,
-  `vdp-render-manifest`, `vdp-status`, `vdp-palette-json`, `vdp-tiles-json`,
-  `vdp-plane-json`, `system-m68k-registers`, `system-z80-registers`,
-  `system-vdp-status`.
-- Script-published experiment artifacts declare no schema version by design;
-  the script owns their shape.
+The declared set is:
 
-Raw byte, image, and text artifacts (including `cpu-trace`, `cpu-trace-jsonl`
-lines, and WAV) have no embedded header of our own, so they are deliberately
-out of scope for this gap list; `cpu-trace-jsonl` lines and
-`trace-session-jsonl` lines *do* carry a per-line schema.
+| Kind | `schema_version` |
+| --- | --- |
+| `memory-search-results` | `memory-search-results/1` |
+| `memory-diff-results` | `memory-diff-results/1` |
+| `experiment-manifest` | `experiment-manifest/1` |
+| `state-diff-results` | `state-diff-results/1` |
+| `capture-manifest` | `capture-manifest/1` |
+| `vdp-capture-manifest` | `vdp-capture-manifest/1` |
+| `vdp-render-manifest` | `vdp-render-manifest/1` |
+| `vdp-status` | `vdp-status/1` |
+| `vdp-palette-json` | `vdp-palette-json/1` |
+| `vdp-tiles-json` | `vdp-tiles-json/1` |
+| `vdp-plane-json` | `vdp-plane-json/1` |
+| `system-m68k-registers` | `system-m68k-registers/1` |
+| `system-z80-registers` | `system-z80-registers/1` |
+| `system-vdp-status` | `system-vdp-status/1` |
+| `system-snapshot-manifest` | `system-snapshot/1` (historical value, unchanged) |
+| `system-render-manifest` | `render-manifest/1` (historical value, unchanged) |
+| `cpu-coverage` | `cpu-coverage/2` |
+| `debug-event` | `debug-event/1` |
+| `replay-manifest` | `replay-manifest/5` |
+| `annotation-export` | `annotation-export/1` |
+
+Reading the version does not require downloading the payload: the store records
+the declared value at write time, so `artifact_get` and `artifact_list`
+descriptors report `schema_version` next to `kind`, `mime_type`,
+`size_bytes`, `sha256`, and `capture_id`. An artifact whose payload declares no
+version (a legacy artifact written before this declaration, or a
+script-published `experiment_run` artifact, whose shape the script owns)
+reports no `schema_version` field instead of a fabricated one.
+
+Raw byte, image, and text artifacts (`memory-dump`, `memory-snapshot`,
+`rom-header`, VDP buffers, PNGs, `cpu-trace`, `experiment-output`, WAV) have no
+embedded header of our own and are deliberately out of scope;
+`cpu-trace-jsonl` and `trace-session-jsonl` lines carry a per-line
+`schema_version` (`trace-event/1`, `trace-session-event/1`,
+`trace-session-access/1`) instead of a document-level one.
+
+`TestEveryJSONArtifactKindDeclaresSchemaVersion` proves every registered kind
+stamps its declared value and that an unregistered kind is refused;
+`TestJSONArtifactWritesGoThroughTheSchemaDeclaration` parses this package and
+fails when a JSON artifact is written around the declaration.
 
 ## Sanitization and safety
 

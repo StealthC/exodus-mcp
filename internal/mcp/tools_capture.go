@@ -352,14 +352,10 @@ func runMemorySnapshotCapture(tc toolContext, args json.RawMessage) map[string]a
 	// response, not the frozen struct's subset.
 	manifest["capture_consistency"] = view
 	restampCaptureProvenance(manifest, view, atomicConsistency.State)
-	manifestBytes, err := json.MarshalIndent(manifest, "", "  ")
-	if err != nil {
-		return failureResult(&toolFailure{Code: "artifact_error", Message: err.Error()}, tc.modern)
-	}
 	manifestProvenance := genericProvenance(tc.server, captureKind, capturedAt)
 	manifestProvenance.CaptureID = captureID
 	manifestProvenance.CaptureConsistency = atomicConsistency
-	storedManifest, err := tc.server.store.PutWithProvenance(context.ID, captureKind, "application/json", manifestBytes, manifestProvenance)
+	storedManifest, err := putJSONArtifact(tc.server, context.ID, captureKind, manifest, manifestProvenance)
 	if err != nil {
 		return failureResult(&toolFailure{Code: "artifact_error", Message: err.Error()}, tc.modern)
 	}
