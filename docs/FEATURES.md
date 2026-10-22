@@ -414,7 +414,13 @@ claim to the exact test function or smoke-script check that proves it.
   event including unknown directions, and `read`/`write`/`execute` never match
   an event whose direction is unknown. `triggering_pc` is `null` together with
   `triggering_pc_source: "unknown"` when the value could not be read, so a stop
-  is never attributed to the plausible address 0. Stop/resume semantics are
+  is never attributed to the plausible address 0. The two provenance fields are
+  never conflated: `triggering_pc_source` (`register_read` | `unknown`) answers
+  *where the PC came from*, and `stop_source` (`instrument` | `external` |
+  `mcp`) answers *why execution stopped* — an event row always reports
+  `stop_source: "instrument"`, the same value a `run_until_*` response reports
+  for its own instrument, and a `run_until_*` stop is joined to its row through
+  `debug_event_id`. Stop/resume semantics are
   explicit: a breaking hit pauses the CPU and increments the native counter
   once; the native counter is the identity of a stop, so while the CPU stays
   paused a repeated observation of the same resource, counter value, and
@@ -854,15 +860,22 @@ loaded.
   window (caller `control_id` reused, otherwise an internal lock), polls
   `emulator_status` every 100 ms (cache bypassed) until the instrument proves
   fired, and reports the stop evidence: `stop_reason`, `stop_source`,
-  resource id, `hit_count`, `one_shot`, `triggering_pc` (+ hex), `pc_source`,
-  registers, `pause_source`, `configured_access`/`observed_direction` and the
-  watched range for watchpoints, the debug `event_id`, and the generation
-  span. The stop evidence never fabricates facts: `triggering_pc` is `null`
-  with `pc_source: "unknown"` when no read proved it, and it is paired with a
-  source (`instrument` when the value recorded at the stop is reused,
-  `register_read` for a live read). `stop_source` distinguishes an instrument
-  stop (`instrument`), an MCP pause (`mcp`), an external pause (`external`),
-  and a window that ended without a stop (`none`). The **tool itself** removes
+  resource id, `hit_count`, `one_shot`, `triggering_pc` (+ hex),
+  `triggering_pc_source`, registers, `pause_source`,
+  `configured_access`/`observed_direction` and the watched range for
+  watchpoints, `debug_event_id`, and the generation span. The stop evidence
+  never fabricates facts: `triggering_pc` is `null` with
+  `triggering_pc_source: "unknown"` when no read proved it, otherwise the value
+  is a `register_read` whether it was captured at the stop or re-read by the
+  tool. Provenance is split into two fields everywhere: `triggering_pc_source`
+  (`register_read` | `unknown`, where the PC came from) and `stop_source`
+  (`instrument` | `external` | `mcp` | `none` — why execution stopped, never a
+  PC source). `pc_source` remains as a deprecated alias of
+  `triggering_pc_source` carrying the same value. `debug_event_id` names the
+  structured event recorded for the stop (`debug_event_ids` lists every event
+  when the stop produced more than one), so a caller joins the tool response to
+  `cpu_debug_events_list` without matching timestamps; `event_id` remains as
+  the historical name of the same id. The **tool itself** removes
   the instrument inside the call, ahead of the paused-state sweep, and reports
   the verified outcome: `instrument_removed` plus `instrument_removal`
   (`removed` | `already_absent` | `failed`). A removal failure is surfaced as
@@ -948,7 +961,7 @@ named subset are asserted by `internal/mcp/server_test.go`
 | Freeze lifecycle, limits, surfaced write errors, purge on ROM load | `internal/mcp/tools_freeze_test.go` |
 | Memory-write echo and audit record, `data_hex`/base64 normalization, read-back verification (the memory-write contract itself is described in its own section above) | `internal/mcp/tools_phase4_test.go` `TestMemoryWriteEchoesAndRecordsAudit`, `internal/mcp/tools_provenance_test.go` `TestMemoryWriteHexInputAndEcho`, `TestMemoryWriteReadbackVerification` |
 | Debug-event history folding (counter identity, changed-PC re-observation), gaps, pagination, observed-vs-configured direction filters, filter-enum validation, cross-context scope and scope-consistent history counters | `internal/mcp/tools_debug_events_test.go` |
-| Run-until wrappers and one-shot sweep: verified instrument removal (including the native-failure path), `pc_source`/null `triggering_pc`, `stop_source`, steady-stop event recording, watchpoint range semantics and `one_shot` echoes | `internal/mcp/tools_run_until_test.go` |
+| Run-until wrappers and one-shot sweep: verified instrument removal (including the native-failure path), shared `triggering_pc_source`/`stop_source` vocabulary across the tool response and the event row, `debug_event_id`/`debug_event_ids` join keys, null `triggering_pc`, steady-stop event recording, watchpoint range semantics and `one_shot` echoes | `internal/mcp/tools_run_until_test.go` |
 | Target generation/control lock store, conflict and resynchronization | `internal/analysis/target_test.go` |
 | Control lock, generation conflicts, audit stream, state save/load/list, frame advance, input set, context close | `internal/mcp/tools_phase4_test.go` |
 | Search/diff modes, ROM header parse and checksum, `target_info` ROM summary, coverage counts and region filter, watchpoint trace arguments | `internal/mcp/tools_phase5_test.go` |
