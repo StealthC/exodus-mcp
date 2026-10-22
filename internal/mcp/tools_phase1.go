@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -90,6 +92,14 @@ func phase1ToolSpecs() []toolSpec {
 			description: "List open analysis contexts, including the implicit default context.",
 			schema:      objectSchema(map[string]any{}, nil),
 			run:         runContextList,
+		},
+		{
+			name:        "context_prune",
+			description: "Reclaim one closed analysis context and its data from disk. Contexts and their annotations now survive a restart, so a finished workspace needs an explicit way out: context_prune removes the context from the persisted workspace, deletes its annotation document, its artifacts and capture index entries (bytes included), and its saved state snapshot files, and reports how much was removed. It refuses the implicit default context and any context that is still open; close it first with context_close. Symbols are in-memory only and end with the context. The global audit stream is not context-scoped and is never pruned.",
+			schema: objectSchema(map[string]any{
+				"context_id": stringProperty("Handle of a closed, non-default analysis context from context_create."),
+			}, []string{"context_id"}),
+			run: runContextPrune,
 		},
 		{
 			name:        "emulator_status",
@@ -222,6 +232,8 @@ func performROMLoad(tc toolContext, path string, run bool, guard mutationGuard, 
 			// presenting a dead session as live.
 			server.retireTraceSession("the cartridge was reloaded, which stops native capture")
 			server.setROMPath(path)
+			// No command of this server describes the new machine's pads.
+			server.resetInputLedger()
 		},
 		resources: func() []string { return invalidated },
 	})
@@ -1157,7 +1169,11 @@ func runContextCreate(tc toolContext, args json.RawMessage) map[string]any {
 	}
 	context, err := tc.server.contexts.Create(parsed.Name)
 	if err != nil {
-		return failureResult(&toolFailure{Code: "invalid_params", Message: err.Error()}, tc.modern)
+		code := "invalid_params"
+		if errors.Is(err, analysis.ErrContextStore) {
+			code = "workspace_store_error"
+		}
+		return failureResult(&toolFailure{Code: code, Message: err.Error()}, tc.modern)
 	}
 	return okResult(map[string]any{"context": contextView(context)}, tc.modern)
 }
@@ -1203,6 +1219,79 @@ func runContextClose(tc toolContext, args json.RawMessage) map[string]any {
 	view := contextView(context)
 	view["closed"] = true
 	return okResult(map[string]any{"context": view}, tc.modern)
+}
+
+type contextPruneArgs struct {
+	ContextID string `json:"context_id"`
+}
+
+func runContextPrune(tc toolContext, args json.RawMessage) map[string]any {
+	parsed, failure := decodeArgs[contextPruneArgs](args)
+	if failure != nil {
+		return failureResult(failure, tc.modern)
+	}
+	if tc.server.contexts.Dir() == "" {
+		return failureResult(&toolFailure{
+			Code:    "unsupported_operation",
+			Message: "this server runs an in-memory analysis workspace, so there is nothing persisted to prune for a context",
+		}, tc.modern)
+	}
+	context, err := tc.server.contexts.Prune(parsed.ContextID)
+	if err != nil {
+		code := "unknown_context"
+		switch {
+		case strings.Contains(err.Error(), "cannot be pruned"):
+			code = "cannot_prune_default"
+		case strings.Contains(err.Error(), "still open"):
+			code = "context_still_open"
+		}
+		return failureResult(&toolFailure{Code: code, Message: err.Error()}, tc.modern)
+	}
+	artifactsRemoved, capturesRemoved, artifactErr := tc.server.store.DeleteContext(context.ID)
+	stateFilesRemoved := removeStateDirectory(tc.server, context.ID)
+	detail := map[string]any{
+		"context_id":          context.ID,
+		"name":                context.Name,
+		"annotations_removed": len(context.Annotations.Export(context.ID)),
+		"artifacts_removed":   artifactsRemoved,
+		"captures_removed":    capturesRemoved,
+		"state_files_removed": stateFilesRemoved,
+		"symbols_note":        "Symbols are in-memory only; they never survived a restart and are gone with the context.",
+		"audit_note":          "The global target audit stream is not context-scoped and is never pruned.",
+	}
+	if artifactErr != nil {
+		detail["artifact_cleanup_error"] = artifactErr.Error()
+	}
+	tc.server.recordAudit(analysis.AuditEntry{
+		Tool:        "context_prune",
+		ContextID:   context.ID,
+		Outcome:     analysis.OutcomeOK,
+		Detail:      detail,
+		ResourceIDs: []string{context.ID},
+	})
+	return okResult(detail, tc.modern)
+}
+
+// removeStateDirectory deletes the saved snapshot files one context owns and
+// reports how many files were removed. A missing directory is not an error: the
+// context may never have saved a snapshot.
+func removeStateDirectory(server *Server, contextID string) int {
+	directory := filepath.Join(server.StatesDir(), contextID)
+	entries, err := os.ReadDir(directory)
+	if err != nil {
+		return 0
+	}
+	removed := 0
+	for _, entry := range entries {
+		if entry.IsDir() {
+			continue
+		}
+		if err := os.Remove(filepath.Join(directory, entry.Name())); err == nil {
+			removed++
+		}
+	}
+	_ = os.Remove(directory)
+	return removed
 }
 
 func contextView(context *analysis.Context) map[string]any {

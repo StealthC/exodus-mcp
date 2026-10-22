@@ -749,11 +749,7 @@ func runMemorySearch(tc toolContext, args json.RawMessage) map[string]any {
 		"addresses":      matches.Addresses,
 		"parsed_pattern": map[string]any{"bytes_hex": patternHex, "mask_hex": maskHex, "alignment": alignment},
 	}
-	resultsBytes, err := json.Marshal(results)
-	if err != nil {
-		return failureResult(&toolFailure{Code: "artifact_error", Message: err.Error()}, tc.modern)
-	}
-	storedResults, err := tc.server.store.PutWithProvenance(context.ID, "memory-search-results", "application/json", resultsBytes, genericProvenance(tc.server, "memory-search-results", time.Now().UTC()))
+	storedResults, err := putJSONArtifact(tc.server, context.ID, "memory-search-results", results, genericProvenance(tc.server, "memory-search-results", time.Now().UTC()))
 	if err != nil {
 		return failureResult(&toolFailure{Code: "artifact_error", Message: err.Error()}, tc.modern)
 	}
@@ -1608,11 +1604,7 @@ func runMemoryDiff(tc toolContext, args json.RawMessage) map[string]any {
 		document["min_value"] = *parsed.MinValue
 		document["max_value"] = *parsed.MaxValue
 	}
-	documentBytes, err := json.Marshal(document)
-	if err != nil {
-		return failureResult(&toolFailure{Code: "artifact_error", Message: err.Error()}, tc.modern)
-	}
-	storedResults, err := tc.server.store.PutWithProvenance(context.ID, "memory-diff-results", "application/json", documentBytes, genericProvenance(tc.server, "memory-diff-results", time.Now().UTC()))
+	storedResults, err := putJSONArtifact(tc.server, context.ID, "memory-diff-results", document, genericProvenance(tc.server, "memory-diff-results", time.Now().UTC()))
 	if err != nil {
 		return failureResult(&toolFailure{Code: "artifact_error", Message: err.Error()}, tc.modern)
 	}
@@ -2498,7 +2490,7 @@ func debugEventDescriptor(server *Server, event debugEvent, contextID, captureID
 	eventData["note"] = "Access width/value fields are not exposed by the native API and are marked unknown."
 	// Store as artifact
 	// Use a temporary context for storage; the event's context is used for provenance but storage is per requesting context
-	stored, _ := server.store.PutWithProvenance(contextID, "debug-event", "application/json", mustMarshal(eventData), provenance)
+	stored, _ := putJSONArtifact(server, contextID, "debug-event", eventData, provenance)
 	return artifactDescriptor(server, stored, contextID)
 }
 
@@ -2649,12 +2641,11 @@ func runCpuCoverageCapture(tc toolContext, args json.RawMessage) map[string]any 
 	coverage := buildCoverageV2(tc, parsed.CPU, filtered, addressesForBlocks, regionStart, regionEnd)
 	// Build versioned document
 	coverageDocument := map[string]any{
-		"schema_version": "cpu-coverage/2",
-		"kind":           "cpu-coverage",
-		"cpu":            parsed.CPU,
-		"address_space":  coverage.AddressSpace,
-		"byte_order":     coverage.ByteOrder,
-		"region":         map[string]any{"start_address": regionStart, "start_address_hex": canonicalHex(regionStart), "end_address": regionEnd, "end_address_hex": canonicalHex(regionEnd)},
+		"kind":          "cpu-coverage",
+		"cpu":           parsed.CPU,
+		"address_space": coverage.AddressSpace,
+		"byte_order":    coverage.ByteOrder,
+		"region":        map[string]any{"start_address": regionStart, "start_address_hex": canonicalHex(regionStart), "end_address": regionEnd, "end_address_hex": canonicalHex(regionEnd)},
 		"capture": map[string]any{
 			"duration_ms":     duration,
 			"max_entries":     maxEntries,
@@ -2668,6 +2659,7 @@ func runCpuCoverageCapture(tc toolContext, args json.RawMessage) map[string]any 
 			"total_events":     entriesTotal,
 			"filtered_events":  len(filtered),
 			"unique_addresses": coverage.Distinct,
+			"decode_sweeps":    coverage.Truncation["decode_sweeps"],
 			"addresses":        coverage.Addresses,
 			"counts":           coverage.Counts,
 		},
@@ -2701,10 +2693,6 @@ func runCpuCoverageCapture(tc toolContext, args json.RawMessage) map[string]any 
 		coverageDocument["addresses"] = coverage.Addresses[:maxCoverageAddresses]
 	}
 	annotateAddressMap(coverageDocument, coverage.AddressSpace)
-	documentBytes, err := json.Marshal(coverageDocument)
-	if err != nil {
-		return failureResult(&toolFailure{Code: "artifact_error", Message: err.Error()}, tc.modern)
-	}
 	provenance := coverageProvenance(tc, parsed.CPU, regionStart, regionEnd)
 	// Record filters in provenance
 	if !includeROM || !includeRAM || !retainRepeated {
@@ -2713,7 +2701,7 @@ func runCpuCoverageCapture(tc toolContext, args json.RawMessage) map[string]any 
 			Note:  fmt.Sprintf("Filters: include_rom=%v include_ram=%v retain_repeated=%v", includeROM, includeRAM, retainRepeated),
 		}
 	}
-	stored, err := tc.server.store.PutWithProvenance(context.ID, "cpu-coverage", "application/json", documentBytes, provenance)
+	stored, err := putJSONArtifact(tc.server, context.ID, "cpu-coverage", coverageDocument, provenance)
 	if err != nil {
 		return failureResult(&toolFailure{Code: "artifact_error", Message: err.Error()}, tc.modern)
 	}
@@ -2733,6 +2721,7 @@ func runCpuCoverageCapture(tc toolContext, args json.RawMessage) map[string]any 
 			"ranges_count":    len(coverage.Ranges),
 			"pages_total":     coverage.PagesTotal,
 			"pages_top":       coverage.PagesTop,
+			"decode_sweeps":   coverage.DecodeSweeps,
 			"truncated":       coverage.Truncation,
 			"sha256":          stored.SHA256,
 		},
@@ -2880,6 +2869,9 @@ type coverageResultV2 struct {
 	Blocks       []map[string]any
 	Edges        []map[string]any
 	Truncation   map[string]any
+	// DecodeSweeps is the number of native disassembly sweeps the block builder
+	// issued; it is reported so the batching is observable, not implicit.
+	DecodeSweeps int
 }
 
 func buildCoverageV2(tc toolContext, cpu string, ordered []uint64, uniqueForBlocks []uint64, regionStart, regionEnd uint64) coverageResultV2 {
@@ -2930,28 +2922,11 @@ func buildCoverageV2(tc toolContext, cpu string, ordered []uint64, uniqueForBloc
 		return edges[i]["to"].(uint64) < edges[j]["to"].(uint64)
 	})
 
-	// Instruction-aware blocks: need lengths
+	// Instruction-aware blocks: need lengths. One native sweep per contiguous
+	// run of executed addresses replaces one call per unique address, so a
+	// 500-address coverage report costs a handful of round trips instead of 500.
 	uniqueSorted := base.Addresses
-	// Fetch lengths for each unique address (cached)
-	lengths := map[uint64]int{}
-	for _, addr := range uniqueSorted {
-		info := fetchInstructionInfo(tc, cpu, addr)
-		if info != nil {
-			if l, ok := info["length"].(int); ok && l > 0 {
-				lengths[addr] = l
-			} else {
-				lengths[addr] = 2 // default for m68k
-				if cpu == "z80" {
-					lengths[addr] = 1
-				}
-			}
-		} else {
-			lengths[addr] = 2
-			if cpu == "z80" {
-				lengths[addr] = 1
-			}
-		}
-	}
+	lengths, decodeSweeps := fetchInstructionLengths(tc, cpu, uniqueSorted)
 	blocks := []map[string]any{}
 	if len(uniqueSorted) > 0 {
 		blockStart := uniqueSorted[0]
@@ -3002,6 +2977,7 @@ func buildCoverageV2(tc toolContext, cpu string, ordered []uint64, uniqueForBloc
 		"source_events":    len(ordered),
 		"decoded_events":   len(ordered), // we decoded all for lengths
 		"unique_addresses": len(uniqueSorted),
+		"decode_sweeps":    decodeSweeps,
 		"blocks":           len(blocks),
 		"edges":            len(edges),
 		"complete":         !base.AddressesTruncated,
@@ -3015,5 +2991,6 @@ func buildCoverageV2(tc toolContext, cpu string, ordered []uint64, uniqueForBloc
 		Blocks:         blocks,
 		Edges:          edges,
 		Truncation:     truncation,
+		DecodeSweeps:   decodeSweeps,
 	}
 }

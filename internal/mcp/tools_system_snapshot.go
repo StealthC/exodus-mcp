@@ -203,15 +203,11 @@ func runSystemSnapshot(tc toolContext, args json.RawMessage) map[string]any {
 		}
 		return failureResult(f, tc.modern)
 	}
-	addJSON := func(name, kind string, value any) *toolFailure {
-		b, e := json.MarshalIndent(value, "", "  ")
-		if e != nil {
-			return &toolFailure{Code: "artifact_error", Message: e.Error()}
-		}
+	addJSON := func(name, kind string, value map[string]any) *toolFailure {
 		prov := genericProvenance(tc.server, kind, at)
 		prov.CaptureID = captureID
 		prov.CaptureConsistency = consistency
-		a, e := tc.server.store.PutWithProvenance(ctx.ID, kind, "application/json", b, prov)
+		a, e := putJSONArtifact(tc.server, ctx.ID, kind, value, prov)
 		if e != nil {
 			return &toolFailure{Code: "artifact_error", Message: e.Error()}
 		}
@@ -345,7 +341,7 @@ func runSystemSnapshot(tc toolContext, args json.RawMessage) map[string]any {
 	}
 	// Keep the renderer-facing relationship explicit and bounded. This is a
 	// derived artifact, not a second read window.
-	if f := addJSON("render_manifest", "system-render-manifest", map[string]any{"schema_version": "render-manifest/1", "capture_id": captureID, "frame": components["frame"], "vdp_status": components["vdp_status"], "palette": components["cram"], "scroll": components["vsram"], "sprites": components["sprite_table"]}); f != nil {
+	if f := addJSON("render_manifest", "system-render-manifest", map[string]any{"capture_id": captureID, "frame": components["frame"], "vdp_status": components["vdp_status"], "palette": components["cram"], "scroll": components["vsram"], "sprites": components["sprite_table"]}); f != nil {
 		return fail(f)
 	}
 	// Close the window once: restore the prior run state, complete the single
@@ -353,7 +349,7 @@ func runSystemSnapshot(tc toolContext, args json.RawMessage) map[string]any {
 	window.closeWindow(tc, resume)
 	restore := window.restoreView()
 	genAfter := tc.server.target.Generation()
-	manifest := map[string]any{"schema_version": systemSnapshotSchema, "kind": "system-snapshot", "capture_id": captureID, "captured_at": at, "capture_consistency": consistency, "run_state_restore": restore, "target_generation_before": genBefore, "target_generation_after": genAfter, "rom_identity": tc.server.romIdentityView(0), "byte_order": map[string]any{"m68k": "big-endian", "z80": "little-endian", "raw": "address-order"}, "components": components, "artifacts": artifacts}
+	manifest := map[string]any{"kind": "system-snapshot", "capture_id": captureID, "captured_at": at, "capture_consistency": consistency, "run_state_restore": restore, "target_generation_before": genBefore, "target_generation_after": genAfter, "rom_identity": tc.server.romIdentityView(0), "byte_order": map[string]any{"m68k": "big-endian", "z80": "little-endian", "raw": "address-order"}, "components": components, "artifacts": artifacts}
 	// The manifest embeds the component descriptors, which were built while the
 	// window was open: re-stamp them before writing the durable manifest so it
 	// cannot carry a provisional window state.
@@ -362,14 +358,10 @@ func runSystemSnapshot(tc toolContext, args json.RawMessage) map[string]any {
 	// response, not the frozen struct's subset.
 	manifest["capture_consistency"] = view
 	restampCaptureProvenance(manifest, view, consistency.State)
-	b, err := json.MarshalIndent(manifest, "", "  ")
-	if err != nil {
-		return failureResult(&toolFailure{Code: "artifact_error", Message: err.Error()}, tc.modern)
-	}
 	prov := genericProvenance(tc.server, "system-snapshot-manifest", at)
 	prov.CaptureID = captureID
 	prov.CaptureConsistency = consistency
-	stored, e := tc.server.store.PutWithProvenance(ctx.ID, "system-snapshot-manifest", "application/json", b, prov)
+	stored, e := putJSONArtifact(tc.server, ctx.ID, "system-snapshot-manifest", manifest, prov)
 	if e != nil {
 		return failureResult(&toolFailure{Code: "artifact_error", Message: e.Error()}, tc.modern)
 	}

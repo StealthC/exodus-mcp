@@ -53,6 +53,37 @@ and this project will use [Semantic Versioning](https://semver.org/spec/v2.0.0.h
   boundary addresses, 64-bit sequence rendering, previous-value availability,
   register-snapshot cap), run by `scripts/test.sh`.
 
+- Every JSON artifact kind embeds a declared `schema_version`: fourteen kinds
+  that published an unversioned payload (`memory-search-results`,
+  `memory-diff-results`, `experiment-manifest`, `state-diff-results`,
+  `capture-manifest`, `vdp-capture-manifest`, `vdp-render-manifest`,
+  `vdp-status`, `vdp-palette-json`, `vdp-tiles-json`, `vdp-plane-json`,
+  `system-m68k-registers`, `system-z80-registers`, `system-vdp-status`) now
+  carry one. `artifactSchemaVersions` is the single declaration and
+  `putJSONArtifact` the single write path; `artifact_get`/`artifact_list`
+  report the recorded value.
+- One error-code taxonomy (`internal/mcp/error_codes.go`): every failure
+  `code` is declared with a class and an origin, every error response carries
+  `error_class`, an unknown native code becomes `native_error` with
+  `native_code` preserved, and the taxonomy is published under
+  `capabilities.x-error-codes`.
+- The analysis workspace persists across restarts: contexts
+  (`analysis-contexts/1`) and one annotation document per context
+  (`annotations/1`) under `<artifact-dir>/analysis`, loaded at startup, so the
+  default context keeps its handle and annotations survive a restart.
+  `context_prune` reclaims a closed context (registry entry, annotations,
+  artifacts, capture entries, state files); `state_delete` removes one saved
+  snapshot; `state_load` accepts a snapshot `name`.
+- `z80_backtrace`: heuristic Z80 stack walk from SP with little-endian slot
+  decoding, symbol resolution through the `z80-bus` coordinate model, and
+  per-frame confidence.
+- `input_status`: the controller state this server last commanded per port,
+  explicitly a command ledger (`verified_by_emulator: false`) because the
+  pinned plugin exposes no pad read.
+- `m68k_disassemble`/`z80_disassemble` accept `addresses` (up to 32) and return
+  one `batches` entry per address; `cpu_coverage_capture` decodes instruction
+  lengths with one native sweep per contiguous run and reports `decode_sweeps`.
+
 ### Changed
 
 - Continuous trace sessions: `trace_session_start`, `trace_session_status`,

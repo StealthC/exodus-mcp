@@ -539,7 +539,6 @@ func runDeterministicReplay(tc toolContext, args json.RawMessage) map[string]any
 	comparisonView := comparison.view()
 	manifest := map[string]any{
 		"kind":                    replayManifestKind,
-		"schema_version":          replayManifestVer,
 		"initial_state_id":        initialSnapshot.ID,
 		"initial_state_name":      initialSnapshot.Name,
 		"steps":                   stepsView,
@@ -567,13 +566,9 @@ func runDeterministicReplay(tc toolContext, args json.RawMessage) map[string]any
 	for key, value := range warmupView {
 		manifest[key] = value
 	}
-	manifestBytes, err := json.Marshal(manifest)
-	if err != nil {
-		return failureResult(&toolFailure{Code: "artifact_error", Message: err.Error()}, tc.modern)
-	}
 	provenance := genericProvenance(tc.server, replayManifestKind, time.Now().UTC())
 	provenance.CaptureConsistency = replayConsistency(entryRunState, entryKnown, pauseResumeCycles > 0, closure, comparison.Deterministic)
-	stored, err := tc.server.store.PutWithProvenance(context.ID, replayManifestKind, "application/json", manifestBytes, provenance)
+	stored, err := putJSONArtifact(tc.server, context.ID, replayManifestKind, manifest, provenance)
 	if err != nil {
 		return failureResult(&toolFailure{Code: "artifact_error", Message: err.Error()}, tc.modern)
 	}

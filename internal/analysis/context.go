@@ -36,6 +36,11 @@ type Registry struct {
 	defaults map[string]bool
 	contexts map[string]*Context
 
+	// dir anchors the persisted workspace (contexts and their annotations).
+	// It is empty for an in-memory registry, which is what tests use and what
+	// keeps `NewRegistry` free of filesystem side effects.
+	dir string
+
 	// States stores context-scoped snapshots; the registry lives for the
 	// server process like the contexts themselves.
 	States *StateStore
@@ -61,7 +66,13 @@ func (registry *Registry) Create(name string) (*Context, error) {
 	if len(name) > 100 {
 		return nil, fmt.Errorf("context name must be at most 100 characters")
 	}
-	return registry.create(name, false), nil
+	context := registry.create(name, false)
+	registry.mu.Lock()
+	defer registry.mu.Unlock()
+	if err := registry.persistLocked(); err != nil {
+		return nil, err
+	}
+	return context, nil
 }
 
 // Default returns the implicit default context.
@@ -120,19 +131,23 @@ func (registry *Registry) Close(id string) (*Context, error) {
 		return nil, fmt.Errorf("the default analysis context cannot be closed")
 	}
 	context.Closed = true
+	if err := registry.persistLocked(); err != nil {
+		return nil, err
+	}
 	return context, nil
 }
 
 func (registry *Registry) create(name string, isDefault bool) *Context {
 	registry.mu.Lock()
 	defer registry.mu.Unlock()
+	contextID := newID()
 	context := &Context{
-		ID:          newID(),
+		ID:          contextID,
 		Name:        name,
 		CreatedAt:   time.Now().UTC(),
 		Default:     isDefault,
 		Symbols:     symbols.NewStore(),
-		Annotations: NewAnnotationStore(),
+		Annotations: registry.newAnnotationStore(contextID),
 	}
 	registry.contexts[context.ID] = context
 	return context

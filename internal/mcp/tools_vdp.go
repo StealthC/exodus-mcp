@@ -502,8 +502,7 @@ func vdpCaptureValue(tc toolContext, context *analysis.Context, includeFrame, in
 		return nil, failure
 	}
 	statusProvenance := vdpProvenanceWithCapture(tc, "vdp-status", "vdp-buffers", "VDP", captureID, consistency)
-	statusBytes, _ := json.Marshal(statusPayload)
-	storedStatus, _ := tc.server.store.PutWithProvenance(context.ID, "vdp-status", "application/json", statusBytes, statusProvenance)
+	storedStatus, _ := putJSONArtifact(tc.server, context.ID, "vdp-status", statusPayload, statusProvenance)
 	addArtifact("vdp_status", storedStatus)
 	manifest["vdp_status"] = statusPayload
 	// The capture identifies one rendered frame whether or not the frame PNG was
@@ -611,9 +610,8 @@ func vdpCaptureValue(tc toolContext, context *analysis.Context, includeFrame, in
 		"sprite_state":     map[string]any{"note": "Sprite table artifact holds link chain; see vdp_sprite_table"},
 		"scroll_state":     map[string]any{"note": "VSRAM and hscroll data in vsram artifact"},
 	}
-	renderBytes, _ := json.Marshal(renderManifest)
 	renderProvenance := vdpProvenanceWithCapture(tc, "vdp-render-manifest", "vdp-buffers", "VDP", captureID, consistency)
-	storedRender, _ := tc.server.store.PutWithProvenance(context.ID, "vdp-render-manifest", "application/json", renderBytes, renderProvenance)
+	storedRender, _ := putJSONArtifact(tc.server, context.ID, "vdp-render-manifest", renderManifest, renderProvenance)
 	addArtifact("render_manifest", storedRender)
 
 	// The manifest links every component artifact, so it must describe the
@@ -625,14 +623,10 @@ func vdpCaptureValue(tc toolContext, context *analysis.Context, includeFrame, in
 		manifest["artifact_count"] = len(artifacts)
 		manifest["capture_consistency"] = view
 		restampCaptureProvenance(manifest, view, consistency.State)
-		manifestBytes, err := json.MarshalIndent(manifest, "", "  ")
-		if err != nil {
-			return nil, &toolFailure{Code: "artifact_error", Message: err.Error()}
-		}
 		manifestProvenance := genericProvenance(tc.server, "vdp-capture-manifest", capturedAt)
 		manifestProvenance.CaptureID = captureID
 		manifestProvenance.CaptureConsistency = consistency
-		storedManifest, err := tc.server.store.PutWithProvenance(context.ID, "vdp-capture-manifest", "application/json", manifestBytes, manifestProvenance)
+		storedManifest, err := putJSONArtifact(tc.server, context.ID, "vdp-capture-manifest", manifest, manifestProvenance)
 		if err != nil {
 			return nil, &toolFailure{Code: "artifact_error", Message: err.Error()}
 		}
@@ -983,7 +977,7 @@ func runVDPPaletteExport(tc toolContext, args json.RawMessage) map[string]any {
 	jsonDocument := buildPaletteJSON(decoded)
 	jsonProvenance := vdpProvenanceWithCapture(tc, "vdp-palette-json", "mem-vdp-cram", "VDP CRAM", captureID, consistency)
 	jsonProvenance.ByteLength = &cramLength
-	jsonStored, err := tc.server.store.PutWithProvenance(context.ID, "vdp-palette-json", "application/json", jsonDocument, jsonProvenance)
+	jsonStored, err := putJSONArtifact(tc.server, context.ID, "vdp-palette-json", jsonDocument, jsonProvenance)
 	if err != nil {
 		return failureResult(&toolFailure{Code: "artifact_error", Message: err.Error()}, tc.modern)
 	}
@@ -1049,22 +1043,14 @@ func renderPalettePNG(entries []map[string]any) image.Image {
 	return img
 }
 
-func buildPaletteJSON(entries []map[string]any) []byte {
+func buildPaletteJSON(entries []map[string]any) map[string]any {
 	type colorEntry struct {
 		Index     int    `json:"index"`
 		Word      int    `json:"word"`
 		RGB333    [3]int `json:"rgb333_r_g_b"`
 		RGB888Hex string `json:"rgb888_hex"`
 	}
-	document := struct {
-		Kind        string           `json:"kind"`
-		ColorFormat string           `json:"color_format"`
-		ByteOrder   string           `json:"byte_order"`
-		Lines       [][16]colorEntry `json:"lines"`
-	}{}
-	document.Kind = "vdp-palette"
-	document.ColorFormat = "9-bit RGB expanded to 8-bit"
-	document.ByteOrder = "big-endian"
+	lines := make([][16]colorEntry, 0, 4)
 	for line := 0; line < 4; line++ {
 		var row [16]colorEntry
 		for column := 0; column < 16; column++ {
@@ -1077,10 +1063,16 @@ func buildPaletteJSON(entries []map[string]any) []byte {
 				RGB888Hex: source["color_hex"].(string),
 			}
 		}
-		document.Lines = append(document.Lines, row)
+		lines = append(lines, row)
 	}
-	data, _ := json.MarshalIndent(document, "", "  ")
-	return data
+	// schema_version is stamped by putJSONArtifact; the document carries only
+	// its own payload fields.
+	return map[string]any{
+		"kind":         "vdp-palette",
+		"color_format": "9-bit RGB expanded to 8-bit",
+		"byte_order":   "big-endian",
+		"lines":        lines,
+	}
 }
 
 const (
@@ -1250,6 +1242,18 @@ func storeArtifactAndDescriptor(tc toolContext, contextID, kind, mimeType string
 	return stored, artifactDescriptor(tc.server, stored, contextID), nil
 }
 
+// storeJSONArtifactAndDescriptor is the JSON counterpart of
+// storeArtifactAndDescriptor: the document's schema_version is stamped by the
+// single declaration, so a derived JSON export cannot drift from its kind.
+func storeJSONArtifactAndDescriptor(tc toolContext, contextID, kind string, document map[string]any, captureID string, consistency *artifact.CaptureConsistency) (artifact.Artifact, map[string]any, error) {
+	provenance := vdpProvenanceWithCapture(tc, kind, vdpSpaceForKind(kind), vdpDeviceForKind(kind), captureID, consistency)
+	stored, err := putJSONArtifact(tc.server, contextID, kind, document, provenance)
+	if err != nil {
+		return artifact.Artifact{}, nil, err
+	}
+	return stored, artifactDescriptor(tc.server, stored, contextID), nil
+}
+
 // vdpProvenance builds the capture envelope for a VDP-derived artifact: the
 // device buffer domain (VRAM/CRAM/VSRAM are not linearly CPU-mapped, so the
 // space carries a note), target identity, and capture time. Addresses are
@@ -1293,7 +1297,7 @@ func vdpSpaceForKind(kind string) string {
 		return "mem-vdp-cram"
 	case "vdp-plane-a", "vdp-plane-b", "vdp-plane-window", "vdp-plane-json":
 		return "mem-vdp-vram"
-	case "vdp-tile-strip", "vdp-tile-json":
+	case "vdp-tile-strip", "vdp-tile-json", "vdp-tiles", "vdp-tiles-json":
 		return "mem-vdp-vram"
 	default:
 		return "vdp-buffers"
@@ -1307,7 +1311,7 @@ func vdpDeviceForKind(kind string) string {
 		return "VDP CRAM"
 	case "vdp-plane-a", "vdp-plane-b", "vdp-plane-window", "vdp-plane-json":
 		return "VDP VRAM"
-	case "vdp-tile-strip", "vdp-tile-json":
+	case "vdp-tile-strip", "vdp-tile-json", "vdp-tiles", "vdp-tiles-json":
 		return "VDP VRAM"
 	default:
 		return "VDP"
@@ -1444,28 +1448,19 @@ func runVDPTileExport(tc toolContext, args json.RawMessage) map[string]any {
 	if err := png.Encode(&pngBuffer, img); err != nil {
 		return failureResult(&toolFailure{Code: "artifact_error", Message: "encode PNG: " + err.Error()}, tc.modern)
 	}
-	jsonDocument, err := json.MarshalIndent(struct {
-		Kind       string         `json:"kind"`
-		PixelOrder string         `json:"pixel_order"`
-		ByteOrder  string         `json:"byte_order"`
-		Palette    int            `json:"palette_line"`
-		Tiles      []exportedTile `json:"tiles"`
-	}{
-		Kind:       "vdp-tiles",
-		PixelOrder: "high-nibble-left",
-		ByteOrder:  "big-endian",
-		Palette:    int(parsed.Palette),
-		Tiles:      tiles,
-	}, "", "  ")
-	if err != nil {
-		return failureResult(&toolFailure{Code: "artifact_error", Message: err.Error()}, tc.modern)
+	jsonDocument := map[string]any{
+		"kind":         "vdp-tiles",
+		"pixel_order":  "high-nibble-left",
+		"byte_order":   "big-endian",
+		"palette_line": int(parsed.Palette),
+		"tiles":        tiles,
 	}
 
 	pngStored, pngDescriptor, err := storeArtifactAndDescriptor(tc, context.ID, "vdp-tiles", "image/png", pngBuffer.Bytes(), captureID, consistency)
 	if err != nil {
 		return failureResult(&toolFailure{Code: "artifact_error", Message: err.Error()}, tc.modern)
 	}
-	jsonStored, jsonDescriptor, err := storeArtifactAndDescriptor(tc, context.ID, "vdp-tiles-json", "application/json", jsonDocument, captureID, consistency)
+	jsonStored, jsonDescriptor, err := storeJSONArtifactAndDescriptor(tc, context.ID, "vdp-tiles-json", jsonDocument, captureID, consistency)
 	if err != nil {
 		return failureResult(&toolFailure{Code: "artifact_error", Message: err.Error()}, tc.modern)
 	}
@@ -1637,38 +1632,24 @@ func runVDPPlaneExport(tc toolContext, args json.RawMessage) map[string]any {
 	if err := png.Encode(&pngBuffer, img); err != nil {
 		return failureResult(&toolFailure{Code: "artifact_error", Message: "encode PNG: " + err.Error()}, tc.modern)
 	}
-	jsonDocument, err := json.MarshalIndent(struct {
-		Kind            string      `json:"kind"`
-		Plane           string      `json:"plane"`
-		ByteOrder       string      `json:"byte_order"`
-		NameEntryFormat string      `json:"name_entry_format"`
-		NameTableBase   int         `json:"name_table_base"`
-		SizeCells       [2]int      `json:"size_cells"`
-		DistinctTiles   map[int]int `json:"distinct_tiles"`
-		PriorityEntries int         `json:"priority_entries"`
-		InvalidEntries  int         `json:"invalid_entries"`
-		Truncated       bool        `json:"truncated"`
-	}{
-		Kind:            "vdp-plane",
-		Plane:           parsed.Plane,
-		ByteOrder:       "big-endian",
-		NameEntryFormat: "bits 0-10 tile, 11 hflip, 12 vflip, 13-14 palette, 15 priority",
-		NameTableBase:   int(nameTableBase),
-		SizeCells:       [2]int{widthCells, heightCells},
-		DistinctTiles:   histogram,
-		PriorityEntries: priorityEntries,
-		InvalidEntries:  invalidEntries,
-		Truncated:       truncated,
-	}, "", "  ")
-	if err != nil {
-		return failureResult(&toolFailure{Code: "artifact_error", Message: err.Error()}, tc.modern)
+	jsonDocument := map[string]any{
+		"kind":              "vdp-plane",
+		"plane":             parsed.Plane,
+		"byte_order":        "big-endian",
+		"name_entry_format": "bits 0-10 tile, 11 hflip, 12 vflip, 13-14 palette, 15 priority",
+		"name_table_base":   int(nameTableBase),
+		"size_cells":        [2]int{widthCells, heightCells},
+		"distinct_tiles":    histogram,
+		"priority_entries":  priorityEntries,
+		"invalid_entries":   invalidEntries,
+		"truncated":         truncated,
 	}
 
 	pngStored, pngDescriptor, err := storeArtifactAndDescriptor(tc, context.ID, "vdp-plane", "image/png", pngBuffer.Bytes(), captureID, consistency)
 	if err != nil {
 		return failureResult(&toolFailure{Code: "artifact_error", Message: err.Error()}, tc.modern)
 	}
-	jsonStored, jsonDescriptor, err := storeArtifactAndDescriptor(tc, context.ID, "vdp-plane-json", "application/json", jsonDocument, captureID, consistency)
+	jsonStored, jsonDescriptor, err := storeJSONArtifactAndDescriptor(tc, context.ID, "vdp-plane-json", jsonDocument, captureID, consistency)
 	if err != nil {
 		return failureResult(&toolFailure{Code: "artifact_error", Message: err.Error()}, tc.modern)
 	}
