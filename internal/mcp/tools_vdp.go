@@ -9,7 +9,6 @@ import (
 	"image/color"
 	"image/png"
 	"strconv"
-	"strings"
 	"time"
 
 	"github.com/StealthC/exodus-mcp/internal/analysis"
@@ -39,11 +38,11 @@ func vdpToolSpecs() []toolSpec {
 		},
 		{
 			name:        "vdp_sprite_table",
-			description: "Decode the VDP sprite attribute table from VRAM: positions, size, tile mapping, palette, priority, link-chain order with cycle detection, and whether the read paused a running system (system_paused_during_read). Reports chain_visible_count (hardware-rendered link-chain length), table_entry_count (populated entries), and a warning when the chain renders fewer sprites than the table holds. Bounded paging over at most 80 entries. Optionally consumes a vdp_capture manifest.",
+			description: "Decode the VDP sprite attribute table from VRAM: positions, size, tile mapping, palette, priority, link-chain order with cycle detection, and whether the read paused a running system (system_paused_during_read). Reports chain_visible_count (hardware-rendered link-chain length), table_entry_count (populated entries), and a warning when the chain renders fewer sprites than the table holds. Bounded paging over at most 80 entries. vdp_capture_id resolves a stored vdp_capture and decodes its captured VRAM and status components instead of reading the device: the response then reports data_source \"capture\", vdp_capture_reused true, the capture's frame token and capture_consistency. A capture without a usable VRAM component fails with capture_component_omitted; an unknown or foreign id fails with capture_not_found.",
 			schema: objectSchema(map[string]any{
 				"offset":         integerProperty("First sprite index to return (default 0, max 79).", 0),
 				"count":          integerProperty(fmt.Sprintf("Entry count between 1 and %d (default %d). The link chain always covers the whole table.", vdpSpriteTableMaxEntries, defaultVDPSpritePage), 0),
-				"vdp_capture_id": stringProperty("Optional capture_id from vdp_capture to reuse a coherent snapshot."),
+				"vdp_capture_id": stringProperty("Optional capture_id from vdp_capture; when set, the table is decoded from the capture's stored VRAM and status components and no device read is performed."),
 				"context":        contextProperty(),
 			}, nil),
 			run: runVDPSpriteTable,
@@ -56,37 +55,37 @@ func vdpToolSpecs() []toolSpec {
 		},
 		{
 			name:        "vdp_tile_export",
-			description: "Export one or more consecutive 8x8 4bpp VRAM patterns (tiles) as a scaled PNG artifact plus a JSON pixel-decode artifact, colored through a chosen CRAM palette line. Reports whether any read paused a running system (system_paused_during_read) and coherent_snapshot. Optionally consumes a compatible vdp_capture manifest via vdp_capture_id to make repeated inspection deterministic and avoid pausing the game.",
+			description: "Export one or more consecutive 8x8 4bpp VRAM patterns (tiles) as a scaled PNG artifact plus a JSON pixel-decode artifact, colored through a chosen CRAM palette line. Reports whether any read paused a running system (system_paused_during_read) and coherent_snapshot. vdp_capture_id resolves a stored vdp_capture and renders from its captured VRAM and CRAM components instead of reading the device, so repeated inspection is byte-identical and performs no read: the response then reports data_source \"capture\", vdp_capture_reused true, the capture's frame token, and source_capture_id. A capture without a covering VRAM or CRAM component fails with capture_component_omitted; an unknown or foreign id fails with capture_not_found.",
 			schema: objectSchema(map[string]any{
 				"tile":             integerProperty("First tile index counted from VRAM offset 0 (default 0). Each tile occupies 32 bytes.", 0),
 				"count":            integerProperty(fmt.Sprintf("Consecutive tile count between 1 and %d (default 1).", maxVDPTileStripCount), 1),
 				"palette":          integerProperty("CRAM palette line 0-3 used to color pixel indices 1-15 (default 0).", 0),
 				"scale":            integerProperty("Nearest-neighbor upscale factor 1-32 (default 8).", 1),
 				"transparent_zero": booleanProperty("Render pixel index 0 as transparent instead of its palette color (default true)."),
-				"vdp_capture_id":   stringProperty("Optional capture_id from vdp_capture to reuse a coherent snapshot instead of a new live read."),
+				"vdp_capture_id":   stringProperty("Optional capture_id from vdp_capture; when set, the tiles come from the capture's stored VRAM and CRAM components and no device read is performed."),
 				"context":          contextProperty(),
 			}, nil),
 			run: runVDPTileExport,
 		},
 		{
 			name:        "vdp_plane_export",
-			description: "Render a full scroll plane (A, B, or window) from VRAM as an unscrolled texture view: scaled PNG artifact plus JSON structural summary with distinct tiles, priority counts, and capture consistency (system_paused_during_read / coherent_snapshot). Optionally consumes a compatible vdp_capture manifest via vdp_capture_id.",
+			description: "Render a full scroll plane (A, B, or window) from VRAM as an unscrolled texture view: scaled PNG artifact plus JSON structural summary with distinct tiles, priority counts, and capture consistency (system_paused_during_read / coherent_snapshot). vdp_capture_id resolves a stored vdp_capture and renders from its captured VRAM, CRAM, and status components instead of reading the device: the response then reports data_source \"capture\" and vdp_capture_reused true. A capture whose VRAM component does not cover the whole buffer fails with capture_component_omitted; an unknown or foreign id fails with capture_not_found.",
 			schema: objectSchema(map[string]any{
 				"plane":            enumProperty("Which name table to render.", []string{"a", "b", "window"}),
 				"scale":            integerProperty("Nearest-neighbor upscale factor 1-4 (default 1).", 1),
 				"transparent_zero": booleanProperty("Render pixel index 0 as transparent instead of its palette color (default true)."),
-				"vdp_capture_id":   stringProperty("Optional capture_id from vdp_capture to reuse a coherent snapshot."),
+				"vdp_capture_id":   stringProperty("Optional capture_id from vdp_capture; when set, the plane comes from the capture's stored VRAM, CRAM, and status components and no device read is performed."),
 				"context":          contextProperty(),
 			}, nil),
 			run: runVDPPlaneExport,
 		},
 		{
 			name:        "vdp_pixel_info",
-			description: "Report per-pixel rendering attribution for one completed-frame coordinate: source layer, name-entry mapping, palette entry, shadow/highlight state, and sprite cell data. Enables full image buffer info lazily; if attribution is not ready yet the call fails with pixel_info_pending and must be retried after one rendered frame. Optionally consumes a vdp_capture manifest.",
+			description: "Report per-pixel rendering attribution for one completed-frame coordinate: source layer, name-entry mapping, palette entry, shadow/highlight state, and sprite cell data. Enables full image buffer info lazily; if attribution is not ready yet the call fails with pixel_info_pending and must be retried after one rendered frame. This tool cannot reuse a vdp_capture: attribution exists only for the frame the VDP just completed and the bridge answers it one coordinate at a time, so a supplied vdp_capture_id fails with capture_component_omitted naming pixel_attribution instead of silently reading live.",
 			schema: objectSchema(map[string]any{
 				"x":              integerProperty("Pixel X within the completed frame buffer, including border and blanking regions.", 0),
 				"y":              integerProperty("Pixel Y within the completed frame buffer.", 0),
-				"vdp_capture_id": stringProperty("Optional capture_id from vdp_capture to reuse a coherent snapshot."),
+				"vdp_capture_id": stringProperty("Rejected: per-pixel attribution cannot be stored in a capture. Supplying an id fails with capture_component_omitted; omit it to read the live frame buffer."),
 				"context":        contextProperty(),
 			}, []string{"x", "y"}),
 			run: runVDPPixelInfo,
@@ -99,15 +98,15 @@ func vdpToolSpecs() []toolSpec {
 		},
 		{
 			name:        "vdp_capture",
-			description: "Atomic VDP capture: acquire the capture guard once, obtain VDP registers/status, frame buffer, CRAM, VSRAM, sprite table, and scroll data, then restore prior run state. Returns a manifest plus linked artifacts sharing one capture_id and frame_token. Callers can select expensive components (include_frame, include_cram, include_vsram, include_vram, include_sprite_table) and caps are documented; omitted components are marked omitted in the manifest. All artifacts share one capture_id; when the composition is composite_non_atomic the pieces may come from different frames and must not be combined. The capture is artifact-first.",
+			description: "Atomic VDP capture: acquire the capture guard once, obtain VDP registers/status, frame buffer, CRAM, VSRAM, and the VRAM range the sprite and plane readers need, then restore prior run state. Returns a manifest plus linked artifacts sharing one capture_id and frame_token. The stored components are what vdp_sprite_table, vdp_tile_export, and vdp_plane_export consume when they are given this capture_id, so reuse is byte-identical and needs no device read (vdp_pixel_info cannot reuse a capture: per-pixel attribution exists only for the live frame). Callers can select components (include_frame, include_cram, include_vsram, include_vram, include_sprite_table); VRAM defaults to on because the other readers depend on it, and caps are documented. Omitted components are marked omitted in the manifest and in capture_get. All artifacts share one capture_id; when the composition is composite_non_atomic the pieces may come from different frames and must not be combined. The capture is artifact-first; resolve the id later with capture_get or artifact_list{capture_id}.",
 			schema: objectSchema(map[string]any{
 				"include_frame":        booleanProperty("Include the rendered frame PNG (default true)."),
 				"include_cram":         booleanProperty("Include CRAM (default true)."),
 				"include_vsram":        booleanProperty("Include VSRAM (default true)."),
-				"include_vram":         booleanProperty("Include VRAM range (default false, expensive)."),
+				"include_vram":         booleanProperty("Include the VRAM range (default true: vdp_sprite_table, vdp_tile_export, and vdp_plane_export read it from the capture; false makes those reuse attempts fail with capture_component_omitted)."),
 				"vram_address":         addressProperty(),
 				"vram_length":          integerProperty("VRAM bytes to capture when include_vram is true (default 65536, cap 131072).", 1),
-				"include_sprite_table": booleanProperty("Include sprite table (default true)."),
+				"include_sprite_table": booleanProperty("Record that the sprite table is available through the VRAM component (default true)."),
 				"capture_mode":         captureModeProperty(),
 				"context":              contextProperty(),
 			}, nil),
@@ -446,7 +445,7 @@ func runVDPCapture(tc toolContext, args json.RawMessage) map[string]any {
 	includeFrame := parsed.IncludeFrame == nil || *parsed.IncludeFrame
 	includeCRAM := parsed.IncludeCRAM == nil || *parsed.IncludeCRAM
 	includeVSRAM := parsed.IncludeVSRAM == nil || *parsed.IncludeVSRAM
-	includeVRAM := parsed.IncludeVRAM != nil && *parsed.IncludeVRAM
+	includeVRAM := parsed.IncludeVRAM == nil || *parsed.IncludeVRAM
 	includeSprite := parsed.IncludeSpriteTable == nil || *parsed.IncludeSpriteTable
 	vramAddr := uint64(0)
 	if parsed.VRAMAddress != nil {
@@ -511,6 +510,14 @@ func vdpCaptureValue(tc toolContext, context *analysis.Context, includeFrame, in
 	storedStatus, _ := tc.server.store.PutWithProvenance(context.ID, "vdp-status", "application/json", statusBytes, statusProvenance)
 	addArtifact("vdp_status", storedStatus)
 	manifest["vdp_status"] = statusPayload
+	// The capture identifies one rendered frame whether or not the frame PNG was
+	// requested; the token comes from the captured status.
+	if imageBuffer, ok := statusPayload["image_buffer"].(map[string]any); ok {
+		if token, ok := imageBuffer["last_rendered_frame_token"].(float64); ok && uint64(token) != 0 {
+			rendered := uint64(token)
+			captureFrameToken = &rendered
+		}
+	}
 
 	// Frame buffer
 	if includeFrame {
@@ -582,14 +589,21 @@ func vdpCaptureValue(tc toolContext, context *analysis.Context, includeFrame, in
 	}
 
 	// Sprite table
-	if includeSprite {
-		// The sprite table lives in VRAM: the stored VRAM component is what a
-		// later vdp_sprite_table reads, so this component records that the data
-		// is available there instead of claiming a separate read.
-		manifest["components"].(map[string]any)["sprite_table"] = map[string]any{"included": true, "source": "vram", "note": "The sprite table is part of the captured VRAM component; decode it with vdp_sprite_table using this capture id."}
-	} else {
+	switch {
+	case !includeSprite:
 		manifest["components"].(map[string]any)["sprite_table"] = map[string]any{"omitted": true}
 		captureComponents = append(captureComponents, omittedCaptureComponent("sprite_table", true, false, "include_sprite_table=false"))
+	case !includeVRAM:
+		// The table lives in VRAM: without the VRAM component there is nothing to
+		// decode from, so the manifest says that instead of claiming the table.
+		reason := "the sprite table lives in the VRAM component and include_vram=false"
+		manifest["components"].(map[string]any)["sprite_table"] = map[string]any{"unavailable": true, "reason": reason}
+		captureComponents = append(captureComponents, omittedCaptureComponent("sprite_table", false, true, reason))
+	default:
+		// The stored VRAM component is what a later vdp_sprite_table reads, so
+		// this component records where the data lives instead of claiming a
+		// separate table read.
+		manifest["components"].(map[string]any)["sprite_table"] = map[string]any{"included": true, "source": "vram", "note": "The sprite table is part of the captured VRAM component; decode it with vdp_sprite_table using this capture id."}
 	}
 
 	// Render manifest (simplified)
@@ -741,11 +755,9 @@ func runVDPSpriteTable(tc toolContext, args json.RawMessage) map[string]any {
 	if failure != nil {
 		return failureResult(failure, tc.modern)
 	}
-	if _, failure = resolveContext(tc.server, parsed.Context); failure != nil {
+	context, failure := resolveContext(tc.server, parsed.Context)
+	if failure != nil {
 		return failureResult(failure, tc.modern)
-	}
-	if parsed.VDPCaptureID != "" && !isValidCaptureID(parsed.VDPCaptureID) {
-		return failureResult(&toolFailure{Code: "invalid_params", Message: "vdp_capture_id must be a valid capture id from vdp_capture (cap_...)"}, tc.modern)
 	}
 	offset := parsed.Offset
 	count := parsed.Count
@@ -760,9 +772,27 @@ func runVDPSpriteTable(tc toolContext, args json.RawMessage) map[string]any {
 		}, tc.modern)
 	}
 
-	statusPayload, failure := tc.server.executeCommand(tc.ctx, "vdp_status", nil)
-	if failure != nil {
-		return failureResult(failure, tc.modern)
+	// A supplied capture replaces the VDP status read and the VRAM read with the
+	// stored components; an unusable one fails instead of reading the device.
+	source := captureReuseOf("", nil)
+	var statusPayload map[string]any
+	if parsed.VDPCaptureID != "" {
+		captureData, failure := resolveVDPCapture(tc, context.ID, parsed.VDPCaptureID)
+		if failure != nil {
+			return failureResult(failure, tc.modern)
+		}
+		capturedStatus, failure := captureData.statusView(tc, context.ID)
+		if failure != nil {
+			return failureResult(failure, tc.modern)
+		}
+		source = captureReuseOf(parsed.VDPCaptureID, captureData)
+		statusPayload = capturedStatus
+	} else {
+		liveStatus, failure := tc.server.executeCommand(tc.ctx, "vdp_status", nil)
+		if failure != nil {
+			return failureResult(failure, tc.modern)
+		}
+		statusPayload = liveStatus
 	}
 	baseValue, _ := statusPayload["decoded"].(map[string]any)["name_table_base_sprite"].(float64)
 	base := uint64(baseValue)
@@ -774,7 +804,13 @@ func runVDPSpriteTable(tc toolContext, args json.RawMessage) map[string]any {
 	if remaining := (vramSize - base) / 8; remaining < uint64(fetchCount) {
 		fetchCount = int(remaining)
 	}
-	raw, pausedDuringRead, failure := fetchVDPBytes(tc, "vram", base, uint64(fetchCount)*8)
+	var raw []byte
+	pausedDuringRead := false
+	if source.unused {
+		raw, pausedDuringRead, failure = fetchVDPBytes(tc, "vram", base, uint64(fetchCount)*8)
+	} else {
+		raw, failure = source.data.vramRange(tc, context.ID, base, uint64(fetchCount)*8)
+	}
 	if failure != nil {
 		return failureResult(failure, tc.modern)
 	}
@@ -797,14 +833,15 @@ func runVDPSpriteTable(tc toolContext, args json.RawMessage) map[string]any {
 		warning = fmt.Sprintf("link chain renders %d of %d entries; verify against the rendered frame (system may have been mid-update)", chainVisible, tableEntryCount)
 	}
 
+	consistency := buildCaptureConsistency(tc.server, map[string]any{"system_paused_during_read": pausedDuringRead}, false, true, nil, nil)
 	value := map[string]any{
 		"address_space":             "315-5313 VRAM",
 		"sprite_table_base":         base,
 		"sprite_table_base_hex":     canonicalHex(base),
 		"byte_order":                "big-endian",
-		"consistency":               "live",
+		"consistency":               consistency.State,
 		"system_paused_during_read": pausedDuringRead,
-		"capture_consistency":       captureConsistencyToMap(buildCaptureConsistency(tc.server, map[string]any{"system_paused_during_read": pausedDuringRead}, false, true, nil, nil)),
+		"capture_consistency":       captureConsistencyToMap(consistency),
 		"entries":                   window,
 		"returned_entries":          len(window),
 		"table_entries_valid":       len(all),
@@ -815,11 +852,7 @@ func runVDPSpriteTable(tc toolContext, args json.RawMessage) map[string]any {
 		"warning":                   warning,
 		"layout_note":               "8 bytes per entry; X/Y are 9-bit offsets minus 128; link occupies bits 8-14 of word 1; chain starts at sprite 0 and ends when a link returns 0. chain_visible_count is the hardware-rendered link-chain length; table_entry_count counts populated table entries (any nonzero field), so a mid-update table can hold more entries than the chain renders.",
 	}
-	if parsed.VDPCaptureID != "" {
-		value["vdp_capture_reused"] = true
-		value["vdp_capture_id"] = parsed.VDPCaptureID
-		value["note"] = "This sprite table reused a compatible vdp_capture manifest; no new live read was performed."
-	}
+	source.annotate(tc, value, captureReuseNote("vdp_sprite_table", "VRAM", parsed.VDPCaptureID))
 	return okResult(value, tc.modern)
 }
 
@@ -1319,13 +1352,28 @@ func runVDPTileExport(tc toolContext, args json.RawMessage) map[string]any {
 			Data: map[string]any{"max_tiles": maxVDPTileStripCount, "max_scale": maxVDPTileUpscale},
 		}, tc.modern)
 	}
-	if parsed.VDPCaptureID != "" && !isValidCaptureID(parsed.VDPCaptureID) {
-		return failureResult(&toolFailure{Code: "invalid_params", Message: "vdp_capture_id must be a valid capture id from vdp_capture (cap_...)"}, tc.modern)
-	}
 
-	statusPayload, failure := tc.server.executeCommand(tc.ctx, "vdp_status", nil)
-	if failure != nil {
-		return failureResult(failure, tc.modern)
+	// A supplied capture replaces the status, VRAM, and CRAM reads with the stored
+	// components; a capture that cannot serve them fails explicitly.
+	source := captureReuseOf("", nil)
+	var statusPayload map[string]any
+	if parsed.VDPCaptureID != "" {
+		captureData, failure := resolveVDPCapture(tc, context.ID, parsed.VDPCaptureID)
+		if failure != nil {
+			return failureResult(failure, tc.modern)
+		}
+		capturedStatus, failure := captureData.statusView(tc, context.ID)
+		if failure != nil {
+			return failureResult(failure, tc.modern)
+		}
+		source = captureReuseOf(parsed.VDPCaptureID, captureData)
+		statusPayload = capturedStatus
+	} else {
+		liveStatus, failure := tc.server.executeCommand(tc.ctx, "vdp_status", nil)
+		if failure != nil {
+			return failureResult(failure, tc.modern)
+		}
+		statusPayload = liveStatus
 	}
 	vramSize := fetchVRAMSize(statusPayload)
 	firstByte := parsed.Tile * mdTileSizeBytes
@@ -1339,17 +1387,38 @@ func runVDPTileExport(tc toolContext, args json.RawMessage) map[string]any {
 		}, tc.modern)
 	}
 
-	vram, coherent, failure := fetchVDPBytesChunked(tc, "vram", firstByte, totalBytes)
-	if failure != nil {
-		return failureResult(failure, tc.modern)
-	}
-	cramRaw, _, failure := fetchVDPBytesChunked(tc, "cram", 0, 128)
-	if failure != nil {
-		return failureResult(failure, tc.modern)
+	var vram, cramRaw []byte
+	var consistency *artifact.CaptureConsistency
+	coherent := false
+	if source.unused {
+		vram, coherent, failure = fetchVDPBytesChunked(tc, "vram", firstByte, totalBytes)
+		if failure != nil {
+			return failureResult(failure, tc.modern)
+		}
+		cramRaw, _, failure = fetchVDPBytesChunked(tc, "cram", 0, 128)
+		if failure != nil {
+			return failureResult(failure, tc.modern)
+		}
+		consistency = compositeCaptureConsistency(tc.server, coherent)
+	} else {
+		vram, failure = source.data.vramRange(tc, context.ID, firstByte, totalBytes)
+		if failure != nil {
+			return failureResult(failure, tc.modern)
+		}
+		cramRaw, failure = source.data.componentBytes(tc, context.ID, "cram")
+		if failure != nil {
+			return failureResult(failure, tc.modern)
+		}
+		coherent = source.data.coherentCapture()
+		consistency = source.data.consistency
 	}
 	colors := cramPaletteColors(cramRGB333Entries(cramRaw))
+	// A derived export of a stored capture stays in that capture's lineage, so
+	// artifact_list(capture_id) finds it next to the captured components.
 	captureID := newCaptureID()
-	consistency := compositeCaptureConsistency(tc.server, coherent)
+	if !source.unused {
+		captureID = source.id
+	}
 
 	width := int(count) * mdTileEdgePixels * scale
 	height := mdTileEdgePixels * scale
@@ -1419,7 +1488,7 @@ func runVDPTileExport(tc toolContext, args json.RawMessage) map[string]any {
 		"nonzero_pixels_per_tile":   nonzeroPerTile,
 		"coherent_snapshot":         coherent,
 		"system_paused_during_read": !coherent,
-		"consistency":               "live",
+		"consistency":               consistency.State,
 		"capture_id":                captureID,
 		"capture_consistency":       captureConsistencyToMap(consistency),
 		"byte_order":                "big-endian",
@@ -1429,19 +1498,15 @@ func runVDPTileExport(tc toolContext, args json.RawMessage) map[string]any {
 		"json_size_bytes":           len(jsonDocument),
 		"json_sha256":               jsonStored.SHA256,
 	}
-	if parsed.VDPCaptureID != "" {
-		summary["vdp_capture_reused"] = true
-		summary["vdp_capture_id"] = parsed.VDPCaptureID
-		summary["note"] = "This export reused a compatible vdp_capture manifest; no new live read was performed, so the result is byte-identical to the capture and did not pause the game."
+	if !source.unused {
+		summary["system_paused_during_read"] = false
+		summary["source_capture_id"] = source.id
 	}
+	source.annotate(tc, summary, captureReuseNote("vdp_tile_export", "VRAM and CRAM", parsed.VDPCaptureID))
 	return okResult(map[string]any{
 		"summary":   summary,
 		"artifacts": []map[string]any{pngDescriptor, jsonDescriptor},
 	}, tc.modern)
-}
-
-func isValidCaptureID(id string) bool {
-	return strings.HasPrefix(id, "cap_") && len(id) > 4
 }
 
 func runVDPPlaneExport(tc toolContext, args json.RawMessage) map[string]any {
@@ -1472,13 +1537,28 @@ func runVDPPlaneExport(tc toolContext, args json.RawMessage) map[string]any {
 			Message: fmt.Sprintf("vdp_plane_export scale must be between 1 and %d.", maxVDPPlaneUpscale),
 		}, tc.modern)
 	}
-	if parsed.VDPCaptureID != "" && !isValidCaptureID(parsed.VDPCaptureID) {
-		return failureResult(&toolFailure{Code: "invalid_params", Message: "vdp_capture_id must be a valid capture id from vdp_capture (cap_...)"}, tc.modern)
-	}
 
-	statusPayload, failure := tc.server.executeCommand(tc.ctx, "vdp_status", nil)
-	if failure != nil {
-		return failureResult(failure, tc.modern)
+	// A supplied capture replaces the status, VRAM, and CRAM reads with the stored
+	// components; a capture that cannot serve them fails explicitly.
+	source := captureReuseOf("", nil)
+	var statusPayload map[string]any
+	if parsed.VDPCaptureID != "" {
+		captureData, failure := resolveVDPCapture(tc, context.ID, parsed.VDPCaptureID)
+		if failure != nil {
+			return failureResult(failure, tc.modern)
+		}
+		capturedStatus, failure := captureData.statusView(tc, context.ID)
+		if failure != nil {
+			return failureResult(failure, tc.modern)
+		}
+		source = captureReuseOf(parsed.VDPCaptureID, captureData)
+		statusPayload = capturedStatus
+	} else {
+		liveStatus, failure := tc.server.executeCommand(tc.ctx, "vdp_status", nil)
+		if failure != nil {
+			return failureResult(failure, tc.modern)
+		}
+		statusPayload = liveStatus
 	}
 	decoded, _ := statusPayload["decoded"].(map[string]any)
 	baseValue, _ := decoded["name_table_base_"+parsed.Plane].(float64)
@@ -1488,17 +1568,39 @@ func runVDPPlaneExport(tc toolContext, args json.RawMessage) map[string]any {
 	heightCells := planeCellSpan(registers[16] >> 4)
 	interlaceActive := registers[12]&0x2 != 0
 
-	vramAll, coherent, failure := fetchVDPBytesChunked(tc, "vram", 0, fetchVRAMSize(statusPayload))
-	if failure != nil {
-		return failureResult(failure, tc.modern)
-	}
-	cramRaw, _, failure := fetchVDPBytesChunked(tc, "cram", 0, 128)
-	if failure != nil {
-		return failureResult(failure, tc.modern)
+	vramSize := fetchVRAMSize(statusPayload)
+	var vramAll, cramRaw []byte
+	var consistency *artifact.CaptureConsistency
+	coherent := false
+	if source.unused {
+		vramAll, coherent, failure = fetchVDPBytesChunked(tc, "vram", 0, vramSize)
+		if failure != nil {
+			return failureResult(failure, tc.modern)
+		}
+		cramRaw, _, failure = fetchVDPBytesChunked(tc, "cram", 0, 128)
+		if failure != nil {
+			return failureResult(failure, tc.modern)
+		}
+		consistency = compositeCaptureConsistency(tc.server, coherent)
+	} else {
+		vramAll, failure = source.data.vramRange(tc, context.ID, 0, vramSize)
+		if failure != nil {
+			return failureResult(failure, tc.modern)
+		}
+		cramRaw, failure = source.data.componentBytes(tc, context.ID, "cram")
+		if failure != nil {
+			return failureResult(failure, tc.modern)
+		}
+		coherent = source.data.coherentCapture()
+		consistency = source.data.consistency
 	}
 	colors := cramPaletteColors(cramRGB333Entries(cramRaw))
+	// A derived export of a stored capture stays in that capture's lineage, so
+	// artifact_list(capture_id) finds it next to the captured components.
 	captureID := newCaptureID()
-	consistency := compositeCaptureConsistency(tc.server, coherent)
+	if !source.unused {
+		captureID = source.id
+	}
 
 	nameTableBytes := widthCells * heightCells * 2
 	truncated := false
@@ -1607,17 +1709,17 @@ func runVDPPlaneExport(tc toolContext, args json.RawMessage) map[string]any {
 		"interlace_active":          interlaceActive,
 		"coherent_snapshot":         coherent,
 		"system_paused_during_read": !coherent,
-		"consistency":               "live",
+		"consistency":               consistency.State,
 		"capture_id":                captureID,
 		"capture_consistency":       captureConsistencyToMap(consistency),
 		"byte_order":                "big-endian",
 		"notes":                     notes,
 	}
-	if parsed.VDPCaptureID != "" {
-		summary["vdp_capture_reused"] = true
-		summary["vdp_capture_id"] = parsed.VDPCaptureID
-		summary["note"] = "This plane export reused a compatible vdp_capture manifest; no new live read was performed."
+	if !source.unused {
+		summary["system_paused_during_read"] = false
+		summary["source_capture_id"] = source.id
 	}
+	source.annotate(tc, summary, captureReuseNote("vdp_plane_export", "VRAM and CRAM", parsed.VDPCaptureID))
 	return okResult(map[string]any{
 		"summary":   summary,
 		"artifacts": []map[string]any{pngDescriptor, jsonDescriptor},
@@ -1640,11 +1742,21 @@ func runVDPPixelInfo(tc toolContext, args json.RawMessage) map[string]any {
 	if failure != nil {
 		return failureResult(failure, tc.modern)
 	}
-	if _, failure = resolveContext(tc.server, parsed.Context); failure != nil {
+	context, failure := resolveContext(tc.server, parsed.Context)
+	if failure != nil {
 		return failureResult(failure, tc.modern)
 	}
-	if parsed.VDPCaptureID != "" && !isValidCaptureID(parsed.VDPCaptureID) {
-		return failureResult(&toolFailure{Code: "invalid_params", Message: "vdp_capture_id must be a valid capture id from vdp_capture (cap_...)"}, tc.modern)
+	if parsed.VDPCaptureID != "" {
+		// Per-pixel attribution exists only for the frame the VDP has just
+		// completed: it is produced while rendering and the bridge answers it one
+		// coordinate at a time, so no vdp_capture component can hold it. Say so
+		// instead of pretending to reuse the capture.
+		captureData, failure := resolveVDPCapture(tc, context.ID, parsed.VDPCaptureID)
+		if failure != nil {
+			return failureResult(failure, tc.modern)
+		}
+		return failureResult(captureData.omittedFailure("pixel_attribution",
+			"vdp_pixel_info reads the per-pixel attribution of the completed frame buffer, which the native bridge exposes only for the current frame and one coordinate at a time; vdp_capture cannot persist it. Call vdp_pixel_info without vdp_capture_id to read the live frame buffer."), tc.modern)
 	}
 
 	payload, failure := tc.server.executeCommand(tc.ctx, "vdp_pixel_info", map[string]string{
@@ -1675,10 +1787,6 @@ func runVDPPixelInfo(tc toolContext, args json.RawMessage) map[string]any {
 		"state": consistencyLive,
 		"note":  "The completed render buffer is read under the VDP's own lock; the read never pauses the system and the buffer may advance between reads.",
 	}
-	if parsed.VDPCaptureID != "" {
-		payload["vdp_capture_reused"] = true
-		payload["vdp_capture_id"] = parsed.VDPCaptureID
-		payload["vdp_capture_note"] = "This pixel info reused a compatible vdp_capture manifest; no new live read was performed."
-	}
+	captureReuseOf("", nil).annotate(tc, payload, "")
 	return okResult(payload, tc.modern)
 }

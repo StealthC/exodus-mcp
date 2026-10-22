@@ -513,25 +513,36 @@ claim to the exact test function or smoke-script check that proves it.
   `"live"` guard performs no pause; `"paused"` pauses once and restores the
   prior run state through the shared capture guard, and every artifact of the
   capture is re-stamped with the finalized window object so provenance and
-  response agree. It reads status/registers,
-  the frame buffer, CRAM, VSRAM, and optionally one VRAM range (131072-byte
-  `vram_length` cap), then writes a `vdp-capture-manifest` linking the produced
-  artifacts to one `capture_id`; omitted components carry a reason. Two
-  components are placeholders today and the manifest states it: the
-  sprite-table component is recorded as included with a note pointing at
-  `vdp_sprite_table` without reading the table, and the `vdp-render-manifest`
-  artifact is a structural stub whose `display_geometry`, `palette_state`,
-  `sprite_state`, and `scroll_state` entries are notes referring to other
-  artifacts, not decoded plane/window configuration, scroll offsets, sprite
-  display order, or priority data. **unvalidated**: no test and no
-  `scripts/live-smoke.sh` check calls `vdp_capture`.
-- `vdp_capture_id` reuse is **not implemented**. `vdp_tile_export`,
-  `vdp_plane_export`, `vdp_sprite_table`, and `vdp_pixel_info` accept
-  `vdp_capture_id`, validate the `cap_` prefix, and echo
-  `vdp_capture_reused`/`vdp_capture_id`, but each still performs a fresh read;
-  no bytes or artifact of the named capture are consumed, so repeated
-  inspection is not byte-identical and does not avoid pausing. Do not build a
-  workflow on capture reuse until it is implemented.
+  response agree. It reads status/registers, the frame buffer, CRAM, VSRAM, and
+  a VRAM range (default the whole 64 KiB buffer, 131072-byte `vram_length` cap,
+  `include_vram: false` opts out), then writes a `vdp-capture-manifest` linking
+  the produced artifacts to one `capture_id` and registers the capture in the
+  durable capture index; omitted and unavailable components carry a reason in
+  the manifest and in `capture_get`. The sprite-table component records that the
+  table lives in the captured VRAM component instead of claiming a separate
+  read; with `include_vram: false` it is reported unavailable. One placeholder
+  remains: the `vdp-render-manifest` artifact is a structural stub whose
+  `display_geometry`, `palette_state`, `sprite_state`, and `scroll_state`
+  entries are notes referring to other artifacts, not decoded plane/window
+  configuration, scroll offsets, sprite display order, or priority data.
+  **unvalidated live**: no `scripts/live-smoke.sh` check calls `vdp_capture`.
+- `vdp_capture_id` reuse is implemented for the VRAM-backed readers.
+  `vdp_sprite_table`, `vdp_tile_export`, and `vdp_plane_export` resolve the id
+  through the capture index and decode the stored components (status, VRAM, and
+  CRAM) instead of the device; they report `data_source: "capture"`,
+  `vdp_capture_reused: true`, `vdp_capture_id`, the capture's
+  `vdp_capture_frame_token`, and the capture's own `capture_consistency`, and
+  their derived artifacts stay in that capture's `capture_id` lineage (plus
+  `source_capture_id` in the response). A capture whose components cannot serve
+  the request fails with `capture_component_omitted` naming the missing
+  component, the reason, and what the capture holds; an unknown, expired, or
+  foreign id fails with `capture_not_found`. Neither error falls back to a live
+  read. `vdp_pixel_info` cannot reuse a capture: per-pixel attribution exists
+  only for the frame the VDP just completed and the bridge answers it one
+  coordinate at a time, so a supplied id fails with
+  `capture_component_omitted` naming `pixel_attribution`.
+  A live read of any of the four tools reports `data_source: "live"` and makes
+  no reuse claim.
 - VDP-specific semantics are preserved in the fields that are actually decoded:
   big-endian VRAM words (`vdp_memory_read` word view), CRAM 9-bit packing
   (`vdp_memory_read` `cram_rgb333`, `vdp_palette_export`), high-nibble-left
@@ -1002,13 +1013,15 @@ behavior is unverified as of this revision:
 - `audio_capture`: unreachable success path — the pinned plugin answers
   `audio_unavailable` for every call.
 - `vdp_capture` and its `vdp-capture-manifest` / `vdp-render-manifest`
-  artifacts: no smoke check, and the sprite-table and render-manifest
-  components are placeholders (see the VDP section). Only the paused-window
-  provenance agreement is covered, by
-  `internal/mcp/tools_capture_window_test.go`.
-- `vdp_capture_id` reuse in `vdp_tile_export`, `vdp_plane_export`,
-  `vdp_sprite_table`, and `vdp_pixel_info`: the parameter is validated and
-  echoed; no captured bytes are reused.
+  artifacts: no live-smoke check, and the render-manifest component is still a
+  structural stub (see the VDP section). The paused-window provenance agreement
+  is covered by `internal/mcp/tools_capture_window_test.go`, the capture index by
+  `internal/mcp/tools_artifact_index_test.go`, and capture reuse by
+  `internal/mcp/tools_vdp_capture_reuse_test.go`.
+- `vdp_capture_id` reuse against a **real** plugin build: the reuse contract
+  (stored component reads, `capture_component_omitted`, `capture_not_found`, and
+  byte-identical derived exports) is proven against the fake bridge only; the
+  live check still does not call `vdp_capture` or pass a `vdp_capture_id`.
 - `system_snapshot_capture` component selection beyond a memory range: the
   register, VDP buffer, and frame components have no behavioral test (the
   pause window, restore verification, and manifest provenance are proven by
