@@ -31,6 +31,21 @@ type toolContext struct {
 	server *Server
 	ctx    context.Context
 	modern bool
+	// invokedAs is the tool name the client called. A composed tool reuses the
+	// handler of the concept it absorbed, so a hardcoded audit tool name would
+	// attribute the mutation to a tool nobody called; handlers that record the
+	// tool name resolve it with toolName instead.
+	invokedAs string
+}
+
+// toolName reports the tool the client called, falling back to the handler's own
+// name when the handler runs outside the dispatcher (tests, experiment steps
+// before the name is threaded through).
+func (tc toolContext) toolName(fallback string) string {
+	if tc.invokedAs != "" {
+		return tc.invokedAs
+	}
+	return fallback
 }
 
 type toolSpec struct {
@@ -53,6 +68,7 @@ func init() {
 
 func buildToolRegistry() []toolSpec {
 	specs := append(phase1ToolSpecs(), cpuToolSpecs()...)
+	specs = append(specs, targetStatusSpec())
 	specs = append(specs, controlToolSpecs()...)
 	specs = append(specs, vdpToolSpecs()...)
 	specs = append(specs, vdpCommandDMAToolSpecs()...)
@@ -97,11 +113,18 @@ func lookupTool(name string) *toolSpec {
 func toolSchemas() []map[string]any {
 	schemas := make([]map[string]any, 0, len(toolRegistry))
 	for _, spec := range toolRegistry {
-		schemas = append(schemas, map[string]any{
+		descriptor := map[string]any{
 			"name":        spec.name,
 			"description": spec.description,
 			"inputSchema": publishedSchema(spec.schema),
-		})
+		}
+		// A deprecated alias publishes its replacement next to the schema, so a
+		// client can warn before calling it instead of parsing prose.
+		if annotation := deprecationAnnotation(spec.name); annotation != nil {
+			descriptor["description"] = "DEPRECATED: use " + annotation["replacement"].(string) + ". " + spec.description
+			descriptor["x-deprecated-tool"] = annotation
+		}
+		schemas = append(schemas, descriptor)
 	}
 	return schemas
 }
@@ -142,7 +165,7 @@ func (server *Server) callTool(ctx context.Context, params json.RawMessage, mode
 	if failure := validateToolArguments(spec, call.Arguments); failure != nil {
 		return failureResult(failure, modern)
 	}
-	result := spec.run(toolContext{server: server, ctx: ctx, modern: modern}, call.Arguments)
+	result := spec.run(toolContext{server: server, ctx: ctx, modern: modern, invokedAs: call.Name}, call.Arguments)
 	result = annotateContractFailure(result, call.Name)
 	failed, _ := result["isError"].(bool)
 	server.metrics.recordCall(call.Name, failed)

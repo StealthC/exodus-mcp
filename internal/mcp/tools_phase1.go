@@ -73,7 +73,7 @@ func phase1ToolSpecs() []toolSpec {
 			name:        "bridge_status",
 			description: "Report native Exodus bridge connectivity, plugin version, lifecycle, and supported bridge operations.",
 			schema:      objectSchema(map[string]any{}, nil),
-			run:         runBridgeStatus,
+			run:         aliasRun("bridge_status", runBridgeStatus),
 		},
 		{
 			name:        "context_close",
@@ -105,7 +105,7 @@ func phase1ToolSpecs() []toolSpec {
 			name:        "emulator_status",
 			description: "Report running state plus loaded modules and devices from the connected Exodus instance, with run-state observability: `run_state` is the observed run state (running | paused | unknown), `pause_source` names who caused it (mcp | ui_or_external | breakpoint_or_watchpoint | unknown), `stop_source` answers why execution stopped in the same vocabulary as run_until_* (instrument | external | mcp | none | unknown), and `capture_consistency` is the standardized state-observing object every read tool reports. `last_run_state_change` is the UTC time of the last observed transition. Externally observed transitions (UI pauses, other bridge clients, native stops) are recorded in the audit stream as run_state_change events and never advance target_generation: the generation advances only on successful MCP mutations.",
 			schema:      objectSchema(map[string]any{}, nil),
-			run:         runEmulatorStatus,
+			run:         aliasRun("emulator_status", runEmulatorStatus),
 		},
 		{
 			name:        "memory_dump",
@@ -154,7 +154,7 @@ func phase1ToolSpecs() []toolSpec {
 			name:        "target_info",
 			description: "Report emulator identity (plugin version and lifecycle), loaded modules, device summary, the platform baseline, and a light cartridge summary read from the 256-byte header at 0x100 (identified flag, system type, title, serial, region, or an explicit reason when no cartridge is identified). The full parsed header, checksum validation, and memory mapping are available through rom_info.",
 			schema:      objectSchema(map[string]any{}, nil),
-			run:         runTargetInfo,
+			run:         aliasRun("target_info", runTargetInfo),
 		},
 	}
 }
@@ -250,13 +250,21 @@ func runBridgeStatus(tc toolContext, args json.RawMessage) map[string]any {
 	if _, failure := decodeArgs[noArgs](args); failure != nil {
 		return failureResult(failure, tc.modern)
 	}
+	return okResult(bridgeStatusView(tc), tc.modern)
+}
+
+// bridgeStatusView renders the bridge connectivity object. It is shared by
+// bridge_status (deprecated) and target_status.bridge so the two can never
+// describe the same bridge differently. A bridge that cannot be reached is
+// reported honestly instead of failing: connectivity is the answer.
+func bridgeStatusView(tc toolContext) map[string]any {
 	status, err := tc.server.statusFor(tc.ctx)
 	if err == nil {
 		operations := status.SupportedOperations
 		if len(operations) == 0 {
 			operations = []string{"status"}
 		}
-		return okResult(map[string]any{
+		return map[string]any{
 			"connected":            true,
 			"transport":            "windows-named-pipe",
 			"plugin_version":       status.PluginVersion,
@@ -264,14 +272,14 @@ func runBridgeStatus(tc toolContext, args json.RawMessage) map[string]any {
 			"bridge_enabled":       status.BridgeEnabled,
 			"loaded_module_count":  status.LoadedModuleCount,
 			"supported_operations": operations,
-		}, tc.modern)
+		}
 	}
-	return okResult(map[string]any{
+	return map[string]any{
 		"connected":            false,
 		"transport":            "windows-named-pipe",
 		"supported_operations": []string{},
 		"message":              "The Exodus native bridge is unavailable: " + err.Error(),
-	}, tc.modern)
+	}
 }
 
 type moduleInfo struct {
@@ -380,6 +388,14 @@ func runEmulatorStatus(tc toolContext, args json.RawMessage) map[string]any {
 	if failure != nil {
 		return failureResult(failure, tc.modern)
 	}
+	return okResult(emulatorStatusView(tc, status), tc.modern)
+}
+
+// emulatorStatusView renders the observed run state and the loaded module and
+// device inventory of one already-fetched status. It is shared by
+// emulator_status (deprecated), target_info (deprecated) and target_status so
+// the three cannot describe the same observation differently.
+func emulatorStatusView(tc toolContext, status *emulatorStatusData) map[string]any {
 	modules := status.Modules
 	devices := status.Devices
 	pauseSource, pauseNote, lastChange, changeKnown := runStateView(tc.server, status)
@@ -406,7 +422,7 @@ func runEmulatorStatus(tc toolContext, args json.RawMessage) map[string]any {
 		result["one_shot_removals"] = status.OneShotRemovals
 		result["one_shot_note"] = "Fired one-shot instruments were removed through the audited mutation path during this read; see cpu_debug_events_list for the stop evidence."
 	}
-	return okResult(result, tc.modern)
+	return result
 }
 
 func runTargetInfo(tc toolContext, args json.RawMessage) map[string]any {
@@ -421,7 +437,33 @@ func runTargetInfo(tc toolContext, args json.RawMessage) map[string]any {
 	if failure != nil {
 		return failureResult(failure, tc.modern)
 	}
+	return okResult(targetInfoView(tc, emulatorIdentityView(tc, statusPayload), emulator), tc.modern)
+}
 
+// emulatorIdentityView renders the emulator identity block from a native status
+// payload, falling back to the bridge-advertised plugin identity when the status
+// operation itself is unavailable.
+func emulatorIdentityView(tc toolContext, statusPayload map[string]any) map[string]any {
+	identity := map[string]any{
+		"name":           "Exodus",
+		"plugin_version": statusPayload["plugin_version"],
+		"lifecycle":      statusPayload["lifecycle"],
+	}
+	if identity["plugin_version"] == nil || identity["lifecycle"] == nil {
+		bridge := bridgeStatusView(tc)
+		if identity["plugin_version"] == nil {
+			identity["plugin_version"] = bridge["plugin_version"]
+		}
+		if identity["lifecycle"] == nil {
+			identity["lifecycle"] = bridge["lifecycle"]
+		}
+	}
+	return identity
+}
+
+// deviceSummaryView renders the processor and memory device inventory of one
+// observed status.
+func deviceSummaryView(emulator *emulatorStatusData) map[string]any {
 	processors := []string{}
 	memories := []string{}
 	for _, device := range emulator.Devices {
@@ -432,27 +474,34 @@ func runTargetInfo(tc toolContext, args json.RawMessage) map[string]any {
 			memories = append(memories, device.DisplayName)
 		}
 	}
-	modules := emulator.Modules
-	return okResult(map[string]any{
-		"emulator": map[string]any{
-			"name":           "Exodus",
-			"plugin_version": statusPayload["plugin_version"],
-			"lifecycle":      statusPayload["lifecycle"],
-		},
-		"system_running": emulator.SystemRunning,
-		"modules":        modules,
-		"devices": map[string]any{
-			"count":         len(emulator.Devices),
-			"processors":    processors,
-			"memory_spaces": memories,
-		},
-		"platform": map[string]any{
-			"baseline": "sega-mega-drive",
-			"assumed":  true,
-			"note":     "The baseline is derived from the Mega Drive modules shipped with Exodus; explicit target detection is planned.",
-		},
-		"rom": targetInfoROM(tc),
-	}, tc.modern)
+	return map[string]any{
+		"count":         len(emulator.Devices),
+		"processors":    processors,
+		"memory_spaces": memories,
+	}
+}
+
+// targetInfoPlatformView is the declared platform baseline of the one supported
+// target.
+func targetInfoPlatformView() map[string]any {
+	return map[string]any{
+		"baseline": "sega-mega-drive",
+		"assumed":  true,
+		"note":     "The baseline is derived from the Mega Drive modules shipped with Exodus; explicit target detection is planned.",
+	}
+}
+
+// targetInfoView renders the identity, device inventory, platform and cartridge
+// summary of one already-fetched status.
+func targetInfoView(tc toolContext, emulator map[string]any, emulatorStatus *emulatorStatusData) map[string]any {
+	return map[string]any{
+		"emulator":       emulator,
+		"system_running": emulatorStatus.SystemRunning,
+		"modules":        emulatorStatus.Modules,
+		"devices":        deviceSummaryView(emulatorStatus),
+		"platform":       targetInfoPlatformView(),
+		"rom":            targetInfoROM(tc),
+	}
 }
 
 // targetInfoROM fills the rom summary from a light header read. Any read or
