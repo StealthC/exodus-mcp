@@ -4,11 +4,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
-	"sort"
 	"strings"
-
-	"github.com/StealthC/exodus-mcp/internal/analysis"
-	"github.com/StealthC/exodus-mcp/internal/symbols"
 )
 
 // m68k_backtrace (roadmap P7): walk the M68K stack through A7 (the active
@@ -93,34 +89,10 @@ func registerValue(registers map[string]any, names ...string) (uint64, bool) {
 	return 0, false
 }
 
-// backtraceSymbolIndex resolves addresses against the context symbols that
-// belong to the M68K bus, through the 24-bit bus mask (mirroring the
-// disassembly annotation rules).
-type backtraceSymbolIndex struct {
-	byAddress map[uint64]string
-	sorted    []symbols.Symbol
-}
-
-func buildBacktraceSymbolIndex(context *analysis.Context, romSHA256 string) *backtraceSymbolIndex {
-	index := &backtraceSymbolIndex{byAddress: map[uint64]string{}}
-	for _, symbol := range context.Symbols.ListForROM("", romSHA256) {
-		if symbol.SpaceID != "" && symbol.SpaceID != disasmSpaceID("m68k") {
-			continue
-		}
-		masked := symbol.Address & m68kBusMask
-		if _, exists := index.byAddress[masked]; !exists {
-			index.byAddress[masked] = symbol.Name
-		}
-		index.sorted = append(index.sorted, symbols.Symbol{Name: symbol.Name, Address: masked})
-	}
-	sort.Slice(index.sorted, func(i, j int) bool { return index.sorted[i].Address < index.sorted[j].Address })
-	return index
-}
-
 // resolve returns the symbol at the exact masked address (offset 0), or the
 // nearest symbol at or below the address when the distance is bounded.
-func (index *backtraceSymbolIndex) resolve(address uint64) (string, uint64) {
-	masked := address & m68kBusMask
+func (index *symbolBusIndex) resolve(address uint64) (string, uint64) {
+	masked := address & index.mask
 	if name, ok := index.byAddress[masked]; ok {
 		return name, 0
 	}
@@ -167,7 +139,7 @@ func backtraceConfidence(candidate uint64) string {
 
 // backtraceFrame builds one result frame entry with symbol resolution and the
 // optional raw stack slot view.
-func backtraceFrame(address, stackAddress uint64, raw []byte, method, confidence, note string, includeRaw bool, index *backtraceSymbolIndex) map[string]any {
+func backtraceFrame(address, stackAddress uint64, raw []byte, method, confidence, note string, includeRaw bool, index *symbolBusIndex) map[string]any {
 	masked := address & m68kBusMask
 	frame := map[string]any{
 		"address":        masked,
@@ -239,7 +211,7 @@ func runBacktrace(tc toolContext, args json.RawMessage) map[string]any {
 	usp, _ := registerValue(registers, "usp")
 	ssp, _ := registerValue(registers, "ssp")
 
-	symbolsIndex := buildBacktraceSymbolIndex(context, tc.server.currentROMSHA256())
+	symbolsIndex := newSymbolBusIndex(context.Symbols, tc.server.currentROMSHA256(), disasmSpaceID("m68k"))
 
 	// readWord reads one big-endian 32-bit slot through the M68K bus and
 	// reports whether the plugin had to pause a running system for the read.

@@ -10,16 +10,43 @@ import (
 
 var errInvalidSymbol = errors.New("symbol name must not be empty")
 
-// Symbol binds one name to an address inside an address space. ROMSHA256 binds
-// the symbol to the cartridge it was derived from: a symbol recorded while a
-// ROM was loaded is never applied to a different cartridge, because equal
-// addresses in two ROMs are unrelated code. An empty ROMSHA256 is an explicitly
-// unbound (ROM-independent) symbol, which resolution reports separately.
+// Symbol binds one name to an address. Two coordinates are recorded:
+//
+//   - SpaceID/Address is the coordinate the caller supplied, for example
+//     mem-ram 0x1000. It is exactly what was asked for and never rewritten.
+//   - BusSpaceID/BusAddress is the processor-bus coordinate resolved from it,
+//     for example m68k-bus 0xFF1000. Disassembly and backtrace annotation
+//     compare against this coordinate, so a RAM or Z80-RAM symbol labels the
+//     instructions at its real bus address.
+//
+// A symbol stored before both coordinates were persisted carries only
+// SpaceID/Address; BusCoordinate reports false and callers derive the bus
+// coordinate from the space mapping. A symbol with an empty SpaceID is untyped:
+// it has no space coordinate and resolves against the raw address on every
+// processor bus.
+//
+// ROMSHA256 binds the symbol to the cartridge it was derived from: a symbol
+// recorded while a ROM was loaded is never applied to a different cartridge,
+// because equal addresses in two ROMs are unrelated code. An empty ROMSHA256 is
+// an explicitly unbound (ROM-independent) symbol, which resolution reports
+// separately.
 type Symbol struct {
-	Name      string `json:"name"`
-	SpaceID   string `json:"space_id,omitempty"`
-	Address   uint64 `json:"address"`
-	ROMSHA256 string `json:"rom_sha256,omitempty"`
+	Name       string `json:"name"`
+	SpaceID    string `json:"space_id,omitempty"`
+	Address    uint64 `json:"address"`
+	BusSpaceID string `json:"bus_space_id,omitempty"`
+	BusAddress uint64 `json:"bus_address"`
+	ROMSHA256  string `json:"rom_sha256,omitempty"`
+}
+
+// BusCoordinate reports the recorded processor-bus coordinate. Symbols created
+// before both coordinates were stored report false; callers then resolve the
+// bus coordinate from SpaceID/Address instead of guessing.
+func (symbol Symbol) BusCoordinate() (spaceID string, address uint64, ok bool) {
+	if symbol.BusSpaceID == "" {
+		return "", 0, false
+	}
+	return symbol.BusSpaceID, symbol.BusAddress, true
 }
 
 // Store is one context's symbol table with upsert semantics.
@@ -38,19 +65,19 @@ func (store *Store) Set(symbols []Symbol) (int, error) {
 	if len(symbols) == 0 {
 		return 0, nil
 	}
-	prepared := make([]Symbol, 0, len(symbols))
 	for _, symbol := range symbols {
 		if symbol.Name == "" {
 			return 0, errInvalidSymbol
 		}
-		prepared = append(prepared, Symbol{Name: symbol.Name, SpaceID: symbol.SpaceID, Address: symbol.Address, ROMSHA256: symbol.ROMSHA256})
 	}
+	// Store the symbols verbatim: rebuilding them field by field silently drops
+	// any coordinate a later caller adds to Symbol.
 	store.mu.Lock()
 	defer store.mu.Unlock()
-	for _, symbol := range prepared {
+	for _, symbol := range symbols {
 		store.byName[symbol.Name] = symbol
 	}
-	return len(prepared), nil
+	return len(symbols), nil
 }
 
 // List returns every symbol ordered by address, then name. An empty prefix
