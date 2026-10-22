@@ -1345,7 +1345,7 @@ var mdBusMap = []map[string]any{
 // paddedSizeBytes is the padded mapping size for the rom_identity view;
 // contextID scopes the header artifact.
 func mdROMInfo(tc toolContext, contextID string, romSizeBytes uint64, paddedSizeBytes uint64) (map[string]any, *toolFailure) {
-	header, byteOrder, effective, _, failure := readBridgeBytes(tc, "m68k-bus", 0x100, 0x100)
+	header, byteOrder, effective, headerPaused, failure := readBridgeBytes(tc, "m68k-bus", 0x100, 0x100)
 	if failure != nil {
 		return nil, failure
 	}
@@ -1425,6 +1425,10 @@ func mdROMInfo(tc toolContext, contextID string, romSizeBytes uint64, paddedSize
 
 	generation := tc.server.target.Generation()
 	romFacts := tc.server.romIdentity.romFileFacts(tc.server.currentROMPath())
+	// One capture-consistency object for the header artifact and the response;
+	// the legacy consistency label is derived from it, so the durable artifact
+	// can never claim "live" while the object reports a paused system.
+	consistencyObject := buildCaptureConsistency(tc.server, map[string]any{"system_paused_during_read": headerPaused}, false, true, nil, nil)
 	headerProvenance := &artifact.Provenance{
 		State:               artifact.ProvenanceStateComplete,
 		Kind:                "rom-header",
@@ -1441,9 +1445,9 @@ func mdROMInfo(tc toolContext, contextID string, romSizeBytes uint64, paddedSize
 		TargetGeneration:    &generation,
 		ROMSHA256:           romFacts.SHA256,
 		ROMPath:             tc.server.currentROMPath(),
-		Consistency:         "live",
+		Consistency:         consistencyObject.State,
 		CapturedAt:          time.Now().UTC(),
-		CaptureConsistency:  buildCaptureConsistency(tc.server, map[string]any{}, false, true, nil, nil),
+		CaptureConsistency:  consistencyObject,
 	}
 	headerArtifact, err := tc.server.store.PutWithProvenance(contextID, "rom-header", "application/octet-stream", header, headerProvenance)
 	if err != nil {
@@ -1505,8 +1509,9 @@ func mdROMInfo(tc toolContext, contextID string, romSizeBytes uint64, paddedSize
 				"countries": countries,
 			},
 		},
-		"mapping":  mapping,
-		"artifact": artifactDescriptor(tc.server, headerArtifact, contextID),
+		"mapping":             mapping,
+		"artifact":            artifactDescriptor(tc.server, headerArtifact, contextID),
+		"capture_consistency": captureConsistencyToMap(consistencyObject),
 	}
 	if len(hardwareCode) > 0 {
 		result["header"].(map[string]any)["region"].(map[string]any)["hardware_code"] = hardwareCode

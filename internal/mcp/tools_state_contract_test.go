@@ -196,8 +196,8 @@ func TestStateLoadDefaultRestoreIssuesNoOverride(t *testing.T) {
 	if loaded["isError"] == true {
 		t.Fatalf("state_load failed: %v", loaded)
 	}
-	if loaded["run_state_override"] != "restore" {
-		t.Fatalf("run_state_override = %v, want restore", loaded["run_state_override"])
+	if loaded["run_state_override"] != "preserve" {
+		t.Fatalf("run_state_override = %v, want preserve (the default)", loaded["run_state_override"])
 	}
 	if loaded["final_run_state"] != "paused" {
 		t.Fatalf("final_run_state = %v, want paused (plugin restored paused)", loaded["final_run_state"])

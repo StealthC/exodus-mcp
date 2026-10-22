@@ -274,6 +274,16 @@ func (store *Store) PutWithProvenance(contextID, kind, mimeType string, data []b
 	}
 	if provenance != nil {
 		stamped := *provenance
+		// The capture-consistency object is attached by reference while the
+		// producing capture window is open; copy it so the stored envelope is a
+		// snapshot of the moment of the write. A producer that must complete it
+		// after the window closes re-stamps it through
+		// FinalizeCaptureConsistency, which the store records as the single
+		// allowed completion of capture-window metadata.
+		if stamped.CaptureConsistency != nil {
+			consistency := *stamped.CaptureConsistency
+			stamped.CaptureConsistency = &consistency
+		}
 		stamped.Schema = ProvenanceSchema
 		if stamped.State == "" {
 			stamped.State = ProvenanceStateComplete
@@ -293,6 +303,35 @@ func (store *Store) PutWithProvenance(contextID, kind, mimeType string, data []b
 		store.OnPut(kind)
 	}
 	return artifact, nil
+}
+
+// FinalizeCaptureConsistency completes the capture-consistency object of the
+// artifacts one capture window wrote.
+//
+// A capture guard writes its raw artifacts before it can know how the window
+// ends: whether the pre-call run state was restored, and what the final
+// observed state is. The capture-consistency object is therefore attached to
+// the stored envelopes as a provisional snapshot and completed exactly once
+// through this method, before the producing tool publishes its response. Only
+// that object (and the legacy consistency label derived from it) is replaced:
+// content bytes, hashes, addresses, target and ROM facts are never touched, and
+// ids outside the store are ignored.
+func (store *Store) FinalizeCaptureConsistency(ids []string, consistency *CaptureConsistency) {
+	if consistency == nil {
+		return
+	}
+	store.mu.Lock()
+	defer store.mu.Unlock()
+	for _, id := range ids {
+		stored, present := store.artifacts[id]
+		if !present || stored.Provenance == nil {
+			continue
+		}
+		completed := *consistency
+		stored.Provenance.CaptureConsistency = &completed
+		stored.Provenance.Consistency = consistency.State
+		store.artifacts[id] = stored
+	}
 }
 
 // Metadata resolves one artifact scoped to an analysis context.

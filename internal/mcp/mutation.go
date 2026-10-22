@@ -20,12 +20,30 @@ type guardArgs struct {
 }
 
 func (args guardArgs) guard() mutationGuard {
-	guard := mutationGuard{ControlID: args.ControlID}
-	if args.ExpectedTargetGeneration != nil {
-		guard.ExpectedGeneration = *args.ExpectedTargetGeneration
+	return newWindowOpenGuard(args.ControlID, args.ExpectedTargetGeneration)
+}
+
+// newWindowOpenGuard resolves the precondition set of the first mutation
+// inside a composite control window: the effective control id (caller-provided
+// or internally acquired) plus, when the caller supplied one, the expected
+// target generation.
+func newWindowOpenGuard(controlID string, expected *uint64) mutationGuard {
+	guard := mutationGuard{ControlID: controlID}
+	if expected != nil {
+		guard.ExpectedGeneration = *expected
 		guard.HasExpectedGeneration = true
 	}
 	return guard
+}
+
+// windowCloseGuard resolves the precondition set of every follow-up mutation
+// inside the same window: only the effective control id, never the caller's
+// expected generation. The window's first successful mutation advanced the
+// target generation, so carrying the caller's precondition into the follow-up
+// (resume after a capture, run-state override after a state load) would reject
+// the mutation that closes the window it was supposed to complete.
+func windowCloseGuard(controlID string) mutationGuard {
+	return mutationGuard{ControlID: controlID}
 }
 
 // mutationGuard is the resolved precondition set of one mutating call.
@@ -278,7 +296,10 @@ func targetGenerationConflict(server *Server, expected uint64) *toolFailure {
 
 // targetGenerationPrecondition evaluates a caller's expected generation,
 // returning the resynchronization failure while the target revision is
-// unknown and the conflict failure on mismatch.
+// unknown, nil when the caller's observation is still current, and the
+// conflict failure on mismatch. Composite tools call it before taking an
+// exclusive lock so a stale caller never churns the window; returning a
+// conflict for a matching generation would reject every guarded caller.
 func targetGenerationPrecondition(server *Server, expected uint64) *toolFailure {
 	if server.target.Unknown() {
 		current := server.target.Generation()
@@ -291,6 +312,9 @@ func targetGenerationPrecondition(server *Server, expected uint64) *toolFailure 
 				"retry_hint":                   "Call a read-only tool such as emulator_status, then retry with the target_generation it reports.",
 			},
 		}
+	}
+	if server.target.Generation() == expected {
+		return nil
 	}
 	return targetGenerationConflict(server, expected)
 }
