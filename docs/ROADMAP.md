@@ -78,6 +78,26 @@ restart recovery, and ROM-hash-bound symbol resolution. See
   down without a window. See [HEADLESS.md](HEADLESS.md) for the assessment,
   phases, estimates, and open decisions.
 
+## Catalog consolidation follow-up (issue #17)
+
+Delivered: one concept per tool (72 canonical concepts) with every
+pre-consolidation name registered as a deprecated alias that returns its previous
+payload shape plus a `deprecated` block and `x-deprecated-tool` metadata. The
+merged tools are facades over the absorbed handlers for this release.
+
+- [ ] Move each implementation into its canonical tool and delete the facade
+  layer: `target_status`, `memory_map`, `disassemble`, `cpu_step`,
+  `debug_instrument`, `events_list`, `vdp_memory_read`, `vdp_render_export`,
+  `capture`, `snapshot_diff`, `trace_session_query`, `trace`, and
+  `sound_status` should own their logic once the aliases are removed, so a
+  payload section no longer re-publishes another handler's map.
+- [ ] Deprecated-alias catalog gating: decide whether `tools/list` keeps listing
+  deprecated aliases, hides them behind an `include_deprecated` flag, or drops
+  them entirely after the deprecation window. Aliases are listed today; the
+  decision is deliberately deferred to a separate, small change.
+- [ ] Remove the 39 aliases after their deprecation window, with a changelog
+  entry and a migration note per replacement.
+
 ## Delivery rules for remaining work
 
 These rules apply to every item above:

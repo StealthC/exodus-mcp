@@ -5,12 +5,13 @@ grouped by capability, and records how far each behavior is verified. Only
 open work is tracked in [ROADMAP.md](ROADMAP.md); the
 [CHANGELOG.md](../CHANGELOG.md) records the delivery history.
 
-The MCP server currently exposes **100 tools** spanning roadmap phases 0-10:
-bridge and context foundations, memory and artifact access, both processors,
-VDP graphics, deterministic controlled experimentation, advanced analysis,
-evidence annotations, advanced debugging, deterministic replay, workflow
-ergonomics, per-occurrence trace sessions with restart recovery, and trace
-sessions.
+The MCP server currently registers **111 tools**: **72 canonical concepts** and
+**39 deprecated aliases**, spanning roadmap phases 0-10: bridge and context
+foundations, memory and artifact access, both processors, VDP graphics,
+deterministic controlled experimentation, advanced analysis, evidence
+annotations, advanced debugging, deterministic replay, workflow ergonomics,
+per-occurrence trace sessions with restart recovery, trace sessions, and the
+consolidated catalog described in the next section.
 
 A tool exists in the catalog whether or not anyone has verified it, so every
 entry that claims a verified behavior carries one of these markers:
@@ -26,6 +27,89 @@ Unavailable native capabilities are stated as unavailable instead of being
 described as working. When an entry says something is validated without a
 marker, the marker is defined in [Validation](#validation), which maps each
 claim to the exact test function or smoke-script check that proves it.
+
+## Consolidated tool catalog (issue #17)
+
+The catalog is organized **one concept per tool**. The consolidation merged 39
+duplicate or near-duplicate tools into 11 merged tools, and every pre-existing
+name stays registered for this release as a **deprecated alias**:
+
+- an alias keeps its published `inputSchema` and runs the *unchanged* handler it
+  ran before, so its payload shape is the shape an existing client already
+  parses (`TestCaptureAbsorbsTheMemorySnapshot` and the rest of the
+  `Test...Absorbs...` family compare the merged payload with the alias payload
+  field by field);
+- every alias response additionally carries a `deprecated` block:
+  `{code: "tool_alias_deprecated", tool, replacement, removal, message, mapping}`,
+  where `mapping` states exactly which merged field carries the legacy payload.
+  Failure responses carry it too (`TestAliasDeprecationAlsoAnnotatesFailures`);
+- `tools/list` publishes the same mapping as an `x-deprecated-tool` annotation
+  and prefixes the description with `DEPRECATED: use <replacement>.`
+  (`TestDeprecatedAliasesArePublishedAsDeprecated`). Aliases stay **listed** in
+  this release; hiding them behind a catalog flag is deferred (ROADMAP).
+
+**Architecture for this release: a facade.** A merged tool dispatches to the
+handler of the concept it absorbed, in-process, with exactly the arguments the
+merged tool validated, and re-publishes that handler's payload (often under a
+section or `result`/`detail` key). It does not reimplement the behavior, so
+provenance, capture consistency (#1/#4/#8), cursor paging (#11), vocabularies
+(#12), error codes and artifact schema versions (#18) cannot drift between the
+merged tool and its alias. Moving each implementation into its canonical tool
+and deleting the facades is follow-up work (ROADMAP).
+
+### Merged tools and their aliases
+
+| Canonical tool | Concept | Deprecated aliases (payload mapping) |
+| --- | --- | --- |
+| `target_status` | one target observation: `bridge`, `run_state`, `devices`, `rom`, `platform`, `emulator` | `bridge_status` → `bridge`; `emulator_status` → `run_state` + `devices.entries` + `devices.modules` + `rom`; `target_info` → `emulator` + `devices` summary + `platform` + `rom.summary` |
+| `memory_map` | memory layout: `reference` (bus map) + `live` (space inventory) | `mega_drive_memory_map` → `reference`; `memory_spaces_list` → `live` |
+| `memory_read{cpu}` | inline read of one space **or** one processor bus view | `m68k_read_memory`, `z80_read_memory` (same bytes, plus `cpu` and the request echo) |
+| `disassemble{cpu}` | linear-sweep disassembly of one processor, with `addresses[]` batching and symbol annotation | `m68k_disassemble`, `z80_disassemble` (identical payload) |
+| `cpu_step{cpu, mode, timeout_ms}` | advance one processor: `instruction`, `over`, or `out` | `m68k_step`, `z80_step` (mode `instruction`), `cpu_step_over` (mode `over`), `cpu_step_out` (mode `out`); `mode`/`step_completion` are added fields |
+| `debug_instrument{action, kind}` | manage a breakpoint or watchpoint: `set`, `list`, `remove`, `update`, and `run_until: true` on `set` | `cpu_breakpoint_set/list/remove`, `cpu_watchpoint_set/list/remove`, `run_until_breakpoint`, `run_until_watchpoint` (each payload under `result`, plus `instrument_id`) |
+| `events_list{kinds}` | read event streams: `audit`, `mutation`, `debug`, `trace`, `run_state` | `target_audit_log` → `sections.audit`; `context_mutation_log` → `sections.mutation`; `cpu_debug_events_list` → `sections.debug` (plus an id-based `next_cursor`) |
+| `vdp_memory_read{output}` | read one VDP buffer inline or as a binary artifact | `vdp_memory_export` → `output: "artifact"` (same descriptor and provenance, plus `output`) |
+| `vdp_render_export{mode, crop}` | render tiles or a scroll plane as image artifacts, optionally cropped | `vdp_tile_export` → `mode: "tiles"`; `vdp_plane_export` → `mode: "plane"` (same `{summary, artifacts}` payload plus `mode`) |
+| `capture{components, mode}` | freeze a component set into one resolvable capture | `memory_snapshot_capture` / `system_snapshot_capture` / `vdp_capture` → the same capture under `detail`; `frame_capture` → a frame stored inside a tracked VDP capture (same PNG bytes, different envelope: `capture_id` + manifest instead of a bare artifact) |
+| `snapshot_diff{sections}` | compare recorded snapshots: `state` byte diff, `memory` cell diff | `state_diff` → `results.state`; `memory_diff` → `results.memory` (same cursor family) |
+| `trace_session_query{include}` | query the trace session: `status`, `events` | `trace_session_status` → `sections.status`; `trace_session_events` → `sections.events` (same cursor family) |
+| `trace{analyze, until}` | record execution: `trace` or `coverage`, until a `window` or a `watchpoint` | `cpu_trace_capture` → `analyze:trace, until:window`; `cpu_trace_capture_watchpoint` → `analyze:trace, until:watchpoint`; `cpu_coverage_capture` → `analyze:coverage` (payload under `result`) |
+| `sound_status{output}` | sound subsystem: `state` inline, `artifact` as a JSON artifact, `wav` for bounded PCM | `audio_capture` → `output: "wav"` (both report `audio_unavailable` against the pinned bridge) |
+
+`memory_read` and `vdp_memory_read` and `sound_status` already existed: they kept
+their name and gained the merged argument (`cpu`, `output`). Their previous
+payloads are unchanged, with added echo fields (`cpu`, `output`).
+
+Dispatch contract of every merged selector (`TestEverySchemaPropertyIsConsumedOrRejected`
+probes each published property alone):
+
+- an argument that the selected action/mode/kind/section does not consume is
+  rejected with `unsupported_parameter` naming the field and the accepted set,
+  never silently ignored;
+- when the selector itself is omitted, the tool infers it from the arguments the
+  caller supplied (`events_list` from audit/debug filters, `debug_instrument`
+  from the watchpoint id, `snapshot_diff` from the comparison arguments,
+  `trace_session_query` from the view-specific arguments, `sound_status` from the
+  PCM arguments, `trace`'s `until` from `watchpoint_id`), so a published argument
+  is always meaningful;
+- the one exception is a read-only selector whose first enum value is the safe
+  read (`events_list` defaults to `audit`, `debug_instrument.action` is required
+  and probes as `list`).
+
+New capabilities introduced by the merge (additive, not migrated behavior):
+
+- `debug_instrument.update`: the native API exposes create/delete only, so
+  `update` removes the old instrument and creates the replacement in one call,
+  reporting `previous_instrument_id`, the new `instrument_id`, and a
+  `result.removed`/`result.created` pair; a failed replacement reports
+  `update_partial` instead of a plain set failure.
+- `vdp_render_export.crop`: a rectangular window in source pixels before
+  scaling, applied to both modes and reported as `summary.crop` with the cropped
+  `png_width`/`png_height`. The same `crop` argument is published on the two
+  deprecated render aliases (additive).
+- `cpu_step.timeout_ms`: an opt-in bound on the wait for the pause that a
+  step-over/step-out produces (`step_completion`), rejected for `instruction`
+  mode, which is synchronous.
 
 ## Cross-cutting behavior
 
@@ -451,22 +535,28 @@ exactly the vocabularies the code enforces.
 
 ## Audio observability (Phase 6, partial)
 
-- `sound_status` reads typed YM2612 and SN76489/PSG state without reconstructing
-  registers from bus writes. It reports raw register snapshots, FM channel and
-  operator envelope/pan/DAC fields, PSG tone/volume/mute fields, device
-  availability, and explicit null/unobservable notes. The result is
+- `sound_status{output}` reads typed YM2612 and SN76489/PSG state without
+  reconstructing registers from bus writes. It reports raw register snapshots, FM
+  channel and operator envelope/pan/DAC fields, PSG tone/volume/mute fields,
+  device availability, and explicit null/unobservable notes. The result is
   `sound-status/1` and is a live, non-atomic sample relative to CPU/VDP.
-  **unvalidated**: no Go test and no `scripts/live-smoke.sh` check calls this
-  tool; the typed reads are only exercised by running it against a live pair.
-- `audio_capture` — **planned, not delivered.** The server-side argument
-  contract exists (duration 1-10000 ms, sample rate 22050/44100/48000,
-  channels 1-2, 8 MiB WAV cap, malformed-WAV rejection) and is returned before
-  the bridge is called, but the pinned plugin answers every `audio_capture`
-  request with `audio_unavailable`
-  (`native-plugin/ExodusMcpPlugin.cpp`, `audio_capture` branch), so the shipped
-  pair can never produce an `audio-capture` artifact. No test covers the
-  server's success branch. Completion is tracked in [ROADMAP.md](ROADMAP.md)
-  Phase 6, which requires a safe bounded PCM buffer from the native SDK.
+  `output: "state"` (default) returns it inline; `output: "artifact"` stores the
+  same versioned document as a JSON artifact and returns a compact summary plus
+  its descriptor, so a large register dump never has to travel inline
+  (`TestSoundStatusArtifactOutput`). `component` filters the chip.
+  **unvalidated against a live pair**: the inline reads have no
+  `scripts/live-smoke.sh` check; the artifact/wav contract is covered by Go
+  tests.
+- `sound_status{output: "wav"}` (merged successor of `audio_capture`) captures a
+  bounded mixed-audio WAV artifact: duration 1-10000 ms, sample rate
+  22050/44100/48000, channels 1-2, 8 MiB cap, malformed-WAV rejection, and the
+  `audio-capture/1` artifact with provenance. The pinned plugin answers every
+  `audio_capture` request with `audio_unavailable`
+  (`native-plugin/ExodusMcpPlugin.cpp`), so the shipped pair reports that
+  honestly instead of fabricating silence (`TestSoundStatusWavReportsThePinnedPluginHonestly`);
+  the success branch is covered by a fixture (`TestSoundStatusAbsorbsAudioCapture`).
+  Completion requires a safe bounded PCM buffer from the native SDK, tracked in
+  [ROADMAP.md](ROADMAP.md) Phase 6.
 
 ## Processors, symbols, and execution (Phase 2 and Phase 4 control)
 

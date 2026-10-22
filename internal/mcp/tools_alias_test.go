@@ -137,6 +137,21 @@ func TestConsolidatedCatalogHasNoDuplicateConcept(t *testing.T) {
 			t.Fatalf("merged tool %q is not registered as a canonical concept", name)
 		}
 	}
+	// The consolidation lands the catalog on 72 concepts: the 100 tools that
+	// existed before the merge, 39 of them now deprecated aliases, plus 11 merged
+	// tools.
+	if len(toolAliasRecords) != consolidatedAliasCount {
+		t.Fatalf("declared aliases = %d, want %d", len(toolAliasRecords), consolidatedAliasCount)
+	}
+	if len(canonical) != consolidatedCanonicalCount {
+		t.Fatalf("canonical concepts = %d, want %d", len(canonical), consolidatedCanonicalCount)
+	}
+	if len(toolRegistry) != consolidatedAliasCount+consolidatedCanonicalCount {
+		t.Fatalf("registry = %d tools, want %d", len(toolRegistry), consolidatedAliasCount+consolidatedCanonicalCount)
+	}
+	if len(aliasToolNames()) != consolidatedAliasCount {
+		t.Fatalf("published aliases = %d, want %d", len(aliasToolNames()), consolidatedAliasCount)
+	}
 }
 
 // ----------------------------------------------------------------------------------------------------------------------
@@ -145,6 +160,13 @@ func TestConsolidatedCatalogHasNoDuplicateConcept(t *testing.T) {
 
 // consolidatedCanonicalTools is the merged catalog. Each consolidation group
 // appends its canonical concept here.
+// consolidatedAliasCount and consolidatedCanonicalCount pin the consolidated
+// catalog shape (issue #17).
+const (
+	consolidatedAliasCount     = 39
+	consolidatedCanonicalCount = 72
+)
+
 var consolidatedCanonicalTools = []string{"target_status", "memory_map", "memory_read", "disassemble", "cpu_step", "debug_instrument", "events_list", "vdp_memory_read", "vdp_render_export", "capture", "snapshot_diff", "trace_session_query", "trace", "sound_status"}
 
 // payloadView strips the fields the dispatcher injects into every response and
