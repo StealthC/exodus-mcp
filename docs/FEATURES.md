@@ -502,12 +502,17 @@ claim to the exact test function or smoke-script check that proves it.
   with SHA-256 and size and carrying provenance (context, target generation,
   ROM path and SHA-256, optional control id, and `saved_run_state` — the last
   observed run state at save time, honest `"unknown"` without an
-  observation). `state_save` does not mutate the target; `state_load` does
-  and reports before/after generations, `capture_consistency.state:
-  "state_restored"`, `saved_run_state`, and `final_run_state` (observations
-  describe the restored instant until the system runs again; no defensive
-  pause after a restore is needed). Lists flag entries stale for the loaded
-  ROM and generation-mismatched while preserving them for historical
+  observation). `state_save` does not mutate the target. `saved_run_state` is
+  historical metadata: the native load never applies it (the core records the
+  pre-load run state, restores the snapshot, and runs again only when the
+  pre-load state was running), so `state_load` reports it with
+  `saved_run_state_note`. `state_load` mutates the target and reports the
+  before/after generations, `capture_consistency.state: "state_restored"`,
+  `run_state_override` (`preserve` by default, or the forced `paused`/
+  `running`), `final_run_state`, and `final_run_state_verified` (read from the
+  native run-state echo, never asserted); observations describe the restored
+  instant until the system runs again. Lists flag entries stale for the
+  loaded ROM and generation-mismatched while preserving them for historical
   analysis.
 - `frame_advance`: pause, execute exactly N rendered VDP frames, pause —
   reports the final frame token, before/after target generations, and times
@@ -734,15 +739,22 @@ suppressed when a different ROM is loaded.
   changes (the plugin does not expose a stop reason). The attribution is
   cleared by any MCP run-state action or by observing the system running
   again, and the `run_state_change` audit entry carries the attribution.
-- `state_load` `run_state` override: `run_state: "restore" | "paused" |
-  "running"` (default `restore` keeps the snapshot's saved run state, exactly
-  today's contract). `paused`/`running` issue a post-load `cpu_control`
-  inside the same control window, audited under the `state_load` tool with
-  `reason: "state_load run_state override"`; the response reports
-  `run_state_override` and the final run state from the overridden payload.
-  An override failure is observable, never silent: the load already applied,
-  and the error carries `state_loaded: true`, the requested state, and the
-  un-overridden `final_run_state`.
+- `state_load` `run_state`: `preserve` (default) keeps the machine in the run
+  state it had before the load, which is exactly what the native restore does;
+  `paused` and `running` force the restored state through a post-load
+  `cpu_control` inside the same control window, audited under the `state_load`
+  tool with `reason: "state_load run_state override"`. The response reports the
+  resolved `run_state_override`, `final_run_state` (verified from the native
+  run-state echo), and `saved_run_state` with `saved_run_state_note` stating
+  that the recorded value is historical and never applied. `restore` is kept as
+  a deprecated alias for `preserve`: it behaves identically and reports
+  `deprecated_parameter_value` instead of being silently reinterpreted. An
+  override failure is observable, never silent: the load already applied, and
+  the error carries `state_loaded: true`, the requested state, and the
+  un-overridden `final_run_state`. The override is a follow-up mutation in the
+  window and carries the control id alone, so a caller's
+  `expected_target_generation` applies to the load and never rejects the
+  override it was meant to protect.
 
 ## Operations
 
@@ -797,6 +809,7 @@ named subset are asserted by `internal/mcp/server_test.go`
 | Control lock, generation conflicts, audit stream, state save/load/list, frame advance, input set, context close | `internal/mcp/tools_phase4_test.go` |
 | Search/diff modes, ROM header parse and checksum, `target_info` ROM summary, coverage counts and region filter, watchpoint trace arguments | `internal/mcp/tools_phase5_test.go` |
 | State run-state contract and `state_load` `run_state` override | `internal/mcp/tools_state_contract_test.go` |
+| `state_load` `run_state` `preserve`/alias contract, verified `final_run_state`, guarded override | `internal/mcp/tools_state_load_preserve_test.go` |
 | State diff metadata, file bytes, identical detection | `internal/mcp/tools_state_diff_test.go` |
 | Deterministic replay true/false/validation | `internal/mcp/tools_replay_test.go` |
 | Annotation lifecycle, filters, staleness, export/import round trip | `internal/mcp/tools_annotations_test.go`, `internal/analysis/annotations_test.go` |

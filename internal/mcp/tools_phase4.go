@@ -82,11 +82,11 @@ func phase4ToolSpecs() []toolSpec {
 		},
 		{
 			name:        "state_load",
-			description: "Load a previously saved system snapshot back into the emulator. The snapshot must belong to the same analysis context and, in practice, to the same loaded ROM: device state from another cartridge is ignored by Exodus with a logged warning. Restores the snapshot's saved run state exactly by default (run_state \"restore\"); the response reports saved_run_state (recorded at state_save time) and final_run_state, so no defensive pause after a restore is needed. Optional run_state \"paused\" or \"running\" forces the restored state through a post-load cpu_control issued inside the same control window (audited as part of this tool); an override failure surfaces with the load already applied, never silently. Accepts optional expected_target_generation and control_id.",
+			description: "Load a previously saved system snapshot back into the emulator. The snapshot must belong to the same analysis context and, in practice, to the same loaded ROM: device state from another cartridge is ignored by Exodus with a logged warning. The native load preserves the machine's current run state (it records the pre-load state, restores it, and never applies the snapshot's recorded saved_run_state, which is historical metadata from state_save time). run_state \"preserve\" (default) keeps that behavior; \"paused\" or \"running\" forces the restored state through a post-load cpu_control inside the same control window (audited as part of this tool), and an override failure surfaces with the load already applied, never silently. \"restore\" is a deprecated alias for \"preserve\" and reports deprecated_parameter_value. The response always reports final_run_state, whether it was verified from the native run-state echo, saved_run_state with a note that it is historical, and the resolved run_state_override. Accepts optional expected_target_generation and control_id.",
 			schema: objectSchema(map[string]any{
 				"context":                    contextProperty(),
 				"state_id":                   stringProperty("Snapshot id returned by state_save."),
-				"run_state":                  enumProperty("Forced restored run state. restore (default) keeps the snapshot's saved run state; paused/running override it with a post-load cpu_control inside the same control window.", []string{"restore", "paused", "running"}),
+				"run_state":                  enumProperty("Restored run state. preserve (default) keeps the machine in the run state it had before the load; paused/running force it with a post-load cpu_control inside the same control window. The deprecated alias \"restore\" is accepted and behaves exactly like preserve.", []string{"preserve", "paused", "running"}),
 				"expected_target_generation": integerProperty("Optional target generation the caller last observed; fails with target_generation_conflict on mismatch.", 1),
 				"control_id":                 stringProperty("Optional control id from target_control_acquire; required while the control lock is active."),
 			}, []string{"state_id"}),
@@ -486,6 +486,46 @@ type stateLoadArgs struct {
 	guardArgs
 }
 
+// state_load run_state values. The native load never applies a snapshot's
+// recorded run state: it captures the pre-load state, restores it, and runs
+// again only when the pre-load state was running. "preserve" states exactly
+// that contract instead of claiming a restore the core cannot do.
+const (
+	stateLoadRunStatePreserve = "preserve"
+	stateLoadRunStatePaused   = "paused"
+	stateLoadRunStateRunning  = "running"
+	// stateLoadRunStateRestore is the deprecated alias of "preserve". It is
+	// accepted for compatibility, reported as deprecated_parameter_value, and
+	// never silently reinterpreted.
+	stateLoadRunStateRestore = "restore"
+)
+
+// savedRunStateNote documents saved_run_state as historical metadata.
+const savedRunStateNote = "Recorded at state_save time from the run-state tracker and never applied by state_load: the native load preserves the machine's pre-load run state."
+
+// resolveStateLoadRunState validates run_state and returns the resolved value
+// plus a deprecation record when the caller used the legacy alias.
+func resolveStateLoadRunState(requested string) (string, map[string]any, *toolFailure) {
+	switch strings.TrimSpace(requested) {
+	case "":
+		return stateLoadRunStatePreserve, nil, nil
+	case stateLoadRunStatePreserve, stateLoadRunStatePaused, stateLoadRunStateRunning:
+		return strings.TrimSpace(requested), nil, nil
+	case stateLoadRunStateRestore:
+		return stateLoadRunStatePreserve, map[string]any{
+			"parameter":   "run_state",
+			"value":       stateLoadRunStateRestore,
+			"replacement": stateLoadRunStatePreserve,
+			"note":        "run_state \"restore\" is deprecated: the native load never restores the snapshot's saved run state, it preserves the pre-load run state. Use \"preserve\" to state that contract explicitly, or \"paused\"/\"running\" to force the restored state.",
+		}, nil
+	default:
+		return "", nil, &toolFailure{
+			Code:    "invalid_params",
+			Message: "run_state must be preserve (default), paused, or running; \"restore\" is accepted as a deprecated alias for preserve",
+		}
+	}
+}
+
 func runStateLoad(tc toolContext, args json.RawMessage) map[string]any {
 	parsed, failure := decodeArgs[stateLoadArgs](args)
 	if failure != nil {
@@ -495,14 +535,9 @@ func runStateLoad(tc toolContext, args json.RawMessage) map[string]any {
 	if failure != nil {
 		return failureResult(failure, tc.modern)
 	}
-	runState := parsed.RunState
-	switch runState {
-	case "", "restore", "paused", "running":
-	default:
-		return failureResult(&toolFailure{Code: "invalid_params", Message: "run_state must be restore, paused, or running"}, tc.modern)
-	}
-	if runState == "" {
-		runState = "restore"
+	runState, deprecation, failure := resolveStateLoadRunState(parsed.RunState)
+	if failure != nil {
+		return failureResult(failure, tc.modern)
 	}
 	snapshot, err := tc.server.contexts.States.Get(context.ID, parsed.StateID)
 	if err != nil {
@@ -512,6 +547,10 @@ func runStateLoad(tc toolContext, args json.RawMessage) map[string]any {
 		return failureResult(&toolFailure{Code: "state_file_missing", Message: "snapshot file " + snapshot.Path + " no longer exists"}, tc.modern)
 	}
 
+	// The load is the window's first mutation, so it carries the caller's
+	// expected generation; the run-state override that follows is a second
+	// mutation under the same control lock and must not repeat that
+	// precondition, which this load already consumed.
 	payload, before, after, failure := tc.server.executeMutation(tc.ctx, mutationCall{
 		tool:      "state_load",
 		operation: "state_load",
@@ -533,16 +572,16 @@ func runStateLoad(tc toolContext, args json.RawMessage) map[string]any {
 	// machine lands in the requested run state. The override failure is
 	// observable and never silent: the load itself already applied.
 	finalPayload := payload
-	if runState == "paused" || runState == "running" {
+	if runState == stateLoadRunStatePaused || runState == stateLoadRunStateRunning {
 		action := "pause"
-		if runState == "running" {
+		if runState == stateLoadRunStateRunning {
 			action = "run"
 		}
 		overridePayload, _, _, overrideFailure := tc.server.executeMutation(tc.ctx, mutationCall{
 			tool:      "state_load",
 			operation: "cpu_control",
 			params:    map[string]string{"action": action},
-			guard:     parsed.guard(),
+			guard:     windowCloseGuard(parsed.ControlID),
 			contextID: context.ID,
 			detail: map[string]any{
 				"action": action, "reason": "state_load run_state override", "state_id": snapshot.ID,
@@ -561,23 +600,35 @@ func runStateLoad(tc toolContext, args json.RawMessage) map[string]any {
 				},
 			}, tc.modern)
 		}
-		recordStateFromPayload(tc.server, overridePayload, runState == "running")
+		recordStateFromPayload(tc.server, overridePayload, runState == stateLoadRunStateRunning)
 		finalPayload = overridePayload
 	} else {
-		// state_load restores the saved run state; attribute the echoed state
-		// to MCP so emulator_status derives the pause source.
+		// The native load returns the machine to its pre-load run state;
+		// attribute the echoed state to MCP so emulator_status derives the
+		// pause source.
 		recordStateFromPayload(tc.server, payload, false)
 	}
+	finalRunState, finalVerified := payloadRunState(finalPayload)
+	savedRunState := snapshot.SavedRunState
+	if savedRunState == "" {
+		savedRunState = runStateUnknown
+	}
 	result := map[string]any{
-		"state_id":           snapshot.ID,
-		"sha256":             snapshot.SHA256,
-		"saved_run_state":    snapshot.SavedRunState,
-		"final_run_state":    runStateLabelFromBool(finalPayload),
-		"run_state_override": runState,
+		"state_id":                 snapshot.ID,
+		"sha256":                   snapshot.SHA256,
+		"saved_run_state":          savedRunState,
+		"saved_run_state_note":     savedRunStateNote,
+		"final_run_state":          finalRunState,
+		"final_run_state_verified": finalVerified,
+		"run_state_override":       runState,
+		"run_state_note":           "state_load preserves the machine's pre-load run state; saved_run_state is historical metadata and is never applied.",
 		"capture_consistency": map[string]any{
 			"state": consistencyStateRestored,
 			"note":  "The machine now describes the restored snapshot's instant, not a live capture; observations describe the restored state until the system runs again.",
 		},
+	}
+	if deprecation != nil {
+		result["deprecated_parameter_value"] = deprecation
 	}
 	for key, value := range finalPayload {
 		result[key] = value
