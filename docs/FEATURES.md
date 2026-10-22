@@ -685,10 +685,24 @@ claim to the exact test function or smoke-script check that proves it.
   than a harness artifact. The VDP render counter is not part of a saved state
   and is never reset by `state_load`, so absolute tokens are not comparable
   across the restore: every step is compared as a delta from a
-  `frame_token_baseline` captured at the start of its own run. Every restore
-  that precedes stepping forces the machine paused, and each run reports
-  `initial_run_state`; a pause the native echo cannot verify is reported, not
-  assumed. A difference is reported in `diverged_step` (`step`, `field`,
+  `frame_token_baseline` captured at the start of its own run. A target that
+  is **running when the call arrives is paused before the first restore**, not
+  after it: a pause issued after the restore lets the machine execute between
+  `state_load` and the pause, so run 1 would observe frames run 2 never gets
+  and a deterministic target would be reported as nondeterministic (the
+  reported defect, covered by
+  `TestDeterministicReplayRunningTargetStaysDeterministic`). Because of that
+  ordering, `pause_resume_cycle` and the per-run `initial_run_state_verified`
+  are informational: `initial_run_state_verified` is true only when the
+  machine was already paused before the run changed anything, and a run the
+  tool had to pause still reports `paused_start_confirmed` true and does not
+  weaken the verdict. Every restore that precedes stepping ends paused, and a
+  pause or run state the native echo cannot verify is reported, not assumed.
+  The final restore reloads the initial state and leaves the target in the run
+  state observed before the call (`run_state_restored`: `restored` when a
+  running target was resumed, `already_paused`, or
+  `resume_skipped_initial_run_state_unknown` when the server never observed
+  it). A difference is reported in `diverged_step` (`step`, `field`,
   `run1`, `run2`) when it belongs to one step and in `divergences` otherwise,
   and an axis that could not be read (a missing token, an unreadable register
   set, a counter that wrapped) is listed in `unproven` and never counted as a

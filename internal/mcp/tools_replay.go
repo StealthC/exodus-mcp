@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/StealthC/exodus-mcp/internal/analysis"
+	"github.com/StealthC/exodus-mcp/internal/artifact"
 )
 
 // deterministic_replay (roadmap P8): execute one declarative input sequence
@@ -52,7 +53,7 @@ func replayToolSpecs() []toolSpec {
 	return []toolSpec{
 		{
 			name:        "deterministic_replay",
-			description: "Record and replay one declarative input sequence to verify frame-for-frame determinism: run the same steps twice from the same saved state under exclusive control, capture per-step frame-token deltas, per-step M68K register samples and final M68K registers for both runs, then report deterministic true/false plus a replay-manifest/2 artifact. Each step holds the listed buttons down for the given number of frames (input_set down, frame_advance x N, input_set up). The VDP render counter is not part of a saved state, so every step is compared as a delta from a baseline token captured at the start of its own run (frame_token_baseline), never as an absolute token. After each restore the machine is forced paused and initial_run_state is reported per run, so both runs step from a comparable instant. A difference is reported in diverged_step (step, field, run1, run2) when it belongs to one step and in divergences otherwise; an axis that could not be read is listed in unproven and never counts as a match. initial_state_id is optional: omitting it snapshots the current machine state first. The emulator is restored to the initial state afterwards. Accepts optional expected_target_generation and control_id; without control_id the server acquires an internal lock for the whole window.",
+			description: "Record and replay one declarative input sequence to verify frame-for-frame determinism: run the same steps twice from the same saved state under exclusive control, capture per-step frame-token deltas, per-step M68K register samples and final M68K registers for both runs, then report deterministic true/false plus a replay-manifest/2 artifact. Each step holds the listed buttons down for the given number of frames (input_set down, frame_advance x N, input_set up). If the target is running when the call arrives the replay pauses it BEFORE the first restore, so no frame executes between the restore and the first step and a running start does not make a deterministic target look nondeterministic; pause_resume_cycle and per-run initial_run_state_verified report that pause and are informational only. The VDP render counter is not part of a saved state, so every step is compared as a delta from a baseline token captured at the start of its own run (frame_token_baseline), never as an absolute token. A difference is reported in diverged_step (step, field, run1, run2) when it belongs to one step and in divergences otherwise; an axis that could not be read is listed in unproven and never counts as a match. initial_state_id is optional: omitting it snapshots the current machine state first. The initial state is restored afterwards and the target is left in the run state it had before the call (a running target runs again, a paused target stays paused). Accepts optional expected_target_generation and control_id; without control_id the server acquires an internal lock for the whole window.",
 			schema: objectSchema(map[string]any{
 				"initial_state_id": stringProperty("Optional state id saved through this analysis context; omitting it snapshots the current machine state first."),
 				"steps": map[string]any{
@@ -195,15 +196,55 @@ type replayRunResult struct {
 	GenerationEnd   uint64
 	GenerationSpan  uint64
 
-	// InitialRunState is the run state the restore left the machine in before
-	// the first step; InitialRunStateVerified reports whether the native echo
-	// confirmed it was paused.
+	// InitialRunState is the run state the native echo reported when the run
+	// began. InitialRunStateVerified reports that the machine was already
+	// paused before this run changed anything, so the pause was not caused by
+	// the tool. PausedStartConfirmed reports that the native echo proved the
+	// run actually began paused; that is the fact the verdict rests on, because
+	// a pause issued before the restore costs the run nothing.
 	InitialRunState         string
 	InitialRunStateVerified bool
+	PausedStartConfirmed    bool
+	InitialRunStateNote     string
 
 	// Unproven records every axis this run could not observe, so the verdict
 	// never silently drops an axis it failed to read.
 	Unproven []string
+}
+
+// replayRunStart is the run-state evidence one run begins with.
+type replayRunStart struct {
+	// RunState is the run state the native echo reported for the run's start.
+	RunState string
+	// Confirmed reports that the echo proved the machine was paused.
+	Confirmed bool
+	// PreexistingPause reports that the machine was already paused before the
+	// replay changed anything for this run, so the tool never paused it.
+	PreexistingPause bool
+	// Note explains who paused the machine for this run.
+	Note string
+}
+
+// newReplayRunStart resolves the run-state evidence of one restore. It never
+// promotes a pause the replay performed into a preexisting one: the reported
+// fact is what the machine did before the tool touched it.
+func newReplayRunStart(outcome *replayRestoreOutcome, stage string, toolPausedBefore bool) replayRunStart {
+	start := replayRunStart{
+		RunState:  outcome.RunState,
+		Confirmed: outcome.Verified && outcome.RunState == runStatePaused,
+	}
+	start.PreexistingPause = start.Confirmed && !outcome.PausedByTool && !toolPausedBefore
+	switch {
+	case outcome.PausedByTool:
+		start.Note = stage + " left the machine running, so the replay paused it afterwards; frames may have executed between that restore and the pause, and the paused start is reported as not preexisting."
+	case toolPausedBefore:
+		start.Note = "The target was running when deterministic_replay was called, so the replay paused it before the initial restore. Because the pause precedes the restore, no frame executed between the restore and the first step; this is informational and does not weaken the verdict."
+	case start.Confirmed:
+		start.Note = "The machine was already paused before " + stage + ", so the replay did not change the run state to start this run."
+	default:
+		start.Note = "The native echo did not prove a paused start for " + stage + ", so the stepped frames are not comparable."
+	}
+	return start
 }
 
 func runDeterministicReplay(tc toolContext, args json.RawMessage) map[string]any {
@@ -257,53 +298,71 @@ func runDeterministicReplay(tc toolContext, args json.RawMessage) map[string]any
 	windowGuard := mutationGuard{ControlID: controlID}
 	generationBefore := tc.server.target.Generation()
 
+	// Observe the run state the target has when the call arrives. It decides
+	// both whether the replay has to pause before its first restore and the run
+	// state the target is left in when the window closes.
+	entryRunState, entryKnown := replayEntryRunState(tc)
+	entryPaused := entryKnown && entryRunState == runStatePaused
+
+	// Pause before the first restore, inside the same guard window. A pause
+	// issued after the restore lets the machine execute between state_load and
+	// the pause, so run 1 would observe frames run 2 never gets and a
+	// deterministic target would be reported as nondeterministic.
+	pauseResumeCycles := 0
+	pausedBeforeRestore := false
+	if !entryPaused {
+		if _, _, failure := replaySetRunState(tc, context.ID, windowGuard, "pre_restore_pause", "pause", "pause before the initial restore so no frame executes between the restore and the run"); failure != nil {
+			return failureResult(failure, tc.modern)
+		}
+		pauseResumeCycles++
+		pausedBeforeRestore = true
+	}
+
 	// Determine the initial state: the caller's snapshot, or a fresh snapshot
-	// of the current machine. Both runs start from this exact instant.
+	// of the current machine, taken after the pause so the snapshot is already
+	// a quiescent instant.
 	initialSnapshot, failure := replayInitialState(tc, context, parsed.InitialStateID)
 	if failure != nil {
 		return failureResult(failure, tc.modern)
 	}
-	// Every restore that precedes stepping forces the machine paused, so a
+	// Every restore that precedes stepping ends with the machine paused, so a
 	// running target cannot advance frames between the replay's own steps.
 	initialRestore, failure := replayRestoreState(tc, context.ID, initialSnapshot.Path, windowGuard, "initial_load", true)
 	if failure != nil {
 		return failureResult(failure, tc.modern)
 	}
-	pauseResumeCycles := 0
-	if initialRestore.pauseCycle() {
+	if initialRestore.PausedByTool {
 		pauseResumeCycles++
 	}
+	run1Start := newReplayRunStart(initialRestore, "the initial restore", pausedBeforeRestore)
 
-	run1, failure := replayRunSequence(tc, context.ID, steps, windowGuard, initialRestore, "run_1")
+	run1, failure := replayRunSequence(tc, context.ID, steps, windowGuard, run1Start, "run_1")
 	if failure != nil {
-		_, _ = replayRestoreState(tc, context.ID, initialSnapshot.Path, windowGuard, "abort_restore", false)
+		_, _ = replayCloseWindow(tc, context.ID, initialSnapshot.Path, windowGuard, "abort_restore", entryRunState, entryKnown)
 		return failureResult(failure, tc.modern)
 	}
 	betweenRuns, failure := replayRestoreState(tc, context.ID, initialSnapshot.Path, windowGuard, "between_runs_restore", true)
 	if failure != nil {
 		return failureResult(failure, tc.modern)
 	}
-	if betweenRuns.pauseCycle() {
+	if betweenRuns.PausedByTool {
 		pauseResumeCycles++
 	}
-	run2, failure := replayRunSequence(tc, context.ID, steps, windowGuard, betweenRuns, "run_2")
+	run2Start := newReplayRunStart(betweenRuns, "the between-runs restore", false)
+
+	run2, failure := replayRunSequence(tc, context.ID, steps, windowGuard, run2Start, "run_2")
 	if failure != nil {
-		_, _ = replayRestoreState(tc, context.ID, initialSnapshot.Path, windowGuard, "abort_restore", false)
+		_, _ = replayCloseWindow(tc, context.ID, initialSnapshot.Path, windowGuard, "abort_restore", entryRunState, entryKnown)
 		return failureResult(failure, tc.modern)
 	}
-	// Reload the initial snapshot so the machine describes it again. The final
-	// restore preserves the machine's run state instead of forcing one, and
-	// because the replay's last frame_advance ended paused, the target ends
-	// paused; a failed restore is surfaced, not silently swallowed.
-	restored := true
-	finalRunState := runStateUnknown
-	finalRunStateVerified := false
-	if finalRestore, failure := replayRestoreState(tc, context.ID, initialSnapshot.Path, windowGuard, "final_restore", false); failure != nil {
-		restored = false
-	} else {
-		finalRunState = finalRestore.RunState
-		finalRunStateVerified = finalRestore.Verified
-	}
+	// Reload the initial snapshot so the machine describes it again, and leave
+	// the target in the run state this call found it in: a target that was
+	// running runs again, a paused target stays paused. A failed restore or a
+	// failed resume is surfaced, never silently swallowed.
+	closure, closureFailure := replayCloseWindow(tc, context.ID, initialSnapshot.Path, windowGuard, "final_restore", entryRunState, entryKnown)
+	restored := closure.Restored
+	finalRunState := closure.FinalRunState
+	finalRunStateVerified := closure.FinalRunStateVerified
 	generationAfter := tc.server.target.Generation()
 
 	comparison := compareReplayRuns(run1, run2)
@@ -318,21 +377,25 @@ func runDeterministicReplay(tc toolContext, args json.RawMessage) map[string]any
 	}
 	comparisonView := comparison.view()
 	manifest := map[string]any{
-		"kind":                   replayManifestKind,
-		"schema_version":         replayManifestVer,
-		"initial_state_id":       initialSnapshot.ID,
-		"initial_state_name":     initialSnapshot.Name,
-		"steps":                  stepsView,
-		"run_1":                  replayRunView(run1),
-		"run_2":                  replayRunView(run2),
-		"deterministic":          comparison.Deterministic,
-		"checks":                 comparison.Checks,
-		"unproven":               comparison.Unproven,
-		"frame_token_comparison": replayTokenComparison,
-		"pause_resume_cycle":     pauseResumeCycles,
-		"final_run_state":        finalRunState,
-		"restored":               restored,
-		"methodology":            replayMethodology,
+		"kind":                    replayManifestKind,
+		"schema_version":          replayManifestVer,
+		"initial_state_id":        initialSnapshot.ID,
+		"initial_state_name":      initialSnapshot.Name,
+		"steps":                   stepsView,
+		"run_1":                   replayRunView(run1),
+		"run_2":                   replayRunView(run2),
+		"deterministic":           comparison.Deterministic,
+		"checks":                  comparison.Checks,
+		"unproven":                comparison.Unproven,
+		"frame_token_comparison":  replayTokenComparison,
+		"entry_run_state":         entryRunState,
+		"pause_resume_cycle":      pauseResumeCycles,
+		"final_run_state":         finalRunState,
+		"resumed_after_restore":   closure.Resumed,
+		"run_state_restored":      closure.RestoreState,
+		"restored":                restored,
+		"methodology":             replayMethodology,
+		"pause_resume_cycle_note": replayPauseCycleNote,
 	}
 	for key, value := range comparisonView {
 		manifest[key] = value
@@ -341,7 +404,9 @@ func runDeterministicReplay(tc toolContext, args json.RawMessage) map[string]any
 	if err != nil {
 		return failureResult(&toolFailure{Code: "artifact_error", Message: err.Error()}, tc.modern)
 	}
-	stored, err := tc.server.store.PutWithProvenance(context.ID, replayManifestKind, "application/json", manifestBytes, genericProvenance(tc.server, replayManifestKind, time.Now().UTC()))
+	provenance := genericProvenance(tc.server, replayManifestKind, time.Now().UTC())
+	provenance.CaptureConsistency = replayConsistency(entryRunState, entryKnown, pauseResumeCycles > 0, closure, comparison.Deterministic)
+	stored, err := tc.server.store.PutWithProvenance(context.ID, replayManifestKind, "application/json", manifestBytes, provenance)
 	if err != nil {
 		return failureResult(&toolFailure{Code: "artifact_error", Message: err.Error()}, tc.modern)
 	}
@@ -356,25 +421,83 @@ func runDeterministicReplay(tc toolContext, args json.RawMessage) map[string]any
 		"frames_total":             totalFrames,
 		"run_1":                    replayRunView(run1),
 		"run_2":                    replayRunView(run2),
+		"entry_run_state":          entryRunState,
 		"pause_resume_cycle":       pauseResumeCycles,
+		"pause_resume_cycle_note":  replayPauseCycleNote,
 		"final_run_state":          finalRunState,
 		"final_run_state_verified": finalRunStateVerified,
+		"resumed_after_restore":    closure.Resumed,
+		"run_state_restored":       closure.RestoreState,
 		"restored":                 restored,
 		"artifact":                 artifactDescriptor(tc.server, stored, context.ID),
 		"sha256":                   stored.SHA256,
 		"initial_state_id":         initialSnapshot.ID,
-		"run_state_note":           "The replay forces a paused start after every restore and never resumes the target inside the window: pause_resume_cycle counts the restores that had to pause a machine which was not already paused. The final restore reloads the initial snapshot and preserves the run state rather than forcing one, so the target ends paused because the replay's own frame advances end paused.",
+		"run_state_note":           "Before the first restore the replay pauses a target that is running, so no frame executes between the restore and the first step and a running start does not make a deterministic target nondeterministic; pause_resume_cycle and initial_run_state_verified report that pause but neither affects the verdict. The final restore reloads the initial snapshot and leaves the target in the run state observed before the call, so a target that was running runs again and a paused target stays paused.",
 	}
 	for key, value := range comparisonView {
 		result[key] = value
 	}
-	if !restored {
+	switch {
+	case !restored:
 		result["restore_warning"] = "WARNING: restoring the initial state after the replay failed; the emulator still describes the end of run 2."
+	case closureFailure != nil:
+		result["restore_warning"] = "WARNING: the initial state was restored, but restoring the run state observed before the call failed (" + closureFailure.Message + "); the target stays paused."
 	}
 	return okResult(stampGenerations(result, generationBefore, generationAfter), tc.modern)
 }
 
-const replayMethodology = "Two identical input sequences (input_set down, frame_advance x N, input_set up per step) executed from the same saved state under exclusive control. Every restore that precedes stepping forces the machine paused, so no frame advances outside the replay's own steps, and each run reports its initial_run_state. The VDP render counter is not part of a saved state and is never reset by state_load, so per-step tokens are compared as deltas from a frame_token_baseline captured at the start of each run, never as absolute values; a token below its run's baseline proves the counter was reset or wrapped and is reported unproven. Per-step M68K register samples (pc/a7/d0) and the final register set are compared field by field. An unreadable token or register set is reported as unproven and never counted as a match. Demonstrated determinism holds for this emulator build and this ROM only; it does not guarantee cross-build reproducibility."
+// replayPauseCycleNote states what pause_resume_cycle counts and why a call that
+// had to pause a running target is still expected to be deterministic.
+const replayPauseCycleNote = "pause_resume_cycle counts the pauses the replay issued to guarantee a quiescent machine: one for a target that was running when the call arrived, plus any restore that had to pause a machine the load left running. It is informational: the pause happens BEFORE the restore, so no frame executes between the restore and the first step, and a call that had to pause a running target is still expected to report deterministic true when the two runs match."
+
+// replayPauseOrigin names who produced the paused start of one run, for the
+// check detail. initial_run_state_verified is reported separately so a caller
+// can tell a preexisting pause from one the replay performed.
+func replayPauseOrigin(run *replayRunResult) string {
+	switch {
+	case !run.PausedStartConfirmed:
+		return "unproven"
+	case run.InitialRunStateVerified:
+		return "already paused before the run"
+	default:
+		return "paused by the replay before the restore"
+	}
+}
+
+// replayConsistency states in the artifact envelope that the manifest spans a
+// paused execution window: the machine was paused before the first restore and
+// left in the run state the call found.
+func replayConsistency(entryRunState string, entryKnown, pausedByTool bool, closure *replayClosureResult, deterministic bool) *artifact.CaptureConsistency {
+	consistency := &artifact.CaptureConsistency{
+		State:                 consistencyPaused,
+		ExecutionPausedByTool: pausedByTool,
+		ExecutionResumedAfter: closure.Resumed,
+		InitialRunState:       entryRunState,
+		FinalRunState:         closure.FinalRunState,
+	}
+	verdict := "deterministic"
+	if !deterministic {
+		verdict = "not deterministic for the observed steps"
+	}
+	note := "The replay ran both input sequences on a paused machine and restored the initial state; the verdict is " + verdict + "."
+	if pausedByTool {
+		note += " The target was running when the call arrived and was paused before the first restore, so no frame executed between the restore and the first step."
+	}
+	switch {
+	case closure.Resumed:
+		consistency.State = consistencyAtomic
+		note += " The target was resumed afterwards because it was running before the call."
+	case !entryKnown:
+		consistency.State = consistencyAtomic
+		note += " The run state before the call was never observed, so the target was left paused instead of guessing."
+	case !closure.Restored:
+		note += " Restoring the initial state failed; the target describes the end of run 2."
+	}
+	consistency.Note = note
+	return consistency
+}
+
+const replayMethodology = "Two identical input sequences (input_set down, frame_advance x N, input_set up per step) executed from the same saved state under exclusive control. If the target is running when the call arrives it is paused before the initial restore, so nothing executes between the restore and the first step; every restore that precedes stepping ends paused, so no frame advances outside the replay's own steps, and each run reports initial_run_state, initial_run_state_verified (was the machine already paused before this run changed anything), paused_start_confirmed (did the native echo prove the run began paused) and initial_run_state_note. A pause the replay had to perform is informational and does not weaken the verdict. The VDP render counter is not part of a saved state and is never reset by state_load, so per-step tokens are compared as deltas from a frame_token_baseline captured at the start of each run, never as absolute values; a token below its run's baseline proves the counter was reset or wrapped and is reported unproven. Per-step M68K register samples (pc/a7/d0) and the final register set are compared field by field. An unreadable token or register set is reported as unproven and never counted as a match. The final restore reloads the initial snapshot and leaves the target in the run state observed before the call. Demonstrated determinism holds for this emulator build and this ROM only; it does not guarantee cross-build reproducibility."
 
 // replayRunView renders one run's observables.
 func replayRunView(run *replayRunResult) map[string]any {
@@ -394,6 +517,8 @@ func replayRunView(run *replayRunResult) map[string]any {
 		"generation_span":            run.GenerationSpan,
 		"initial_run_state":          run.InitialRunState,
 		"initial_run_state_verified": run.InitialRunStateVerified,
+		"initial_run_state_note":     run.InitialRunStateNote,
+		"paused_start_confirmed":     run.PausedStartConfirmed,
 		"final_registers":            run.FinalRegisters.view(),
 	}
 	if len(run.Unproven) > 0 {
@@ -512,12 +637,13 @@ func compareReplayRuns(run1, run2 *replayRunResult) replayComparison {
 		addCheck("frames_advanced_match", false, fmt.Sprintf("run 1 advanced %d frames, run 2 advanced %d (requested %d)", run1.FramesAdvanced, run2.FramesAdvanced, run1.FramesRequested))
 	}
 
-	// 5. A replay is only meaningful when both runs started paused: a running
-	// target advances frames between the steps.
-	startedPaused := run1.InitialRunStateVerified && run2.InitialRunStateVerified
-	addCheck("initial_run_state_paused", startedPaused, fmt.Sprintf("run 1 started %s, run 2 started %s", run1.InitialRunState, run2.InitialRunState))
-	if !startedPaused {
-		comparison.Unproven = append(comparison.Unproven, fmt.Sprintf("the replay did not verify a paused start (run 1: %s, run 2: %s), so the stepped frames are not comparable", run1.InitialRunState, run2.InitialRunState))
+	// 5. Both runs must have actually begun paused, proven by the native echo.
+	// A pause the replay had to perform does not fail this check: it is issued
+	// before the restore, so the run still started from a quiescent machine.
+	pausedStarts := run1.PausedStartConfirmed && run2.PausedStartConfirmed
+	addCheck("initial_run_state_paused", pausedStarts, fmt.Sprintf("run 1 began %s (%s), run 2 began %s (%s)", run1.InitialRunState, replayPauseOrigin(run1), run2.InitialRunState, replayPauseOrigin(run2)))
+	if !pausedStarts {
+		comparison.Unproven = append(comparison.Unproven, fmt.Sprintf("the replay could not prove a paused start (run 1: %s, run 2: %s), so the stepped frames are not comparable", run1.InitialRunState, run2.InitialRunState))
 	}
 
 	comparison.Deterministic = len(comparison.Divergences) == 0 && len(comparison.Unproven) == 0
@@ -698,30 +824,26 @@ func replayInitialState(tc toolContext, context *analysis.Context, stateID strin
 // replayRestoreOutcome reports the run state one restore left the machine in and
 // whether the replay had to force a pause to get there.
 type replayRestoreOutcome struct {
-	// RestoredRunState is the run state the load echo reported before the
-	// replay forced a pause, so a caller can see whether the machine had to be
-	// paused at all.
+	// RestoredRunState is the run state the load echo reported, before any
+	// follow-up pause, so a caller can see whether the restore itself left the
+	// machine running.
 	RestoredRunState string
-	// RunState is the run state after the restore, including the forced pause
-	// when one was requested; Verified reports whether the native echo
-	// confirmed it.
+	// RunState is the last run state a native echo reported for this restore
+	// and Verified reports whether that echo proved the machine was paused.
 	RunState string
 	Verified bool
-	Paused   bool
-}
-
-// pauseCycle reports whether this restore needed a pause cycle: the replay
-// paused a machine that was not already paused. A machine that was already
-// paused costs no run-state transition.
-func (outcome *replayRestoreOutcome) pauseCycle() bool {
-	return outcome != nil && outcome.Paused && outcome.RestoredRunState != runStatePaused
+	// PausedByTool reports whether this restore had to pause a machine the load
+	// left running (or left unobserved).
+	PausedByTool bool
 }
 
 // replayRestoreState loads a snapshot back into the emulator under the
-// exclusive window guard. When pause is set, it forces the restored machine
-// paused inside the same window: a replay that steps on a running target
-// observes frames the sequence never requested.
-func replayRestoreState(tc toolContext, contextID, path string, guard mutationGuard, phase string, pause bool) (*replayRestoreOutcome, *toolFailure) {
+// exclusive window guard. When pauseIfRunning is set, a load that leaves the
+// machine running (or leaves its run state unobserved) is followed by a pause:
+// a replay that steps on a running target observes frames the sequence never
+// requested. The replay always pauses before its first restore, so this
+// fallback only covers a bridge whose load resumes execution.
+func replayRestoreState(tc toolContext, contextID, path string, guard mutationGuard, phase string, pauseIfRunning bool) (*replayRestoreOutcome, *toolFailure) {
 	payload, _, _, failure := tc.server.executeMutation(tc.ctx, mutationCall{
 		tool:      "deterministic_replay",
 		operation: "state_load",
@@ -735,20 +857,13 @@ func replayRestoreState(tc toolContext, contextID, path string, guard mutationGu
 	}
 	recordStateFromPayload(tc.server, payload, false)
 	outcome := &replayRestoreOutcome{}
-	outcome.RestoredRunState, _ = payloadRunState(payload)
-	outcome.RunState = outcome.RestoredRunState
-	if !pause {
-		outcome.Verified = outcome.RestoredRunState != runStateUnknown
+	state, echoPresent := payloadRunState(payload)
+	outcome.RestoredRunState = state
+	outcome.RunState, outcome.Verified = state, echoPresent && state == runStatePaused
+	if outcome.Verified || !pauseIfRunning {
 		return outcome, nil
 	}
-	pausePayload, _, _, failure := tc.server.executeMutation(tc.ctx, mutationCall{
-		tool:      "deterministic_replay",
-		operation: "cpu_control",
-		params:    map[string]string{"action": "pause"},
-		guard:     windowCloseGuard(guard.ControlID),
-		contextID: contextID,
-		detail:    map[string]any{"phase": phase, "action": "pause", "reason": "the replay requires a paused start"},
-	})
+	pauseState, pausePresent, failure := replaySetRunState(tc, contextID, guard, phase, "pause", "the replay requires a paused start")
 	if failure != nil {
 		return nil, &toolFailure{
 			Code:    failure.Code,
@@ -756,10 +871,93 @@ func replayRestoreState(tc toolContext, contextID, path string, guard mutationGu
 			Data:    map[string]any{"state_restored": true, "restore_phase": phase},
 		}
 	}
-	outcome.Paused = true
-	recordStateFromPayload(tc.server, pausePayload, false)
-	outcome.RunState, outcome.Verified = payloadRunState(pausePayload)
+	outcome.PausedByTool = true
+	outcome.RunState = pauseState
+	outcome.Verified = pausePresent && pauseState == runStatePaused
 	return outcome, nil
+}
+
+// replaySetRunState issues one run-state action (pause or run) inside the
+// exclusive window and returns the state the native echo reported with whether
+// the echo carried it at all.
+func replaySetRunState(tc toolContext, contextID string, guard mutationGuard, phase, action, reason string) (string, bool, *toolFailure) {
+	payload, _, _, failure := tc.server.executeMutation(tc.ctx, mutationCall{
+		tool:      "deterministic_replay",
+		operation: "cpu_control",
+		params:    map[string]string{"action": action},
+		guard:     windowCloseGuard(guard.ControlID),
+		contextID: contextID,
+		detail:    map[string]any{"phase": phase, "action": action, "reason": reason},
+	})
+	if failure != nil {
+		return runStateUnknown, false, failure
+	}
+	recordStateFromPayload(tc.server, payload, action == "run")
+	state, present := payloadRunState(payload)
+	return state, present, nil
+}
+
+// replayEntryRunState observes the run state the target has when the call
+// arrives. It asks the emulator instead of trusting the run-state tracker: a
+// tracker observation can predate a UI-initiated resume, and this reading
+// decides whether the replay has to pause before its first restore.
+func replayEntryRunState(tc toolContext) (string, bool) {
+	payload, failure := tc.server.executeCommand(tc.ctx, "emulator_status", nil)
+	if failure == nil {
+		if running, ok := payload["system_running"].(bool); ok {
+			tc.server.runState.observe(tc.server, running, nil)
+			return runStateLabel(running), true
+		}
+	}
+	return observedRunState(tc)
+}
+
+// replayClosureResult is the outcome of closing the replay window: the initial
+// state is reloaded and the target is left in the run state the call found.
+type replayClosureResult struct {
+	Restored              bool
+	FinalRunState         string
+	FinalRunStateVerified bool
+	Resumed               bool
+	// RestoreState is one of the runStateRestore* labels, so a caller can tell
+	// a resumed target from one that was already paused and from a resume the
+	// server refused to guess.
+	RestoreState string
+}
+
+// replayCloseWindow reloads the initial snapshot and restores the run state the
+// call observed before it changed anything: a target that was running runs
+// again, a paused target stays paused, and a run state the server never
+// observed is not guessed (the target stays paused, like the capture windows).
+// The returned outcome is non-nil even when a step failed.
+func replayCloseWindow(tc toolContext, contextID, path string, guard mutationGuard, phase, entryRunState string, entryKnown bool) (*replayClosureResult, *toolFailure) {
+	result := &replayClosureResult{FinalRunState: runStateUnknown, RestoreState: runStateRestoreFailed}
+	outcome, failure := replayRestoreState(tc, contextID, path, guard, phase, false)
+	if failure != nil {
+		return result, failure
+	}
+	result.Restored = true
+	result.FinalRunState = outcome.RunState
+	result.FinalRunStateVerified = outcome.Verified
+	switch {
+	case !entryKnown:
+		// A run state the server never observed is not guessed: the target
+		// stays paused instead of being started blindly.
+		result.RestoreState = runStateRestoreSkippedUnknown
+		return result, nil
+	case entryRunState != runStateRunning:
+		result.RestoreState = runStateRestoreAlreadyPaused
+		return result, nil
+	}
+	state, present, failure := replaySetRunState(tc, contextID, guard, phase, "run", "restore the run state observed before the call")
+	if failure != nil {
+		return result, failure
+	}
+	result.FinalRunState = state
+	result.FinalRunStateVerified = present && state == runStateRunning
+	result.Resumed = true
+	result.RestoreState = runStateRestoreRestored
+	return result, nil
 }
 
 // replayFrameTokenBaseline reads the absolute VDP render token the run starts
@@ -840,7 +1038,7 @@ func (run *replayRunResult) derivePerStepDeltas() {
 // presses the step's buttons down on each port, advances the requested number of
 // frames, records the resulting frame token, samples the M68K registers, and
 // releases the buttons.
-func replayRunSequence(tc toolContext, contextID string, steps []normalizedReplayStep, guard mutationGuard, restored *replayRestoreOutcome, phase string) (*replayRunResult, *toolFailure) {
+func replayRunSequence(tc toolContext, contextID string, steps []normalizedReplayStep, guard mutationGuard, start replayRunStart, phase string) (*replayRunResult, *toolFailure) {
 	var requested uint64
 	for _, step := range steps {
 		requested += step.Frames
@@ -851,8 +1049,10 @@ func replayRunSequence(tc toolContext, contextID string, steps []normalizedRepla
 		StepRegisters:           make([]replayRegisters, 0, len(steps)),
 		FramesRequested:         requested,
 		GenerationStart:         tc.server.target.Generation(),
-		InitialRunState:         restored.RunState,
-		InitialRunStateVerified: restored.Verified && restored.RunState == runStatePaused,
+		InitialRunState:         start.RunState,
+		InitialRunStateVerified: start.PreexistingPause,
+		PausedStartConfirmed:    start.Confirmed,
+		InitialRunStateNote:     start.Note,
 	}
 	// The baseline is captured before the first step so every step is compared
 	// as a distance from this run's own starting token.

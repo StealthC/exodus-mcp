@@ -12,18 +12,25 @@ import (
 )
 
 // replayFakeConfig configures replayFake. The zero value models an honest
-// bridge: state_save writes a real file (so stat/hash succeed), state_load
-// leaves the VDP render counter alone because the counter is not part of a
-// saved state, frame_advance reports the advancing token, regs_get reports
-// pc/a7/d0 derived from the frames this run advanced, and cpu_control verifies
-// the resulting run state.
+// paused bridge: state_save writes a real file (so stat/hash succeed),
+// state_load restores machine state but never the run state (the VDP render
+// counter is not part of a saved state either), frame_advance reports the
+// advancing token and leaves the system paused, regs_get reports pc/a7/d0
+// derived from the frames the machine executed since the last restore, and
+// cpu_control echoes the run state it produced.
 type replayFakeConfig struct {
 	// startToken is the render counter the machine had already reached before
 	// the replay began.
 	startToken uint64
 	// runningAtStart models a caller that left the machine running: the state
-	// load preserves that run state, so the replay has to pause it once.
+	// load preserves that run state, so the replay has to pause it.
 	runningAtStart bool
+	// autoAdvanceFrames models a machine that keeps executing while it runs:
+	// every IPC call that arrives advances that many frames before it is
+	// served, so a still-running bridge does real work in the gaps between the
+	// replay's own calls. This is what makes a pause issued after the restore
+	// skew run 1 relative to run 2.
+	autoAdvanceFrames uint64
 	// resetTokenOnLoad models a counter reset across the restore. The replay
 	// must not depend on it: deltas are compared either way.
 	resetTokenOnLoad bool
@@ -38,45 +45,74 @@ type replayFakeConfig struct {
 	omitFrameToken bool
 	// unreadableRegisters makes regs_get return no register map.
 	unreadableRegisters bool
-	// pauseEcho, when set, replaces the run state cpu_control echoes so a
-	// pause that cannot be verified can be modelled.
+	// omitLoadRunState drops system_running from the state_load echo, modelling
+	// a bridge that cannot report the run state a restore left behind.
+	omitLoadRunState bool
+	// omitStatusRunState drops system_running from emulator_status, modelling a
+	// target whose pre-call run state the server cannot observe.
+	omitStatusRunState bool
+	// pauseEcho, when set, replaces the run state a pause echoes so a pause that
+	// cannot be verified can be modelled.
 	pauseEcho map[string]any
 }
 
 // replayFake builds a bridge that answers the deterministic_replay flow and
-// keeps the render counter across state_load, exactly like the real plugin.
+// keeps the render counter and the run state across state_load, exactly like the
+// real plugin.
 func replayFake(config replayFakeConfig) *fakeBridgeClient {
 	client := &fakeBridgeClient{status: newFakeStatus()}
 	token := config.startToken
+	running := config.runningAtStart
 	loads := 0
-	runFrames := uint64(0)
 	advances := 0
+	executed := uint64(0) // frames the machine ran since the last restore
 	client.executeFunc = func(ctx context.Context, method string, params map[string]string) (json.RawMessage, error) {
+		// A running machine executes on its own between IPC calls until
+		// something pauses it.
+		if running && config.autoAdvanceFrames > 0 {
+			token += config.autoAdvanceFrames
+			executed += config.autoAdvanceFrames
+		}
 		switch method {
+		case "emulator_status":
+			if config.omitStatusRunState {
+				return json.RawMessage(`{}`), nil
+			}
+			return json.RawMessage(fmt.Sprintf(`{"system_running":%t}`, running)), nil
 		case "state_save":
 			if err := os.WriteFile(params["path"], []byte("state-bytes"), 0o644); err != nil {
 				return nil, err
 			}
-			return json.RawMessage(`{"saved":true}`), nil
+			return json.RawMessage(fmt.Sprintf(`{"saved":true,"system_running":%t}`, running)), nil
 		case "state_load":
 			// The VDP render counter is not part of the saved state and this
-			// bridge does not reset it unless the test asks for a reset.
+			// bridge does not reset it unless the test asks for a reset. The
+			// load never changes the run state either.
 			if config.resetTokenOnLoad {
 				token = 0
 			}
 			loads++
-			runFrames = 0
+			executed = 0
 			advances = 0
-			running := config.runningAtStart && loads == 1
+			if config.omitLoadRunState {
+				return json.RawMessage(`{"loaded":true}`), nil
+			}
 			return json.RawMessage(fmt.Sprintf(`{"loaded":true,"system_running":%t}`, running)), nil
 		case "vdp_status":
 			return json.RawMessage(fmt.Sprintf(`{"vdp_found":true,"image_buffer":{"last_rendered_frame_token":%d}}`, token)), nil
 		case "cpu_control":
-			if config.pauseEcho != nil {
-				encoded, _ := json.Marshal(config.pauseEcho)
-				return json.RawMessage(encoded), nil
+			action := params["action"]
+			switch action {
+			case "pause":
+				running = false
+				if config.pauseEcho != nil {
+					encoded, _ := json.Marshal(config.pauseEcho)
+					return json.RawMessage(encoded), nil
+				}
+			case "run":
+				running = true
 			}
-			return json.RawMessage(`{"action":"pause","system_running":false}`), nil
+			return json.RawMessage(fmt.Sprintf(`{"action":%q,"system_running":%t}`, action, running)), nil
 		case "input_set":
 			return json.RawMessage(`{}`), nil
 		case "frame_advance":
@@ -89,7 +125,8 @@ func replayFake(config replayFakeConfig) *fakeBridgeClient {
 			}
 			advances++
 			token += frames
-			runFrames += frames
+			executed += frames
+			running = false
 			if config.omitFrameToken {
 				return json.RawMessage(fmt.Sprintf(`{"frames_requested":%d,"frames_completed":%d,"system_running":false}`, frames, frames)), nil
 			}
@@ -98,11 +135,11 @@ func replayFake(config replayFakeConfig) *fakeBridgeClient {
 			if config.unreadableRegisters {
 				return json.RawMessage(`{"cpu":"m68k","byte_order":"big-endian"}`), nil
 			}
-			pc := uint64(0x200) + runFrames*2
+			pc := uint64(0x200) + executed*2
 			if config.registerDrift && loads == 2 {
 				pc += 0x100
 			}
-			return json.RawMessage(fmt.Sprintf(`{"cpu":"m68k","byte_order":"not-applicable","system_paused_during_read":false,"registers":{"pc":%d,"a7":16776672,"d0":%d},"flags":{},"width_bits":32}`, pc, runFrames)), nil
+			return json.RawMessage(fmt.Sprintf(`{"cpu":"m68k","byte_order":"not-applicable","system_paused_during_read":false,"registers":{"pc":%d,"a7":16776672,"d0":%d},"flags":{},"width_bits":32}`, pc, executed)), nil
 		default:
 			return json.RawMessage(`{}`), nil
 		}
@@ -205,16 +242,21 @@ func TestDeterministicReplayComparesPerStepDeltas(t *testing.T) {
 		t.Fatalf("diverged_step reported for a matching replay: %v", content["diverged_step"])
 	}
 	if content["pause_resume_cycle"] != float64(1) {
-		t.Fatalf("pause_resume_cycle = %v, want 1 (only the running start had to be paused; the between-runs restore was already paused)", content["pause_resume_cycle"])
+		t.Fatalf("pause_resume_cycle = %v, want 1 (the running target had to be paused once, before the first restore)", content["pause_resume_cycle"])
 	}
-	for key := range map[string]bool{"run_1": true, "run_2": true} {
-		run := replayRun(t, content, key)
-		if run["initial_run_state"] != "paused" || run["initial_run_state_verified"] != true {
-			t.Fatalf("%s initial_run_state = %v (verified %v), want paused/verified", key, run["initial_run_state"], run["initial_run_state_verified"])
-		}
+	if run := replayRun(t, content, "run_1"); run["initial_run_state"] != "paused" || run["paused_start_confirmed"] != true {
+		t.Fatalf("run_1 initial_run_state = %v (confirmed %v), want a confirmed paused start", run["initial_run_state"], run["paused_start_confirmed"])
+	} else if run["initial_run_state_verified"] != false {
+		t.Fatalf("run_1 initial_run_state_verified = %v, want false: the replay paused a running target", run["initial_run_state_verified"])
 	}
-	if content["final_run_state"] != "paused" || content["restored"] != true {
-		t.Fatalf("final_run_state = %v restored = %v", content["final_run_state"], content["restored"])
+	if run := replayRun(t, content, "run_2"); run["initial_run_state"] != "paused" || run["initial_run_state_verified"] != true {
+		t.Fatalf("run_2 initial_run_state = %v (verified %v), want paused/verified", run["initial_run_state"], run["initial_run_state_verified"])
+	}
+	if content["final_run_state"] != "running" || content["resumed_after_restore"] != true {
+		t.Fatalf("final_run_state = %v (resumed %v), want running: the target ran before the call", content["final_run_state"], content["resumed_after_restore"])
+	}
+	if content["restored"] != true {
+		t.Fatalf("restored = %v, want true", content["restored"])
 	}
 	artifact, _ := content["artifact"].(map[string]any)
 	if artifact["kind"] != "replay-manifest" {
@@ -351,56 +393,150 @@ func TestDeterministicReplayUnreadableRegistersAreNotProven(t *testing.T) {
 	}
 }
 
-// TestDeterministicReplayPausesBeforeStepping asserts the machine is forced
-// paused after every restore that precedes stepping.
-func TestDeterministicReplayPausesBeforeStepping(t *testing.T) {
-	client := replayFake(replayFakeConfig{})
-	content := replayContent(t, client, `{"steps":[{"inputs":{"1":["a"]},"frames":1}]}`)
-	if content["pause_resume_cycle"] != float64(0) {
-		t.Fatalf("pause_resume_cycle = %v, want 0 when the machine was already paused", content["pause_resume_cycle"])
+// TestDeterministicReplayRunningTargetStaysDeterministic is the regression test
+// for the reported defect: the target is running when the call arrives and keeps
+// executing on its own between IPC calls until something pauses it. The window
+// must pause it BEFORE the first restore, otherwise run 1 observes frames run 2
+// never gets and a deterministic target is reported as nondeterministic.
+func TestDeterministicReplayRunningTargetStaysDeterministic(t *testing.T) {
+	client := replayFake(replayFakeConfig{runningAtStart: true, autoAdvanceFrames: 1})
+	content := replayContent(t, client,
+		`{"steps":[{"inputs":{"1":["a","b"]},"frames":2},{"inputs":{"2":["start"]},"frames":1}]}`)
+
+	if content["deterministic"] != true {
+		t.Fatalf("deterministic = %v, want true: %v", content["deterministic"], content)
+	}
+	if unproven, _ := content["unproven"].([]any); len(unproven) != 0 {
+		t.Fatalf("unproven = %v, want none", unproven)
+	}
+	if _, exists := content["divergences"]; exists {
+		t.Fatalf("divergences reported for a matching replay: %v", content["divergences"])
+	}
+	checks := replayChecks(content)
+	for _, name := range []string{"frame_token_deltas_match", "step_registers_match", "final_registers_match", "frames_advanced_match", "initial_run_state_paused"} {
+		if check := checks[name]; check == nil || check["passed"] != true {
+			t.Fatalf("%s = %v, want a passed check", name, check)
+		}
+	}
+	if content["pause_resume_cycle"] != float64(1) {
+		t.Fatalf("pause_resume_cycle = %v, want 1 (the running target was paused once, before the restore)", content["pause_resume_cycle"])
+	}
+	if note, _ := content["pause_resume_cycle_note"].(string); !strings.Contains(note, "BEFORE the restore") {
+		t.Fatalf("pause_resume_cycle_note does not state that the pause precedes the restore: %q", note)
+	}
+	run1 := replayRun(t, content, "run_1")
+	run2 := replayRun(t, content, "run_2")
+	for key, run := range map[string]map[string]any{"run_1": run1, "run_2": run2} {
+		if run["initial_run_state"] != "paused" || run["paused_start_confirmed"] != true {
+			t.Fatalf("%s initial_run_state = %v (confirmed %v), want a confirmed paused start", key, run["initial_run_state"], run["paused_start_confirmed"])
+		}
+	}
+	if run1["initial_run_state_verified"] != false {
+		t.Fatalf("run_1 initial_run_state_verified = %v, want false (the replay paused the running target)", run1["initial_run_state_verified"])
+	}
+	if note, _ := run1["initial_run_state_note"].(string); !strings.Contains(note, "before the initial restore") {
+		t.Fatalf("run_1 initial_run_state_note does not explain the pause: %q", note)
+	}
+	if run2["initial_run_state_verified"] != true {
+		t.Fatalf("run_2 initial_run_state_verified = %v, want true (run 2 starts from the machine run 1 left paused)", run2["initial_run_state_verified"])
 	}
 
+	// The pause must precede every restore, and the resume must follow the last
+	// one: a pause after a restore is what skewed the runs.
 	loads := []int{}
 	pauses := []int{}
-	advances := []int{}
+	resumes := []int{}
 	for index, call := range client.recordedCalls {
 		switch call.Method {
 		case "state_load":
 			loads = append(loads, index)
 		case "cpu_control":
-			pauses = append(pauses, index)
-			if call.Params["action"] != "pause" {
-				t.Fatalf("cpu_control action = %q, want pause", call.Params["action"])
+			switch call.Params["action"] {
+			case "pause":
+				pauses = append(pauses, index)
+			case "run":
+				resumes = append(resumes, index)
 			}
-		case "frame_advance":
-			advances = append(advances, index)
 		}
 	}
 	if len(loads) != 3 {
 		t.Fatalf("state_load calls = %d, want 3 (initial, between runs, final)", len(loads))
 	}
-	if len(pauses) != 2 {
-		t.Fatalf("pause calls = %d, want 2 (one per run)", len(pauses))
+	if len(pauses) != 1 || pauses[0] > loads[0] {
+		t.Fatalf("pause calls = %v, want exactly one before the first state_load at call %d", pauses, loads[0])
 	}
-	for run := 0; run < 2; run++ {
-		if pauses[run] != loads[run]+1 {
-			t.Fatalf("pause %d at call %d, want immediately after state_load at %d", run, pauses[run], loads[run])
-		}
+	if len(resumes) != 1 || resumes[0] < loads[2] {
+		t.Fatalf("run calls = %v, want exactly one after the final state_load at call %d", resumes, loads[2])
 	}
-	if advances[0] < pauses[0] || advances[1] < pauses[1] {
-		t.Fatalf("frame_advance before the run's pause: advances %v pauses %v", advances, pauses)
+	// The target must be left in the run state it had before the call.
+	if content["entry_run_state"] != "running" {
+		t.Fatalf("entry_run_state = %v, want running", content["entry_run_state"])
 	}
-	for _, pause := range pauses {
-		if pause > loads[2] {
-			t.Fatalf("the final restore must not force a pause (pause %d after final load %d)", pause, loads[2])
+	if content["final_run_state"] != "running" || content["final_run_state_verified"] != true {
+		t.Fatalf("final_run_state = %v (verified %v), want running/verified", content["final_run_state"], content["final_run_state_verified"])
+	}
+	if content["resumed_after_restore"] != true || content["run_state_restored"] != "restored" {
+		t.Fatalf("resumed_after_restore = %v run_state_restored = %v, want true/restored", content["resumed_after_restore"], content["run_state_restored"])
+	}
+}
+
+// TestDeterministicReplayPausedTargetNeedsNoPause asserts a target that is
+// already paused sees no run-state transition at all, and stays paused.
+func TestDeterministicReplayPausedTargetNeedsNoPause(t *testing.T) {
+	client := replayFake(replayFakeConfig{})
+	content := replayContent(t, client, `{"steps":[{"inputs":{"1":["a"]},"frames":1}]}`)
+	if content["pause_resume_cycle"] != float64(0) {
+		t.Fatalf("pause_resume_cycle = %v, want 0 when the machine was already paused", content["pause_resume_cycle"])
+	}
+	if content["entry_run_state"] != "paused" || content["final_run_state"] != "paused" {
+		t.Fatalf("entry_run_state = %v final_run_state = %v, want paused/paused", content["entry_run_state"], content["final_run_state"])
+	}
+	if content["resumed_after_restore"] != false || content["run_state_restored"] != "already_paused" {
+		t.Fatalf("resumed_after_restore = %v run_state_restored = %v, want false/already_paused", content["resumed_after_restore"], content["run_state_restored"])
+	}
+	for _, call := range client.recordedCalls {
+		if call.Method == "cpu_control" {
+			t.Fatalf("cpu_control %q called for an already paused target", call.Params["action"])
 		}
 	}
 }
 
-// TestDeterministicReplayUnverifiedPausedStartIsNotProven covers a pause whose
-// echo cannot confirm the run state.
+// TestDeterministicReplayUnknownEntryRunStateIsNotResumed covers a target whose
+// pre-call run state the server cannot observe: the replay still pauses before
+// the restore (so the runs stay comparable) but never resumes a machine it
+// cannot attribute.
+func TestDeterministicReplayUnknownEntryRunStateIsNotResumed(t *testing.T) {
+	client := replayFake(replayFakeConfig{omitStatusRunState: true, autoAdvanceFrames: 1, runningAtStart: true})
+	content := replayContent(t, client, `{"steps":[{"inputs":{"1":["a"]},"frames":2}]}`)
+	if content["deterministic"] != true {
+		t.Fatalf("deterministic = %v, want true: %v", content["deterministic"], content)
+	}
+	if content["entry_run_state"] != "unknown" {
+		t.Fatalf("entry_run_state = %v, want unknown", content["entry_run_state"])
+	}
+	if content["run_state_restored"] != "resume_skipped_initial_run_state_unknown" {
+		t.Fatalf("run_state_restored = %v, want resume_skipped_initial_run_state_unknown", content["run_state_restored"])
+	}
+	if content["resumed_after_restore"] != false || content["final_run_state"] != "paused" {
+		t.Fatalf("resumed_after_restore = %v final_run_state = %v, want false/paused", content["resumed_after_restore"], content["final_run_state"])
+	}
+	resumes := 0
+	for _, call := range client.recordedCalls {
+		if call.Method == "cpu_control" && call.Params["action"] == "run" {
+			resumes++
+		}
+	}
+	if resumes != 0 {
+		t.Fatalf("cpu_control run called %d times for an unobserved entry state", resumes)
+	}
+}
+
+// TestDeterministicReplayUnverifiedPausedStartIsNotProven covers a bridge that
+// reports no run state on either the restore or the pause: the replay still
+// pauses before stepping, but the paused start stays unproven instead of being
+// assumed.
 func TestDeterministicReplayUnverifiedPausedStartIsNotProven(t *testing.T) {
-	content := replayContent(t, replayFake(replayFakeConfig{pauseEcho: map[string]any{"action": "pause"}}),
+	content := replayContent(t, replayFake(replayFakeConfig{omitLoadRunState: true, pauseEcho: map[string]any{"action": "pause"}}),
 		`{"steps":[{"inputs":{"1":["a"]},"frames":1}]}`)
 	if content["deterministic"] != false {
 		t.Fatalf("deterministic = %v, want false when the paused start is unverified", content["deterministic"])
@@ -411,7 +547,7 @@ func TestDeterministicReplayUnverifiedPausedStartIsNotProven(t *testing.T) {
 	unproven, _ := content["unproven"].([]any)
 	found := false
 	for _, entry := range unproven {
-		if reason, _ := entry.(string); strings.Contains(reason, "did not verify a paused start") {
+		if reason, _ := entry.(string); strings.Contains(reason, "could not prove a paused start") {
 			found = true
 		}
 	}
@@ -419,8 +555,9 @@ func TestDeterministicReplayUnverifiedPausedStartIsNotProven(t *testing.T) {
 		t.Fatalf("unproven does not explain the unverified start: %v", unproven)
 	}
 	for key := range map[string]bool{"run_1": true, "run_2": true} {
-		if run := replayRun(t, content, key); run["initial_run_state"] != "unknown" {
-			t.Fatalf("%s initial_run_state = %v, want unknown", key, run["initial_run_state"])
+		run := replayRun(t, content, key)
+		if run["initial_run_state"] != "unknown" || run["paused_start_confirmed"] != false {
+			t.Fatalf("%s initial_run_state = %v (confirmed %v), want unknown/unconfirmed", key, run["initial_run_state"], run["paused_start_confirmed"])
 		}
 	}
 }
@@ -494,6 +631,23 @@ func TestDeterministicReplayManifestRecordsBaselines(t *testing.T) {
 	}
 	if methodology, _ := manifest["methodology"].(string); !strings.Contains(methodology, "delta") {
 		t.Fatalf("methodology does not describe the delta comparison: %q", methodology)
+	}
+	if note, _ := manifest["pause_resume_cycle_note"].(string); !strings.Contains(note, "BEFORE the restore") {
+		t.Fatalf("manifest pause_resume_cycle_note does not state that the pause precedes the restore: %q", note)
+	}
+	if manifest["pause_resume_cycle"] != float64(0) || manifest["entry_run_state"] != "paused" {
+		t.Fatalf("manifest pause_resume_cycle = %v entry_run_state = %v, want 0/paused", manifest["pause_resume_cycle"], manifest["entry_run_state"])
+	}
+	if manifest["run_state_restored"] != "already_paused" || manifest["resumed_after_restore"] != false {
+		t.Fatalf("manifest run_state_restored = %v resumed_after_restore = %v, want already_paused/false", manifest["run_state_restored"], manifest["resumed_after_restore"])
+	}
+	// The artifact envelope must not claim a live sample of a paused window.
+	provenance := mustMap(t, mustMap(t, descriptor["provenance"], "artifact provenance")["capture_consistency"], "capture consistency")
+	if provenance["state"] != "paused" || provenance["initial_run_state"] != "paused" || provenance["final_run_state"] != "paused" {
+		t.Fatalf("capture_consistency = %v, want a paused window", provenance)
+	}
+	if provenance["execution_paused_by_tool"] != false || provenance["execution_resumed_after"] != false {
+		t.Fatalf("capture_consistency = %v, want no tool run-state change", provenance)
 	}
 }
 
