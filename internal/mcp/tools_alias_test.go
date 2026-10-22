@@ -142,7 +142,7 @@ func TestConsolidatedCatalogHasNoDuplicateConcept(t *testing.T) {
 
 // consolidatedCanonicalTools is the merged catalog. Each consolidation group
 // appends its canonical concept here.
-var consolidatedCanonicalTools = []string{"target_status", "memory_map", "memory_read", "disassemble", "cpu_step", "debug_instrument", "events_list"}
+var consolidatedCanonicalTools = []string{"target_status", "memory_map", "memory_read", "disassemble", "cpu_step", "debug_instrument", "events_list", "vdp_memory_read"}
 
 // payloadView strips the fields the dispatcher injects into every response and
 // the alias' own deprecation marker, so two payloads can be compared field by
@@ -876,6 +876,11 @@ var volatileAuditFields = map[string]bool{
 	// volatile; the parity assertion below still compares the cursor family.
 	"next_cursor": true,
 	"cursor":      true,
+	// Artifact identity is per store instance: an id, its download URL, and the
+	// capture timestamp cannot be equal across two servers.
+	"id":          true,
+	"url":         true,
+	"captured_at": true,
 }
 
 // cursorPrefix returns the family prefix of one cursor, the part that names the
@@ -909,6 +914,71 @@ func normalizeVolatile(value any) any {
 		return normalized
 	default:
 		return value
+	}
+}
+
+// ----------------------------------------------------------------------------------------------------------------------
+// vdp_memory_read alias parity (group 8)
+// ----------------------------------------------------------------------------------------------------------------------
+
+// vdpReadClient answers the timed-buffer VDP read for any target.
+func vdpReadClient() *fakeBridgeClient {
+	client := &fakeBridgeClient{status: newFakeStatus()}
+	client.executeFunc = func(_ context.Context, method string, params map[string]string) (json.RawMessage, error) {
+		if method != "vdp_mem_read" {
+			return json.RawMessage(`{}`), nil
+		}
+		length := 32
+		if value, err := strconv.Atoi(params["length"]); err == nil && value > 0 {
+			length = value
+		}
+		buffer := make([]byte, length)
+		buffer[0] = 0x02
+		return json.RawMessage(fmt.Sprintf(`{"target":%q,"address_space":"mem-vdp-%s","address":0,"effective_address":0,"length":%d,"buffer_size":65536,"entry_size":1,"byte_order":"big-endian","encoding":"base64","consistency":"live","system_paused_during_read":false,"data":%q}`,
+			params["target"], params["target"], length, base64.StdEncoding.EncodeToString(buffer))), nil
+	}
+	return client
+}
+
+// TestVDPMemoryReadAbsorbsTheExport proves the binary export is the artifact
+// output of the same read.
+func TestVDPMemoryReadAbsorbsTheExport(t *testing.T) {
+	arguments := `{"target":"vram","address":0,"length":32}`
+	canonical := canonicalPayload(t, vdpReadClient(), "vdp_memory_read", `{"output":"artifact",`+strings.TrimPrefix(arguments, "{"))
+	legacy := canonicalPayload(t, vdpReadClient(), "vdp_memory_export", arguments)
+
+	if canonical["output"] != "artifact" {
+		t.Fatalf("output = %v", canonical["output"])
+	}
+	delete(canonical, "output")
+	if !jsonEqual(t, canonical["sha256"], legacy["sha256"]) {
+		t.Fatalf("sha256 = %v, vdp_memory_export says %v", canonical["sha256"], legacy["sha256"])
+	}
+	// Artifact ids, URLs and capture timestamps are per-server; normalize them
+	// and compare everything else, including the provenance envelope.
+	if !jsonEqual(t, normalizeVolatile(canonical), normalizeVolatile(legacy)) {
+		t.Fatalf("artifact parity failed:\ncanonical = %v\nlegacy     = %v", canonical, legacy)
+	}
+}
+
+// TestVDPMemoryReadDefaultsToInline proves the pre-merge inline behavior is the
+// default: omitting output publishes inline and returns the same decoded view.
+func TestVDPMemoryReadDefaultsToInline(t *testing.T) {
+	canonical := canonicalPayload(t, vdpReadClient(), "vdp_memory_read", `{"target":"cram","address":0,"length":32,"representation":"hexdump"}`)
+	if canonical["output"] != "inline" {
+		t.Fatalf("output = %v", canonical["output"])
+	}
+	if canonical["representation"] != "hexdump" || canonical["hex"] == nil {
+		t.Fatalf("inline payload lost its decoded view: %v", canonical)
+	}
+}
+
+// TestVDPMemoryReadRejectsAnInlineRepresentationOnArtifact keeps the two
+// deliveries unambiguous.
+func TestVDPMemoryReadRejectsAnInlineRepresentationOnArtifact(t *testing.T) {
+	result := postToolCall(t, newTestServer(t, vdpReadClient()), "vdp_memory_read", `{"output":"artifact","target":"vram","address":0,"representation":"hexdump"}`)
+	if structured(result)["code"] != "invalid_params" {
+		t.Fatalf("code = %v, want invalid_params", structured(result))
 	}
 }
 

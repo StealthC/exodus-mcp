@@ -25,8 +25,9 @@ func vdpToolSpecs() []toolSpec {
 		},
 		{
 			name:        "vdp_memory_read",
-			description: fmt.Sprintf("Read raw VRAM, CRAM, or VSRAM bytes inline (cap %d) with explicit byte-order metadata, plus VDP-specific decoded views: big-endian words and CRAM 9-bit RGB entries. Reports the standardized capture_consistency object (atomic when the timed-buffer read had to pause the system); optional capture_mode \"paused\" makes the sample temporally atomic.", inlineReadCapBytes),
+			description: fmt.Sprintf("Read one VDP buffer (vram, cram, or vsram). output \"inline\" (default) returns at most %d bytes in the response with explicit byte-order metadata plus VDP-specific decoded views (big-endian words and CRAM 9-bit RGB entries); output \"artifact\" stores the range as a downloadable binary artifact and returns its descriptor, hash, size and URL, so a whole VRAM buffer never travels as Base64. Both paths report the standardized capture_consistency object (atomic when the timed-buffer read had to pause the system); optional capture_mode \"paused\" makes the sample temporally atomic. Inline length defaults to %d; an artifact length defaults to the whole buffer and is capped per buffer (vram 65536, cram 128, vsram 80 bytes).", inlineReadCapBytes, defaultVDPMemoryReadLen),
 			schema: objectSchema(map[string]any{
+				"output":         vdpOutputVocab.property("Delivery of the read: \"inline\" (default) returns the bytes in the response, \"artifact\" stores them as a downloadable binary artifact."),
 				"target":         vdpBufferVocab.property("VDP memory buffer to read."),
 				"address":        addressProperty(),
 				"length":         integerProperty(fmt.Sprintf("Byte length between 1 and %d (default %d). Word views require an even address and length.", inlineReadCapBytes, defaultVDPMemoryReadLen), 1),
@@ -135,7 +136,12 @@ const defaultVDPMemoryReadLen = 128
 // are not part of any real sprite table.
 const vdpSpriteTableMaxEntries = 80
 
+// vdpOutputVocab is the closed delivery vocabulary of vdp_memory_read: inline
+// bytes rendered in the response, or one downloadable binary artifact.
+var vdpOutputVocab = newEnumVocab("output", "inline", "artifact")
+
 type vdpMemoryReadArgs struct {
+	Output         string `json:"output"`
 	Target         string `json:"target"`
 	Address        any    `json:"address"`
 	AddressSpace   string `json:"address_space"`
@@ -230,6 +236,31 @@ func runVDPMemoryRead(tc toolContext, args json.RawMessage) map[string]any {
 	if failure != nil {
 		return failureResult(failure, tc.modern)
 	}
+	output, failure := vdpOutputVocab.resolve(parsed.Output, "inline")
+	if failure != nil {
+		return failureResult(failure, tc.modern)
+	}
+	if output == "artifact" {
+		// The artifact path owns its own length contract (default: the whole
+		// buffer, per-buffer caps), so an inline representation has nothing to
+		// render and is rejected rather than dropped.
+		if parsed.Representation != "" {
+			return failureResult(&toolFailure{Code: "invalid_params", Message: "representation applies only to output \"inline\"; output \"artifact\" returns raw bytes as a downloadable artifact"}, tc.modern)
+		}
+		payload, failure := composeTool(tc, runVDPMemoryExport, map[string]any{
+			"target":        parsed.Target,
+			"address":       parsed.Address,
+			"address_space": parsed.AddressSpace,
+			"length":        parsed.Length,
+			"capture_mode":  parsed.CaptureMode,
+			"context":       parsed.Context,
+		})
+		if failure != nil {
+			return failureResult(failure, tc.modern)
+		}
+		payload["output"] = output
+		return okResult(payload, tc.modern)
+	}
 	if _, failure = resolveContext(tc.server, parsed.Context); failure != nil {
 		return failureResult(failure, tc.modern)
 	}
@@ -259,9 +290,10 @@ func runVDPMemoryRead(tc toolContext, args json.RawMessage) map[string]any {
 	if failure = guard.resolve(); failure != nil {
 		return failureResult(failure, tc.modern)
 	}
-	return withCaptureGuard(tc, guard, func(window *captureWindow) (map[string]any, *toolFailure) {
+	result := withCaptureGuard(tc, guard, func(window *captureWindow) (map[string]any, *toolFailure) {
 		return vdpMemoryReadValue(tc, parsed.Target, address, length, representation, window)
 	})
+	return patchPayloadField(result, "output", output)
 }
 
 func representationNote(representation string) string {

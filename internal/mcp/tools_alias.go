@@ -65,6 +65,11 @@ var toolAliasRecords = []toolAliasRecord{
 		Mapping:     "mega_drive_memory_map returns the legacy {regions, note, live_spaces} object; memory_map.reference carries the same fields.",
 	},
 	{
+		Alias:       "vdp_memory_export",
+		Replacement: "vdp_memory_read",
+		Mapping:     "vdp_memory_export returns the legacy artifact payload; vdp_memory_read{output:\"artifact\", ...} returns the same artifact descriptor and provenance with an output echo.",
+	},
+	{
 		Alias:       "target_audit_log",
 		Replacement: "events_list",
 		Mapping:     "target_audit_log returns the global audit page; events_list{kinds:[\"audit\"], ...} returns the same page under sections.audit with the same cursor family.",
