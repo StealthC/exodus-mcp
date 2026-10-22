@@ -27,10 +27,10 @@ func vdpToolSpecs() []toolSpec {
 			name:        "vdp_memory_read",
 			description: fmt.Sprintf("Read raw VRAM, CRAM, or VSRAM bytes inline (cap %d) with explicit byte-order metadata, plus VDP-specific decoded views: big-endian words and CRAM 9-bit RGB entries. Reports the standardized capture_consistency object (atomic when the timed-buffer read had to pause the system); optional capture_mode \"paused\" makes the sample temporally atomic.", inlineReadCapBytes),
 			schema: objectSchema(map[string]any{
-				"target":         enumProperty("VDP memory buffer to read.", []string{"vram", "cram", "vsram"}),
+				"target":         vdpBufferVocab.property("VDP memory buffer to read."),
 				"address":        addressProperty(),
 				"length":         integerProperty(fmt.Sprintf("Byte length between 1 and %d (default %d). Word views require an even address and length.", inlineReadCapBytes, defaultVDPMemoryReadLen), 1),
-				"representation": enumProperty("Inline rendering.", []string{"hexdump", "array_u8", "raw_base64", "array_u16", "cram_rgb333"}),
+				"representation": vdpRepresentationVocab.property("Inline rendering."),
 				"capture_mode":   captureModeProperty(),
 				"context":        contextProperty(),
 			}, []string{"target", "address"}),
@@ -71,7 +71,7 @@ func vdpToolSpecs() []toolSpec {
 			name:        "vdp_plane_export",
 			description: "Render a full scroll plane (A, B, or window) from VRAM as an unscrolled texture view: scaled PNG artifact plus JSON structural summary with distinct tiles, priority counts, and capture consistency (system_paused_during_read / coherent_snapshot). vdp_capture_id resolves a stored vdp_capture and renders from its captured VRAM, CRAM, and status components instead of reading the device: the response then reports data_source \"capture\" and vdp_capture_reused true. A capture whose VRAM component does not cover the whole buffer fails with capture_component_omitted; an unknown or foreign id fails with capture_not_found.",
 			schema: objectSchema(map[string]any{
-				"plane":            enumProperty("Which name table to render.", []string{"a", "b", "window"}),
+				"plane":            vdpPlaneVocab.property("Which name table to render."),
 				"scale":            integerProperty("Nearest-neighbor upscale factor 1-4 (default 1).", 1),
 				"transparent_zero": booleanProperty("Render pixel index 0 as transparent instead of its palette color (default true)."),
 				"vdp_capture_id":   stringProperty("Optional capture_id from vdp_capture; when set, the plane comes from the capture's stored VRAM, CRAM, and status components and no device read is performed."),
@@ -115,7 +115,10 @@ func vdpToolSpecs() []toolSpec {
 	}
 }
 
-func runVdpStatus(tc toolContext, _ json.RawMessage) map[string]any {
+func runVdpStatus(tc toolContext, args json.RawMessage) map[string]any {
+	if _, failure := decodeArgs[noArgs](args); failure != nil {
+		return failureResult(failure, tc.modern)
+	}
 	payload, failure := tc.server.executeCommand(tc.ctx, "vdp_status", nil)
 	if failure != nil {
 		return failureResult(failure, tc.modern)
@@ -246,14 +249,12 @@ func runVDPMemoryRead(tc toolContext, args json.RawMessage) map[string]any {
 			Data:    map[string]any{"inline_cap_bytes": inlineReadCapBytes},
 		}, tc.modern)
 	}
-	switch parsed.Target {
-	case "vram", "cram", "vsram":
-	default:
-		return errorResult("invalid_params", "target must be vram, cram, or vsram", tc.modern)
+	if failure := vdpBufferVocab.validate(parsed.Target); failure != nil {
+		return failureResult(failure, tc.modern)
 	}
-	representation := parsed.Representation
-	if representation == "" {
-		representation = "hexdump"
+	representation, failure := vdpRepresentationVocab.resolve(parsed.Representation, "hexdump")
+	if failure != nil {
+		return failureResult(failure, tc.modern)
 	}
 	guard := captureGuard{Mode: parsed.CaptureMode}
 	if failure = guard.resolve(); failure != nil {
@@ -1525,11 +1526,8 @@ func runVDPPlaneExport(tc toolContext, args json.RawMessage) map[string]any {
 	}
 	transparentZero := parsed.TransparentZero == nil || *parsed.TransparentZero
 
-	if parsed.Plane != "a" && parsed.Plane != "b" && parsed.Plane != "window" {
-		return failureResult(&toolFailure{
-			Code:    "invalid_params",
-			Message: "vdp_plane_export plane must be one of: a, b, window.",
-		}, tc.modern)
+	if failure := vdpPlaneVocab.validate(parsed.Plane); failure != nil {
+		return failureResult(failure, tc.modern)
 	}
 	if scale < 1 || scale > maxVDPPlaneUpscale {
 		return failureResult(&toolFailure{

@@ -203,15 +203,11 @@ type captureGuard struct {
 
 // resolve validates the capture_mode argument.
 func (guard *captureGuard) resolve() *toolFailure {
-	if guard.Mode == "" {
-		guard.Mode = captureModeLive
+	mode, failure := captureModeVocab.resolve(guard.Mode, captureModeLive)
+	if failure != nil {
+		return failure
 	}
-	if guard.Mode != captureModeLive && guard.Mode != captureModePaused {
-		return &toolFailure{
-			Code:    "invalid_params",
-			Message: fmt.Sprintf("capture_mode must be %q (default) or %q", captureModeLive, captureModePaused),
-		}
-	}
+	guard.Mode = mode
 	return nil
 }
 

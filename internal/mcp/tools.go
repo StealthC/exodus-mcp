@@ -118,13 +118,39 @@ func (server *Server) callTool(ctx context.Context, params json.RawMessage, mode
 	if len(call.Arguments) == 0 {
 		call.Arguments = json.RawMessage("{}")
 	}
+	// Closed vocabularies are enforced from the published schema before the
+	// handler can substitute a default for an unsupported value.
+	if failure := validateToolArguments(spec, call.Arguments); failure != nil {
+		return failureResult(failure, modern)
+	}
 	result := spec.run(toolContext{server: server, ctx: ctx, modern: modern}, call.Arguments)
+	result = annotateContractFailure(result, call.Name)
 	failed, _ := result["isError"].(bool)
 	server.metrics.recordCall(call.Name, failed)
 	result = injectResultType(result, call.Name)
 	// Every result carries the target generation observed at response
 	// completion; mutations additionally report before/after.
 	return injectTargetGeneration(server, result)
+}
+
+// annotateContractFailure names the addressed tool on an unsupported_parameter
+// rejection: the decode-time failure cannot know it, and the caller needs to
+// know which tool's contract it violated.
+func annotateContractFailure(result map[string]any, toolName string) map[string]any {
+	if result == nil {
+		return result
+	}
+	structured, ok := result["structuredContent"].(map[string]any)
+	if !ok {
+		return result
+	}
+	if code, _ := structured["code"].(string); code != "unsupported_parameter" {
+		return result
+	}
+	if _, present := structured["tool"]; !present {
+		structured["tool"] = toolName
+	}
+	return result
 }
 
 func injectResultType(result map[string]any, toolName string) map[string]any {
@@ -272,9 +298,10 @@ func contextProperty() map[string]any {
 
 // captureModeProperty is the optional capture guard: "paused" pauses once
 // before the read and restores the prior run state (temporally atomic, but
-// perturbs real-time behavior); "live" (default) never pauses.
+// perturbs real-time behavior); "live" (default) never pauses. The schema
+// property and the decoder both read captureModeVocab.
 func captureModeProperty() map[string]any {
-	return enumProperty("Capture guard. \"paused\" pauses once before the read, samples, and restores the prior run state it observed (temporally atomic, perturbs timing-sensitive software); a target whose pre-call run state could not be observed is left paused and the response reports run_state_restore.code resume_skipped_initial_run_state_unknown. \"live\" (default) never pauses and samples a possibly inconsistent instant.", []string{"live", "paused"})
+	return captureModeVocab.property("Capture guard. \"paused\" pauses once before the read, samples, and restores the prior run state it observed (temporally atomic, perturbs timing-sensitive software); a target whose pre-call run state could not be observed is left paused and the response reports run_state_restore.code resume_skipped_initial_run_state_unknown. \"live\" (default) never pauses and samples a possibly inconsistent instant.")
 }
 
 // ----------------------------------------------------------------------------------------------------------------------
@@ -292,15 +319,6 @@ func decodeArgs[T any](args json.RawMessage) (*T, *toolFailure) {
 		return nil, &toolFailure{Code: "invalid_params", Message: "invalid arguments: " + err.Error()}
 	}
 	return &parsed, nil
-}
-
-func isGloballyAllowedField(key string) bool {
-	switch key {
-	case "context", "control_id", "expected_target_generation":
-		return true
-	default:
-		return false
-	}
 }
 
 // strictValidateArgs rejects unknown JSON properties with a full JSON path such as $.ranges[0].address.
@@ -323,16 +341,32 @@ func strictValidateArgs(raw json.RawMessage, typ reflect.Type, path string) *too
 			return nil
 		}
 		allowed := structFieldMap(typ)
-		for key, value := range fields {
-			if isGloballyAllowedField(key) {
-				continue
-			}
+		acceptedNames := sortedArgumentFieldNames(allowed)
+		keys := make([]string, 0, len(fields))
+		for key := range fields {
+			keys = append(keys, key)
+		}
+		sort.Strings(keys)
+		for _, key := range keys {
+			value := fields[key]
 			fieldType, ok := allowed[key]
 			if !ok {
+				// A mediation field the tool does not consume is a contract
+				// lie, not a typo: report it as unsupported so the caller
+				// never believes a guard was applied.
+				if isContractGuardField(key) {
+					return unsupportedParameterFailure(key, path+"."+key, acceptedNames)
+				}
+				data := map[string]any{"field": key, "path": path + "." + key}
+				if path == "$" {
+					// Name the accepted top-level fields so a caller can tell
+					// a typo from an argument the tool never had.
+					data["accepted_fields"] = acceptedNames
+				}
 				return &toolFailure{
 					Code:    "invalid_params",
 					Message: fmt.Sprintf("unknown field %q at %s.%s", key, path, key),
-					Data:    map[string]any{"field": key, "path": path + "." + key},
+					Data:    data,
 				}
 			}
 			// Recurse into known field value.

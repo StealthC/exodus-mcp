@@ -193,16 +193,13 @@ func TestPublishedSchemaMatchesArgumentStructs(t *testing.T) {
 			if _, decodable := fields[published]; decodable {
 				continue
 			}
-			if isGloballyAllowedField(published) {
-				continue
+			if isContractGuardField(published) {
+				t.Fatalf("%s publishes the mediation field %q but its argument struct does not decode it; publish it only when the handler applies it", tc.tool, published)
 			}
 			t.Fatalf("%s publishes %q but the strict decoder rejects it (decoded fields: %v)", tc.tool, published, sortedFieldNames(fields))
 		}
 		for field := range fields {
 			if _, published := properties[field]; published {
-				continue
-			}
-			if isGloballyAllowedField(field) {
 				continue
 			}
 			t.Fatalf("%s decodes %q but does not publish it", tc.tool, field)

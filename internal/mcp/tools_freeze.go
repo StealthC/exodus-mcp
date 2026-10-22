@@ -270,8 +270,8 @@ func freezeToolSpecs() []toolSpec {
 		},
 		{
 			name:        "memory_freeze_list",
-			description: "List the cell ranges currently frozen by this server process, with byte lengths, write counts, last write time, provenance (context, target generation, ROM), and any last error from the periodic re-write.",
-			schema:      objectSchema(map[string]any{}, nil),
+			description: "List the cell ranges currently frozen by this server process, with byte lengths, write counts, last write time, provenance (context, target generation, ROM), and any last error from the periodic re-write. An optional context handle restricts the listing to the ranges that context froze; omitted or \"all\" lists every entry.",
+			schema:      objectSchema(map[string]any{"context": listScopeProperty()}, nil),
 			run:         runMemoryFreezeList,
 		},
 		{
@@ -439,13 +439,30 @@ func freezeEntryView(entry *freezeEntry) map[string]any {
 	return view
 }
 
-func runMemoryFreezeList(tc toolContext, _ json.RawMessage) map[string]any {
+func runMemoryFreezeList(tc toolContext, args json.RawMessage) map[string]any {
+	parsed, failure := decodeArgs[listScopeArgs](args)
+	if failure != nil {
+		return failureResult(failure, tc.modern)
+	}
+	scope, contextID, failure := resolveListScope(tc, parsed.Context)
+	if failure != nil {
+		return failureResult(failure, tc.modern)
+	}
 	entries := tc.server.freezes.list()
 	views := make([]map[string]any, 0, len(entries))
+	hidden := 0
 	for _, entry := range entries {
+		if contextID != "" && entry.ContextID != contextID {
+			hidden++
+			continue
+		}
 		views = append(views, freezeEntryView(entry))
 	}
-	return okResult(map[string]any{"freezes_total": len(views), "freezes": views}, tc.modern)
+	payload := map[string]any{"freezes_total": len(views), "freezes": views, "context_scope": scope}
+	if hidden > 0 {
+		payload["hidden_out_of_scope"] = hidden
+	}
+	return okResult(payload, tc.modern)
 }
 
 type memoryFreezeRemoveArgs struct {

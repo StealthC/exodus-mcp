@@ -86,7 +86,7 @@ func phase4ToolSpecs() []toolSpec {
 			schema: objectSchema(map[string]any{
 				"context":                    contextProperty(),
 				"state_id":                   stringProperty("Snapshot id returned by state_save."),
-				"run_state":                  enumProperty("Restored run state. preserve (default) keeps the machine in the run state it had before the load; paused/running force it with a post-load cpu_control inside the same control window. The deprecated alias \"restore\" is accepted and behaves exactly like preserve.", []string{"preserve", "paused", "running"}),
+				"run_state":                  deprecatedEnumAliases(enumProperty("Restored run state. preserve (default) keeps the machine in the run state it had before the load; paused/running force it with a post-load cpu_control inside the same control window. The deprecated alias \"restore\" is accepted and behaves exactly like preserve.", []string{"preserve", "paused", "running"}), stateLoadRunStateRestore),
 				"expected_target_generation": integerProperty("Optional target generation the caller last observed; fails with target_generation_conflict on mismatch.", 1),
 				"control_id":                 stringProperty("Optional control id from target_control_acquire; required while the control lock is active."),
 			}, []string{"state_id"}),

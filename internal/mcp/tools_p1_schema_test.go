@@ -138,10 +138,19 @@ func TestStrictDecodingRejectsTypoWithPath(t *testing.T) {
 			t.Fatalf("valid address form %s rejected: %v", args, structured(result))
 		}
 	}
-	// Globally allowed fields must not be rejected.
+	// Mediation fields are declared per tool: memory_read consumes a context
+	// but not a control id or a generation precondition, so those are rejected
+	// instead of silently ignored (roadmap issue #9).
 	result := postToolCall(t, server, "memory_read", `{"space":"m68k-ram","address":0,"length":4,"control_id":"abc","expected_target_generation":1}`)
-	if result["isError"] == true {
-		t.Fatalf("globally allowed control_id must not be rejected: %v", structured(result))
+	if result["isError"] != true {
+		t.Fatalf("memory_read must reject the guard fields it does not consume: %v", structured(result))
+	}
+	rejected := structured(result)
+	if rejected["code"] != "unsupported_parameter" || rejected["field"] != "control_id" {
+		t.Fatalf("memory_read must report unsupported_parameter for control_id, got %v", rejected)
+	}
+	if accepted, ok := rejected["accepted_fields"].([]any); !ok || len(accepted) == 0 {
+		t.Fatalf("memory_read rejection must list the accepted fields, got %v", rejected)
 	}
 }
 

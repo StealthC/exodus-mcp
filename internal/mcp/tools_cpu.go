@@ -24,7 +24,7 @@ func cpuToolSpecs() []toolSpec {
 			name:        "cpu_trace_capture",
 			description: "Capture a bounded M68K or Z80 execution trace into a text artifact plus a versioned JSONL artifact with one event per executed instruction (PC numeric/hex, address_space, opcode bytes, length, mnemonic/operands, cycle, target_generation, capture_id, frame_token where available, and typed control-flow where available). The capture stops the system, routes the processor trace log through a temporary on-disk file, and restores the prior run state. The system runs during the window, so the capture mutates the target and advances the target generation. Optional filters (address_range_start/end, include_rom/include_ram, retain_repeated) are applied to the JSONL view and recorded in provenance. Accepts optional expected_target_generation and control_id.",
 			schema: objectSchema(map[string]any{
-				"cpu":                        enumProperty("Processor to trace.", []string{"m68k", "z80"}),
+				"cpu":                        cpuVocab.property("Processor to trace."),
 				"max_entries":                integerProperty(fmt.Sprintf("Maximum entries (default %d, cap %d).", defaultTraceEntries, maxTraceEntries), 1),
 				"timeout_ms":                 integerProperty("Capture window in milliseconds (default 5000, cap 30000).", 100),
 				"address_range_start":        addressProperty(),
@@ -129,7 +129,7 @@ func cpuReadMemorySchema() map[string]any {
 	return objectSchema(map[string]any{
 		"address":        addressProperty(),
 		"length":         integerProperty(fmt.Sprintf("Byte length between 1 and %d.", inlineReadCapBytes), 1),
-		"representation": enumProperty("Inline rendering.", []string{"raw_base64", "hexdump", "array_u8"}),
+		"representation": memoryRepresentationVocab.property("Inline rendering."),
 		"decode":         decodeSchemaProperty(),
 		"capture_mode":   captureModeProperty(),
 		"context":        contextProperty(),
@@ -140,7 +140,12 @@ func cpuReadMemorySchema() map[string]any {
 // Registers and disassembly
 // ----------------------------------------------------------------------------------------------------------------------
 func makeRunRegisters(cpu string) func(toolContext, json.RawMessage) map[string]any {
-	return func(tc toolContext, _ json.RawMessage) map[string]any {
+	return func(tc toolContext, args json.RawMessage) map[string]any {
+		// The schema publishes no arguments, so the decoder rejects every
+		// field instead of letting a caller pass a guard the handler ignores.
+		if _, failure := decodeArgs[noArgs](args); failure != nil {
+			return failureResult(failure, tc.modern)
+		}
 		payload, failure := tc.server.executeCommand(tc.ctx, "regs_get", map[string]string{"cpu": cpu})
 		if failure != nil {
 			return failureResult(failure, tc.modern)
@@ -421,7 +426,7 @@ func annotateDisassemblySymbols(context *analysis.Context, cpu, romSHA256 string
 // ----------------------------------------------------------------------------------------------------------------------
 func makeRunCpuMemoryRead(spaceID string) func(toolContext, json.RawMessage) map[string]any {
 	return func(tc toolContext, args json.RawMessage) map[string]any {
-		parsed, failure := decodeArgs[memoryReadArgs](args)
+		parsed, failure := decodeArgs[cpuMemoryReadArgs](args)
 		if failure != nil {
 			return failureResult(failure, tc.modern)
 		}
@@ -460,6 +465,9 @@ type traceCaptureArgs struct {
 func runCpuTraceCapture(tc toolContext, args json.RawMessage) map[string]any {
 	parsed, failure := decodeArgs[traceCaptureArgs](args)
 	if failure != nil {
+		return failureResult(failure, tc.modern)
+	}
+	if failure := cpuVocab.validate(parsed.CPU); failure != nil {
 		return failureResult(failure, tc.modern)
 	}
 	context, failure := resolveContext(tc.server, parsed.Context)

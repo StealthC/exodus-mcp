@@ -31,10 +31,15 @@ func phase1ToolSpecs() []toolSpec {
 		},
 		{
 			name:        "artifact_describe",
-			description: "DEPRECATED: use artifact_get with include [\"metadata\",\"provenance\"], which returns the same payload. Returns the full typed provenance envelope of one artifact: address domain (space, requested and effective addresses in decimal and canonical hex, byte length, byte order, raw-byte ordering), owning device, target generation, ROM identity, frame token, CPU run state, capture consistency, and capture time. Artifacts whose producer attached no capture metadata are reported honestly with the provenance_unknown state instead of invented fields.",
+			description: "DEPRECATED: use artifact_get with include [\"metadata\",\"provenance\"], which returns the same payload. Returns the full typed provenance envelope of one artifact: address domain (space, requested and effective addresses in decimal and canonical hex, byte length, byte order, raw-byte ordering), owning device, target generation, ROM identity, frame token, CPU run state, capture consistency, and capture time. Artifacts whose producer attached no capture metadata are reported honestly with the provenance_unknown state instead of invented fields. include selects the metadata and provenance sections exactly like artifact_get.",
 			schema: objectSchema(map[string]any{
 				"artifact_id": stringProperty("Opaque artifact id returned by a producing tool or artifact_list."),
-				"context":     contextProperty(),
+				"include": map[string]any{
+					"type":        "array",
+					"description": "Sections to return; omitted means both. \"metadata\" adds the metadata block, \"provenance\" adds the typed provenance envelope.",
+					"items":       map[string]any{"type": "string", "enum": []string{"metadata", "provenance"}},
+				},
+				"context": contextProperty(),
 			}, []string{"artifact_id"}),
 			run: runArtifactDescribe,
 		},
@@ -57,7 +62,7 @@ func phase1ToolSpecs() []toolSpec {
 				"artifact_id": stringProperty("Opaque artifact id."),
 				"offset":      integerProperty("Byte offset to start the preview at.", 0),
 				"length":      integerProperty(fmt.Sprintf("Maximum preview bytes (default %d, cap %d).", defaultPreviewLen, maxPreviewLen), 0),
-				"mode":        enumProperty("Preview rendering.", []string{"hex", "text", "base64"}),
+				"mode":        artifactPreviewModeVocab.property("Preview rendering (default hex)."),
 				"context":     contextProperty(),
 			}, []string{"artifact_id"}),
 			run: runArtifactPreview,
@@ -111,7 +116,7 @@ func phase1ToolSpecs() []toolSpec {
 				"space":          stringProperty("Address space id from memory_spaces_list."),
 				"address":        addressProperty(),
 				"length":         integerProperty(fmt.Sprintf("Byte length between 1 and %d.", inlineReadCapBytes), 1),
-				"representation": enumProperty("Inline rendering.", []string{"raw_base64", "hexdump", "array_u8"}),
+				"representation": memoryRepresentationVocab.property("Inline rendering."),
 				"decode":         decodeSchemaProperty(),
 				"capture_mode":   captureModeProperty(),
 				"context":        contextProperty(),
@@ -229,7 +234,10 @@ func performROMLoad(tc toolContext, path string, run bool, guard mutationGuard, 
 // ----------------------------------------------------------------------------------------------------------------------
 // Status and identity
 // ----------------------------------------------------------------------------------------------------------------------
-func runBridgeStatus(tc toolContext, _ json.RawMessage) map[string]any {
+func runBridgeStatus(tc toolContext, args json.RawMessage) map[string]any {
+	if _, failure := decodeArgs[noArgs](args); failure != nil {
+		return failureResult(failure, tc.modern)
+	}
 	status, err := tc.server.statusFor(tc.ctx)
 	if err == nil {
 		operations := status.SupportedOperations
@@ -331,7 +339,10 @@ func runStateView(server *Server, status *emulatorStatusData) (string, string, t
 	return source, note, lastChange, known
 }
 
-func runEmulatorStatus(tc toolContext, _ json.RawMessage) map[string]any {
+func runEmulatorStatus(tc toolContext, args json.RawMessage) map[string]any {
+	if _, failure := decodeArgs[noArgs](args); failure != nil {
+		return failureResult(failure, tc.modern)
+	}
 	status, failure := fetchEmulatorStatus(tc)
 	if failure != nil {
 		return failureResult(failure, tc.modern)
@@ -363,7 +374,10 @@ func runEmulatorStatus(tc toolContext, _ json.RawMessage) map[string]any {
 	return okResult(result, tc.modern)
 }
 
-func runTargetInfo(tc toolContext, _ json.RawMessage) map[string]any {
+func runTargetInfo(tc toolContext, args json.RawMessage) map[string]any {
+	if _, failure := decodeArgs[noArgs](args); failure != nil {
+		return failureResult(failure, tc.modern)
+	}
 	statusPayload, failure := tc.server.executeCommand(tc.ctx, "status", nil)
 	if failure != nil {
 		return failureResult(failure, tc.modern)
@@ -441,7 +455,10 @@ func targetInfoROM(tc toolContext) map[string]any {
 // ----------------------------------------------------------------------------------------------------------------------
 // Memory
 // ----------------------------------------------------------------------------------------------------------------------
-func runMemorySpacesList(tc toolContext, _ json.RawMessage) map[string]any {
+func runMemorySpacesList(tc toolContext, args json.RawMessage) map[string]any {
+	if _, failure := decodeArgs[noArgs](args); failure != nil {
+		return failureResult(failure, tc.modern)
+	}
 	payload, failure := tc.server.executeCommand(tc.ctx, "mem_spaces", nil)
 	if failure != nil {
 		return failureResult(failure, tc.modern)
@@ -470,6 +487,20 @@ type decodeRequest struct {
 	ByteOrder string `json:"byte_order"`
 }
 
+// cpuMemoryReadArgs is the argument set of the bus-pinned readers
+// (m68k_read_memory, z80_read_memory). The address space is the tool's own, so
+// a supplied `space` is rejected by the strict decoder instead of being
+// decoded and ignored.
+type cpuMemoryReadArgs struct {
+	Address        any            `json:"address"`
+	AddressSpace   string         `json:"address_space"`
+	Length         uint64         `json:"length"`
+	Representation string         `json:"representation"`
+	Decode         *decodeRequest `json:"decode"`
+	CaptureMode    string         `json:"capture_mode"`
+	Context        string         `json:"context"`
+}
+
 type memoryReadArgs struct {
 	Space          string         `json:"space"`
 	Address        any            `json:"address"`
@@ -492,10 +523,8 @@ func readMemoryValue(tc toolContext, spaceID string, address uint64, length uint
 			Data:    map[string]any{"inline_cap_bytes": inlineReadCapBytes},
 		}
 	}
-	switch representation {
-	case "", "raw_base64", "hexdump", "array_u8":
-	default:
-		return nil, &toolFailure{Code: "invalid_params", Message: "representation must be raw_base64, hexdump, or array_u8"}
+	if failure := memoryRepresentationVocab.validate(representation); failure != nil {
+		return nil, failure
 	}
 	params := map[string]string{
 		"space":   spaceID,
@@ -1021,9 +1050,9 @@ func runArtifactPreview(tc toolContext, args json.RawMessage) map[string]any {
 	if failure != nil {
 		return failureResult(failure, tc.modern)
 	}
-	mode := parsed.Mode
-	if mode == "" {
-		mode = "hex"
+	mode, failure := artifactPreviewModeVocab.resolve(parsed.Mode, "hex")
+	if failure != nil {
+		return failureResult(failure, tc.modern)
 	}
 	length := parsed.Length
 	if length == 0 {
@@ -1061,7 +1090,10 @@ func runContextCreate(tc toolContext, args json.RawMessage) map[string]any {
 	return okResult(map[string]any{"context": contextView(context)}, tc.modern)
 }
 
-func runContextList(tc toolContext, _ json.RawMessage) map[string]any {
+func runContextList(tc toolContext, args json.RawMessage) map[string]any {
+	if _, failure := decodeArgs[noArgs](args); failure != nil {
+		return failureResult(failure, tc.modern)
+	}
 	contexts := tc.server.contexts.List()
 	views := make([]map[string]any, 0, len(contexts))
 	defaultID := ""
