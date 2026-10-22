@@ -1698,3 +1698,38 @@ func modernDiscoverCapabilities(t *testing.T, server *Server) map[string]any {
 	}
 	return envelope.Result.Capabilities
 }
+
+// TestToolsListAcceptsTheSpecificationCursor asserts conformance with the
+// MCP tools/list request schema: `cursor` is a defined parameter, so this
+// single-page endpoint accepts it (returning the same complete catalog and no
+// nextCursor) instead of rejecting it as unknown.
+func TestToolsListAcceptsTheSpecificationCursor(t *testing.T) {
+	server := newTestServer(t, &fakeBridgeClient{status: newFakeStatus()})
+	request, err := http.NewRequest(http.MethodPost, "http://127.0.0.1:8768/mcp",
+		strings.NewReader(fmt.Sprintf(`{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{"cursor":"any-token","_meta":{"io.modelcontextprotocol/protocolVersion":%q}}}`, ModernProtocolVersion)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	request.Header.Set("MCP-Protocol-Version", ModernProtocolVersion)
+	request.Header.Set("Mcp-Method", "tools/list")
+	recorder := newRecorder()
+	server.Handler().ServeHTTP(recorder, request)
+	if recorder.status != http.StatusOK {
+		t.Fatalf("status = %d, want %d: %s", recorder.status, http.StatusOK, recorder.body.String())
+	}
+	var response struct {
+		Result struct {
+			Tools      []map[string]any `json:"tools"`
+			NextCursor any              `json:"nextCursor"`
+		} `json:"result"`
+	}
+	if err := json.Unmarshal(recorder.body.Bytes(), &response); err != nil {
+		t.Fatalf("decode catalog: %v", err)
+	}
+	if len(response.Result.Tools) != canonicalConceptCount {
+		t.Fatalf("tools = %d, want %d", len(response.Result.Tools), canonicalConceptCount)
+	}
+	if response.Result.NextCursor != nil {
+		t.Fatalf("nextCursor = %v, want none for a single-page catalog", response.Result.NextCursor)
+	}
+}

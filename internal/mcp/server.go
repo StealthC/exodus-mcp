@@ -561,10 +561,13 @@ const toolsListIncludeDeprecatedParameter = "include_deprecated"
 
 // toolsListIncludeDeprecated parses the tools/list parameters. tools/list is a
 // dispatcher endpoint, not a tool, so it validates its own small parameter set:
-// include_deprecated selects the deprecated aliases and _meta is the dispatcher's
-// own envelope. Any other parameter is rejected with the same -32602
-// invalid-params error the dispatcher already returns for malformed request
-// params, never ignored.
+// include_deprecated selects the deprecated aliases, cursor is the pagination
+// cursor the MCP tools/list request schema defines (accepted for conformance:
+// this endpoint answers in a single page and never emits a nextCursor, so a
+// cursor selects the same complete catalog), and _meta is the dispatcher's own
+// envelope. Any other parameter is rejected with the same -32602 invalid-params
+// error the dispatcher already returns for malformed request params, never
+// ignored.
 func toolsListIncludeDeprecated(params json.RawMessage) (bool, *rpcError) {
 	trimmed := bytes.TrimSpace(params)
 	if len(trimmed) == 0 || string(trimmed) == "null" {
@@ -590,6 +593,21 @@ func toolsListIncludeDeprecated(params json.RawMessage) (bool, *rpcError) {
 					Data:    map[string]any{"field": key, "value": string(fields[key])},
 				}
 			}
+		case "cursor":
+			// Pagination cursor defined by the MCP tools/list request schema.
+			// The catalog is returned in one page and carries no nextCursor,
+			// so a cursor can never be followed by this server; a caller that
+			// sends one anyway gets the same complete catalog rather than a
+			// rejection, which is what a spec-compliant paginating client
+			// expects from a single-page result.
+			var cursor string
+			if err := json.Unmarshal(fields[key], &cursor); err != nil {
+				return false, &rpcError{
+					Code:    -32602,
+					Message: "cursor must be a string",
+					Data:    map[string]any{"field": key, "value": string(fields[key])},
+				}
+			}
 		case "_meta":
 			// The dispatcher's own envelope (protocol version, capabilities).
 		default:
@@ -598,7 +616,7 @@ func toolsListIncludeDeprecated(params json.RawMessage) (bool, *rpcError) {
 				Message: fmt.Sprintf("tools/list does not accept %q", key),
 				Data: map[string]any{
 					"field":           key,
-					"accepted_fields": []string{"_meta", toolsListIncludeDeprecatedParameter},
+					"accepted_fields": []string{"_meta", "cursor", toolsListIncludeDeprecatedParameter},
 				},
 			}
 		}
