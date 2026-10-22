@@ -65,6 +65,11 @@ var toolAliasRecords = []toolAliasRecord{
 		Mapping:     "mega_drive_memory_map returns the legacy {regions, note, live_spaces} object; memory_map.reference carries the same fields.",
 	},
 	{
+		Alias:       "audio_capture",
+		Replacement: "sound_status",
+		Mapping:     "audio_capture{duration_ms, sample_rate, channels, context} returns the legacy WAV artifact payload; sound_status{output:\"wav\", duration_ms, sample_rate, channels, context} runs the same capture and adds an output echo. Against the pinned bridge both report audio_unavailable.",
+	},
+	{
 		Alias:       "trace_session_status",
 		Replacement: "trace_session_query",
 		Mapping:     "trace_session_status returns the legacy session report; trace_session_query{include:[\"status\"], ...} returns the same payload under sections.status.",

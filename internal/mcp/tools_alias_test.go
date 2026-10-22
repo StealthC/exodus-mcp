@@ -3,6 +3,7 @@ package mcp
 import (
 	"context"
 	"encoding/base64"
+	"encoding/binary"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -144,7 +145,7 @@ func TestConsolidatedCatalogHasNoDuplicateConcept(t *testing.T) {
 
 // consolidatedCanonicalTools is the merged catalog. Each consolidation group
 // appends its canonical concept here.
-var consolidatedCanonicalTools = []string{"target_status", "memory_map", "memory_read", "disassemble", "cpu_step", "debug_instrument", "events_list", "vdp_memory_read", "vdp_render_export", "capture", "snapshot_diff", "trace_session_query", "trace"}
+var consolidatedCanonicalTools = []string{"target_status", "memory_map", "memory_read", "disassemble", "cpu_step", "debug_instrument", "events_list", "vdp_memory_read", "vdp_render_export", "capture", "snapshot_diff", "trace_session_query", "trace", "sound_status"}
 
 // payloadView strips the fields the dispatcher injects into every response and
 // the alias' own deprecation marker, so two payloads can be compared field by
@@ -1339,5 +1340,108 @@ func TestTraceInferenceAndRejections(t *testing.T) {
 	payload = structured(postToolCall(t, server, "trace", `{"analyze":"coverage","until":"watchpoint","watchpoint_id":3}`))
 	if payload["code"] != "invalid_params" {
 		t.Fatalf("coverage/watchpoint must be rejected: %v", payload)
+	}
+}
+
+// ----------------------------------------------------------------------------------------------------------------------
+// sound_status / audio_capture parity (group 13)
+// ----------------------------------------------------------------------------------------------------------------------
+
+// wavFixture renders one small valid 16-bit stereo RIFF/WAVE payload.
+func wavFixture(frames int) []byte {
+	dataSize := frames * 2 * 2
+	buffer := make([]byte, 44+dataSize)
+	copy(buffer[0:4], "RIFF")
+	binary.LittleEndian.PutUint32(buffer[4:8], uint32(36+dataSize))
+	copy(buffer[8:12], "WAVE")
+	copy(buffer[12:16], "fmt ")
+	binary.LittleEndian.PutUint32(buffer[16:20], 16)
+	binary.LittleEndian.PutUint16(buffer[20:22], 1)
+	binary.LittleEndian.PutUint16(buffer[22:24], 2)
+	binary.LittleEndian.PutUint32(buffer[24:28], 44100)
+	binary.LittleEndian.PutUint32(buffer[28:32], 44100*4)
+	binary.LittleEndian.PutUint16(buffer[32:34], 4)
+	binary.LittleEndian.PutUint16(buffer[34:36], 16)
+	copy(buffer[36:40], "data")
+	binary.LittleEndian.PutUint32(buffer[40:44], uint32(dataSize))
+	return buffer
+}
+
+// audioClient answers sound_status and audio_capture; with available=false it
+// models the pinned plugin, which reports audio_unavailable.
+func audioClient(available bool) *fakeBridgeClient {
+	client := &fakeBridgeClient{status: newFakeStatus()}
+	client.status.SupportedOperations = append(client.status.SupportedOperations, "sound_status", "audio_capture")
+	client.executeFunc = func(_ context.Context, method string, params map[string]string) (json.RawMessage, error) {
+		switch method {
+		case "sound_status":
+			return json.RawMessage(`{"component":"` + params["component"] + `","ym2612":{"present":true,"registers":{"0x22":128}},"psg":{"present":true,"tone":[1,2,3,4]}}`), nil
+		case "audio_capture":
+			if !available {
+				return nil, &bridge.CommandError{Code: "audio_unavailable", Message: "the pinned plugin does not expose PCM capture"}
+			}
+			encoded := base64.StdEncoding.EncodeToString(wavFixture(4))
+			return json.RawMessage(`{"wav_base64":"` + encoded + `"}`), nil
+		}
+		return json.RawMessage(`{}`), nil
+	}
+	return client
+}
+
+// TestSoundStatusAbsorbsAudioCapture proves the PCM capture is sound_status'
+// wav output, including its artifact payload.
+func TestSoundStatusAbsorbsAudioCapture(t *testing.T) {
+	arguments := `"duration_ms":10,"sample_rate":44100,"channels":2`
+	canonical := canonicalPayload(t, audioClient(true), "sound_status", `{"output":"wav",`+arguments+`}`)
+	legacy := canonicalPayload(t, audioClient(true), "audio_capture", `{`+arguments+`}`)
+
+	if canonical["output"] != "wav" {
+		t.Fatalf("output = %v", canonical["output"])
+	}
+	delete(canonical, "output")
+	if !jsonEqual(t, normalizeVolatile(canonical), normalizeVolatile(legacy)) {
+		t.Fatalf("wav parity failed:\ncanonical = %v\nlegacy = %v", canonical, legacy)
+	}
+	if canonical["frames"] != float64(4) || canonical["state"] != "complete" {
+		t.Fatalf("wav payload lost its capture facts: %v", canonical)
+	}
+}
+
+// TestSoundStatusWavReportsThePinnedPluginHonestly: the deprecated alias and the
+// merged output report the same failure against the pinned bridge.
+func TestSoundStatusWavReportsThePinnedPluginHonestly(t *testing.T) {
+	canonical := structured(postToolCall(t, newTestServer(t, audioClient(false)), "sound_status", `{"output":"wav","duration_ms":10}`))
+	legacy := structured(postToolCall(t, newTestServer(t, audioClient(false)), "audio_capture", `{"duration_ms":10}`))
+	if canonical["code"] != "audio_unavailable" {
+		t.Fatalf("sound_status{output:wav} code = %v, want audio_unavailable", canonical["code"])
+	}
+	if legacy["code"] != "audio_unavailable" {
+		t.Fatalf("audio_capture code = %v, want audio_unavailable", legacy["code"])
+	}
+}
+
+// TestSoundStatusArtifactOutput covers the added artifact contract for the large
+// register dump, and the state output staying inline.
+func TestSoundStatusArtifactOutput(t *testing.T) {
+	client := audioClient(false)
+	state := canonicalPayload(t, client, "sound_status", `{"component":"ym2612"}`)
+	if state["output"] != "state" || state["ym2612"] == nil {
+		t.Fatalf("state output must stay inline: %v", state)
+	}
+	artifact := canonicalPayload(t, client, "sound_status", `{"component":"ym2612","output":"artifact"}`)
+	if artifact["output"] != "artifact" || artifact["artifact"] == nil {
+		t.Fatalf("artifact output must return a descriptor: %v", artifact)
+	}
+	if artifact["ym2612"] != nil {
+		t.Fatalf("artifact output must not inline the register dump: %v", artifact)
+	}
+	summary, _ := artifact["summary"].(map[string]any)
+	if summary["component"] != "ym2612" {
+		t.Fatalf("artifact summary = %v", summary)
+	}
+	// A field outside the selected output is rejected instead of dropped.
+	rejected := structured(postToolCall(t, newTestServer(t, client), "sound_status", `{"output":"state","duration_ms":10}`))
+	if rejected["code"] != "unsupported_parameter" || rejected["field"] != "duration_ms" {
+		t.Fatalf("expected unsupported_parameter for duration_ms: %v", rejected)
 	}
 }
