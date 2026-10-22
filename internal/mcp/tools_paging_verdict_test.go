@@ -231,12 +231,22 @@ func TestAnnotationListKeysetCursorSurvivesWrites(t *testing.T) {
 			seen[id] = true
 		}
 	}
-	// The two oldest annotations are the continuation: the new one sorts before
-	// the cursor and the edited one was already returned.
-	for _, annotation := range second["annotations"].([]any) {
-		id := annotation.(map[string]any)["id"].(string)
-		if id == ids[0] {
-			t.Fatalf("an annotation returned on page 1 must not reappear: %v", second["annotations"])
+	// Page 2 is exactly the continuation of the documented order: the rows that
+	// sort strictly after page 1's last row in (created_at desc, id desc). It must
+	// not be expressed as "the two oldest creations" — several annotations can
+	// share one created_at when the host clock ticks coarsely (Windows resolves
+	// ~0.5-15.6 ms), and the id then decides their order.
+	want := expectedAnnotationContinuation(t, server, first, 2)
+	got := make([]string, 0, len(second["annotations"].([]any)))
+	for _, raw := range second["annotations"].([]any) {
+		got = append(got, raw.(map[string]any)["id"].(string))
+	}
+	if len(got) != len(want) {
+		t.Fatalf("page 2 returned %v, want the continuation %v", got, want)
+	}
+	for index := range want {
+		if got[index] != want[index] {
+			t.Fatalf("page 2 = %v, want the continuation %v of the documented order", got, want)
 		}
 	}
 	// offset and cursor name two different positions.
@@ -244,6 +254,57 @@ func TestAnnotationListKeysetCursorSurvivesWrites(t *testing.T) {
 	if both["code"] != "invalid_params" {
 		t.Fatalf("cursor with offset must be rejected: %v", both)
 	}
+}
+
+// expectedAnnotationContinuation derives the page that must follow one page,
+// from a single full listing and the documented (created_at desc, id desc)
+// order. It is tie-safe: rows sharing a timestamp are ordered by id, exactly as
+// the contract states, instead of assuming creation order.
+func expectedAnnotationContinuation(t *testing.T, server *Server, page map[string]any, limit int) []string {
+	t.Helper()
+	rows := page["annotations"].([]any)
+	if len(rows) == 0 {
+		t.Fatalf("cannot derive a continuation from an empty page")
+	}
+	last := rows[len(rows)-1].(map[string]any)
+	anchorTime := parseAnnotationCreatedAt(t, last["created_at"])
+	anchorID := last["id"].(string)
+
+	full := structured(postToolCall(t, server, "annotation_list", `{"limit":100,"include_stale":true}`))
+	expected := make([]string, 0, limit)
+	for _, raw := range full["annotations"].([]any) {
+		view := raw.(map[string]any)
+		id := view["id"].(string)
+		created := parseAnnotationCreatedAt(t, view["created_at"])
+		if created.After(anchorTime) {
+			continue
+		}
+		if created.Equal(anchorTime) && id > anchorID {
+			continue
+		}
+		if created.Equal(anchorTime) && id == anchorID {
+			continue
+		}
+		expected = append(expected, id)
+		if len(expected) == limit {
+			break
+		}
+	}
+	return expected
+}
+
+// parseAnnotationCreatedAt reads one response created_at string as an instant.
+func parseAnnotationCreatedAt(t *testing.T, raw any) time.Time {
+	t.Helper()
+	text, ok := raw.(string)
+	if !ok {
+		t.Fatalf("created_at is not a string: %v", raw)
+	}
+	parsed, err := time.Parse(time.RFC3339Nano, text)
+	if err != nil {
+		t.Fatalf("parse created_at %q: %v", text, err)
+	}
+	return parsed
 }
 
 // TestTargetAuditLogPaginationFactsAreConsistent: has_more, next_cursor and
