@@ -98,7 +98,7 @@ func vdpToolSpecs() []toolSpec {
 			name:        "frame_capture",
 			description: "Capture the current rendered VDP frame as a PNG image artifact. The frame buffer is read without pausing the system, so system_paused_during_read is always false and capture_consistency.state is live (the frame token identifies the rendered frame). Optional capture_mode \"paused\" pauses once before the capture and restores the prior run state, making the frame match a temporally atomic instant.",
 			schema:      objectSchema(map[string]any{"capture_mode": captureModeProperty(), "context": contextProperty()}, nil),
-			run:         runFrameCapture,
+			run:         aliasRun("frame_capture", runFrameCapture),
 		},
 		{
 			name:        "vdp_capture",
@@ -114,7 +114,7 @@ func vdpToolSpecs() []toolSpec {
 				"capture_mode":         captureModeProperty(),
 				"context":              contextProperty(),
 			}, nil),
-			run: runVDPCapture,
+			run: aliasRun("vdp_capture", runVDPCapture),
 		},
 	}
 }

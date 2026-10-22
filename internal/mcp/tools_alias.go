@@ -65,6 +65,26 @@ var toolAliasRecords = []toolAliasRecord{
 		Mapping:     "mega_drive_memory_map returns the legacy {regions, note, live_spaces} object; memory_map.reference carries the same fields.",
 	},
 	{
+		Alias:       "memory_snapshot_capture",
+		Replacement: "capture",
+		Mapping:     "memory_snapshot_capture returns the legacy paused range capture; capture{components:[\"memory\"], space, ranges} returns the same capture_id, manifest, ranges and artifacts, with the producer payload under detail.",
+	},
+	{
+		Alias:       "system_snapshot_capture",
+		Replacement: "capture",
+		Mapping:     "system_snapshot_capture returns the legacy system snapshot; capture{components:[\"memory\",\"registers\",\"vdp\",\"frame\",...], ranges} captures the same components and returns the same capture_id and artifacts, with the producer payload under detail.",
+	},
+	{
+		Alias:       "vdp_capture",
+		Replacement: "capture",
+		Mapping:     "vdp_capture returns the legacy VDP capture; capture{components:[\"vdp\",\"frame\",\"cram\",\"vsram\",\"vram\",\"sprites\"]} captures the same components and returns the same capture_id and artifacts, with the producer payload under detail.",
+	},
+	{
+		Alias:       "frame_capture",
+		Replacement: "capture",
+		Mapping:     "frame_capture returns one PNG artifact without a capture index entry; capture{components:[\"frame\"], mode:atomic} stores the same frame inside a tracked VDP capture and returns its capture_id and manifest. Resolve the frame with capture_get or artifact_list{capture_id}.",
+	},
+	{
 		Alias:       "vdp_tile_export",
 		Replacement: "vdp_render_export",
 		Mapping:     "vdp_tile_export returns the legacy {summary, artifacts} payload; vdp_render_export{mode:\"tiles\", ...} runs the same render and returns the same payload with mode and, when requested, crop.",

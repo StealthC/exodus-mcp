@@ -142,7 +142,7 @@ func TestConsolidatedCatalogHasNoDuplicateConcept(t *testing.T) {
 
 // consolidatedCanonicalTools is the merged catalog. Each consolidation group
 // appends its canonical concept here.
-var consolidatedCanonicalTools = []string{"target_status", "memory_map", "memory_read", "disassemble", "cpu_step", "debug_instrument", "events_list", "vdp_memory_read", "vdp_render_export"}
+var consolidatedCanonicalTools = []string{"target_status", "memory_map", "memory_read", "disassemble", "cpu_step", "debug_instrument", "events_list", "vdp_memory_read", "vdp_render_export", "capture"}
 
 // payloadView strips the fields the dispatcher injects into every response and
 // the alias' own deprecation marker, so two payloads can be compared field by
@@ -883,6 +883,9 @@ var volatileAuditFields = map[string]bool{
 	"captured_at": true,
 	// A capture id is generated per export, so two runs never share one.
 	"capture_id": true,
+	// A manifest embeds the capture id and wall-clock timestamps, so its own
+	// digest cannot match between two runs.
+	"manifest_sha256": true,
 }
 
 // cursorPrefix returns the family prefix of one cursor, the part that names the
@@ -900,8 +903,17 @@ func normalizeVolatile(value any) any {
 	switch typed := value.(type) {
 	case map[string]any:
 		normalized := make(map[string]any, len(typed))
+		kind, _ := typed["kind"].(string)
 		for key, entry := range typed {
 			if volatileAuditFields[key] {
+				normalized[key] = "<volatile>"
+				continue
+			}
+			// A manifest artifact embeds capture ids and RFC3339Nano
+			// timestamps, so both its digest and its byte size vary with the
+			// run. The digest and size of a deterministic payload (PNG, tile
+			// JSON, raw bytes) are still compared.
+			if strings.HasSuffix(kind, "manifest") && (key == "sha256" || key == "size_bytes") {
 				normalized[key] = "<volatile>"
 				continue
 			}
