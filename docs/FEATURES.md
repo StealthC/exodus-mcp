@@ -101,12 +101,13 @@ claim to the exact test function or smoke-script check that proves it.
   afterwards, observed initial/final run states, and frame tokens when the
   VDP exposes them. One window yields exactly one object: the response (top
   level and `summary`) and the stored artifact provenance are completed from
-  the same object after the guard, the legacy `consistency` label is derived
-  from it instead of copied from the plugin payload, and the object is
-  stamped in both modes, so an artifact can never describe a different window
-  than the response it was returned with
-  (`TestPausedCaptureArtifactProvenanceMatchesResponse`,
-  `TestPausedCaptureCompositeArtifactsMatchResponse`). Each capture window
+  the same object after the guard, and the object is stamped in both modes, so
+  an artifact can never describe a different window than the response it was
+  returned with (`TestPausedCaptureArtifactProvenanceMatchesResponse`,
+  `TestPausedCaptureCompositeArtifactsMatchResponse`). Responses carry no
+  second consistency label: the deprecated flat `consistency` field survives
+  only inside the artifact provenance envelope, always derived from the object
+  (see [Response vocabularies](#response-vocabularies)). Each capture window
   also reports `run_state_restore` with a stable code — `restored`,
   `already_paused`, `resume_skipped_initial_run_state_unknown`,
   `run_state_restore_failed`, or `run_state_restore_unverified` — plus
@@ -130,14 +131,70 @@ claim to the exact test function or smoke-script check that proves it.
   — the default `"live"` never pauses, so timing-sensitive software is never
   silently perturbed. Mixing artifacts from different composite captures is
   rejected by `memory_diff` unless explicitly allowed.
-- **Run-state observability.** `emulator_status` reports `pause_source`
-  (`mcp` | `ui_or_external` | `breakpoint_or_watchpoint` | `unknown`) and
-  `last_run_state_change` (UTC). Externally observed transitions (UI pauses,
-  other bridge clients, native stops) land in the audit stream as
-  `run_state_change` events with the observed target generation and never
-  advance it — the generation advances only on successful MCP mutations.
+- **Run-state observability.** `emulator_status` reports the observed
+  `run_state` (`running` | `paused` | `unknown`), `pause_source`
+  (`mcp` | `ui_or_external` | `breakpoint_or_watchpoint` | `unknown`),
+  `stop_source` (`instrument` | `external` | `mcp` | `none` | `unknown`), an
+  empty-argument `capture_consistency` object, and `last_run_state_change`
+  (UTC). Externally observed transitions (UI pauses, other bridge clients,
+  native stops) land in the audit stream as `run_state_change` events with the
+  observed target generation and never advance it — the generation advances
+  only on successful MCP mutations.
 - **System-specific prefixes.** Tools use clear `m68k_`, `z80_`, and `vdp_`
   prefixes rather than pretending behavior is generic.
+
+### Response vocabularies
+
+Every closed vocabulary the server *emits* is declared once in
+`internal/mcp/args_contract.go` and published in the tool catalog under the
+`x-response-vocabularies` schema annotation, so a consumer writes one
+conditional instead of special-casing tools. `x-deprecated-response-fields`
+names the fields kept only for backwards compatibility, their replacement, and
+whether they are derived.
+
+| Field | Declared values | Emitted by |
+| --- | --- | --- |
+| `capture_consistency.state` | `live`, `atomic`, `paused`, `composite_non_atomic`, `state_restored`, `unknown` | every capture-provenance envelope and every state-observing tool, `state_load`, `trace_session_*` |
+| `capture_consistency.initial_run_state` / `final_run_state` | `running`, `paused`, `unknown` | every `capture_consistency` object |
+| `capture_consistency.execution_paused_by_tool` / `execution_resumed_after` / `paused_by_tool` | booleans (`paused_by_tool` is derived, always equal to `execution_paused_by_tool`) | every `capture_consistency` object |
+| `cpu_run_state` | `running`, `paused`, `unknown` | every capture-provenance envelope |
+| `run_state` | `running`, `paused`, `unknown` | `emulator_status`, `cpu_debug_events_list` events |
+| `pause_source` | `breakpoint_or_watchpoint`, `mcp`, `ui_or_external`, `unknown` | `emulator_status`, `run_until_*` |
+| `stop_source` | `instrument`, `external`, `mcp`, `none`, `unknown` | `emulator_status`, `run_until_*`, `cpu_debug_events_list` |
+| `stop_reason` | `breakpoint_hit`, `watchpoint_hit`, `unknown` | `run_until_*` only (a native trace-capture reason is namespaced `native_stop_reason`) |
+| `capture_mode` (input) | `live`, `paused` | every capture-guard argument |
+
+`capture_consistency.state` is the only consistency claim a response makes.
+The two extended states keep distinctions the earlier contract already
+promised: `composite_non_atomic` means the component reads spanned more than
+one emulated moment and must not be combined into one instant, and
+`state_restored` means the machine describes a restored snapshot rather than a
+capture. `unknown` is the honest fallback for a value the producing path could
+not establish; a value outside the declared vocabulary is rendered as `unknown`
+and named in the object's `undeclared_values` instead of being published.
+
+**Object completeness.** Every `capture_consistency` object — at the top level,
+inside `summary`, inside a manifest, and inside each artifact provenance
+envelope — carries the same key set: `state`, `note`,
+`execution_paused_by_tool`, `execution_resumed_after`, `paused_by_tool`,
+`initial_run_state`, `final_run_state`, `initial_frame_token`,
+`final_frame_token`, `target_generation`. An unknown frame token or target
+generation is an explicit `null`, never a missing key, and `target_generation`
+names the generation the *sample* belongs to (the pause/resume a capture guard
+performs advances the target generation, and a later artifact read must not
+relabel the capture).
+
+**No contradictory claims.** Two views of one response never disagree: a
+`summary` object equals the top-level object, every provenance envelope of the
+same `capture_id` carries the same object, a provenance envelope's deprecated
+flat `consistency` label equals its object's `state`, and the object's own
+facts are coherent (`live` and `paused` never report that the capture paused
+execution; `atomic` always does; `paused_by_tool` always equals
+`execution_paused_by_tool`). `TestNoToolPublishesAnUndeclaredVocabularyValue`
+sweeps the registry, `TestDeclaredResponseVocabularyIsProduced` drives one
+representative producer per concept, and
+`TestCatalogPublishesTheDeclaredVocabularies` proves the catalog declares
+exactly the vocabularies the code enforces.
 
 ## Bridge and platform foundation (Phases 0-1)
 
@@ -1002,7 +1059,8 @@ loaded.
   instrument after any MCP breakpoint/watchpoint stop — without plugin
   changes (the plugin does not expose a stop reason). The attribution is
   cleared by any MCP run-state action or by observing the system running
-  again, and the `run_state_change` audit entry carries the attribution.
+  again, and the `run_state_change` audit entry carries the same `pause_source`
+  value (with the prose that names the instrument in `pause_source_note`).
 - `state_load` `run_state`: `preserve` (default) keeps the machine in the run
   state it had before the load, which is exactly what the native restore does;
   `paused` and `running` force the restored state through a post-load
@@ -1065,6 +1123,7 @@ named subset are asserted by `internal/mcp/server_test.go`
 | Capture consistency states, paused guard pause/restore (also on read failure), `memory_snapshot_capture` window and validation, cross-capture diff rejection, `state_load` `state_restored`, composite VDP export consistency | `internal/mcp/tools_consistency_test.go` |
 | Guarded capture with `expected_target_generation` (running and paused target) for `memory_snapshot_capture` and `system_snapshot_capture`, verified `run_state_restore` | `internal/mcp/tools_guard_window_test.go` |
 | `capture_mode: "paused"` never resumes a paused or unknown-state target, artifact/summary/response consistency agreement (single, composite, and `rom_info`) | `internal/mcp/tools_capture_window_test.go` |
+| Response vocabularies: registry-wide sweep for undeclared values, one representative producer per concept, complete `capture_consistency` key set, no contradictory claims, catalog declaration matching the Go vocabularies, `capture_mode` enum publication | `internal/mcp/tools_vocabulary_test.go` |
 | Provenance-driven search/diff addressing, typed provenance envelope, ROM identity, checksum completeness, write read-back | `internal/mcp/tools_provenance_test.go` |
 | Breakpoint conditions and the `break_counter` default | `internal/mcp/tools_breakpoint_conditions_test.go` |
 | Freeze lifecycle, limits, surfaced write errors, purge on ROM load | `internal/mcp/tools_freeze_test.go` |

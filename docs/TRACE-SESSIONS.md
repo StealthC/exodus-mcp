@@ -270,8 +270,10 @@ file paths make safe.
   (`artifact-provenance/2`, kind `trace-session-jsonl`, address space, byte
   order, target generation, ROM identity, capture id, and the
   `capture_consistency` object).
-- `session.capture_consistency.state` is `live_windowed`: capture never paused
-  the CPU for the capture itself.
+- `session.capture_consistency.state` is `live`: the capture never paused the
+  CPU for the capture itself, and the note states that the session is a windowed
+  capture (sampled mode leaves gaps between windows), so events from different
+  windows must not be treated as one continuous instant.
 - `loss`: `complete`, `final` (has the session ended?), `complete_definition`,
   `incomplete_reasons` (`session_running`, `sampled_mode`, and the per-dimension
   loss reasons), `capture_is_sampled`, `sampled_mode_gaps`, `capture` (`mode`,

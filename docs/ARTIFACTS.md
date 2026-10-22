@@ -263,9 +263,14 @@ invented. The envelope fields are:
   readable from the server host;
 - capture identity: `capture_id`, `frame_token`, `captured_at`,
   `cpu_run_state`;
-- `capture_consistency` (`state` = `live` | `paused` | `atomic` |
-  `state_restored` | `composite_non_atomic`, pause/resume facts, initial/final
-  run states and frame tokens, note).
+- `capture_consistency` (`state` = `live` | `atomic` | `paused` |
+  `composite_non_atomic` | `state_restored` | `unknown`, pause/resume facts,
+  initial/final run states and frame tokens, `target_generation`, note — the
+  served view always carries the complete key set, see
+  [Response vocabularies](FEATURES.md#response-vocabularies));
+- `consistency`: deprecated, frozen-schema flat label of the same capture; it is
+  always derived from `capture_consistency.state` at render time and can never
+  disagree with it. Read `capture_consistency.state`.
 
 ## Schema version gaps
 
