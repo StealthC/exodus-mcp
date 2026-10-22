@@ -49,7 +49,7 @@ func runUntilToolSpecs() []toolSpec {
 				"expected_target_generation": integerProperty("Optional target generation the caller last observed; fails with target_generation_conflict on mismatch.", 1),
 				"control_id":                 stringProperty("Optional control id from target_control_acquire; required while the control lock is active."),
 			}, []string{"cpu", "address"}),
-			run: runRunUntilBreakpoint,
+			run: aliasRun("run_until_breakpoint", runRunUntilBreakpoint),
 		},
 		{
 			name:        "run_until_watchpoint",
@@ -64,7 +64,7 @@ func runUntilToolSpecs() []toolSpec {
 				"expected_target_generation": integerProperty("Optional target generation the caller last observed; fails with target_generation_conflict on mismatch.", 1),
 				"control_id":                 stringProperty("Optional control id from target_control_acquire; required while the control lock is active."),
 			}, []string{"cpu", "address"}),
-			run: runRunUntilWatchpoint,
+			run: aliasRun("run_until_watchpoint", runRunUntilWatchpoint),
 		},
 	}
 }
@@ -158,7 +158,7 @@ func runRunUntilBreakpoint(tc toolContext, args json.RawMessage) map[string]any 
 		params["break_counter"] = strconv.FormatUint(breakCounter, 10)
 	}
 	return runUntil(tc, context, runUntilPlan{
-		tool:            "run_until_breakpoint",
+		tool:            tc.toolName("run_until_breakpoint"),
 		kind:            "breakpoint",
 		cpu:             parsed.CPU,
 		setOperation:    "breakpoint_set",
@@ -217,7 +217,7 @@ func runRunUntilWatchpoint(tc toolContext, args json.RawMessage) map[string]any 
 		length = *parsed.Length
 	}
 	return runUntil(tc, context, runUntilPlan{
-		tool:            "run_until_watchpoint",
+		tool:            tc.toolName("run_until_watchpoint"),
 		kind:            "watchpoint",
 		cpu:             parsed.CPU,
 		setOperation:    "watchpoint_set",

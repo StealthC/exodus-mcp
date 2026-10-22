@@ -141,7 +141,7 @@ func TestConsolidatedCatalogHasNoDuplicateConcept(t *testing.T) {
 
 // consolidatedCanonicalTools is the merged catalog. Each consolidation group
 // appends its canonical concept here.
-var consolidatedCanonicalTools = []string{"target_status", "memory_map", "memory_read", "disassemble", "cpu_step"}
+var consolidatedCanonicalTools = []string{"target_status", "memory_map", "memory_read", "disassemble", "cpu_step", "debug_instrument"}
 
 // payloadView strips the fields the dispatcher injects into every response and
 // the alias' own deprecation marker, so two payloads can be compared field by
@@ -610,6 +610,116 @@ func TestCPUStepRejectsAMeaninglessTimeout(t *testing.T) {
 	result := postToolCall(t, newTestServer(t, stepClient(0)), "cpu_step", `{"cpu":"m68k","timeout_ms":10}`)
 	if structured(result)["code"] != "invalid_params" {
 		t.Fatalf("code = %v, want invalid_params", structured(result))
+	}
+}
+
+// ----------------------------------------------------------------------------------------------------------------------
+// debug_instrument alias parity (group 6)
+// ----------------------------------------------------------------------------------------------------------------------
+
+// instrumentPayload returns one structured payload without volatile timing.
+func instrumentPayload(t *testing.T, result map[string]any) map[string]any {
+	t.Helper()
+	view := payloadView(t, result)
+	delete(view, "elapsed_ms")
+	return view
+}
+
+// TestDebugInstrumentAbsorbsTheInstrumentTools proves every legacy instrument
+// tool is one (action, kind) pair of debug_instrument with the same payload.
+func TestDebugInstrumentAbsorbsTheInstrumentTools(t *testing.T) {
+	cases := []struct {
+		alias     string
+		aliasArgs string
+		canonical string
+	}{
+		{"cpu_breakpoint_set", `{"cpu":"m68k","address":4096}`, `{"action":"set","kind":"breakpoint","cpu":"m68k","address":4096}`},
+		{"cpu_watchpoint_set", `{"cpu":"m68k","address":4096,"length":2,"access":"write"}`, `{"action":"set","kind":"watchpoint","cpu":"m68k","address":4096,"length":2,"access":"write"}`},
+		{"cpu_breakpoint_list", `{}`, `{"action":"list","kind":"breakpoint"}`},
+		{"cpu_watchpoint_list", `{}`, `{"action":"list","kind":"watchpoint"}`},
+		{"cpu_breakpoint_remove", `{"breakpoint_id":1}`, `{"action":"remove","kind":"breakpoint","breakpoint_id":1}`},
+		{"cpu_watchpoint_remove", `{"watchpoint_id":1}`, `{"action":"remove","kind":"watchpoint","watchpoint_id":1}`},
+	}
+	for _, tc := range cases {
+		fake := newRunUntilFake(t)
+		canonical := canonicalPayload(t, &fakeBridgeClient{status: newFakeStatus(), executeFunc: fake.execute()}, "debug_instrument", tc.canonical)
+		legacy := canonicalPayload(t, &fakeBridgeClient{status: newFakeStatus(), executeFunc: newRunUntilFake(t).execute()}, tc.alias, tc.aliasArgs)
+
+		result, _ := canonical["result"].(map[string]any)
+		if result == nil {
+			t.Fatalf("%s: debug_instrument produced no result object: %v", tc.alias, canonical)
+		}
+		if !jsonEqual(t, result, legacy) {
+			t.Fatalf("%s parity failed:\ncanonical = %v\nlegacy     = %v", tc.alias, result, legacy)
+		}
+		for _, key := range []string{"action", "kind"} {
+			if canonical[key] == nil {
+				t.Fatalf("%s: debug_instrument lost %s", tc.alias, key)
+			}
+		}
+	}
+}
+
+// TestDebugInstrumentAbsorbsRunUntil proves the run_until windows are the same
+// call with run_until: true, including the stop evidence and the residue-free
+// removal.
+func TestDebugInstrumentAbsorbsRunUntil(t *testing.T) {
+	canonicalFake := newRunUntilFake(t)
+	canonicalFake.fireOnStatusCall = 2
+	canonical := instrumentPayload(t, postToolCall(t, canonicalFake.server(t), "debug_instrument", `{"action":"set","kind":"breakpoint","run_until":true,"cpu":"m68k","address":4096}`))
+
+	legacyFake := newRunUntilFake(t)
+	legacyFake.fireOnStatusCall = 2
+	legacy := instrumentPayload(t, postToolCall(t, legacyFake.server(t), "run_until_breakpoint", `{"cpu":"m68k","address":4096}`))
+
+	result, _ := canonical["result"].(map[string]any)
+	if result == nil {
+		t.Fatalf("debug_instrument produced no result object: %v", canonical)
+	}
+	delete(result, "elapsed_ms")
+	if !jsonEqual(t, result, legacy) {
+		t.Fatalf("run_until parity failed:\ncanonical = %v\nlegacy     = %v", result, legacy)
+	}
+	if canonical["instrument_id"] != legacy["resource_id"] {
+		t.Fatalf("instrument_id = %v, resource_id = %v", canonical["instrument_id"], legacy["resource_id"])
+	}
+	if canonical["run_until"] != true {
+		t.Fatalf("run_until marker missing: %v", canonical)
+	}
+}
+
+// TestDebugInstrumentUpdateReplacesTheInstrument documents the one action the
+// legacy tools did not have: a replacement that reports both ids.
+func TestDebugInstrumentUpdateReplacesTheInstrument(t *testing.T) {
+	fake := newRunUntilFake(t)
+	result := structured(postToolCall(t, fake.server(t), "debug_instrument", `{"action":"update","kind":"breakpoint","breakpoint_id":1,"cpu":"m68k","address":4096,"one_shot":true}`))
+	if result["previous_instrument_id"] != float64(1) {
+		t.Fatalf("previous_instrument_id = %v", result["previous_instrument_id"])
+	}
+	if result["instrument_id"] != float64(1) {
+		t.Fatalf("instrument_id = %v", result["instrument_id"])
+	}
+	update, _ := result["result"].(map[string]any)
+	if update["removed"] == nil || update["created"] == nil {
+		t.Fatalf("update result is incomplete: %v", update)
+	}
+}
+
+// TestDebugInstrumentRejectsArgumentsOutsideTheAction keeps the merged contract
+// honest: an argument that does not apply is rejected, never dropped.
+func TestDebugInstrumentRejectsArgumentsOutsideTheAction(t *testing.T) {
+	fake := newRunUntilFake(t)
+	for _, arguments := range []string{
+		`{"action":"list","kind":"breakpoint","address":4096}`,
+		`{"action":"set","kind":"breakpoint","cpu":"m68k","address":4096,"length":2}`,
+		`{"action":"set","kind":"watchpoint","cpu":"m68k","address":4096,"condition":"equal"}`,
+		`{"action":"set","kind":"breakpoint","run_until":true,"cpu":"m68k","address":4096,"one_shot":true}`,
+		`{"action":"remove","kind":"breakpoint","breakpoint_id":1,"address":4096}`,
+	} {
+		result := postToolCall(t, fake.server(t), "debug_instrument", arguments)
+		if structured(result)["code"] != "unsupported_parameter" {
+			t.Fatalf("%s: code = %v, want unsupported_parameter", arguments, structured(result))
+		}
 	}
 }
 

@@ -41,13 +41,13 @@ func controlToolSpecs() []toolSpec {
 				"expected_target_generation": integerProperty("Optional target generation the caller last observed; fails with target_generation_conflict on mismatch.", 1),
 				"control_id":                 stringProperty("Optional control id from target_control_acquire; required while the control lock is active."),
 			}, []string{"cpu", "address"}),
-			run: runBreakpointSet,
+			run: aliasRun("cpu_breakpoint_set", runBreakpointSet),
 		},
 		{
 			name:        "cpu_breakpoint_list",
 			description: "List execution breakpoints created through this MCP process, including enabled state, condition, break-on-counter settings, native hit counters, the one_shot flag, and creation provenance (context, target generation). An optional context handle restricts the listing to the breakpoints that context created; omitted or \"all\" lists every entry.",
 			schema:      objectSchema(map[string]any{"context": listScopeProperty()}, nil),
-			run:         runBreakpointList,
+			run:         aliasRun("cpu_breakpoint_list", runBreakpointList),
 		},
 		{
 			name:        "cpu_breakpoint_remove",
@@ -57,7 +57,7 @@ func controlToolSpecs() []toolSpec {
 				"expected_target_generation": integerProperty("Optional target generation the caller last observed; fails with target_generation_conflict on mismatch.", 1),
 				"control_id":                 stringProperty("Optional control id from target_control_acquire; required while the control lock is active."),
 			}, []string{"breakpoint_id"}),
-			run: runBreakpointRemove,
+			run: aliasRun("cpu_breakpoint_remove", runBreakpointRemove),
 		},
 		{
 			name:        "cpu_watchpoint_set",
@@ -72,9 +72,9 @@ func controlToolSpecs() []toolSpec {
 				"expected_target_generation": integerProperty("Optional target generation the caller last observed; fails with target_generation_conflict on mismatch.", 1),
 				"control_id":                 stringProperty("Optional control id from target_control_acquire; required while the control lock is active."),
 			}, []string{"cpu", "address"}),
-			run: runWatchpointSet,
+			run: aliasRun("cpu_watchpoint_set", runWatchpointSet),
 		},
-		{name: "cpu_watchpoint_list", description: "List read/write watchpoints created through this MCP process, including hit counters, the configured access, the range semantics, the one_shot flag, and creation provenance (context, target generation). An optional context handle restricts the listing to the watchpoints that context created; omitted or \"all\" lists every entry.", schema: objectSchema(map[string]any{"context": listScopeProperty()}, nil), run: runWatchpointList},
+		{name: "cpu_watchpoint_list", description: "List read/write watchpoints created through this MCP process, including hit counters, the configured access, the range semantics, the one_shot flag, and creation provenance (context, target generation). An optional context handle restricts the listing to the watchpoints that context created; omitted or \"all\" lists every entry.", schema: objectSchema(map[string]any{"context": listScopeProperty()}, nil), run: aliasRun("cpu_watchpoint_list", runWatchpointList)},
 		{
 			name:        "cpu_watchpoint_remove",
 			description: "Remove one watchpoint created through this MCP process. Mutates the target: advances the target generation. Accepts optional expected_target_generation and control_id.",
@@ -83,7 +83,7 @@ func controlToolSpecs() []toolSpec {
 				"expected_target_generation": integerProperty("Optional target generation the caller last observed; fails with target_generation_conflict on mismatch.", 1),
 				"control_id":                 stringProperty("Optional control id from target_control_acquire; required while the control lock is active."),
 			}, []string{"watchpoint_id"}),
-			run: runWatchpointRemove,
+			run: aliasRun("cpu_watchpoint_remove", runWatchpointRemove),
 		},
 		{
 			name:        "cpu_debug_events_list",
@@ -268,7 +268,7 @@ func runBreakpointSet(tc toolContext, args json.RawMessage) map[string]any {
 		params["break_counter"] = strconv.FormatUint(breakCounter, 10)
 	}
 	payload, before, after, failure := tc.server.executeMutation(tc.ctx, mutationCall{
-		tool:      "cpu_breakpoint_set",
+		tool:      tc.toolName("cpu_breakpoint_set"),
 		operation: "breakpoint_set",
 		params:    params,
 		guard:     parsed.guard(),
@@ -341,7 +341,7 @@ func runBreakpointRemove(tc toolContext, args json.RawMessage) map[string]any {
 		return failureResult(&toolFailure{Code: "invalid_params", Message: "breakpoint_id must be positive"}, tc.modern)
 	}
 	payload, before, after, failure := tc.server.executeMutation(tc.ctx, mutationCall{
-		tool:      "cpu_breakpoint_remove",
+		tool:      tc.toolName("cpu_breakpoint_remove"),
 		operation: "breakpoint_remove",
 		params:    map[string]string{"breakpoint_id": strconv.FormatUint(parsed.BreakpointID, 10)},
 		guard:     parsed.guard(),
@@ -434,7 +434,7 @@ func runWatchpointSet(tc toolContext, args json.RawMessage) map[string]any {
 		params["length"] = strconv.FormatUint(length, 10)
 	}
 	payload, before, after, failure := tc.server.executeMutation(tc.ctx, mutationCall{
-		tool:      "cpu_watchpoint_set",
+		tool:      tc.toolName("cpu_watchpoint_set"),
 		operation: "watchpoint_set",
 		params:    params,
 		guard:     parsed.guard(),
@@ -511,7 +511,7 @@ func runWatchpointRemove(tc toolContext, args json.RawMessage) map[string]any {
 		return failureResult(&toolFailure{Code: "invalid_params", Message: "watchpoint_id must be positive"}, tc.modern)
 	}
 	payload, before, after, failure := tc.server.executeMutation(tc.ctx, mutationCall{
-		tool:      "cpu_watchpoint_remove",
+		tool:      tc.toolName("cpu_watchpoint_remove"),
 		operation: "watchpoint_remove",
 		params:    map[string]string{"watchpoint_id": strconv.FormatUint(parsed.WatchpointID, 10)},
 		guard:     parsed.guard(),

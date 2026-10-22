@@ -65,6 +65,46 @@ var toolAliasRecords = []toolAliasRecord{
 		Mapping:     "mega_drive_memory_map returns the legacy {regions, note, live_spaces} object; memory_map.reference carries the same fields.",
 	},
 	{
+		Alias:       "cpu_breakpoint_set",
+		Replacement: "debug_instrument",
+		Mapping:     "cpu_breakpoint_set returns its legacy {breakpoint_id, ...} payload; debug_instrument{action:\"set\", kind:\"breakpoint\", ...} performs the same create and returns it under result.",
+	},
+	{
+		Alias:       "cpu_breakpoint_list",
+		Replacement: "debug_instrument",
+		Mapping:     "cpu_breakpoint_list returns its legacy {breakpoints, ...} payload; debug_instrument{action:\"list\", kind:\"breakpoint\"} performs the same listing and returns it under result.",
+	},
+	{
+		Alias:       "cpu_breakpoint_remove",
+		Replacement: "debug_instrument",
+		Mapping:     "cpu_breakpoint_remove returns its legacy payload; debug_instrument{action:\"remove\", kind:\"breakpoint\", breakpoint_id} performs the same removal and returns it under result with instrument_id.",
+	},
+	{
+		Alias:       "cpu_watchpoint_set",
+		Replacement: "debug_instrument",
+		Mapping:     "cpu_watchpoint_set returns its legacy {watchpoint_id, ...} payload; debug_instrument{action:\"set\", kind:\"watchpoint\", ...} performs the same create and returns it under result.",
+	},
+	{
+		Alias:       "cpu_watchpoint_list",
+		Replacement: "debug_instrument",
+		Mapping:     "cpu_watchpoint_list returns its legacy {watchpoints, ...} payload; debug_instrument{action:\"list\", kind:\"watchpoint\"} performs the same listing and returns it under result.",
+	},
+	{
+		Alias:       "cpu_watchpoint_remove",
+		Replacement: "debug_instrument",
+		Mapping:     "cpu_watchpoint_remove returns its legacy payload; debug_instrument{action:\"remove\", kind:\"watchpoint\", watchpoint_id} performs the same removal and returns it under result with instrument_id.",
+	},
+	{
+		Alias:       "run_until_breakpoint",
+		Replacement: "debug_instrument",
+		Mapping:     "run_until_breakpoint returns its legacy stop-evidence payload; debug_instrument{action:\"set\", kind:\"breakpoint\", run_until:true, ...} performs the same one-shot window and returns it under result with instrument_id (the legacy resource_id).",
+	},
+	{
+		Alias:       "run_until_watchpoint",
+		Replacement: "debug_instrument",
+		Mapping:     "run_until_watchpoint returns its legacy stop-evidence payload; debug_instrument{action:\"set\", kind:\"watchpoint\", run_until:true, ...} performs the same one-shot window and returns it under result with instrument_id (the legacy resource_id).",
+	},
+	{
 		Alias:       "m68k_step",
 		Replacement: "cpu_step",
 		Mapping:     "m68k_step returns the legacy synchronous M68K single-step payload; cpu_step{cpu:\"m68k\", mode:\"instruction\"} runs the same native action and adds mode (and cpu, which the native echo already carries).",
