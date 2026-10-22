@@ -675,14 +675,24 @@ claim to the exact test function or smoke-script check that proves it.
   determinism. Each step holds the listed buttons down on a player port for N
   frames (`input_set` down, `frame_advance`×N, `input_set` up; frames 1-60,
   up to 64 steps). The tool runs the sequence twice from the same state —
-  capturing per-step VDP frame tokens and final M68K registers (pc/a7/d0) for
-  both runs — restores the initial state afterwards (caller-provided
-  `initial_state_id`, or a fresh snapshot of the current machine), and
-  reports `deterministic` true/false with named checks plus a
-  `replay-manifest/1` artifact recording both runs, the checks, and the
+  capturing per-step VDP frame tokens, per-step M68K register samples and the
+  final registers (pc/a7/d0) for both runs — restores the initial state
+  afterwards (caller-provided `initial_state_id`, or a fresh snapshot of the
+  current machine), and reports `deterministic` true/false with named checks
+  plus a `replay-manifest/2` artifact recording both runs, the checks, and the
   methodology. Recording (run 1) and replay verification (run 2) share one
   code path, so a mismatch is a real emulator nondeterminism signal rather
-  than a harness artifact.
+  than a harness artifact. The VDP render counter is not part of a saved state
+  and is never reset by `state_load`, so absolute tokens are not comparable
+  across the restore: every step is compared as a delta from a
+  `frame_token_baseline` captured at the start of its own run. Every restore
+  that precedes stepping forces the machine paused, and each run reports
+  `initial_run_state`; a pause the native echo cannot verify is reported, not
+  assumed. A difference is reported in `diverged_step` (`step`, `field`,
+  `run1`, `run2`) when it belongs to one step and in `divergences` otherwise,
+  and an axis that could not be read (a missing token, an unreadable register
+  set, a counter that wrapped) is listed in `unproven` and never counted as a
+  match.
 
 ## Continuous trace sessions (Phase 10)
 
