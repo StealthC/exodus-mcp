@@ -176,3 +176,69 @@ func TestBacktraceMaxFramesCap(t *testing.T) {
 		t.Fatalf("code = %v, want invalid_params", content["code"])
 	}
 }
+
+// TestBacktraceResolvesSpaceRelativeSymbol covers issue #13 for the backtrace:
+// a symbol stored space-relative (mem-ram 0x1000) must label exactly the frame
+// at its processor-bus address (0xFF1000), not the raw space address.
+func TestBacktraceResolvesSpaceRelativeSymbol(t *testing.T) {
+	registers := map[string]uint64{"a7": 0x00FFF000, "pc": 0x00000200, "a6": 0x00000000}
+	stack := map[uint64]uint64{
+		0x00FFF000: 0x00FF1004, // bus address 0x1004 above the RAM symbol
+	}
+	client := &fakeBridgeClient{status: newFakeStatus()}
+	client.executeFunc = stackMemFake(registers, stack)
+	server := newTestServer(t, client)
+	setResult := structured(postToolCall(t, server, "symbols_set", `{"symbols":[{"name":"score","space_id":"mem-ram","address":"0x1000"}]}`))
+	stored := setResult["symbols"].([]any)[0].(map[string]any)
+	if stored["bus_space_id"] != "m68k-bus" || stored["bus_address"] != float64(0xFF1000) {
+		t.Fatalf("symbols_set echo must report the bus coordinate: %v", stored)
+	}
+
+	result := postToolCall(t, server, "m68k_backtrace", `{"max_frames":3}`)
+	if result["isError"] == true {
+		t.Fatalf("unexpected error: %v", structured(result))
+	}
+	frames, _ := structured(result)["frames"].([]any)
+	var scanFrame map[string]any
+	for _, entry := range frames {
+		frame := entry.(map[string]any)
+		if frame["address"] == float64(0xFF1004) {
+			scanFrame = frame
+		}
+	}
+	if scanFrame == nil {
+		t.Fatalf("frame at the bus address 0xFF1004 not found: %v", frames)
+	}
+	if scanFrame["symbol"] != "score" || scanFrame["offset"] != float64(4) {
+		t.Fatalf("space-relative symbol resolution = %v", scanFrame)
+	}
+
+	// The live PC frame keeps its own coordinate and stays unlabeled.
+	if frames[0].(map[string]any)["symbol"] != nil {
+		t.Fatalf("live PC must not pick up a RAM symbol: %v", frames[0])
+	}
+}
+
+// TestBacktraceBusSymbolBackwardCompatible keeps symbol resolution working for
+// symbols declared directly on the 68K bus.
+func TestBacktraceBusSymbolBackwardCompatible(t *testing.T) {
+	registers := map[string]uint64{"a7": 0x00FFF000, "pc": 0x00000200, "a6": 0x00000000}
+	stack := map[uint64]uint64{0x00FFF000: 0x00010000}
+	client := &fakeBridgeClient{status: newFakeStatus()}
+	client.executeFunc = stackMemFake(registers, stack)
+	server := newTestServer(t, client)
+	postToolCall(t, server, "symbols_set", `{"symbols":[{"name":"rom_entry","space_id":"m68k-bus","address":65536}]}`)
+
+	content := structured(postToolCall(t, server, "m68k_backtrace", `{"max_frames":2}`))
+	frames, _ := content["frames"].([]any)
+	labeled := false
+	for _, entry := range frames {
+		frame := entry.(map[string]any)
+		if frame["address"] == float64(0x10000) && frame["symbol"] == "rom_entry" {
+			labeled = true
+		}
+	}
+	if !labeled {
+		t.Fatalf("m68k-bus symbol must still label the frame: %v", frames)
+	}
+}
