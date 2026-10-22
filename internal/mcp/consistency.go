@@ -5,6 +5,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"reflect"
 	"time"
 
 	"github.com/StealthC/exodus-mcp/internal/artifact"
@@ -64,7 +65,6 @@ const (
 	runStateRestoreSkippedUnknown = "resume_skipped_initial_run_state_unknown"
 	runStateRestoreFailed         = "run_state_restore_failed"
 	runStateRestoreUnverified     = "run_state_restore_unverified"
-	runStateRestoreNotRequested   = "not_paused"
 )
 
 // runStateLabel renders one observed run state as a label.
@@ -195,7 +195,8 @@ func compositeCaptureConsistency(server *Server, coherent bool) *artifact.Captur
 
 // captureGuard carries the optional capture_mode argument of a read tool.
 // "live" (default) never pauses; "paused" pauses once before the read and
-// restores the prior run state afterwards.
+// restores the prior run state it observed afterwards. A target whose pre-call
+// run state could not be observed is paused for the sample and never resumed.
 type captureGuard struct {
 	Mode string `json:"capture_mode"`
 }
@@ -281,6 +282,35 @@ type captureWindow struct {
 	// attach it to artifact provenance while the window is open; the window
 	// completes it after the guard and re-stamps the stored envelopes.
 	Consistency *artifact.CaptureConsistency
+
+	// publish, when set by a producer, builds the final response after the
+	// window closed and the consistency object is final. A producer whose
+	// response embeds a durable manifest uses it so no artifact is written
+	// with a provisional window state.
+	publish func() (map[string]any, *toolFailure)
+
+	artifacts []artifact.Artifact
+}
+
+// track registers one artifact written inside the window so its stored
+// capture-consistency object can be completed before the response is published.
+func (window *captureWindow) track(stored artifact.Artifact) {
+	if window == nil {
+		return
+	}
+	window.artifacts = append(window.artifacts, stored)
+}
+
+// ids returns the stored artifact ids written inside the window.
+func (window *captureWindow) ids() []string {
+	if window == nil || len(window.artifacts) == 0 {
+		return nil
+	}
+	ids := make([]string, 0, len(window.artifacts))
+	for _, stored := range window.artifacts {
+		ids = append(ids, stored.ID)
+	}
+	return ids
 }
 
 // consistencyFor returns the capture-consistency object a producer must attach
@@ -288,10 +318,24 @@ type captureWindow struct {
 // the whole window (the guard completes it after the restore); a live capture
 // derives it from the read payload and the run-state tracker.
 func (window *captureWindow) consistencyFor(server *Server, payload map[string]any) *artifact.CaptureConsistency {
-	if window != nil && window.Consistency != nil {
-		return window.Consistency
+	if window == nil {
+		return buildCaptureConsistency(server, payload, false, true, nil, nil)
 	}
-	return buildCaptureConsistency(server, payload, false, true, nil, nil)
+	if window.Consistency == nil {
+		// A live window derives its object from the read payload once; every
+		// later call in the same window reuses it, so one window never reports
+		// two different objects.
+		window.Consistency = buildCaptureConsistency(server, payload, false, true, nil, nil)
+	}
+	return window.Consistency
+}
+
+// legacyConsistency returns the legacy consistency label a producer must
+// report next to the object. It is derived from the object, never copied from
+// the plugin payload, so the two fields describing one capture cannot
+// contradict each other.
+func (window *captureWindow) legacyConsistency(server *Server, payload map[string]any) string {
+	return window.consistencyFor(server, payload).State
 }
 
 // beginCaptureWindow starts a window: it observes the initial run state and
@@ -313,8 +357,15 @@ func beginCaptureWindow(tc toolContext, guard captureGuard) (*captureWindow, *to
 			window.PauseVerified = state == runStatePaused
 		}
 	}
+	// The window only claims atomicity when it really paused the target; a
+	// target that was already paused is the documented "paused" state, exactly
+	// as an unguarded read of the same machine reports.
+	consistencyState := consistencyPaused
+	if paused {
+		consistencyState = consistencyAtomic
+	}
 	window.Consistency = &artifact.CaptureConsistency{
-		State:                 consistencyAtomic,
+		State:                 consistencyState,
 		ExecutionPausedByTool: paused,
 		InitialRunState:       window.InitialRunState,
 		InitialFrameToken:     window.InitialToken,
@@ -452,13 +503,30 @@ func withCaptureGuard(tc toolContext, guard captureGuard, read func(window *capt
 	}
 	if guard.Mode == captureModeLive {
 		result, readFailure := read(window)
+		if readFailure == nil && window.publish != nil {
+			result, readFailure = window.publish()
+		}
 		if readFailure != nil {
 			return failureResult(readFailure, tc.modern)
+		}
+		// A live window never changes the run state, but it still reports the
+		// one consistency object its artifacts were written with.
+		if window.Consistency != nil {
+			view := captureConsistencyToMap(window.Consistency)
+			result["capture_consistency"] = view
+			if summary, ok := result["summary"].(map[string]any); ok {
+				summary["capture_consistency"] = view
+			}
 		}
 		return okResult(result, tc.modern)
 	}
 	result, readFailure := read(window)
 	window.closeWindow(tc, nil)
+	if readFailure == nil && window.publish != nil {
+		// The producer deferred its publication until the window was final, so
+		// no durable artifact states a provisional run-state outcome.
+		result, readFailure = window.publish()
+	}
 	restore := window.restoreView()
 	if readFailure != nil {
 		// Restore the prior run state even when the read failed, so the guard
@@ -497,7 +565,47 @@ func withCaptureGuard(tc toolContext, guard captureGuard, read func(window *capt
 			summary["resume_skipped_reason"] = window.ResumeSkippedReason
 		}
 	}
+	// The artifacts were written while the window was open: complete their
+	// stored provenance now, then re-stamp every provenance view in the
+	// response so the durable artifact and the response agree.
+	tc.server.store.FinalizeCaptureConsistency(window.ids(), window.Consistency)
+	restampCaptureProvenance(result, view, window.Consistency.State)
 	return okResult(result, tc.modern)
+}
+
+// restampCaptureProvenance walks a response and replaces the capture-consistency
+// object of every embedded provenance envelope with the finalized one, so a
+// descriptor built before the restore never reports an earlier window state.
+// Responses nest descriptors in plain maps and in typed slices (such as
+// []map[string]any), so slices and pointers are walked reflectively.
+func restampCaptureProvenance(value any, view map[string]any, state string) {
+	if value == nil {
+		return
+	}
+	if typed, ok := value.(map[string]any); ok {
+		if schema, _ := typed["artifact_schema"].(string); schema == artifact.ProvenanceSchema {
+			typed["capture_consistency"] = view
+			typed["consistency"] = state
+		}
+		for _, item := range typed {
+			restampCaptureProvenance(item, view, state)
+		}
+		return
+	}
+	reflected := reflect.ValueOf(value)
+	if !reflected.IsValid() {
+		return
+	}
+	switch reflected.Kind() {
+	case reflect.Slice, reflect.Array:
+		for index := 0; index < reflected.Len(); index++ {
+			restampCaptureProvenance(reflected.Index(index).Interface(), view, state)
+		}
+	case reflect.Pointer, reflect.Interface:
+		if !reflected.IsNil() {
+			restampCaptureProvenance(reflected.Elem().Interface(), view, state)
+		}
+	}
 }
 
 // currentFrameToken returns the last rendered frame token from vdp_status, or

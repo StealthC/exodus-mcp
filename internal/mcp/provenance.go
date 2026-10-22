@@ -100,7 +100,6 @@ func captureProvenance(server *Server, kind, spaceID string, requestedAddress ui
 	effective, _ := payload["effective_address"].(float64)
 	byteOrder, _ := payload["byte_order"].(string)
 	spaceKind, _ := payload["kind"].(string)
-	consistencyLabel, _ := payload["consistency"].(string)
 	pausedDuringRead, _ := payload["system_paused_during_read"].(bool)
 	generation := server.target.Generation()
 	romFacts := server.romIdentity.romFileFacts(server.currentROMPath())
@@ -127,7 +126,6 @@ func captureProvenance(server *Server, kind, spaceID string, requestedAddress ui
 		TargetGeneration:    &generation,
 		ROMSHA256:           romFacts.SHA256,
 		ROMPath:             server.currentROMPath(),
-		Consistency:         consistencyLabel,
 		CapturedAt:          capturedAt,
 		CaptureID:           captureID,
 	}
@@ -153,6 +151,10 @@ func captureProvenance(server *Server, kind, spaceID string, requestedAddress ui
 		consistency = buildCaptureConsistency(server, payload, false, true, nil, nil)
 	}
 	provenance.CaptureConsistency = consistency
+	// The legacy label is derived from the object, never copied from the
+	// plugin payload: an artifact whose object says "paused" must not claim
+	// "live" in the same envelope.
+	provenance.Consistency = consistency.State
 	return provenance
 }
 

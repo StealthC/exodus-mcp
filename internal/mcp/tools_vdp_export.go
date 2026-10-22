@@ -123,7 +123,7 @@ func runVDPMemoryExport(tc toolContext, args json.RawMessage) map[string]any {
 	if failure = guard.resolve(); failure != nil {
 		return failureResult(failure, tc.modern)
 	}
-	export := func(*captureWindow) (map[string]any, *toolFailure) {
+	export := func(window *captureWindow) (map[string]any, *toolFailure) {
 		payload, failure := tc.server.executeCommand(tc.ctx, "vdp_mem_read", map[string]string{
 			"target":  parsed.Target,
 			"address": fmt.Sprintf("%d", address),
@@ -153,13 +153,19 @@ func runVDPMemoryExport(tc toolContext, args json.RawMessage) map[string]any {
 		provenance.ByteLength = &byteLength
 		provenance.SpaceKind = "timed-buffer"
 		provenance.ByteOrder = byteOrder
-		provenance.Consistency = "live"
-		provenance.CaptureConsistency = buildCaptureConsistency(tc.server, payload, false, true, nil, nil)
+		// One consistency object for the artifact and the response; inside a
+		// paused capture window the window owns it and completes it after the
+		// restore, so the stored provenance can never disagree with the
+		// response.
+		consistencyObject := window.consistencyFor(tc.server, payload)
+		provenance.Consistency = consistencyObject.State
+		provenance.CaptureConsistency = consistencyObject
 
 		stored, err := tc.server.store.PutWithProvenance(context.ID, vdpExportKind, vdpExportMimeType, raw, provenance)
 		if err != nil {
 			return nil, &toolFailure{Code: "artifact_error", Message: err.Error()}
 		}
+		window.track(stored)
 		result := map[string]any{
 			"target":                    parsed.Target,
 			"address_space":             vdpExportSpaceForTarget(parsed.Target),
@@ -169,7 +175,7 @@ func runVDPMemoryExport(tc toolContext, args json.RawMessage) map[string]any {
 			"byte_order":                byteOrder,
 			"raw_byte_ordering":         "address-order",
 			"system_paused_during_read": pausedDuringRead,
-			"capture_consistency":       captureConsistencyToMap(provenance.CaptureConsistency),
+			"capture_consistency":       captureConsistencyToMap(consistencyObject),
 			"artifact":                  artifactDescriptor(tc.server, stored, context.ID),
 			"sha256":                    stored.SHA256,
 		}

@@ -303,6 +303,7 @@ func runMemorySnapshotCapture(tc toolContext, args json.RawMessage) map[string]a
 		if err != nil {
 			return failureResult(&toolFailure{Code: "artifact_error", Message: err.Error()}, tc.modern)
 		}
+		window.track(stored)
 		rangeResult := map[string]any{
 			"name":                  entry.Name,
 			"space":                 space,
@@ -338,6 +339,11 @@ func runMemorySnapshotCapture(tc toolContext, args json.RawMessage) map[string]a
 		"internal_lock_acquired":   internalLock,
 		"run_state_restore":        restore,
 	}
+	// The manifest embeds the range descriptors, which were built while the
+	// window was open: re-stamp them before writing the durable manifest so it
+	// cannot carry a provisional window state.
+	view := captureConsistencyToMap(atomicConsistency)
+	restampCaptureProvenance(manifest, view, atomicConsistency.State)
 	manifestBytes, err := json.MarshalIndent(manifest, "", "  ")
 	if err != nil {
 		return failureResult(&toolFailure{Code: "artifact_error", Message: err.Error()}, tc.modern)
@@ -357,7 +363,6 @@ func runMemorySnapshotCapture(tc toolContext, args json.RawMessage) map[string]a
 			artifacts = append(artifacts, art)
 		}
 	}
-	view := captureConsistencyToMap(atomicConsistency)
 	result := map[string]any{
 		"summary": map[string]any{
 			"kind":                     captureKind,
@@ -388,6 +393,11 @@ func runMemorySnapshotCapture(tc toolContext, args json.RawMessage) map[string]a
 	if window.RestoreFailure != nil {
 		result[runStateRestoreFailed] = true
 	}
+	// The range artifacts were written before the window closed: complete
+	// their stored provenance, then re-stamp the response views, so the
+	// durable artifact and the response never describe different windows.
+	tc.server.store.FinalizeCaptureConsistency(window.ids(), atomicConsistency)
+	restampCaptureProvenance(result, view, atomicConsistency.State)
 	return okResult(stampGenerations(result, generationBefore, generationAfter), tc.modern)
 }
 

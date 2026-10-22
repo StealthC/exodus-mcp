@@ -191,6 +191,7 @@ func runSystemSnapshot(tc toolContext, args json.RawMessage) map[string]any {
 		if e != nil {
 			return &toolFailure{Code: "artifact_error", Message: e.Error()}
 		}
+		window.track(a)
 		d := artifactDescriptor(tc.server, a, ctx.ID)
 		components[name] = d
 		artifacts = append(artifacts, d)
@@ -202,6 +203,7 @@ func runSystemSnapshot(tc toolContext, args json.RawMessage) map[string]any {
 		if e != nil {
 			return &toolFailure{Code: "artifact_error", Message: e.Error()}
 		}
+		window.track(a)
 		d := artifactDescriptor(tc.server, a, ctx.ID)
 		components[name] = d
 		artifacts = append(artifacts, d)
@@ -301,6 +303,7 @@ func runSystemSnapshot(tc toolContext, args json.RawMessage) map[string]any {
 		if e != nil {
 			return fail(&toolFailure{Code: "artifact_error", Message: e.Error()})
 		}
+		window.track(a)
 		d := artifactDescriptor(tc.server, a, ctx.ID)
 		components["frame"] = d
 		artifacts = append(artifacts, d)
@@ -318,6 +321,11 @@ func runSystemSnapshot(tc toolContext, args json.RawMessage) map[string]any {
 	restore := window.restoreView()
 	genAfter := tc.server.target.Generation()
 	manifest := map[string]any{"schema_version": systemSnapshotSchema, "kind": "system-snapshot", "capture_id": captureID, "captured_at": at, "capture_consistency": consistency, "run_state_restore": restore, "target_generation_before": genBefore, "target_generation_after": genAfter, "rom_identity": tc.server.romIdentityView(0), "byte_order": map[string]any{"m68k": "big-endian", "z80": "little-endian", "raw": "address-order"}, "components": components, "artifacts": artifacts}
+	// The manifest embeds the component descriptors, which were built while the
+	// window was open: re-stamp them before writing the durable manifest so it
+	// cannot carry a provisional window state.
+	view := captureConsistencyToMap(consistency)
+	restampCaptureProvenance(manifest, view, consistency.State)
 	b, err := json.MarshalIndent(manifest, "", "  ")
 	if err != nil {
 		return failureResult(&toolFailure{Code: "artifact_error", Message: err.Error()}, tc.modern)
@@ -331,7 +339,6 @@ func runSystemSnapshot(tc toolContext, args json.RawMessage) map[string]any {
 	}
 	md := artifactDescriptor(tc.server, stored, ctx.ID)
 	artifacts = append(artifacts, md)
-	view := captureConsistencyToMap(consistency)
 	summary := map[string]any{"kind": "system-snapshot", "schema_version": systemSnapshotSchema, "capture_id": captureID, "capture_consistency": view, "run_state_restore": restore, "initial_run_state": window.InitialRunState, "final_run_state": window.FinalRunState, "resumed": window.Resumed, "pause_resume_cycle": map[bool]int{true: 1, false: 0}[wasRunning], "target_generation_before": genBefore, "target_generation_after": genAfter, "artifact_count": len(artifacts), "internal_lock_acquired": internal}
 	if window.ResumeSkippedReason != "" {
 		summary["resume_skipped_reason"] = window.ResumeSkippedReason
@@ -340,5 +347,9 @@ func runSystemSnapshot(tc toolContext, args json.RawMessage) map[string]any {
 	if window.RestoreFailure != nil {
 		result[runStateRestoreFailed] = true
 	}
+	// Every component artifact was written while the window was open:
+	// complete its stored provenance, then re-stamp the response views.
+	tc.server.store.FinalizeCaptureConsistency(window.ids(), consistency)
+	restampCaptureProvenance(result, view, consistency.State)
 	return okResult(stampGenerations(result, genBefore, genAfter), tc.modern)
 }

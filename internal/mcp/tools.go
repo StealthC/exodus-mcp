@@ -273,7 +273,7 @@ func contextProperty() map[string]any {
 // before the read and restores the prior run state (temporally atomic, but
 // perturbs real-time behavior); "live" (default) never pauses.
 func captureModeProperty() map[string]any {
-	return enumProperty("Capture guard. \"paused\" pauses once before the read and restores the prior run state (temporally atomic, perturbs timing-sensitive software); \"live\" (default) never pauses and samples a possibly inconsistent instant.", []string{"live", "paused"})
+	return enumProperty("Capture guard. \"paused\" pauses once before the read, samples, and restores the prior run state it observed (temporally atomic, perturbs timing-sensitive software); a target whose pre-call run state could not be observed is left paused and the response reports run_state_restore.code resume_skipped_initial_run_state_unknown. \"live\" (default) never pauses and samples a possibly inconsistent instant.", []string{"live", "paused"})
 }
 
 // ----------------------------------------------------------------------------------------------------------------------

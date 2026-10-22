@@ -96,19 +96,35 @@ claim to the exact test function or smoke-script check that proves it.
   `composite_non_atomic` (component reads spanned multiple moments). The
   object states whether execution was paused by the tool and resumed
   afterwards, observed initial/final run states, and frame tokens when the
-  VDP exposes them. `memory_snapshot_capture` captures one or more named
-  ranges in one pause window (exactly one pause/resume cycle, one capture id,
-  one manifest); `memory_read`, `memory_dump`, `vdp_memory_read`, and
+  VDP exposes them. One window yields exactly one object: the response (top
+  level and `summary`) and the stored artifact provenance are completed from
+  the same object after the guard, the legacy `consistency` label is derived
+  from it instead of copied from the plugin payload, and the object is
+  stamped in both modes, so an artifact can never describe a different window
+  than the response it was returned with
+  (`TestPausedCaptureArtifactProvenanceMatchesResponse`,
+  `TestPausedCaptureCompositeArtifactsMatchResponse`). Each capture window
+  also reports `run_state_restore` with a stable code — `restored`,
+  `already_paused`, `resume_skipped_initial_run_state_unknown`,
+  `run_state_restore_failed`, or `run_state_restore_unverified` — plus
+  `initial_run_state`, `final_run_state`, and `resumed`; a restore is
+  verified from the native run-state echo, and a pre-call run state that no
+  observation established is never resumed, so a paused target can never be
+  started by a capture it did not ask for
+  (`TestPausedCaptureUnknownRunStateIsNotResumed`,
+  `TestPausedCaptureLeavesPausedTargetPaused`). `memory_snapshot_capture`
+  captures one or more named ranges in one pause window (exactly one
+  pause/resume cycle, one capture id, one manifest);
   `system_snapshot_capture` provides the cross-domain atomic form: memory
   ranges, CPU registers, VDP status/buffers, and an optional frame share one
-  pause window and one `capture_id` in a `system-snapshot/1` manifest;
+  pause window and one `capture_id` in a `system-snapshot/1` manifest, and
   omitted or unavailable components are explicit. `memory_read`,
-  `memory_dump`, `vdp_memory_read`, and `frame_capture` accept an optional
+  `memory_dump`, `m68k_read_memory`, `z80_read_memory`, `vdp_memory_read`,
+  `vdp_memory_export`, `frame_capture`, and `vdp_capture` accept an optional
   `capture_mode: "paused"` guard that makes a single sample temporally atomic
   — the default `"live"` never pauses, so timing-sensitive software is never
-  silently perturbed. Mixing artifacts
-  from different composite captures is rejected by `memory_diff` unless
-  explicitly allowed.
+  silently perturbed. Mixing artifacts from different composite captures is
+  rejected by `memory_diff` unless explicitly allowed.
 - **Run-state observability.** `emulator_status` reports `pause_source`
   (`mcp` | `ui_or_external` | `breakpoint_or_watchpoint` | `unknown`) and
   `last_run_state_change` (UTC). Externally observed transitions (UI pauses,
@@ -211,9 +227,14 @@ claim to the exact test function or smoke-script check that proves it.
   captures. Bounded inline matches plus a `memory-diff-results` artifact.
 - `system_snapshot_capture`: bounded atomic cross-domain snapshot with a
   `system-snapshot/1` artifact manifest, shared capture provenance, explicit
-  omitted/unavailable components, and one pause/resume window. **unvalidated**:
-  the tool appears only in the catalog test; its pause window, manifest, and
-  component selection have no behavioral test.
+  omitted/unavailable components, and one pause/resume window. **proven** for
+  the pause window, the verified run-state restore, and the manifest
+  provenance, including a guard that carries the caller's
+  `expected_target_generation`
+  (`TestSystemSnapshotCaptureRestoresWithExpectedGeneration`,
+  `TestSystemSnapshotCapturePausedTargetStaysPaused`); **unvalidated** for
+  component selection beyond a memory range (register, VDP buffer, and frame
+  components have no behavioral test).
 - `memory_snapshot_capture`: bounded paused composite capture — one or more
   named ranges of one address space are read inside a single pause window
   (the system is paused exactly once when running and restored afterwards;
@@ -221,10 +242,15 @@ claim to the exact test function or smoke-script check that proves it.
   temporally atomic instant. All raw range artifacts and the JSON manifest
   share one stable `capture_id` and the `artifact-provenance/2` envelope; the
   summary reports the pause/resume cycle count, the target generation span,
-  initial/final run states, frame tokens, and the atomic capture-consistency
-  object. Runs under exclusive control for the full window (caller
-  `control_id` reused or internal lock). A paused capture can perturb
-  real-time behavior; the cost is documented in the tool description.
+  initial/final run states, frame tokens, the atomic capture-consistency
+  object, and the `run_state_restore` outcome. A caller-supplied
+  `expected_target_generation` gates the pause only — the resume that closes
+  the window carries the control id alone
+  (`TestMemorySnapshotCaptureRestoresWithExpectedGeneration`,
+  `TestMemorySnapshotCapturePausedTargetStaysPaused`). Runs under exclusive
+  control for the full window (caller `control_id` reused or internal lock).
+  A paused capture can perturb real-time behavior; the cost is documented in
+  the tool description.
 - `memory_freeze`, `memory_freeze_list`, `memory_freeze_remove`,
   `memory_freeze_clear`: server-managed value freezing with optional
   generation/control preconditions. A registered range is written once and
@@ -430,7 +456,9 @@ claim to the exact test function or smoke-script check that proves it.
   is always false).
 - `vdp_capture`: one bounded VDP capture guarded by `capture_mode`. The default
   `"live"` guard performs no pause; `"paused"` pauses once and restores the
-  prior run state through the shared capture guard. It reads status/registers,
+  prior run state through the shared capture guard, and every artifact of the
+  capture is re-stamped with the finalized window object so provenance and
+  response agree. It reads status/registers,
   the frame buffer, CRAM, VSRAM, and optionally one VRAM range (131072-byte
   `vram_length` cap), then writes a `vdp-capture-manifest` linking the produced
   artifacts to one `capture_id`; omitted components carry a reason. Two
@@ -540,7 +568,11 @@ claim to the exact test function or smoke-script check that proves it.
   `bytes_covered`, `expected_range`, and `cap_reason` (`none` |
   `dump_cap` | `declared_end_beyond_file` | `degenerate_declared_range`) state
   exactly what was compared, and a partial comparison carries a note that it
-  is NOT full header-checksum validation. The response also carries the shared
+  is NOT full header-checksum validation. The response also reports the
+  standardized `capture_consistency` object for the header reads, and the
+  header artifact's legacy `consistency` label is derived from that object
+  instead of being stamped as a literal `live`
+  (`TestROMInfoConsistencyLabelMatchesObject`). It also carries the shared
   `rom_identity` object (file SHA-256 when the ROM file is readable from the
   server host, file and padded mapping sizes, header title/serial, Sega
   checksum status computed over the file, mapped image base, target
@@ -799,6 +831,8 @@ named subset are asserted by `internal/mcp/server_test.go`
 | Paused-read flag propagation for `memory_read`, `memory_dump`, `memory_search` | `internal/mcp/tools_paused_read_test.go` |
 | Artifact store: roundtrip, context scoping, preview caps, HTTP full/range/ETag, TTL and startup sweep, `provenance_unknown` vs stamped envelope | `internal/artifact/artifact_test.go` |
 | Capture consistency states, paused guard pause/restore (also on read failure), `memory_snapshot_capture` window and validation, cross-capture diff rejection, `state_load` `state_restored`, composite VDP export consistency | `internal/mcp/tools_consistency_test.go` |
+| Guarded capture with `expected_target_generation` (running and paused target) for `memory_snapshot_capture` and `system_snapshot_capture`, verified `run_state_restore` | `internal/mcp/tools_guard_window_test.go` |
+| `capture_mode: "paused"` never resumes a paused or unknown-state target, artifact/summary/response consistency agreement (single, composite, and `rom_info`) | `internal/mcp/tools_capture_window_test.go` |
 | Provenance-driven search/diff addressing, typed provenance envelope, ROM identity, checksum completeness, write read-back | `internal/mcp/tools_provenance_test.go` |
 | Breakpoint conditions and the `break_counter` default | `internal/mcp/tools_breakpoint_conditions_test.go` |
 | Freeze lifecycle, limits, surfaced write errors, purge on ROM load | `internal/mcp/tools_freeze_test.go` |
@@ -884,13 +918,17 @@ behavior is unverified as of this revision:
 - `audio_capture`: unreachable success path — the pinned plugin answers
   `audio_unavailable` for every call.
 - `vdp_capture` and its `vdp-capture-manifest` / `vdp-render-manifest`
-  artifacts: no test, no smoke check, and the sprite-table and render-manifest
-  components are placeholders (see the VDP section).
+  artifacts: no smoke check, and the sprite-table and render-manifest
+  components are placeholders (see the VDP section). Only the paused-window
+  provenance agreement is covered, by
+  `internal/mcp/tools_capture_window_test.go`.
 - `vdp_capture_id` reuse in `vdp_tile_export`, `vdp_plane_export`,
   `vdp_sprite_table`, and `vdp_pixel_info`: the parameter is validated and
   echoed; no captured bytes are reused.
-- `system_snapshot_capture`: appears only in the catalog test; its pause
-  window, manifest, and component selection are untested.
+- `system_snapshot_capture` component selection beyond a memory range: the
+  register, VDP buffer, and frame components have no behavioral test (the
+  pause window, restore verification, and manifest provenance are proven by
+  `internal/mcp/tools_guard_window_test.go`).
 - Trace session `mode: "continuous"` and `stop_after_vdp_frames`: both tests
   and the live check use the default `sampled` window mode.
 - `cpu_coverage_capture` `blocks`/`edges`: the tests assert entry, distinct and
