@@ -105,12 +105,3 @@ func (capture Capture) Component(name string) (CaptureComponent, bool) {
 	}
 	return CaptureComponent{}, false
 }
-
-// ComponentNames lists the component names of a capture in registration order.
-func (capture Capture) ComponentNames() []string {
-	names := make([]string, 0, len(capture.Components))
-	for _, component := range capture.Components {
-		names = append(names, component.Name)
-	}
-	return names
-}

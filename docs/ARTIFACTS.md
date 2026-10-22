@@ -136,7 +136,10 @@ issues #2 and #10):
   `expires_at` (`null` when retention is unlimited), `schema_version` when the
   payload declares one inside itself, `capture_id` when applicable, the download
   `url`, and `provenance_state`. The response reports `total`, `returned`,
-  `has_more`, and `next_cursor` (`null` on the last page).
+  `has_more`, and `next_cursor` (`null` on the last page). A cursor is a position
+  in the filtered, creation-ordered listing: artifacts written between pages
+  append (they cannot shift an earlier page), while an expiry between pages can
+  move a later entry.
 - `capture_get{capture_id}` resolves a capture issued by
   `memory_snapshot_capture`, `system_snapshot_capture`, or `vdp_capture` to the
   tool that produced it, the target generation and frame token observed at
