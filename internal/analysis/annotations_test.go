@@ -385,3 +385,101 @@ func TestAnnotationUpdateAddressDomain(t *testing.T) {
 		t.Fatalf("clear address must drop the whole domain: %+v", clear)
 	}
 }
+
+// importAnnotationsWithTimestamps loads one annotation set whose created_at
+// values come from the caller, which is the only way to build the timestamp
+// ties a coarse host clock produces (Windows resolves ~0.5-15.6 ms, so several
+// annotations created in a row can share one instant).
+func importAnnotationsWithTimestamps(t *testing.T, store *AnnotationStore, ctxID string, stamps []time.Time) []string {
+	t.Helper()
+	document := map[string]any{"schema_version": "annotation-export/1", "annotations": []any{}}
+	ids := make([]string, 0, len(stamps))
+	for _, stamp := range stamps {
+		id := NewAnnotationID()
+		ids = append(ids, id)
+		document["annotations"] = append(document["annotations"].([]any), map[string]any{
+			"id":         id,
+			"context_id": ctxID,
+			"title":      "tie " + id,
+			"kind":       "observation",
+			"created_at": stamp.Format(time.RFC3339Nano),
+			"updated_at": stamp.Format(time.RFC3339Nano),
+			"tags":       []string{},
+			"links":      map[string]any{},
+		})
+	}
+	raw, err := json.Marshal(document)
+	if err != nil {
+		t.Fatal(err)
+	}
+	imported, conflicts, err := store.Import(ctxID, raw, false)
+	if err != nil || imported != len(stamps) || len(conflicts) != 0 {
+		t.Fatalf("import: imported=%d conflicts=%v err=%v", imported, conflicts, err)
+	}
+	return ids
+}
+
+// TestAnnotationListKeysetPagingWithinOneTimestamp pins the keyset order when
+// several annotations share one created_at: the (created_at, id) tuple is total,
+// so paging with a cursor must return exactly the slices of the full listing —
+// no repeat and no skip at a tie boundary, regardless of clock resolution.
+func TestAnnotationListKeysetPagingWithinOneTimestamp(t *testing.T) {
+	base := time.Date(2026, 10, 22, 15, 51, 16, 134068000, time.UTC)
+	cases := []struct {
+		name   string
+		stamps []time.Time
+	}{
+		{"all-tied", []time.Time{base, base, base, base, base}},
+		{"tie-groups", []time.Time{base.Add(-time.Nanosecond), base, base, base, base.Add(time.Nanosecond)}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			store := NewAnnotationStore()
+			importAnnotationsWithTimestamps(t, store, "ctx_tie", tc.stamps)
+			current := AnnotationTarget{Generation: 1}
+
+			full := store.List("ctx_tie", AnnotationFilter{Limit: 100, IncludeStale: true}, current)
+			if len(full.Annotations) != len(tc.stamps) {
+				t.Fatalf("full listing = %d rows, want %d", len(full.Annotations), len(tc.stamps))
+			}
+			want := make([]string, 0, len(full.Annotations))
+			for _, ann := range full.Annotations {
+				want = append(want, ann.ID)
+			}
+
+			got := make([]string, 0, len(want))
+			filter := AnnotationFilter{Limit: 2, IncludeStale: true}
+			for page := 0; page < len(tc.stamps)+2; page++ {
+				result := store.List("ctx_tie", filter, current)
+				for _, ann := range result.Annotations {
+					got = append(got, ann.ID)
+				}
+				if !result.Truncated || len(result.Annotations) == 0 {
+					break
+				}
+				last := result.Annotations[len(result.Annotations)-1]
+				filter.AfterCreatedAt = last.CreatedAt
+				filter.AfterID = last.ID
+			}
+			if len(got) != len(want) {
+				t.Fatalf("paged %d rows, full listing has %d (%v vs %v)", len(got), len(want), got, want)
+			}
+			for index := range want {
+				if got[index] != want[index] {
+					t.Fatalf("paged order differs from the full listing at %d: %v vs %v", index, got, want)
+				}
+			}
+			// The anchor row itself is never returned again: a resume is strict.
+			anchor := full.Annotations[0]
+			resumed := store.List("ctx_tie", AnnotationFilter{Limit: 100, IncludeStale: true, AfterCreatedAt: anchor.CreatedAt, AfterID: anchor.ID}, current)
+			for _, ann := range resumed.Annotations {
+				if ann.ID == anchor.ID {
+					t.Fatalf("the anchor %s was returned again", ann.ID)
+				}
+			}
+			if len(resumed.Annotations) != len(full.Annotations)-1 {
+				t.Fatalf("resume after the first row returned %d rows, want %d", len(resumed.Annotations), len(full.Annotations)-1)
+			}
+		})
+	}
+}
